@@ -277,9 +277,11 @@ pub fn build_auto_address_prompt(pr_number: u64, branch: &str, items: &[PrFeedba
         - Carefully inspect each feedback item and the referenced file locations.\n\
         - If a comment asks a question or does not require code changes, provide a clear, helpful explanation in your response without making unnecessary edits.\n\
         - If code changes are required, keep modifications surgical, focused, and well-tested.\n\
+        - Before editing, inspect the current branch, `git status`, upstream tracking, and whether the PR branch has diverged. If the checkout is not on `{branch}`, locate its worktree or stop and explain the mismatch; do not change another branch.\n\
+        - Preserve existing uncommitted changes: inspect them, do not overwrite or discard them, and stage only your review fixes (use patch staging when files overlap). Never include unrelated user changes in your commit.\n\
         - Verify that your changes compile and tests pass before committing.\n\
-        - Commit and push the fixes to branch `{branch}`.\n\
-        - Reply with a summary of what was fixed and pushed.",
+        - Commit only your review fixes and push to the PR branch `{branch}`. Fetch and integrate upstream changes safely before pushing; never force-push or reset user work. If you cannot safely push, explain the blocker and what remains local.\n\
+        - Reply with a summary of what was fixed and pushed, or explain why no code change was needed.",
         feedback = formatted_items.join("\n\n")
     )
 }
@@ -483,5 +485,10 @@ mod tests {
         assert!(prompt.contains("src/parse.rs:42"));
         assert!(prompt.contains("Check boundary condition"));
         assert!(prompt.contains("Verify that your changes compile"));
+        assert!(prompt.contains("git status"));
+        assert!(prompt.contains("uncommitted"));
+        assert!(prompt.contains("only your review fixes"));
+        assert!(prompt.contains("upstream"));
+        assert!(prompt.contains("cannot safely push"));
     }
 }
