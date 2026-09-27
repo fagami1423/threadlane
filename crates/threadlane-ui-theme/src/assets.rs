@@ -35,7 +35,12 @@ impl AssetSource for Assets {
             "icons/git/branch.svg" => Some(include_bytes!("../assets/icons/git/branch.svg")),
             "icons/git/comments.svg" => Some(include_bytes!("../assets/icons/git/comments.svg")),
             "icons/git/issue.svg" => Some(include_bytes!("../assets/icons/git/issue.svg")),
-            "icons/git/pull-request.svg" => Some(include_bytes!("../assets/icons/git/pull-request.svg")),
+            "icons/git/pull-request.svg" => {
+                Some(include_bytes!("../assets/icons/git/pull-request.svg"))
+            }
+            "icons/threadlane.svg" | "icons/threadlane-logo.svg" => {
+                Some(include_bytes!("../assets/icons/threadlane.svg"))
+            }
             _ => None,
         };
 
@@ -69,6 +74,8 @@ impl AssetSource for Assets {
                 "icons/git/comments.svg",
                 "icons/git/issue.svg",
                 "icons/git/pull-request.svg",
+                "icons/threadlane.svg",
+                "icons/threadlane-logo.svg",
             ]
             .into_iter()
             .filter(|asset| asset.starts_with(path))
