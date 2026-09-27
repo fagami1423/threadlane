@@ -3,6 +3,7 @@ mod editor;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::collapsible::Collapsible;
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, Selectable, Sizable, StyledExt, WindowExt};
@@ -51,6 +52,7 @@ pub(crate) fn picker(
 pub struct AutomationsView {
     model: Entity<AppState>,
     selected: Option<String>,
+    expanded_prompt: Option<String>,
     scope: Option<PathBuf>,
     history: bool,
     page: usize,
@@ -64,6 +66,7 @@ impl AutomationsView {
         Self {
             model,
             selected: None,
+            expanded_prompt: None,
             scope: None,
             history: false,
             page: 0,
@@ -175,6 +178,8 @@ impl Render for AutomationsView {
             let edit = d.clone();
             let owner = cx.entity().downgrade();
             let enabled = d.enabled;
+            let prompt_open = self.expanded_prompt.as_ref() == Some(&d.id);
+            let prompt_id = d.id.clone();
             content = content.child(
                 div()
                     .flex()
@@ -244,13 +249,42 @@ impl Render for AutomationsView {
                     "{} · {} · {}",
                     d.project.display(),
                     d.model,
-                    if d.worktree {
-                        "Fresh worktree"
-                    } else {
-                        "Project checkout"
-                    }
+                    if d.worktree { "Worktree" } else { "Local" }
                 )))
-                .child(div().child(d.prompt.clone()))
+                .child(
+                    Collapsible::new()
+                        .open(prompt_open)
+                        .child(
+                            Button::new("automation-prompt-toggle")
+                                .debug_selector(|| "automation-prompt-toggle".into())
+                                .ghost()
+                                .small()
+                                .label(if prompt_open {
+                                    "Hide prompt"
+                                } else {
+                                    "Show prompt"
+                                })
+                                .accessibility_label(if prompt_open {
+                                    "Hide automation prompt"
+                                } else {
+                                    "Show automation prompt"
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.expanded_prompt =
+                                        (!prompt_open).then(|| prompt_id.clone());
+                                    cx.notify();
+                                })),
+                        )
+                        .content(
+                            div()
+                                .debug_selector(|| "automation-prompt-body".into())
+                                .text_sm()
+                                .p_3()
+                                .bg(cx.theme().muted)
+                                .rounded_md()
+                                .child(d.prompt.clone()),
+                        ),
+                )
                 .children(
                     d.paused_reason
                         .clone()
@@ -282,6 +316,8 @@ impl Render for AutomationsView {
                     Button::new(SharedString::from(format!("automation-{}", d.id)))
                         .ghost()
                         .w_full()
+                        .h_auto()
+                        .py_3()
                         .justify_start()
                         .child(
                             div()
@@ -299,12 +335,13 @@ impl Render for AutomationsView {
                                         .gap_1()
                                         .child(div().font_semibold().child(d.name.clone()))
                                         .child(div().text_sm().text_color(muted).child(format!(
-                                                    "{} · {}",
+                                                    "{} · {} · {}",
                                                     d.project
                                                         .file_name()
                                                         .unwrap_or_default()
                                                         .to_string_lossy(),
-                                                    d.schedule.label()
+                                                    d.schedule.label(),
+                                                    if d.worktree { "Worktree" } else { "Local" }
                                                 ))),
                                 )
                                 .child(div().text_sm().child(if !d.enabled {
@@ -338,14 +375,20 @@ impl Render for AutomationsView {
                         && selected.as_ref().is_none_or(|id| *id == r.definition.id)
                 })
                 .collect();
-            content = content.child(div().font_semibold().child("Run history"));
+            content = content.child(
+                div()
+                    .font_semibold()
+                    .child(format!("Run history · {}", runs.len())),
+            );
+            let page = self.page.min(runs.len().saturating_sub(1) / 25);
             if runs.is_empty() {
                 content = content.child(div().text_color(muted).child("No runs yet"));
             }
-            for run in runs.iter().skip(self.page * 25).take(25) {
+            for run in runs.iter().skip(page * 25).take(25) {
                 let id = run.id.clone();
                 let cancel_id = id.clone();
                 let review_id = id.clone();
+                let delete_id = id.clone();
                 let mut row = div()
                     .flex()
                     .flex_col()
@@ -358,7 +401,8 @@ impl Render for AutomationsView {
                             .flex()
                             .items_center()
                             .gap_3()
-                            .child(div().flex_1().child(format!(
+                            .flex_wrap()
+                            .child(div().flex_1().min_w_0().child(format!(
                                 "{} · {}",
                                 run.definition.name,
                                 display_time(run.created_at, run.definition.schedule.timezone())
@@ -405,8 +449,33 @@ impl Render for AutomationsView {
                                             this.command(Command::Review(review_id.clone()), cx)
                                         })),
                                 )
+                            })
+                            .when(!run.status.active(), |row| {
+                                row.child(
+                                    Button::new(SharedString::from(format!("remove-{delete_id}")))
+                                        .debug_selector(move || format!("remove-run-{delete_id}"))
+                                        .small()
+                                        .ghost()
+                                        .label("Remove")
+                                        .tooltip(
+                                            "Remove from run history; keep the chat and worktree",
+                                        )
+                                        .accessibility_label(
+                                            "Remove from run history; keep the chat and worktree",
+                                        )
+                                        .disabled(self.busy)
+                                        .on_click({
+                                            let id = run.id.clone();
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.command(Command::DeleteRun(id.clone()), cx)
+                                            })
+                                        }),
+                                )
                             }),
-                    );
+                    )
+                    .child(div().text_xs().text_color(muted).child(format!("{} · {}",
+                        run.definition.project.file_name().unwrap_or_default().to_string_lossy(),
+                        if run.definition.worktree { "Worktree" } else { "Local" })));
                 if let Some(error) = &run.error {
                     row = row.child(
                         div()
@@ -430,18 +499,18 @@ impl Render for AutomationsView {
                     .child(
                         Button::new("automation-prev")
                             .label("Previous")
-                            .disabled(self.page == 0)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.page = this.page.saturating_sub(1);
+                            .disabled(page == 0)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.page = page.saturating_sub(1);
                                 cx.notify();
                             })),
                     )
                     .child(
                         Button::new("automation-next")
                             .label("Next")
-                            .disabled((self.page + 1) * 25 >= runs.len())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.page += 1;
+                            .disabled((page + 1) * 25 >= runs.len())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.page = page + 1;
                                 cx.notify();
                             })),
                     ),
@@ -465,6 +534,77 @@ mod tests {
     use gpui::{AppContext, Modifiers, TestAppContext};
     use gpui_component::WindowExt;
     use threadlane_ui_state::{activate_test_session, AppState};
+
+    #[gpui::test]
+    fn history_keeps_long_prompts_collapsed_and_only_finished_runs_removable(
+        cx: &mut TestAppContext,
+    ) {
+        use threadlane_automation::{Definition, Run, RunStatus, Schedule};
+        cx.update(gpui_component::init);
+        let temp = tempfile::tempdir().unwrap();
+        let model = cx.new(|_| {
+            let mut state = AppState::default();
+            activate_test_session(&mut state, "original", &temp.path().join("original.jsonl"));
+            let definition = Definition {
+                id: "research".into(),
+                revision: 1,
+                name: "Research".into(),
+                prompt: "Research without edits. ".repeat(200),
+                project: temp.path().into(),
+                model: "model".into(),
+                effort: "medium".into(),
+                worktree: false,
+                schedule: Schedule::Manual,
+                enabled: false,
+                notify_all: false,
+                anchor: 0,
+                next_at: None,
+                failures: 0,
+                paused_reason: None,
+            };
+            state.automations.snapshot.definitions = vec![definition.clone()];
+            state.automations.snapshot.runs = [RunStatus::Failed, RunStatus::Running]
+                .into_iter()
+                .enumerate()
+                .map(|(i, status)| Run {
+                    id: i.to_string(),
+                    definition: definition.clone(),
+                    scheduled_for: None,
+                    created_at: 0,
+                    finished_at: None,
+                    status,
+                    session_id: format!("automation_{i}"),
+                    session_file: None,
+                    error: None,
+                    reviewed: false,
+                })
+                .collect();
+            state
+        });
+        let shared = model.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = super::AutomationsView::new(shared, cx);
+                view.selected = Some("research".into());
+                view.page = 9; // A removed last page must fall back to existing rows.
+                view
+            });
+            gpui_component::Root::new(view, window, cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("automation-prompt-body").is_none());
+        assert!(cx.debug_bounds("remove-run-0").is_some());
+        assert!(cx.debug_bounds("remove-run-1").is_none());
+        let toggle = cx.debug_bounds("automation-prompt-toggle").unwrap();
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("automation-prompt-body").is_some());
+        model.read_with(cx, |state, _| {
+            assert_eq!(state.active_session_id.as_deref(), Some("original"))
+        });
+    }
 
     #[gpui::test]
     fn automation_sheet_supports_pointer_and_keyboard_without_switching_chat(

@@ -29,6 +29,7 @@ pub enum Command {
     Save(Definition),
     SetEnabled(String, bool),
     Delete(String),
+    DeleteRun(String),
     RunNow(String),
     Cancel(String),
     Review(String),
@@ -257,6 +258,7 @@ impl Actor {
             }
             Command::SetEnabled(id, enabled) => self.store.set_enabled(&id, enabled, now())?,
             Command::Delete(id) => self.store.delete(&id)?,
+            Command::DeleteRun(id) => self.store.delete_run(&id)?,
             Command::RunNow(id) => {
                 self.store.enqueue(&id, false, now())?;
             }

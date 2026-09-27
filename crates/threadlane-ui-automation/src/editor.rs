@@ -375,7 +375,6 @@ impl Render for Editor {
                 let _ = owner.update(cx, |this, cx| {
                     this.definition.project = id.into();
                     this.is_git = true;
-                    this.definition.worktree = true;
                     this.refresh_project(cx);
                     this.models = threadlane_ui_catalog::available_models_for_project(Some(
                         &this.definition.project,
@@ -589,11 +588,35 @@ impl Render for Editor {
                 format!("Next runs: {}", times.join(" · "))
             })
         });
-        body = body.child(div().text_sm().text_color(cx.theme().muted_foreground).child(preview.unwrap_or_else(|error| error)))
-            .child(Checkbox::new("automation-worktree").label("Use a fresh worktree for each run").checked(self.definition.worktree)
-                .disabled(self.busy || !self.is_git)
-                .on_click(cx.listener(|this, checked, _, cx| { this.definition.worktree = *checked; cx.notify(); })))
-            .when(!self.definition.worktree, |body| body.child(div().text_sm().text_color(cx.theme().warning).child("Runs can modify files in the project checkout.")))
+        let owner = cx.entity().downgrade();
+        let mut environments = vec![("local".into(), "Local".into())];
+        if self.is_git {
+            environments.push(("worktree".into(), "Worktree".into()));
+        }
+        body = body
+            .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                .child(preview.unwrap_or_else(|error| error)))
+            .child(field("Run in", picker(
+                "automation-environment",
+                if self.definition.worktree { "Worktree" } else { "Local" }.into(),
+                environments,
+                if self.definition.worktree { "worktree" } else { "local" }.into(),
+                self.busy,
+                move |id, cx| {
+                    let _ = owner.update(cx, |this, cx| {
+                        this.definition.worktree = id == "worktree";
+                        cx.notify();
+                    });
+                },
+            )))
+            .child(div().text_sm().text_color(cx.theme().muted_foreground).child(
+                if self.definition.worktree {
+                    "For code changes. Each run gets a fresh Git worktree, separate from your project checkout."
+                } else {
+                    "For research and issue creation. Uses your project checkout without creating a worktree. This is not read-only; the prompt should say when files must not change."
+                }))
+            .when(!self.is_git, |body| body.child(div().text_sm().text_color(cx.theme().muted_foreground)
+                .child("Worktrees require a Git repository.")))
             .child(Checkbox::new("automation-notify").label("Notify on every completion").checked(self.definition.notify_all).disabled(self.busy)
                 .on_click(cx.listener(|this, checked, _, cx| { this.definition.notify_all = *checked; cx.notify(); })))
             .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Runs while Threadlane is open and your computer is awake. Permission and question requests wait for you in the run’s chat. Saving does not run the prompt immediately."))

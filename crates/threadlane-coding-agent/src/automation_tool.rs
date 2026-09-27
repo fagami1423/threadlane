@@ -64,7 +64,7 @@ impl ToolExecutor for AutomationCapability {
     fn tool_definitions(&self) -> Arc<[AgentToolDefinition]> {
         vec![AgentToolDefinition {
             name: "create_automation".into(),
-            description: Some("Create a Threadlane automation only when the user explicitly asks to schedule or automate work. Saves it in the Automations sidebar, without running immediately. Runs require the app open and computer awake. Default project/model/effort come from this chat; Git projects default to a fresh worktree. Ask the user when the prompt, cadence, or timezone is unclear; never guess a wall-clock timezone. Reuse request_key on retries of the SAME request, and use a new key for a distinct automation. Report success only after this tool succeeds, including project, timezone, enabled state, and next run. Schedule examples: \"Manual\", {\"Interval\":{\"minutes\":60}}, {\"Calendar\":{\"hour\":9,\"minute\":0,\"days\":[0,1,2,3,4],\"timezone\":\"America/Toronto\"}}. Calendar days are Monday=0 through Sunday=6.".into()),
+            description: Some("Create a Threadlane automation only when the user explicitly asks to schedule or automate work. Saves it in the Automations sidebar, without running immediately. Runs require the app open and computer awake. Default project/model/effort come from this chat; Git projects default to a fresh worktree. For research or issue creation without code changes, set worktree=false and preserve the no-edit constraint in the prompt. Ask the user when the prompt, cadence, or timezone is unclear; never guess a wall-clock timezone. Reuse request_key on retries of the SAME request, and use a new key for a distinct automation. Report success only after this tool succeeds, including project, timezone, enabled state, and next run. Schedule examples: \"Manual\", {\"Interval\":{\"minutes\":60}}, {\"Calendar\":{\"hour\":9,\"minute\":0,\"days\":[0,1,2,3,4],\"timezone\":\"America/Toronto\"}}. Calendar days are Monday=0 through Sunday=6.".into()),
             parameters: json!({
                 "type":"object", "additionalProperties":false,
                 "required":["request_key","name","prompt","schedule"],
@@ -79,7 +79,7 @@ impl ToolExecutor for AutomationCapability {
                     "project":{"type":"string","description":"Optional absolute attached-project path. Defaults to this chat's owning project."},
                     "model":{"type":"string","description":"Optional native model ID, preserving its provider prefix. Defaults to this chat's saved model."},
                     "reasoning_effort":{"type":"string"},
-                    "worktree":{"type":"boolean","description":"False permits edits in the project checkout. Only choose false if requested."},
+                    "worktree":{"type":"boolean","description":"Choose false for research or issue creation when no code changes are requested; choose true for code changes in a fresh Git worktree. Local execution is not read-only."},
                     "enabled":{"type":"boolean","description":"Defaults true. False saves paused."},
                     "notify_all":{"type":"boolean","description":"Notify for every completion; defaults false (requests and failures only)."}
                 }

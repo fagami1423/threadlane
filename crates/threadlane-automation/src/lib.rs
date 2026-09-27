@@ -589,6 +589,22 @@ impl Store {
             Ok(())
         })
     }
+    /// Remove a finished run from history; its chat and checkout remain untouched.
+    pub fn delete_run(&mut self, id: &str) -> Result<(), String> {
+        self.commit(|state| {
+            let run = state
+                .runs
+                .iter()
+                .find(|run| run.id == id)
+                .ok_or("Run no longer exists")?;
+            if run.status.active() {
+                return Err("Cancel the run and wait for it to finish before removing it".into());
+            }
+            state.runs.retain(|run| run.id != id);
+            Ok(())
+        })
+    }
+
     pub fn mark_reviewed(&mut self, id: &str) -> Result<(), String> {
         self.commit(|state| {
             let run = state
@@ -678,6 +694,43 @@ mod tests {
         store.delete("test").unwrap();
         assert_eq!(store.snapshot().runs.len(), 2);
     }
+    #[test]
+    fn removing_runs_is_durable_and_preserves_schedule_chat_and_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.save(definition(), 0).unwrap();
+        let saved = store.snapshot().definitions[0].clone();
+        let id = store.enqueue("test", false, 1).unwrap();
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let chat = checkout.join("chat.jsonl");
+        std::fs::write(&chat, "keep chat").unwrap();
+        for status in [
+            RunStatus::Queued,
+            RunStatus::Starting,
+            RunStatus::Running,
+            RunStatus::WaitingPermission,
+            RunStatus::WaitingAnswer,
+        ] {
+            store
+                .update_run(&id, status, None, Some(chat.clone()), 2)
+                .unwrap();
+            let revision = store.snapshot().revision;
+            assert!(store.delete_run(&id).is_err());
+            assert_eq!(store.snapshot().revision, revision);
+        }
+        store
+            .update_run(&id, RunStatus::Succeeded, None, None, 3)
+            .unwrap();
+        store.delete_run(&id).unwrap();
+        assert!(store.delete_run("missing").is_err());
+        assert_eq!(std::fs::read_to_string(&chat).unwrap(), "keep chat");
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        assert!(store.snapshot().runs.is_empty());
+        assert_eq!(store.snapshot().definitions, vec![saved]);
+    }
+
     #[test]
     fn corrupt_storage_is_not_overwritten() {
         let dir = tempfile::tempdir().unwrap();
