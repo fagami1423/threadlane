@@ -4339,3 +4339,110 @@ fn active_session_loading_requires_matching_message_hydration() {
     state.finish_session_hydration("session-1", &session_file);
     assert!(!state.active_session_is_loading());
 }
+
+#[test]
+fn pr_task_resolution_handles_checkout_paths_live_branches_and_project_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().canonicalize().unwrap();
+    let project = project_dir.as_path();
+    let checkout = Path::new("/worktrees/app");
+    let mut state = worktree_session_state(project, "active", checkout);
+    let mut first = state.projects[0].sessions[0].clone();
+    first.id = "first".into();
+    first.runtime_work_dir = PathBuf::from("/worktrees/first");
+    first.git_branch = Some("feature/review".into());
+    state.projects[0].sessions.insert(0, first);
+    state.active_work_dir = Some(project.into());
+    state.active_session_id = Some("active".into());
+    // The agent checked out a branch after the durable metadata was saved.
+    state.git_statuses.insert(
+        checkout.into(),
+        threadlane_git::GitStatus {
+            branch: Some("feature/review".into()),
+            ..Default::default()
+        },
+    );
+    for path in [project, checkout] {
+        assert_eq!(
+            state.linked_pr_session(path, "feature/review").unwrap().id,
+            "active"
+        );
+    }
+    assert!(
+        state
+            .linked_pr_session(Path::new("/projects/other"), "feature/review")
+            .is_none()
+    );
+    assert!(state.linked_pr_session(project, "").is_none());
+    assert!(state.linked_pr_session(checkout, "other").is_none());
+    state.projects[0].sessions[1].git_branch = Some("old-branch".into());
+    assert!(state.linked_pr_session(checkout, "old-branch").is_none());
+    state.git_statuses.get_mut(checkout).unwrap().detached = true;
+    assert!(
+        state
+            .linked_pr_session(checkout, "feature/review")
+            .is_none()
+    );
+    state.git_statuses.clear();
+    state.projects[0].sessions[1].git_branch = Some("feature/review".into());
+    assert_eq!(
+        state
+            .linked_pr_session(project, "feature/review")
+            .unwrap()
+            .id,
+        "active"
+    );
+    state.projects[0].sessions[1].worktree_available = false;
+    assert_eq!(
+        state
+            .linked_pr_session(project, "feature/review")
+            .unwrap()
+            .id,
+        "first"
+    );
+    state.active_session_id = Some("missing".into());
+    assert_eq!(
+        state
+            .linked_pr_session(project, "feature/review")
+            .unwrap()
+            .id,
+        "first"
+    );
+}
+
+#[test]
+fn pr_review_actions_reject_missing_checkout_without_dispatch_or_tracking() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().canonicalize().unwrap();
+    let checkout = project.join("missing-worktree");
+    let mut state = worktree_session_state(&project, "review", &checkout);
+    state.projects[0].sessions[0].git_branch = Some("feature/review".into());
+    state.projects[0].sessions[0].worktree_available = false;
+    state.auto_address_pr_reviews_enabled = true;
+    let pr = threadlane_git::GitHubPrInfo {
+        number: 275,
+        state: "OPEN".into(),
+        head_ref: "feature/review".into(),
+        author: "author".into(),
+        review_comments: vec![threadlane_git::PrReviewComment {
+            author: "reviewer".into(),
+            body: "Fix the missing checkout handling".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    for path in [&project, &checkout] {
+        let error = state
+            .address_pr_reviews_manual(path.clone(), pr.head_ref.clone(), &pr)
+            .unwrap_err();
+        assert!(error.contains("checkout is missing"), "{error}");
+        assert!(
+            state
+                .auto_address_pr_reviews(path.clone(), pr.head_ref.clone(), &pr)
+                .is_none()
+        );
+    }
+    assert!(state.active_session_id.is_none());
+    assert!(state.pr_review_tracking.is_empty());
+    assert!(state.session_runtimes.is_empty());
+}

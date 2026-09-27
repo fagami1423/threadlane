@@ -129,22 +129,6 @@ pub(crate) fn linked_session_ids<'a>(
         .collect()
 }
 
-fn linked_pr_session<'a>(
-    sessions: &'a [SessionInfo],
-    head_ref: &str,
-    active_session_id: Option<&str>,
-) -> Option<&'a SessionInfo> {
-    sessions
-        .iter()
-        .filter(|session| session.git_branch.as_deref() == Some(head_ref))
-        .find(|session| active_session_id == Some(session.id.as_str()))
-        .or_else(|| {
-            sessions
-                .iter()
-                .find(|session| session.git_branch.as_deref() == Some(head_ref))
-        })
-}
-
 fn linked_sessions_across_projects<'a>(
     projects: &[(&'a str, &'a [SessionInfo])],
     issue: &GitHubIssueRef,
@@ -236,6 +220,18 @@ fn github_link_fingerprint_rows<'a>(
 }
 
 fn github_link_fingerprint(state: &AppState) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    state.active_work_dir.hash(&mut hasher);
+    for session in state.projects.iter().flat_map(|project| &project.sessions) {
+        threadlane_ui_state::hash_session_identity(&mut hasher, session);
+        session.work_dir.hash(&mut hasher);
+        session.runtime_work_dir.hash(&mut hasher);
+        state
+            .git_statuses
+            .get(&session.runtime_work_dir)
+            .map(|status| (&status.branch, status.detached))
+            .hash(&mut hasher);
+    }
     github_link_fingerprint_rows(
         state.active_session_id.as_deref(),
         state.projects.iter().flat_map(|project| {
@@ -257,6 +253,8 @@ fn github_link_fingerprint(state: &AppState) -> u64 {
             })
         }),
     )
+    .hash(&mut hasher);
+    hasher.finish()
 }
 
 fn linked_session_fingerprint(session: &SessionInfo, pr: Option<&GitHubPrInfo>) -> u64 {
@@ -1596,17 +1594,10 @@ impl GitHubView {
         head_ref: &str,
         cx: &App,
     ) -> Option<SessionInfo> {
-        let state = self.model.read(cx);
-        let project = state
-            .projects
-            .iter()
-            .find(|project| &project.work_dir == project_work_dir)?;
-        linked_pr_session(
-            &project.sessions,
-            head_ref,
-            state.active_session_id.as_deref(),
-        )
-        .cloned()
+        self.model
+            .read(cx)
+            .linked_pr_session(project_work_dir, head_ref)
+            .cloned()
     }
 
     fn select_ix(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -2710,45 +2701,23 @@ impl GitHubView {
         let selected_project = self.selected_pr.clone().map(|key| key.project);
         let head_ref = head_ref.to_owned();
         model.update(cx, |state, cx| {
-            let target = state
-                .projects
-                .iter()
-                .filter(|project| {
-                    selected_project
-                        .as_ref()
-                        .is_none_or(|selected| &project.work_dir == selected)
-                })
-                .find_map(|project| {
-                    linked_pr_session(
-                        &project.sessions,
-                        &head_ref,
-                        state.active_session_id.as_deref(),
-                    )
-                })
-                .or_else(|| {
-                    state.projects.iter().find_map(|project| {
-                        linked_pr_session(
-                            &project.sessions,
-                            &head_ref,
-                            state.active_session_id.as_deref(),
-                        )
-                    })
-                })
+            let target = selected_project
+                .as_ref()
+                .and_then(|project| state.linked_pr_session(project, &head_ref))
                 .map(|session| (session.work_dir.clone(), session.id.clone()));
-            if let Some((work_dir, session_id)) = target {
+            let Some((work_dir, session_id)) = target else {
+                state.session_status =
+                    Some("No active task is linked to this pull request branch.".into());
+                cx.notify();
+                return;
+            };
+            if state.active_work_dir.as_ref() != Some(&work_dir)
+                || state.active_session_id.as_deref() != Some(session_id.as_str())
+            {
                 controller::dispatch(
                     state,
-                    AppAction::SelectSession {
-                        work_dir,
-                        session_id: session_id.clone(),
-                    },
+                    AppAction::SelectSession { work_dir, session_id },
                 );
-                if state.active_session_id.as_deref() != Some(session_id.as_str()) {
-                    state.session_status =
-                        Some("Couldn’t select the linked task for this pull request.".into());
-                    cx.notify();
-                    return;
-                }
             }
             state.request_composer_prompt(prompt);
             controller::dispatch(state, AppAction::CloseGitHub);
@@ -2761,13 +2730,11 @@ impl GitHubView {
             return;
         };
         let head_ref = pr.head_ref.clone();
-        let selected_project = self.selected_pr.clone().map(|key| key.project);
+        let Some(work_dir) = self.selected_pr.as_ref().map(|key| key.project.clone()) else {
+            return;
+        };
         let model = self.model.clone();
         model.update(cx, |state, cx| {
-            let work_dir = selected_project
-                .clone()
-                .or_else(|| state.active_work_dir.clone())
-                .unwrap_or_default();
             match state.address_pr_reviews_manual(work_dir, head_ref.clone(), &pr) {
                 Ok(_) => {
                     controller::dispatch(state, AppAction::CloseGitHub);
@@ -4178,7 +4145,7 @@ mod tests {
         detail_result_matches_list, draft_reply_prompt, github_empty_message,
         github_link_fingerprint_rows, github_result_matches_request, github_server_query,
         github_state_for_tab, issue_start_activation, issue_start_confirmation,
-        issue_start_dialog_result, linked_pr_session, linked_session_fingerprint,
+        issue_start_dialog_result, linked_session_fingerprint,
         linked_session_ids, linked_session_status, linked_sessions_across_projects,
         list_count_splice, merge_pr_timeline, pr_check_label, pr_diff_result_matches_request,
         pr_file_action_ix, pr_publish_control, pr_publish_refresh_matches_selection,
@@ -4280,6 +4247,53 @@ mod tests {
         view.pr_list_state.reset(1);
         view.pr_file_list_state.reset(files.len());
         cx.notify();
+    }
+
+    #[gpui::test]
+    fn github_pr_reply_handoff_stays_in_project_and_tracks_live_branch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            super::init(cx);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let model = cx.new(|_| AppState::default());
+            GitHubView::new(model, window, cx)
+        });
+        view.update(cx, |view, cx| {
+            configure_pr_workspace(view, cx);
+            let project = view.selected_pr.as_ref().unwrap().project.clone();
+            let before = super::github_link_fingerprint(view.model.read(cx));
+            view.model.update(cx, |state, _| {
+                let checkout = state.projects[0].sessions[0].runtime_work_dir.clone();
+                state.git_statuses.insert(
+                    checkout,
+                    threadlane_git::GitStatus {
+                        branch: Some("feature/review".into()),
+                        ..Default::default()
+                    },
+                );
+            });
+            assert_ne!(before, super::github_link_fingerprint(view.model.read(cx)));
+            assert!(
+                view.linked_pr_task(&project, "feature/review", cx)
+                    .is_some()
+            );
+            view.handoff_pr_reply("feature/review", "draft this reply".into(), cx);
+            assert_eq!(
+                view.model.read(cx).requested_composer_prompt.as_deref(),
+                Some("draft this reply")
+            );
+            view.model.update(cx, |state, _| {
+                state.requested_composer_prompt = None;
+            });
+            view.selected_pr.as_mut().unwrap().project = PathBuf::from("/projects/other");
+            let active = view.model.read(cx).active_session_id.clone();
+            view.handoff_pr_reply("feature/review", "wrong project".into(), cx);
+            assert!(view.model.read(cx).requested_composer_prompt.is_none());
+            assert_eq!(view.model.read(cx).active_session_id, active);
+        });
     }
 
     #[test]
@@ -6134,29 +6148,6 @@ mod tests {
         assert!(prompt.contains("> context"));
         assert_eq!(prompt.matches(instruction).count(), 1);
         assert!(prompt.chars().count() < 1_700);
-    }
-
-    #[test]
-    fn github_pr_linked_session_prefers_the_active_matching_branch() {
-        let mut first = session("first", None);
-        first.git_branch = Some("feature/pr-workspace".into());
-        let mut active = session("active", None);
-        active.git_branch = Some("feature/pr-workspace".into());
-        let mut other = session("other", None);
-        other.git_branch = Some("feature/other".into());
-        let sessions = vec![first, active, other];
-
-        assert_eq!(
-            linked_pr_session(&sessions, "feature/pr-workspace", Some("active"))
-                .map(|session| session.id.as_str()),
-            Some("active")
-        );
-        assert_eq!(
-            linked_pr_session(&sessions, "feature/pr-workspace", Some("missing"))
-                .map(|session| session.id.as_str()),
-            Some("first")
-        );
-        assert!(linked_pr_session(&sessions, "feature/missing", None).is_none());
     }
 
     #[test]

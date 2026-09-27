@@ -1543,6 +1543,29 @@ impl AppState {
             .is_some_and(|runtime| runtime.is_generating())
     }
 
+    /// Resolve a PR task within its project or exact checkout, preferring the
+    /// active available task. Live checkout state supersedes saved branch metadata.
+    pub fn linked_pr_session(&self, work_dir: &Path, branch: &str) -> Option<&SessionInfo> {
+        if branch.is_empty() {
+            return None;
+        }
+        self.projects
+            .iter()
+            .flat_map(|project| &project.sessions)
+            .filter(|session| {
+                (session.work_dir == work_dir || session.runtime_work_dir == work_dir)
+                    && match self.git_statuses.get(&session.runtime_work_dir) {
+                        Some(status) => !status.detached && status.branch.as_deref() == Some(branch),
+                        None => session.git_branch.as_deref() == Some(branch),
+                    }
+            })
+            .min_by_key(|session| {
+                let active = self.active_work_dir.as_ref() == Some(&session.work_dir)
+                    && self.active_session_id.as_deref() == Some(session.id.as_str());
+                (!session.worktree_available, !active)
+            })
+    }
+
     /// Auto-address new PR review feedback for an open PR.
     ///
     /// Only active (non-archived) sessions reach this path: archived sessions
@@ -1561,24 +1584,14 @@ impl AppState {
         if !pr.state.eq_ignore_ascii_case("open") {
             return None;
         }
-        let (session_id, session_file, runtime_work_dir) = self
-            .projects
-            .iter()
-            .flat_map(|project| project.sessions.iter())
-            .find(|session| {
-                session.work_dir == work_dir && session.git_branch.as_deref() == Some(&branch)
-            })
-            .map(|session| {
-                (
-                    session.id.clone(),
-                    session.session_file.clone(),
-                    session.runtime_work_dir.clone(),
-                    session.worktree_available,
-                )
-            })
-            .and_then(|(id, file, dir, available)| available.then(|| (id, file, dir)))?;
-        // Skip sessions whose checkout is gone; the agent cannot fix or push.
-
+        let session = self.linked_pr_session(&work_dir, &branch)?;
+        if !session.worktree_available {
+            return None;
+        }
+        let work_dir = session.work_dir.clone();
+        let session_id = session.id.clone();
+        let session_file = session.session_file.clone();
+        let runtime_work_dir = session.runtime_work_dir.clone();
         // Guard against overwriting uncommitted user work when agent is not generating.
         if !self.session_is_generating(&session_file) {
             if let Some(status) = self.git_statuses.get(&runtime_work_dir) {
@@ -1679,18 +1692,19 @@ impl AppState {
         let prompt = threadlane_git::build_auto_address_prompt(pr.number, &branch, &feedback_items);
 
         let session = self
-            .projects
-            .iter()
-            .flat_map(|project| project.sessions.iter())
-            .find(|session| {
-                session.work_dir == work_dir && session.git_branch.as_deref() == Some(&branch)
-            })
+            .linked_pr_session(&work_dir, &branch)
             .ok_or_else(|| "No active task is linked to this pull request branch.".to_string())?;
-        let session_work_dir = session.work_dir.clone();
+        if !session.worktree_available {
+            return Err(
+                "The linked task’s checkout is missing. Restore it before addressing reviews.".into(),
+            );
+        }
+        let work_dir = session.work_dir.clone();
         let session_id = session.id.clone();
-        let _ = self.select_session(session_work_dir, session_id.clone());
-        if self.active_session_id.as_deref() != Some(session_id.as_str()) {
-            return Err("Couldn't select the linked task for this pull request.".into());
+        if self.active_work_dir.as_ref() != Some(&work_dir)
+            || self.active_session_id.as_deref() != Some(session_id.as_str())
+        {
+            self.select_session(work_dir.clone(), session_id);
         }
         let model = self.selected_model.clone();
         let (api_key, _) = threadlane_coding_agent::credentials::provider_credentials(&model);
