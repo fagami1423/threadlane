@@ -182,18 +182,29 @@ impl CodingSessionHarness {
     /// harness adapter.
     pub(crate) fn open(path: &Path) -> Result<Self, String> {
         if !path.exists() {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                fs::create_dir_all(parent).map_err(|error| {
+                    format!(
+                        "Failed to create session directory {}: {error}",
+                        parent.display()
+                    )
+                })?;
+            }
             fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| format!("Failed to create session {}: {error}", path.display()))?;
         }
         let events = harness_event_hub(path);
         let hooks = harness_hook_registry(path);
         let cancellation = harness_cancellation_state(path);
         let store = JsonlStore::open(path)
             .map(|store| AgentHarness::with_events_and_hooks(store, events.clone(), hooks.clone()))
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("Failed to open session {}: {error}", path.display()))?;
         Ok(Self {
             store,
             main_lane_name: "main".into(),
