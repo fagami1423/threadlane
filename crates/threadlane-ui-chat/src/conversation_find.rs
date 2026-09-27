@@ -1,0 +1,418 @@
+use super::*;
+
+actions!(
+    threadlane_chat_find,
+    [
+        FindInConversation,
+        CloseConversationFind,
+        NextConversationMatch,
+        PreviousConversationMatch
+    ]
+);
+
+pub(super) fn init_conversation_find(cx: &mut App) {
+    let shortcut = if cfg!(target_os = "macos") {
+        "cmd-f"
+    } else {
+        "ctrl-f"
+    };
+    cx.bind_keys([
+        KeyBinding::new(shortcut, FindInConversation, Some("Conversation")),
+        KeyBinding::new(
+            "escape",
+            CloseConversationFind,
+            Some("ConversationFindActive"),
+        ),
+        KeyBinding::new(
+            "enter",
+            NextConversationMatch,
+            Some("ConversationFind > Input"),
+        ),
+        KeyBinding::new(
+            "shift-enter",
+            PreviousConversationMatch,
+            Some("ConversationFind > Input"),
+        ),
+    ]);
+}
+
+impl ChatListView {
+    pub(super) fn open_conversation_find(
+        &mut self,
+        _: &FindInConversation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.current_tab != CentralTab::Chat || window.has_active_dialog(cx) {
+            cx.propagate();
+            return;
+        }
+        if !self.find_open {
+            self.find_previous_focus = window.focused(cx);
+            let state = self.model.read(cx);
+            self.find_session = (
+                state.active_work_dir.clone(),
+                state.active_session_id.clone(),
+            );
+            self.find_open = true;
+            self.find_query.clear();
+            self.find_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.refresh_conversation_find(true, cx);
+        }
+        self.find_input.update(cx, |input, cx| {
+            input.focus(window, cx);
+            input.select_all(window, cx);
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    pub(super) fn clear_conversation_find(&mut self) {
+        self.find_open = false;
+        self.find_generation += 1;
+        self.find_task = None;
+        self.find_results.clear();
+        self.find_selected = None;
+        self.find_source = None;
+        self.find_pending = false;
+        self.find_previous_focus = None;
+        self.find_query.clear();
+    }
+
+    pub(super) fn close_conversation_find(
+        &mut self,
+        _: &CloseConversationFind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.find_open || window.has_active_dialog(cx) {
+            cx.propagate();
+            return;
+        }
+        let focus = self.find_previous_focus.take();
+        self.clear_conversation_find();
+        if let Some(focus) = focus {
+            window.focus(&focus, cx);
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    // Called by input/model subscriptions, never render. Arc identity catches
+    // same-length replacements without scanning on unrelated model notifications.
+    pub(super) fn refresh_conversation_find(
+        &mut self,
+        explicit_query: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.find_open {
+            return;
+        }
+        let state = self.model.read(cx);
+        let session = (
+            state.active_work_dir.clone(),
+            state.active_session_id.clone(),
+        );
+        if session != self.find_session || self.current_tab != CentralTab::Chat {
+            self.clear_conversation_find();
+            cx.notify();
+            return;
+        }
+        let source = state.messages.clone();
+        let generating = state.is_generating;
+        let loading = state.active_session_is_loading();
+        if !explicit_query
+            && self
+                .find_source
+                .as_ref()
+                .is_some_and(|(old, old_generating, old_loading)| {
+                    Arc::ptr_eq(old, &source)
+                        && *old_generating == generating
+                        && *old_loading == loading
+                })
+        {
+            return;
+        }
+        // Coalesce streamed snapshots into the retained task rather than
+        // restarting its timer indefinitely on a busy turn. Query edits still
+        // cancel immediately, so Enter cannot act on the previous query.
+        if !explicit_query && self.find_pending && self.find_task.is_some() && !loading {
+            return;
+        }
+        self.find_generation += 1;
+        let generation = self.find_generation;
+        self.find_task = None;
+        self.find_source = Some((source.clone(), generating, loading));
+        self.find_results.clear();
+        self.find_pending = !self.find_query.trim().is_empty() && !loading;
+        cx.notify();
+        if !self.find_pending {
+            return;
+        }
+        let query = self.find_query.clone();
+        self.find_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(120))
+                .await;
+            let Ok(Some((source, generating, explicit_query))) = this.update(cx, |this, cx| {
+                if !this.find_open || this.find_generation != generation {
+                    return None;
+                }
+                let state = this.model.read(cx);
+                let latest = state.messages.clone();
+                // A source refresh is not an explicit navigation request.
+                let explicit_query = explicit_query && Arc::ptr_eq(&source, &latest);
+                let generating = state.is_generating;
+                this.find_source = Some((
+                    latest.clone(),
+                    generating,
+                    state.active_session_is_loading(),
+                ));
+                Some((latest, generating, explicit_query))
+            }) else {
+                return;
+            };
+            let scan_source = source.clone();
+            let results = cx
+                .background_executor()
+                .spawn(async move { find_conversation_messages(&scan_source, generating, &query) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let state = this.model.read(cx);
+                if !this.find_open
+                    || this.find_generation != generation
+                    || this.find_session != session
+                    || (
+                        state.active_work_dir.clone(),
+                        state.active_session_id.clone(),
+                    ) != session
+                {
+                    return;
+                }
+                if !Arc::ptr_eq(&state.messages, &source)
+                    || state.is_generating != generating
+                    || state.active_session_is_loading()
+                {
+                    this.find_pending = false;
+                    this.find_task = None;
+                    this.refresh_conversation_find(false, cx);
+                    return;
+                }
+                this.find_pending = false;
+                this.find_results = results;
+                // A reconciled ID is not the same message, even if text matches.
+                if !this
+                    .find_results
+                    .iter()
+                    .any(|hit| Some(&hit.message_id) == this.find_selected.as_ref())
+                {
+                    this.find_selected = None;
+                }
+                if explicit_query {
+                    this.navigate_conversation_find(false, cx);
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn find_ready(&self, cx: &App) -> bool {
+        let state = self.model.read(cx);
+        self.find_open
+            && !self.find_pending
+            && !state.active_session_is_loading()
+            && !state
+                .session_status
+                .as_ref()
+                .is_some_and(|status| status.starts_with("Could not load session:"))
+            && self.find_session
+                == (
+                    state.active_work_dir.clone(),
+                    state.active_session_id.clone(),
+                )
+            && self
+                .find_source
+                .as_ref()
+                .is_some_and(|(source, generating, _)| {
+                    Arc::ptr_eq(source, &state.messages) && *generating == state.is_generating
+                })
+    }
+
+    pub(super) fn navigate_conversation_find(&mut self, previous: bool, cx: &mut Context<Self>) {
+        if !self.find_ready(cx) {
+            return;
+        }
+        let selected = self
+            .find_results
+            .iter()
+            .position(|hit| Some(&hit.message_id) == self.find_selected.as_ref());
+        let Some(index) = next_find_match(selected, self.find_results.len(), previous) else {
+            return;
+        };
+        let state = self.model.read(cx);
+        let messages = state.messages.clone();
+        let generating = state.is_generating;
+        self.sync_transcript_rows(messages, generating, false);
+        let hit = &self.find_results[index];
+        // The result belongs to this exact source snapshot. Validate its row
+        // identity instead of treating a message index as a row index.
+        let row = hit.row_index;
+        if !matches!(self.transcript_rows.get(row),
+            Some(TranscriptRow::Message(index)) if self.transcript_messages[*index].id == hit.message_id)
+        {
+            return;
+        }
+        self.find_selected = Some(hit.message_id.clone());
+        self.initial_scroll_frames = 0;
+        self.transcript_list_state.pause_following_tail();
+        self.transcript_list_state.scroll_to(ListOffset {
+            item_ix: row,
+            offset_in_item: px(0.),
+        });
+        cx.notify();
+    }
+
+    pub(super) fn next_conversation_match(
+        &mut self,
+        _: &NextConversationMatch,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_conversation_find(false, cx);
+        cx.stop_propagation();
+    }
+
+    pub(super) fn previous_conversation_match(
+        &mut self,
+        _: &PreviousConversationMatch,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_conversation_find(true, cx);
+        cx.stop_propagation();
+    }
+
+    pub(super) fn conversation_find_status(&self, cx: &App) -> String {
+        let state = self.model.read(cx);
+        let selected = self
+            .find_results
+            .iter()
+            .position(|hit| Some(&hit.message_id) == self.find_selected.as_ref());
+        if state.active_session_is_loading() {
+            "Loading conversation…".to_owned()
+        } else if let Some(error) = state
+            .session_status
+            .as_ref()
+            .filter(|status| status.starts_with("Could not load session:"))
+        {
+            error.clone()
+        } else if self.find_query.trim().is_empty() {
+            "Type to find a message".to_owned()
+        } else if self.find_pending {
+            "Searching…".to_owned()
+        } else if self.find_results.is_empty() {
+            "No matching messages".to_owned()
+        } else if let Some(index) = selected {
+            format!(
+                "{} of {} matching messages",
+                index + 1,
+                self.find_results.len()
+            )
+        } else {
+            format!(
+                "{} matching messages · Choose Previous or Next",
+                self.find_results.len()
+            )
+        }
+    }
+
+    pub(super) fn render_conversation_find(&self, cx: &mut Context<Self>) -> AnyElement {
+        let status = self.conversation_find_status(cx);
+        let selected = self
+            .find_results
+            .iter()
+            .position(|hit| Some(&hit.message_id) == self.find_selected.as_ref());
+        let disabled = !self.find_ready(cx) || self.find_results.is_empty();
+        div()
+            .key_context("ConversationFind")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_4()
+            .pl(self.header_left_padding)
+            .py_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div().flex_1().min_w(rems(10.)).child(
+                            Input::new(&self.find_input)
+                                .small()
+                                .aria_label("Find in conversation"),
+                        ),
+                    )
+                    .child(
+                        Button::new("conversation-find-previous")
+                            .debug_selector(|| "conversation-find-previous".into())
+                            .label("Previous")
+                            .small()
+                            .ghost()
+                            .accessibility_label("Previous matching message (Shift+Enter)")
+                            .tooltip("Previous matching message (Shift+Enter)")
+                            .disabled(disabled)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.navigate_conversation_find(true, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("conversation-find-next")
+                            .debug_selector(|| "conversation-find-next".into())
+                            .label("Next")
+                            .small()
+                            .ghost()
+                            .accessibility_label("Next matching message (Enter)")
+                            .tooltip("Next matching message (Enter)")
+                            .disabled(disabled)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.navigate_conversation_find(false, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("conversation-find-close")
+                            .debug_selector(|| "conversation-find-close".into())
+                            .label("Close")
+                            .small()
+                            .ghost()
+                            .accessibility_label("Close find in conversation (Escape)")
+                            .tooltip("Close find (Escape)")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_conversation_find(&CloseConversationFind, window, cx)
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("conversation-find-status")
+                    .role(Role::Status)
+                    .aria_label(status.clone())
+                    .text_sm()
+                    .child(status),
+            )
+            .children(selected.map(|index| {
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "Selected message: {}",
+                        self.find_results[index].excerpt
+                    ))
+            }))
+            .into_any_element()
+    }
+}
