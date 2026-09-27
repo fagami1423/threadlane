@@ -2743,6 +2743,30 @@ fn environment_git_shortcuts_follow_checkout(cx: &mut gpui::TestAppContext) {
     ] {
         assert!(cx.debug_bounds(selector).is_some(), "missing {selector}");
     }
+    let pr = cx.debug_bounds("environment-pr").unwrap();
+    cx.simulate_click(pr.center(), gpui::Modifiers::default());
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://github.com/owner/repo/pull/271")
+    );
+    for key in ["enter", "space"] {
+        cx.update(|window, cx| {
+            cx.open_url("https://example.invalid/keyboard-marker");
+            window.draw(cx).clear(cx);
+        });
+        let keystroke = gpui::Keystroke::parse(key).unwrap();
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(gpui::KeyUpEvent { keystroke });
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://github.com/owner/repo/pull/271"),
+            "PR link activates with {key}"
+        );
+    }
     let repository = cx.debug_bounds("environment-repository").unwrap();
     cx.simulate_click(repository.center(), gpui::Modifiers::default());
     retained_model.read_with(cx, |state, _| {

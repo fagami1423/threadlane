@@ -1333,8 +1333,23 @@ impl ChatListView {
                                     .px_2()
                                     .min_w_0()
                                     .child(
-                                        gpui_component::link::Link::new("environment-pr-link")
+                                        gpui_kit::base::Link::new("environment-pr-link")
                                             .href(pr.url.clone())
+                                            .open_with(|url, _, _, cx| cx.open_url(url))
+                                            .accessibility_label(format!(
+                                                "Open PR #{}: {}",
+                                                pr.number, pr.title
+                                            ))
+                                            .text_color(theme.link)
+                                            .underline()
+                                            .cursor_pointer()
+                                            .border_1()
+                                            .border_color(theme.transparent)
+                                            .rounded(theme.radius)
+                                            .hover(|style| style.bg(theme.list_hover))
+                                            .focus_visible(|style| {
+                                                style.border_color(theme.primary)
+                                            })
                                             .child(div().min_w_0().truncate().child(format!(
                                                 "PR #{} · {}",
                                                 pr.number, pr.title

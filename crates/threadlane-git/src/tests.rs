@@ -22,6 +22,47 @@ fn run_git(work_dir: &Path, args: &[&str]) {
 }
 
 #[test]
+fn inspect_counts_untracked_files_inside_new_directories() {
+    let dir = tempdir().unwrap();
+    run_git(dir.path(), &["init", "-q"]);
+    run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+    run_git(dir.path(), &["config", "user.name", "Threadlane"]);
+    fs::write(dir.path().join(".gitignore"), "ignored/\n").unwrap();
+    run_git(dir.path(), &["add", ".gitignore"]);
+    run_git(dir.path(), &["commit", "-qm", "initial"]);
+    // Explicitly override Git's directory-collapsing user preference.
+    run_git(
+        dir.path(),
+        &["config", "status.showUntrackedFiles", "normal"],
+    );
+    fs::create_dir_all(dir.path().join("new/nested")).unwrap();
+    fs::create_dir_all(dir.path().join("ignored")).unwrap();
+    fs::write(dir.path().join("new/one.txt"), "one\ntwo\n").unwrap();
+    fs::write(dir.path().join("new/nested/two.txt"), "three\nfour\nfive\n").unwrap();
+    fs::write(dir.path().join("ignored/hidden.txt"), "ignored\n").unwrap();
+
+    let status = inspect(dir.path()).unwrap();
+    assert_eq!(status.files.len(), 2);
+    assert!(status.files.iter().all(|file| file.is_untracked()));
+    assert!(status
+        .files
+        .iter()
+        .any(|file| file.path == "new/one.txt" && file.additions == 2));
+    assert!(status
+        .files
+        .iter()
+        .any(|file| file.path == "new/nested/two.txt" && file.additions == 3));
+    assert_eq!(
+        status.files.iter().map(|file| file.additions).sum::<u32>(),
+        5
+    );
+    assert_eq!(
+        status.files.iter().map(|file| file.deletions).sum::<u32>(),
+        0
+    );
+}
+
+#[test]
 fn diff_file_uses_builtin_text_diff_when_external_diff_is_configured() {
     let dir = tempdir().unwrap();
     run_git(dir.path(), &["init", "-q"]);
