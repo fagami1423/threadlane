@@ -2388,6 +2388,9 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &threadlane_ui_chat::OpenWorkspaceReview, _, cx| {
                 this.open_git_review(cx);
             }))
+            .on_action(cx.listener(|this, _: &threadlane_ui_chat::OpenWorkspaceBranches, _, cx| {
+                this.open_git_branches(cx);
+            }))
             .on_action(cx.listener(|this, _: &threadlane_ui_chat::OpenWorkspaceFiles, _, cx| {
                 this.right_panel_visible = true;
                 this.right_panel.update(cx, |panel, cx| {

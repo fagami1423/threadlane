@@ -1274,6 +1274,9 @@ impl SettingsView {
             (
                 "Composer & Chat",
                 vec![
+                    ("⌘ F / Ctrl F", "Find in conversation (Chat or composer focused)"),
+                    ("Enter / ⇧ Enter", "Next / previous matching message (find focused)"),
+                    ("Escape", "Close conversation find before cancelling a turn"),
                     ("Enter", "Submit prompt to agent"),
                     ("⇧ Enter", "Insert newline in composer"),
                     ("/ (in empty composer)", "Open Slash Commands palette"),

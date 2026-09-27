@@ -158,7 +158,16 @@ pub(crate) fn parse_status(_work_dir: &Path, porcelain: &str) -> GitStatus {
 
 #[cfg(test)]
 fn inspect_files(work_dir: &Path) -> Result<Vec<GitFile>, GitError> {
-    let porcelain = command(work_dir, &["status", "--porcelain=v1", "-b", "-z"])?;
+    let porcelain = command(
+        work_dir,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-b",
+            "-z",
+            "--untracked-files=all",
+        ],
+    )?;
     let mut status = parse_status(work_dir, &porcelain);
     apply_numstats(work_dir, &mut status);
     Ok(status.files)
@@ -295,7 +304,17 @@ pub(crate) fn list_branches_detailed(
 }
 
 pub fn inspect(work_dir: &Path) -> Result<GitStatus, GitError> {
-    let porcelain = command(work_dir, &["status", "--porcelain=v1", "-b", "-z"])?;
+    // Expand new directories so file-level review and line totals include their contents.
+    let porcelain = command(
+        work_dir,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-b",
+            "-z",
+            "--untracked-files=all",
+        ],
+    )?;
     let mut status = parse_status(work_dir, &porcelain);
     apply_numstats(work_dir, &mut status);
     status.branches = command(

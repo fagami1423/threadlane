@@ -1869,6 +1869,7 @@ fn reasoning_disclosure_supports_keyboard_and_pauses_following(cx: &mut gpui::Te
     });
     cx.update(|window, cx| {
         window.blur(cx);
+        window.focus_next(cx); // Find in conversation
         window.focus_next(cx); // Chat
         window.focus_next(cx); // Trajectory
         window.focus_next(cx); // Editor
@@ -2701,6 +2702,140 @@ fn environment_section_renders_without_git_data(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+fn environment_git_shortcuts_follow_checkout(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    cx.update(gpui_component::init);
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::default();
+        state.is_new_task = false;
+        state.active_work_dir = Some("/project".into());
+        state.active_session_id = None;
+        state.git_statuses.insert(
+            "/project".into(),
+            threadlane_git::GitStatus {
+                branch: Some("feature".into()),
+                remote: Some("git@github.com:owner/repo.git".into()),
+                ahead: 2,
+                behind: 1,
+                pr: Some(threadlane_git::GitHubPrInfo {
+                    number: 271,
+                    url: "https://github.com/owner/repo/pull/271".into(),
+                    title: "Environment".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        state
+    });
+    let retained_model = model.clone();
+    let (chat, cx) =
+        cx.add_window_view(move |window, cx| super::ChatListView::new(model, window, cx));
+    chat.update(cx, |chat, cx| {
+        chat.set_environment_width(gpui::px(1200.), gpui::px(16.), cx)
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    for selector in [
+        "environment-git-actions",
+        "environment-repository",
+        "environment-pr",
+        "environment-sync",
+    ] {
+        assert!(cx.debug_bounds(selector).is_some(), "missing {selector}");
+    }
+    let pr = cx.debug_bounds("environment-pr").unwrap();
+    cx.simulate_click(pr.center(), gpui::Modifiers::default());
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://github.com/owner/repo/pull/271")
+    );
+    for key in ["enter", "space"] {
+        cx.update(|window, cx| {
+            cx.open_url("https://example.invalid/keyboard-marker");
+            window.draw(cx).clear(cx);
+        });
+        let keystroke = gpui::Keystroke::parse(key).unwrap();
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(gpui::KeyUpEvent { keystroke });
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://github.com/owner/repo/pull/271"),
+            "PR link activates with {key}"
+        );
+    }
+    let repository = cx.debug_bounds("environment-repository").unwrap();
+    cx.simulate_click(repository.center(), gpui::Modifiers::default());
+    retained_model.read_with(cx, |state, _| {
+        assert_eq!(
+            state.workspace_page,
+            threadlane_ui_state::WorkspacePage::GitHub
+        );
+    });
+    retained_model.update(cx, |state, cx| {
+        let status = state
+            .git_statuses
+            .get_mut(std::path::Path::new("/project"))
+            .unwrap();
+        status.remote = None;
+        status.ahead = 0;
+        status.behind = 0;
+        status.pr.as_mut().unwrap().url = "file:///private/file".into();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("environment-git-actions").is_some());
+    for selector in [
+        "environment-repository",
+        "environment-pr",
+        "environment-sync",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_none(),
+            "unavailable {selector}"
+        );
+    }
+    retained_model.update(cx, |state, cx| {
+        state.active_work_dir = Some("/other".into());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    for selector in [
+        "environment-git-actions",
+        "environment-repository",
+        "environment-pr",
+        "environment-sync",
+    ] {
+        assert!(cx.debug_bounds(selector).is_none(), "stale {selector}");
+    }
+}
+
+#[test]
+fn environment_changes_summary_handles_missing_clean_binary_and_large_totals() {
+    use super::environment_changes_label;
+    assert_eq!(environment_changes_label(None), "Git status unavailable");
+    let mut status = threadlane_git::GitStatus::default();
+    assert_eq!(
+        environment_changes_label(Some(&status)),
+        "No uncommitted changes"
+    );
+    status.files.push(threadlane_git::GitFile::default());
+    assert_eq!(environment_changes_label(Some(&status)), "1 changed file");
+    status.files[0].additions = u32::MAX;
+    status.files[0].deletions = 3;
+    status.files.push(status.files[0].clone());
+    assert_eq!(
+        environment_changes_label(Some(&status)),
+        "2 changed files · +8589934590 −6"
+    );
+}
+
+#[gpui::test]
 fn trajectory_toolbar_filters_are_reachable(cx: &mut gpui::TestAppContext) {
     use gpui::AppContext as _;
     use std::collections::BTreeMap;
@@ -2751,4 +2886,815 @@ fn trajectory_toolbar_filters_are_reachable(cx: &mut gpui::TestAppContext) {
             "{selector} is reachable in the trajectory toolbar"
         );
     }
+}
+
+fn find_message(id: &str, role: MessageRole, content: &str) -> ChatMessageInfo {
+    ChatMessageInfo {
+        id: id.into(),
+        role,
+        content: content.into(),
+        tool_activities: Vec::new(),
+        streaming: false,
+        reasoning_content: None,
+        reasoning_expanded: false,
+    }
+}
+
+#[test]
+fn conversation_find_matches_message_rows_not_occurrences_or_hidden_payloads() {
+    let mut activity = find_message("activity", MessageRole::Assistant, "");
+    activity.tool_activities.push(ToolActivityInfo {
+        id: "tool".into(),
+        category: "tool".into(),
+        title: "read_file".into(),
+        display_summary: "needle".into(),
+        detail: "needle".into(),
+        is_expanded: false,
+    });
+    let mut reasoning = find_message("reasoning", MessageRole::Assistant, "");
+    reasoning.reasoning_content = Some("needle".into());
+    let messages = vec![
+        find_message("a", MessageRole::User, "needle needle"),
+        activity.clone(),
+        activity,
+        reasoning,
+        find_message("marker", MessageRole::ContextMarker, "needle"),
+        find_message("system", MessageRole::System, "needle"),
+        find_message("error", MessageRole::Error, "needle"),
+        find_message("queued-user-1", MessageRole::User, "needle"),
+        find_message("b", MessageRole::Assistant, "needle needle"),
+    ];
+    let hits = super::find_conversation_messages(&messages, true, "NEEDLE");
+    assert_eq!(
+        hits.iter()
+            .map(|hit| hit.message_id.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    assert_eq!(
+        hits.iter().map(|hit| hit.row_index).collect::<Vec<_>>(),
+        [0, 6]
+    );
+    for query in ["", "  \n  "] {
+        assert!(super::find_conversation_messages(&messages, true, query).is_empty());
+    }
+}
+
+#[test]
+fn conversation_find_literal_unicode_excerpts_and_wraparound() {
+    let content = format!("{}İ ÉCOLE [a.*]{}", "🐈".repeat(200), "界".repeat(200));
+    let messages = vec![find_message("unicode", MessageRole::Assistant, &content)];
+    for query in ["i\u{307}", "école", "[a.*]"] {
+        let hits = super::find_conversation_messages(&messages, false, query);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].excerpt.contains("ÉCOLE [a.*]"));
+        assert!(hits[0].excerpt.chars().count() <= 162);
+    }
+    assert!(super::find_conversation_messages(&messages, false, ".+").is_empty());
+    let spaced = vec![find_message("spaced", MessageRole::User, "alpha beta")];
+    assert_eq!(
+        super::find_conversation_messages(&spaced, false, "alpha ").len(),
+        1
+    );
+    assert_eq!(
+        super::find_conversation_messages(&spaced, false, " beta").len(),
+        1
+    );
+    for query in [" alpha", "beta ", "   "] {
+        assert!(super::find_conversation_messages(&spaced, false, query).is_empty());
+    }
+    assert_eq!(super::next_find_match(None, 3, false), Some(0));
+    assert_eq!(super::next_find_match(None, 3, true), Some(2));
+    assert_eq!(super::next_find_match(Some(2), 3, false), Some(0));
+    assert_eq!(super::next_find_match(Some(0), 3, true), Some(2));
+    assert_eq!(super::next_find_match(Some(0), 0, false), None);
+    let messages = vec![find_message(
+        "multiline",
+        MessageRole::Assistant,
+        &format!("{}needle", "\n".repeat(200)),
+    )];
+    assert!(
+        !super::find_conversation_messages(&messages, false, "needle")[0]
+            .excerpt
+            .contains('\n')
+    );
+}
+
+#[gpui::test]
+fn conversation_find_keyboard_offscreen_streaming_and_close(cx: &mut gpui::TestAppContext) {
+    use gpui::{AppContext as _, Focusable as _};
+    cx.update(gpui_component::init);
+    cx.update(super::init);
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::default();
+        state.is_new_task = false;
+        state.pending_hydrations.clear();
+        state.messages = (0..200)
+            .map(|i| {
+                find_message(
+                    &format!("m{i}"),
+                    MessageRole::User,
+                    &format!(
+                        "Message {i} {}",
+                        if i == 4 || i == 150 {
+                            "needle"
+                        } else {
+                            "other"
+                        }
+                    ),
+                )
+            })
+            .collect::<Vec<_>>()
+            .into();
+        state
+    });
+    let retained = model.clone();
+    let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let capture = holder.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        capture.replace(Some(chat.clone()));
+        gpui_component::Root::new(chat, window, cx)
+    });
+    let chat = holder.borrow().as_ref().unwrap().clone();
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        chat.update(cx, |chat, cx| {
+            chat.input_state.update(cx, |input, cx| {
+                input.set_value("unsent draft", window, cx);
+                input.select_all(window, cx);
+            });
+            chat.focus_composer(window, cx);
+        })
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-f"
+    } else {
+        "ctrl-f"
+    });
+    cx.run_until_parked();
+    assert!(chat.read_with(cx, |chat, _| chat.find_open));
+    cx.simulate_input("needle");
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, _| {
+        assert_eq!(
+            chat.find_results.len(),
+            2,
+            "query={:?} pending={} open={} gen={}",
+            chat.find_query,
+            chat.find_pending,
+            chat.find_open,
+            chat.find_generation
+        );
+        assert_eq!(chat.find_selected.as_deref(), Some("m4"));
+        assert!(!chat.transcript_list_state.is_following_tail());
+        assert!(chat.transcript_list_state.logical_scroll_top().item_ix <= 4);
+    });
+    cx.simulate_keystrokes("shift-enter");
+    cx.run_until_parked();
+    assert_eq!(
+        chat.read_with(cx, |chat, _| chat.find_selected.clone()),
+        Some("m150".into())
+    );
+    let before = chat.read_with(cx, |chat, _| {
+        chat.transcript_list_state.logical_scroll_top()
+    });
+    retained.update(cx, |state, cx| {
+        std::sync::Arc::make_mut(&mut state.messages)[199]
+            .content
+            .push_str(" stream");
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, _| {
+        assert_eq!(chat.find_selected.as_deref(), Some("m150"));
+        assert_eq!(
+            chat.transcript_list_state.logical_scroll_top().item_ix,
+            before.item_ix
+        );
+        assert_eq!(
+            chat.transcript_list_state
+                .logical_scroll_top()
+                .offset_in_item,
+            before.offset_in_item
+        );
+    });
+    cx.update(|window, cx| chat.update(cx, |chat, cx| chat.focus_composer(window, cx)));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("end shift-enter");
+    cx.run_until_parked();
+    assert!(
+        chat.read_with(cx, |chat, cx| chat
+            .input_state
+            .read(cx)
+            .value()
+            .ends_with('\n')),
+        "find navigation must not intercept the composer Input context"
+    );
+    cx.update(|window, cx| {
+        chat.update(cx, |chat, cx| {
+            chat.input_state.update(cx, |input, cx| {
+                input.set_value("unsent draft", window, cx);
+                input.select_all(window, cx);
+            });
+            chat.find_input
+                .update(cx, |input, cx| input.focus(window, cx));
+        })
+    });
+    cx.run_until_parked();
+    let generation = chat.read_with(cx, |chat, _| chat.find_generation);
+    retained.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    assert_eq!(
+        chat.read_with(cx, |chat, _| chat.find_generation),
+        generation,
+        "unrelated notifications must not scan"
+    );
+    // Start a refresh, then replace its source before the debounce expires.
+    retained.update(cx, |state, _| {
+        state.is_generating = true;
+        std::sync::Arc::make_mut(&mut state.messages)[199].content = "stream A".into();
+    });
+    chat.update(cx, |chat, cx| chat.refresh_conversation_find(false, cx));
+    let scan_source = retained.update(cx, |state, _| {
+        std::sync::Arc::make_mut(&mut state.messages)[199].content = "needle stream B".into();
+        state.messages.clone()
+    });
+    // Tick only until the task captures B, leaving its background scan in flight.
+    for _ in 0..1000 {
+        cx.executor().tick();
+        cx.dispatcher
+            .scheduler()
+            .clock()
+            .advance(std::time::Duration::from_millis(120));
+        if chat.read_with(cx, |chat, _| {
+            chat.find_source
+                .as_ref()
+                .is_some_and(|(source, _, _)| std::sync::Arc::ptr_eq(source, &scan_source))
+        }) {
+            break;
+        }
+    }
+    let generation = chat.read_with(cx, |chat, _| {
+        assert!(std::sync::Arc::ptr_eq(
+            &chat.find_source.as_ref().unwrap().0,
+            &scan_source
+        ));
+        assert!(chat.find_pending);
+        assert_eq!(chat.find_results.len(), 2);
+        chat.find_generation
+    });
+    retained.update(cx, |state, cx| {
+        std::sync::Arc::make_mut(&mut state.messages)[199].content = "needle stream C".into();
+        cx.notify();
+    });
+    for _ in 0..1000 {
+        cx.executor().tick();
+        if chat.read_with(cx, |chat, _| chat.find_generation != generation) {
+            break;
+        }
+    }
+    chat.read_with(cx, |chat, cx| {
+        assert!(
+            chat.find_generation > generation,
+            "stale scan must schedule a refresh"
+        );
+        assert!(chat.find_pending, "latest scan has not completed yet");
+        assert_eq!(
+            chat.find_results.len(),
+            3,
+            "completed B scan must be published"
+        );
+        assert!(chat.find_results[2].excerpt.contains("stream B"));
+        assert!(chat
+            .conversation_find_status(cx)
+            .contains("3 matching messages"));
+    });
+    // Enter must still navigate while C is pending, using B's validated row IDs.
+    cx.update(|window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("enter").unwrap(), cx);
+    });
+    assert_eq!(
+        chat.read_with(cx, |chat, _| chat.find_selected.clone()),
+        Some("m199".into())
+    );
+    cx.update(|window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("shift-enter").unwrap(), cx);
+    });
+    assert_eq!(
+        chat.read_with(cx, |chat, _| chat.find_selected.clone()),
+        Some("m150".into())
+    );
+    assert!(chat.read_with(cx, |chat, _| chat.find_pending));
+    cx.run_until_parked();
+    let mut settled_during_stream = false;
+    for i in 0..12 {
+        retained.update(cx, |state, cx| {
+            std::sync::Arc::make_mut(&mut state.messages)[199].content = format!("stream {i}");
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(30));
+        cx.run_until_parked();
+        settled_during_stream |= chat.read_with(cx, |chat, _| !chat.find_pending);
+    }
+    assert!(
+        settled_during_stream,
+        "streaming must not indefinitely restart the debounce timer"
+    );
+    retained.update(cx, |state, cx| {
+        let messages = std::sync::Arc::make_mut(&mut state.messages);
+        for message in messages.iter_mut() {
+            message.id = format!("durable-{}", message.id);
+        }
+        messages.push(find_message("hydrated-extra", MessageRole::User, "history"));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, _| {
+        assert!(chat.find_selected.is_none());
+        assert_eq!(
+            chat.transcript_list_state.logical_scroll_top().item_ix,
+            before.item_ix,
+            "hydration must not reset a find reader to the streaming tail"
+        );
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        chat.read_with(cx, |chat, cx| {
+            assert!(!chat.find_open);
+            assert_eq!(chat.input_state.read(cx).value().as_str(), "unsent draft");
+            assert_eq!(chat.input_state.read(cx).selected_range(), 0..12);
+            assert!(chat
+                .input_state
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window));
+            assert_eq!(
+                chat.transcript_list_state.logical_scroll_top().item_ix,
+                before.item_ix
+            );
+            assert_eq!(
+                chat.transcript_list_state
+                    .logical_scroll_top()
+                    .offset_in_item,
+                before.offset_in_item
+            );
+        })
+    });
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-f"
+    } else {
+        "ctrl-f"
+    });
+    chat.update(cx, |chat, cx| {
+        chat.progress_summary_expanded = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let open = cx
+        .debug_bounds("progress-open-trajectory")
+        .expect("trajectory action visible");
+    cx.simulate_click(open.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, _| {
+        assert_eq!(chat.current_tab, super::CentralTab::Trajectory);
+        assert!(!chat.find_open);
+        assert!(chat.find_results.is_empty());
+        assert!(chat.find_task.is_none());
+    });
+
+}
+
+#[gpui::test]
+fn conversation_find_rejects_stale_queries_sessions_and_reconciled_ids(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui::AppContext as _;
+    cx.update(gpui_component::init);
+    cx.update(super::init);
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::default();
+        state.pending_hydrations.clear();
+        state.is_new_task = false;
+        state.messages = vec![
+            find_message("optimistic", MessageRole::User, "alpha"),
+            find_message("second", MessageRole::Assistant, "bravo"),
+        ]
+        .into();
+        state
+    });
+    let retained = model.clone();
+    let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let capture = holder.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        capture.replace(Some(chat.clone()));
+        gpui_component::Root::new(chat, window, cx)
+    });
+    let chat = holder.borrow().as_ref().unwrap().clone();
+    cx.run_until_parked();
+    cx.update(|window, cx| chat.update(cx, |chat, cx| chat.focus_composer(window, cx)));
+    cx.run_until_parked();
+    let shortcut = if cfg!(target_os = "macos") {
+        "cmd-f"
+    } else {
+        "ctrl-f"
+    };
+    cx.simulate_keystrokes(shortcut);
+    cx.run_until_parked();
+    cx.simulate_input("alpha");
+    cx.run_until_parked();
+    cx.simulate_keystrokes(shortcut);
+    cx.simulate_input("bravo");
+    cx.simulate_keystrokes("enter");
+    assert!(chat.read_with(cx, |chat, _| chat.find_selected.is_none()));
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    assert_eq!(
+        chat.read_with(cx, |chat, _| chat.find_selected.clone()),
+        Some("second".into())
+    );
+    retained.update(cx, |state, cx| {
+        let messages = std::sync::Arc::make_mut(&mut state.messages);
+        messages[1].id = "hydrated".into();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, _| {
+        assert!(
+            chat.find_selected.is_none(),
+            "equal text must not migrate a selected identity"
+        );
+        assert_eq!(chat.find_results[0].message_id, "hydrated");
+    });
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        chat.read_with(cx, |chat, _| chat.find_selected.clone()),
+        Some("hydrated".into())
+    );
+    retained.update(cx, |state, cx| {
+        std::sync::Arc::make_mut(&mut state.messages)[1].content = "other".into(); // same byte length
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    assert!(chat.read_with(cx, |chat, _| chat.find_results.is_empty()
+        && chat.find_selected.is_none()));
+    cx.simulate_keystrokes(shortcut);
+    cx.simulate_input("alpha");
+    retained.update(cx, |state, cx| {
+        state.active_session_id = Some("different-session".into());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    assert!(chat.read_with(cx, |chat, _| !chat.find_open
+        && chat.find_results.is_empty()));
+}
+
+#[gpui::test]
+fn conversation_find_escape_dialog_and_other_focus_contexts(cx: &mut gpui::TestAppContext) {
+    use gpui::{
+        AppContext as _, Focusable as _, InteractiveElement as _, ParentElement as _, Styled as _,
+    };
+    use gpui_component::WindowExt as _;
+    gpui::actions!(find_test, [CancelTurn]);
+    struct Host {
+        chat: gpui::Entity<super::ChatListView>,
+        other: gpui::Entity<gpui_component::input::InputState>,
+        cancelled: std::rc::Rc<std::cell::Cell<bool>>,
+        context: &'static str,
+    }
+    impl gpui::Render for Host {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            let cancelled = self.cancelled.clone();
+            gpui::div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .key_context("FindTestWorkspace")
+                .on_action(move |_: &CancelTurn, _, _| cancelled.set(true))
+                .child(self.chat.clone())
+                .child(
+                    gpui::div()
+                        .key_context(self.context)
+                        .child(gpui_component::input::Input::new(&self.other)),
+                )
+        }
+    }
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        super::init(cx);
+        cx.bind_keys([gpui::KeyBinding::new(
+            "escape",
+            CancelTurn,
+            Some("FindTestWorkspace"),
+        )]);
+    });
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::default();
+        state.pending_hydrations.clear();
+        state.is_new_task = false;
+        state
+    });
+    let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let capture = holder.clone();
+    let cancelled = std::rc::Rc::new(std::cell::Cell::new(false));
+    let tracked = cancelled.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        let other = cx.new(|cx| gpui_component::input::InputState::new(window, cx));
+        let host = cx.new(|_| Host {
+            chat: chat.clone(),
+            other: other.clone(),
+            cancelled: tracked,
+            context: "Terminal",
+        });
+        capture.replace(Some((chat, other, host.clone())));
+        gpui_component::Root::new(host, window, cx)
+    });
+    let (chat, other, host) = holder.borrow().as_ref().unwrap().clone();
+    cx.run_until_parked();
+    let shortcut = if cfg!(target_os = "macos") {
+        "cmd-f"
+    } else {
+        "ctrl-f"
+    };
+    for context in ["Terminal", "Editor", "Browser"] {
+        host.update(cx, |host, cx| {
+            host.context = context;
+            cx.notify();
+        });
+        cx.update(|window, cx| window.focus(&other.read(cx).focus_handle(cx), cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes(shortcut);
+        cx.run_until_parked();
+        assert!(
+            !chat.read_with(cx, |chat, _| chat.find_open),
+            "must not intercept {context}"
+        );
+    }
+    cx.update(|window, cx| chat.update(cx, |chat, cx| chat.focus_composer(window, cx)));
+    cx.run_until_parked();
+    cx.simulate_keystrokes(shortcut);
+    cx.run_until_parked();
+    cx.update(|window, cx| window.open_dialog(cx, |dialog, _, _| dialog.title("Topmost dialog")));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|window, cx| assert!(!window.has_active_dialog(cx)));
+    assert!(chat.read_with(cx, |chat, _| chat.find_open));
+    assert!(!cancelled.get());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!chat.read_with(cx, |chat, _| chat.find_open));
+    assert!(!cancelled.get(), "closing find must consume Escape");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        cancelled.get(),
+        "the workspace gets Escape only after find closes"
+    );
+}
+
+#[gpui::test]
+fn conversation_find_same_count_row_replacement_is_reachable(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    cx.update(gpui_component::init);
+    let model = cx.new(|_| threadlane_ui_state::AppState::default());
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        chat.update(cx, |chat, _| {
+            let mut activity = find_message("tool", MessageRole::Assistant, "");
+            activity.tool_activities.push(ToolActivityInfo {
+                id: "tool".into(),
+                category: "tool".into(),
+                title: "read_file".into(),
+                display_summary: String::new(),
+                detail: String::new(),
+                is_expanded: false,
+            });
+            let before = vec![
+                activity,
+                find_message("user", MessageRole::User, "question"),
+            ];
+            chat.sync_transcript_rows(before.clone().into(), true, true);
+            let mut after = before;
+            after[0].content = "answer needle".into();
+            chat.sync_transcript_rows(after.into(), true, false);
+            assert_eq!(chat.transcript_rows[0], TranscriptRow::Message(0));
+        });
+        gpui_component::Root::new(chat, window, cx)
+    });
+    cx.run_until_parked();
+}
+
+#[test]
+fn conversation_find_large_history_profile() {
+    let mut messages: Vec<_> = (0..20_000)
+        .map(|i| {
+            find_message(
+                &format!("m{i}"),
+                MessageRole::Assistant,
+                &format!(
+                    "{} {}",
+                    "Representative coding conversation text and code. ".repeat(20),
+                    if i % 100 == 0 { "needle" } else { "other" }
+                ),
+            )
+        })
+        .collect();
+    messages.insert(
+        10_000,
+        find_message("compacted", MessageRole::ContextMarker, "Compacted"),
+    );
+    let start = std::time::Instant::now();
+    let hits = super::find_conversation_messages(&messages, false, "needle");
+    eprintln!(
+        "conversation find: 20,000 messages (~19 MB), {} hits, {:?}",
+        hits.len(),
+        start.elapsed()
+    );
+    assert_eq!(hits.len(), 200);
+    assert_eq!(
+        hits[0].message_id, "m0",
+        "pre-compaction history is searchable"
+    );
+    assert_eq!(hits[199].message_id, "m19900");
+}
+
+#[gpui::test]
+fn conversation_find_controls_fit_themes_narrow_panes_and_large_text(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui::AppContext as _;
+    cx.update(gpui_component::init);
+    cx.update(super::init);
+    let model = cx.new(|_| threadlane_ui_state::AppState::default());
+    let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let capture = holder.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        capture.replace(Some(chat.clone()));
+        gpui_component::Root::new(chat, window, cx)
+    });
+    let chat = holder.borrow().as_ref().unwrap().clone();
+    cx.run_until_parked();
+    cx.update(|window, cx| chat.update(cx, |chat, cx| chat.focus_composer(window, cx)));
+    cx.run_until_parked();
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-f"
+    } else {
+        "ctrl-f"
+    });
+    for mode in [
+        gpui_component::ThemeMode::Light,
+        gpui_component::ThemeMode::Dark,
+    ] {
+        for font in [14., 20.] {
+            cx.update(|window, cx| {
+                gpui_component::Theme::change(mode, Some(window), cx);
+                gpui_component::Theme::global_mut(cx).font_size = gpui::px(font);
+            });
+            for width in [320., 800.] {
+                cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(800.)));
+                cx.run_until_parked();
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+                for selector in [
+                    "central-tab-chat",
+                    "central-tab-trajectory",
+                    "central-tab-editor",
+                    "conversation-find-open",
+                    "conversation-find-previous",
+                    "conversation-find-next",
+                    "conversation-find-close",
+                ] {
+                    let bounds = cx.debug_bounds(selector).expect("find control visible");
+                    assert!(bounds.size.width > gpui::px(0.));
+                    let right_edge = if selector.starts_with("central-tab-")
+                        || selector == "conversation-find-open"
+                    {
+                        width - font * 8. // Header reserves pr_32 for workspace controls.
+                    } else {
+                        width
+                    };
+                    assert!(
+                        bounds.left() >= gpui::px(0.) && bounds.right() <= gpui::px(right_edge),
+                        "{selector} overflows at width {width}, font {font}: {bounds:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[gpui::test]
+fn conversation_find_loading_failure_and_empty_are_distinct(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    cx.update(gpui_component::init);
+    cx.update(super::init);
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::default();
+        state.pending_hydrations.clear();
+        state.active_work_dir = Some("/tmp/threadlane-find-loading".into());
+        state.active_session_id = Some("find-session".into());
+        state.messages = Vec::new().into();
+        state.is_new_task = false;
+        state.session_status = None;
+        state
+    });
+    let retained = model.clone();
+    let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let capture = holder.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        capture.replace(Some(chat.clone()));
+        gpui_component::Root::new(chat, window, cx)
+    });
+    let chat = holder.borrow().as_ref().unwrap().clone();
+    cx.run_until_parked();
+    cx.update(|window, cx| chat.update(cx, |chat, cx| chat.focus_composer(window, cx)));
+    cx.run_until_parked();
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-f"
+    } else {
+        "ctrl-f"
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        chat.read_with(cx, |chat, cx| chat.conversation_find_status(cx)),
+        "Type to find a message"
+    );
+    retained.update(cx, |state, cx| {
+        state
+            .pending_hydrations
+            .push(threadlane_ui_state::SessionHydrationRequest {
+                session_id: "find-session".into(),
+                session_file:
+                    "/tmp/threadlane-find-loading/.threadlane/sessions/find-session.jsonl".into(),
+                reload_messages: true,
+                runtime_options: None,
+            });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.simulate_input("needle");
+    cx.run_until_parked();
+    assert_eq!(
+        chat.read_with(cx, |chat, cx| chat.conversation_find_status(cx)),
+        "Loading conversation…"
+    );
+    retained.update(cx, |state, cx| {
+        state.pending_hydrations.clear();
+        state.session_status = Some("Could not load session: unreadable fixture".into());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    assert_eq!(
+        chat.read_with(cx, |chat, cx| chat.conversation_find_status(cx)),
+        "Could not load session: unreadable fixture"
+    );
+    retained.update(cx, |state, cx| {
+        state.session_status = None;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        chat.read_with(cx, |chat, cx| chat.conversation_find_status(cx)),
+        "No matching messages"
+    );
+    chat.update(cx, |chat, cx| {
+        chat.set_tab(super::CentralTab::Trajectory, cx)
+    });
+    assert!(!chat.read_with(cx, |chat, _| chat.find_open));
 }

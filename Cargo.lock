@@ -8684,6 +8684,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "gpui-component",
+ "gpui-kit",
  "gpui-pre",
  "rfd",
  "serde_json",

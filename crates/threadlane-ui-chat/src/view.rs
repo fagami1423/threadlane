@@ -34,6 +34,30 @@ use super::markdown::*;
 use super::trajectory::*;
 use super::transcript::*;
 
+fn environment_changes_label(status: Option<&threadlane_git::GitStatus>) -> String {
+    let Some(status) = status else {
+        return "Git status unavailable".into();
+    };
+    let summary = match status.files.len() {
+        0 => "No uncommitted changes".to_string(),
+        1 => "1 changed file".to_string(),
+        count => format!("{count} changed files"),
+    };
+    let (added, removed) = status
+        .files
+        .iter()
+        .fold((0_u64, 0_u64), |(added, removed), file| {
+            (
+                added + u64::from(file.additions),
+                removed + u64::from(file.deletions),
+            )
+        });
+    if added > 0 || removed > 0 {
+        format!("{summary} · +{added} −{removed}")
+    } else {
+        summary
+    }
+}
 fn editor_target_matches_active_work_dir(target: &Path, active: Option<&Path>) -> bool {
     active == Some(target)
 }
@@ -319,6 +343,10 @@ actions!(
     ]
 );
 
+#[path = "conversation_find.rs"]
+mod conversation_find;
+use conversation_find::*;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum CentralTab {
     #[default]
@@ -355,6 +383,7 @@ pub fn init(cx: &mut App) {
             Some(SLASH_COMMAND_BINDING_CONTEXT),
         ),
     ]);
+    init_conversation_find(cx);
 }
 
 pub struct ChatListView {
@@ -368,6 +397,18 @@ pub struct ChatListView {
     transcript_messages: Arc<Vec<ChatMessageInfo>>,
     transcript_rows: Vec<TranscriptRow>,
     transcript_generating: bool,
+    find_open: bool,
+    find_input: Entity<InputState>,
+    find_query: String,
+    find_results: Vec<ConversationMatch>,
+    find_selected: Option<String>,
+    find_previous_focus: Option<FocusHandle>,
+    chat_focus: FocusHandle,
+    find_generation: u64,
+    find_pending: bool,
+    find_source: Option<(Arc<Vec<ChatMessageInfo>>, bool, bool)>,
+    find_session: (Option<PathBuf>, Option<String>),
+    find_task: Option<Task<()>>,
     trajectory_list_state: ListState,
     expanded_activity_groups: HashSet<String>,
     progress_summary_expanded: bool,
@@ -449,6 +490,22 @@ impl ChatListView {
 
         let trajectory_search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search trajectory…"));
+        let find_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Find in conversation…"));
+        let find_subscription = cx.subscribe_in(
+            &find_input,
+            window,
+            |this, input, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let query = input.read(cx).value().to_string();
+                    if query != this.find_query {
+                        this.find_query = query;
+                        this.find_selected = None;
+                        this.refresh_conversation_find(true, cx);
+                    }
+                }
+            },
+        );
         let mut stream_rx = model
             .update(cx, |state, _cx| state.stream_rx.take())
             .unwrap_or_else(|| {
@@ -498,7 +555,7 @@ impl ChatListView {
                             )
                         };
                         if is_active {
-                            this.current_tab = CentralTab::Editor;
+                            this.set_tab(CentralTab::Editor, cx);
                             this.editor.update(cx, |editor, cx| {
                                 editor.open_file(project, &path, cx);
                             });
@@ -517,7 +574,7 @@ impl ChatListView {
                             )
                         };
                         if is_active {
-                            this.current_tab = CentralTab::Editor;
+                            this.set_tab(CentralTab::Editor, cx);
                             this.editor.update(cx, |editor, cx| {
                                 editor.open_diff(&path, &content, cx);
                             });
@@ -526,6 +583,7 @@ impl ChatListView {
                 }
             }
             cx.notify();
+            this.refresh_conversation_find(false, cx);
         });
 
         let sub_editor = cx.observe(&editor, |_this, _editor, cx| {
@@ -686,6 +744,18 @@ impl ChatListView {
             transcript_messages: Arc::new(Vec::new()),
             transcript_rows: Vec::new(),
             transcript_generating: false,
+            find_open: false,
+            find_input,
+            find_query: String::new(),
+            find_results: Vec::new(),
+            find_selected: None,
+            find_previous_focus: None,
+            chat_focus: cx.focus_handle(),
+            find_generation: 0,
+            find_pending: false,
+            find_source: None,
+            find_session: (None, None),
+            find_task: None,
             trajectory_list_state,
             expanded_activity_groups: HashSet::new(),
             progress_summary_expanded: false,
@@ -720,7 +790,7 @@ impl ChatListView {
             copied_message: None,
             expanded_tool_aggregates: HashSet::new(),
             segment_cache: HashMap::new(),
-            _subscriptions: vec![sub1, sub2, sub3, sub_editor],
+            _subscriptions: vec![sub1, sub2, sub3, sub_editor, find_subscription],
         }
     }
 
@@ -798,6 +868,9 @@ impl ChatListView {
     }
 
     pub fn set_tab(&mut self, tab: CentralTab, cx: &mut Context<Self>) {
+        if tab != CentralTab::Chat {
+            self.clear_conversation_find();
+        }
         self.current_tab = tab;
         cx.notify();
     }
@@ -880,9 +953,10 @@ impl ChatListView {
         };
 
         div()
-            .h(rems(3.25))
+            .min_h(rems(3.25))
             .flex_none()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap_3()
             .px_4()
@@ -951,8 +1025,31 @@ impl ChatListView {
                             })
                     })),
             )
+            .when(self.current_tab == CentralTab::Chat, |el| {
+                el.child(
+                    Button::new("conversation-find-open")
+                        .debug_selector(|| "conversation-find-open".into())
+                        .icon(IconName::Search)
+                        .ghost()
+                        .small()
+                        .accessibility_label(if cfg!(target_os = "macos") {
+                            "Find in conversation (⌘F)"
+                        } else {
+                            "Find in conversation (Ctrl+F)"
+                        })
+                        .tooltip(if cfg!(target_os = "macos") {
+                            "Find in conversation (⌘F)"
+                        } else {
+                            "Find in conversation (Ctrl+F)"
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_conversation_find(&FindInConversation, window, cx)
+                        })),
+                )
+            })
             .child(
                 Button::new("central-tab-chat")
+                    .debug_selector(|| "central-tab-chat".into())
                     .label("Chat")
                     .tooltip("Chat (⌘1)")
                     .accessibility_label("Chat (⌘1)")
@@ -963,6 +1060,7 @@ impl ChatListView {
             )
             .child(
                 Button::new("central-tab-trajectory")
+                    .debug_selector(|| "central-tab-trajectory".into())
                     .label("Trajectory")
                     .tooltip("Trajectory (⌘2)")
                     .accessibility_label("Trajectory (⌘2)")
@@ -975,6 +1073,7 @@ impl ChatListView {
             )
             .child(
                 Button::new("central-tab-editor")
+                    .debug_selector(|| "central-tab-editor".into())
                     .label(editor_label.clone())
                     .tooltip("Editor (⌘3)")
                     .accessibility_label(format!(
@@ -1089,13 +1188,7 @@ impl ChatListView {
                 }
                 .into()
             });
-        let changes = status
-            .map(|status| match status.files.len() {
-                0 => "No uncommitted changes".to_string(),
-                1 => "1 changed file".to_string(),
-                count => format!("{count} changed files"),
-            })
-            .unwrap_or_else(|| "Git status unavailable".into());
+        let changes = environment_changes_label(status);
         let model = self.model.clone();
         let theme = cx.theme();
         // Button's built-in icon/label wrapper centers its contents independently.
@@ -1150,15 +1243,15 @@ impl ChatListView {
                     .small()
                     .w_full()
                     .justify_start()
-                    .accessibility_label(branch.clone())
+                    .accessibility_label(format!("Manage branches: {branch}"))
                     .child(action_content(
                         Icon::default().path("icons/git/branch.svg"),
                         branch.clone(),
                     ))
-                    .tooltip(branch)
-                    .disabled(checkout.is_none())
+                    .tooltip(format!("Manage branches: {branch}"))
+                    .disabled(status.is_none())
                     .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(crate::OpenWorkspaceReview), cx)
+                        window.dispatch_action(Box::new(crate::OpenWorkspaceBranches), cx)
                     }),
             )
             .child(
@@ -1176,6 +1269,95 @@ impl ChatListView {
                         window.dispatch_action(Box::new(crate::OpenWorkspaceReview), cx)
                     }),
             )
+            .children(status.map(|status| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .children((status.ahead > 0 || status.behind > 0).then(|| {
+                        div()
+                            .debug_selector(|| "environment-sync".into())
+                            .px_2()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("{} ahead · {} behind", status.ahead, status.behind))
+                    }))
+                    .child(
+                        Button::new("environment-git-actions")
+                            .debug_selector(|| "environment-git-actions".into())
+                            .ghost()
+                            .small()
+                            .w_full()
+                            .justify_start()
+                            .accessibility_label("Git actions: review, commit, push, or pull")
+                            .tooltip("Review, commit, push, or pull in Git review")
+                            .child(action_content(
+                                Icon::default().path("icons/git/branch.svg"),
+                                "Git actions".into(),
+                            ))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(crate::OpenWorkspaceReview), cx)
+                            }),
+                    )
+                    .children(status.remote.as_ref().map(|_| {
+                        let model = self.model.clone();
+                        Button::new("environment-repository")
+                            .debug_selector(|| "environment-repository".into())
+                            .ghost()
+                            .small()
+                            .w_full()
+                            .justify_start()
+                            .accessibility_label("Repository: open GitHub workspace")
+                            .tooltip("Open GitHub workspace")
+                            .child(action_content(
+                                Icon::new(IconName::Folder),
+                                "Repository".into(),
+                            ))
+                            .on_click(move |_, _, cx| {
+                                model.update(cx, |state, cx| {
+                                    controller::dispatch(state, AppAction::OpenGitHub);
+                                    cx.notify();
+                                });
+                            })
+                    }))
+                    .children(
+                        status
+                            .pr
+                            .as_ref()
+                            .filter(|pr| {
+                                pr.url.starts_with("https://") || pr.url.starts_with("http://")
+                            })
+                            .map(|pr| {
+                                div()
+                                    .debug_selector(|| "environment-pr".into())
+                                    .px_2()
+                                    .min_w_0()
+                                    .child(
+                                        gpui_kit::base::Link::new("environment-pr-link")
+                                            .href(pr.url.clone())
+                                            .open_with(|url, _, _, cx| cx.open_url(url))
+                                            .accessibility_label(format!(
+                                                "Open PR #{}: {}",
+                                                pr.number, pr.title
+                                            ))
+                                            .text_color(theme.link)
+                                            .underline()
+                                            .cursor_pointer()
+                                            .border_1()
+                                            .border_color(theme.transparent)
+                                            .rounded(theme.radius)
+                                            .hover(|style| style.bg(theme.list_hover))
+                                            .focus_visible(|style| {
+                                                style.border_color(theme.primary)
+                                            })
+                                            .child(div().min_w_0().truncate().child(format!(
+                                                "PR #{} · {}",
+                                                pr.number, pr.title
+                                            ))),
+                                    )
+                            }),
+                    )
+            }))
             .child(
                 div()
                     .mt_1()
@@ -2732,6 +2914,12 @@ impl ChatListView {
         if !session_changed
             && new_message_count == old_message_count
             && generating == self.transcript_generating
+            // Hydration and streaming can change row topology without changing
+            // message count (an activity-only reply gains visible content).
+            && messages.iter().zip(self.transcript_messages.iter()).all(|(new, old)| {
+                is_activity_only(new) == is_activity_only(old)
+                    && is_queued_message(new, generating) == is_queued_message(old, generating)
+            })
         {
             let last_changed = messages
                 .last()
@@ -2811,7 +2999,17 @@ impl ChatListView {
             self.transcript_list_state
                 .splice(old_row_count..old_row_count, new_row_count - old_row_count);
         } else {
+            // Reconciliation can replace every optimistic ID. Keep a find
+            // reader's viewport, without guessing a new selected message.
+            let reading_position = (self.find_open
+                && !session_changed
+                && !self.transcript_list_state.is_following_tail())
+                .then(|| self.transcript_list_state.logical_scroll_top());
             self.transcript_list_state.reset(new_row_count);
+            if let Some(mut position) = reading_position {
+                position.item_ix = position.item_ix.min(new_row_count.saturating_sub(1));
+                self.transcript_list_state.scroll_to(position);
+            }
         }
         if session_changed {
             self.transcript_list_state.set_follow_mode(FollowMode::Tail);
@@ -2825,6 +3023,9 @@ impl ChatListView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let messages = Arc::clone(&self.transcript_messages);
+        let selected = self.find_open
+            && matches!(self.transcript_rows.get(index),
+            Some(TranscriptRow::Message(i)) if self.find_selected.as_ref() == Some(&messages[*i].id));
         let content = match self.transcript_rows.get(index).cloned() {
             Some(TranscriptRow::Message(message_index)) => messages
                 .get(message_index)
@@ -2840,6 +3041,8 @@ impl ChatListView {
             .w_full()
             .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
             .mx_auto()
+            .when(selected, |el| el.border_1().border_color(cx.theme().primary)
+                .child(div().text_sm().child("Selected matching message")))
             .children(content)
             .into_any_element()
     }
@@ -4075,6 +4278,9 @@ impl ChatListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.find_open {
+            return;
+        }
         let key = event.keystroke.key.as_str();
 
         let text = self.input_state.read(cx).value().to_string();
@@ -4544,7 +4750,7 @@ impl ChatListView {
             div()
                 .debug_selector(|| "question-card".into())
                 .w_full()
-                .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
+                .max_w(rems(QUESTION_CARD_MAX_WIDTH))
                 .mx_auto()
                 .flex_none()
                 .px_4()
@@ -4553,7 +4759,7 @@ impl ChatListView {
                 .child(
                     div()
                         .w_full()
-                        .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
+                        .max_w(rems(QUESTION_CARD_MAX_WIDTH))
                         .mx_auto()
                         .px_3()
                         .py_2()
@@ -6555,14 +6761,14 @@ impl ChatListView {
                     .child("Activity details")
                     .child(
                         Button::new("progress-open-trajectory")
+                            .debug_selector(|| "progress-open-trajectory".into())
                             .label("Open trajectory")
                             .icon(IconName::ChevronRight)
                             .ghost()
                             .xsmall()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.progress_summary_expanded = false;
-                                this.current_tab = CentralTab::Trajectory;
-                                cx.notify();
+                                this.set_tab(CentralTab::Trajectory, cx);
                             })),
                     ),
             );
@@ -6633,6 +6839,7 @@ impl Render for ChatListView {
         };
         let session_changed = session_key != self.last_session_key;
         if session_changed {
+            self.clear_conversation_find();
             self.markdown_cache_namespace = session_key
                 .as_ref()
                 .map(|(work_dir, session_id)| {
@@ -6694,8 +6901,17 @@ impl Render for ChatListView {
             .min_w_0()
             .min_h_0()
             .bg(theme.background)
+            .id("conversation-surface")
+            .when(self.current_tab == CentralTab::Chat, |el| el
+                .role(Role::Group).track_focus(&self.chat_focus)
+                .key_context(if self.find_open { "Conversation ConversationFindActive" } else { "Conversation" })
+                .on_action(cx.listener(Self::open_conversation_find))
+                .on_action(cx.listener(Self::close_conversation_find))
+                .on_action(cx.listener(Self::next_conversation_match))
+                .on_action(cx.listener(Self::previous_conversation_match)))
             .on_key_down(cx.listener(Self::handle_key_down))
             .child(self.render_header(cx))
+            .children(self.find_open.then(|| self.render_conversation_find(cx)))
             .child(
                 div()
                     .flex()
