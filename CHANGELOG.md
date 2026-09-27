@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.1.29](https://github.com/wheregmis/threadlane/compare/v0.1.28...v0.1.29) (2026-09-27)
+
+
+### Features
+
+* **automation:** add run deletion and run modes ([3a178ad](https://github.com/wheregmis/threadlane/commit/3a178adad9ccf29c8aa55e7604875dd5e3d9c05a))
+* **chat:** find and jump to matching conversation messages ([70431fb](https://github.com/wheregmis/threadlane/commit/70431fb77db71831425b325f9c350afb3b3bacc0))
+* **chat:** find and navigate matching conversation messages ([5303128](https://github.com/wheregmis/threadlane/commit/530312868cce83866aabee0516bc36399b8357bd))
+* enhance environment panel with Git workspace shortcuts ([fb2ad35](https://github.com/wheregmis/threadlane/commit/fb2ad353eb6ec389bd503c538371a78c66ba2c57))
+* **settings:** add manual application update controls ([887a090](https://github.com/wheregmis/threadlane/commit/887a0901376c3b1e4cdc3556bf8e71d6838faf8f))
+
+
+### Bug Fixes
+
+* address environment panel accessibility and untracked totals ([b9b971e](https://github.com/wheregmis/threadlane/commit/b9b971e115a3065a3574f03a29e90cf9143917be))
+* **chat:** constrain question card width ([3d69edf](https://github.com/wheregmis/threadlane/commit/3d69edf855c9a13a38eb74fc7efa66977b1f72e9))
+* **chat:** constrain question card width ([830833f](https://github.com/wheregmis/threadlane/commit/830833f5b0e4b9a661350ef08d3bc91731653afc))
+* **chat:** keep conversation find usable during streaming ([f9f1a9a](https://github.com/wheregmis/threadlane/commit/f9f1a9ae53f196390373a9451a564808149eea1a))
+* **github:** Scope PR tasks to live branches ([7fb720d](https://github.com/wheregmis/threadlane/commit/7fb720d405e8794dd44c9ee8b29e50a32e5b532e))
+* **updater:** compact update controls beside sidebar Settings ([9c4de5c](https://github.com/wheregmis/threadlane/commit/9c4de5c387f95df386d891faed1eb0aa44837159))
+* **updater:** move update controls beside sidebar settings ([f7365e1](https://github.com/wheregmis/threadlane/commit/f7365e1590193f6a1fe16092e62c996b3c89bd5a))
+
 ## [0.1.28](https://github.com/wheregmis/threadlane/compare/v0.1.27...v0.1.28) (2026-09-26)
 
 
