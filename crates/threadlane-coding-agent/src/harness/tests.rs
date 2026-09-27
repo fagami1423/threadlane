@@ -5,6 +5,50 @@ fn temp_session() -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
+#[test]
+fn automation_facts_create_missing_session_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let worktree = dir.path().join("worktree");
+    fs::create_dir(&worktree).unwrap();
+    let path = worktree.join(".threadlane/sessions/automation.jsonl");
+    assert!(!path.parent().unwrap().exists());
+
+    CodingSessionHarness::append_fact_to_path(&path, "main", "automation_id", "test", None)
+        .unwrap();
+    CodingSessionHarness::append_fact_to_path(&path, "main", "model", "test-model", None).unwrap();
+
+    let store = JsonlStore::open_read_only(&path).unwrap();
+    assert_eq!(
+        store.facts().get("automation_id").map(String::as_str),
+        Some("test")
+    );
+    assert_eq!(
+        store.facts().get("model").map(String::as_str),
+        Some("test-model")
+    );
+}
+
+#[test]
+fn session_directory_creation_error_includes_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocked = dir.path().join(".threadlane");
+    fs::write(&blocked, "not a directory").unwrap();
+    let path = blocked.join("sessions/automation.jsonl");
+
+    let error =
+        CodingSessionHarness::append_fact_to_path(&path, "main", "automation_id", "test", None)
+            .unwrap_err();
+    assert!(
+        error.contains("Failed to create session directory"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&path.parent().unwrap().display().to_string()),
+        "{error}"
+    );
+    assert_eq!(fs::read_to_string(blocked).unwrap(), "not a directory");
+}
+
 fn open_long_run(path: &Path) -> CodingSessionHarness {
     let mut harness = CodingSessionHarness::open(path).unwrap();
     harness

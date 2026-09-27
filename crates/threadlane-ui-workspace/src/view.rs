@@ -34,6 +34,8 @@ use threadlane_git::GitStatus;
 use threadlane_ui_state::{actions::AppAction, controller};
 use threadlane_ui_chat::ChatListView;
 use threadlane_ui_github::GitHubView;
+use threadlane_ui_automation::AutomationsView;
+use gpui_component::WindowExt;
 use threadlane_ui_right_panel::RightPanelView;
 use threadlane_ui_settings::SettingsView;
 use threadlane_ui_sidebar::SidebarView;
@@ -61,20 +63,8 @@ fn open_github_from_palette(state: &mut AppState, notify: impl FnOnce()) {
     notify();
 }
 
-fn update_notice_key(status: &UpdateStatus) -> String {
-    match status {
-        UpdateStatus::Idle => "idle".to_string(),
-        UpdateStatus::Checking => "checking".to_string(),
-        UpdateStatus::Available(info) => format!("available:{}", info.version),
-        UpdateStatus::UpToDate => "up-to-date".to_string(),
-        UpdateStatus::Downloading { version, .. } => format!("downloading:{version}"),
-        UpdateStatus::ReadyToInstall { info, .. } => format!("ready:{}", info.version),
-        UpdateStatus::Installing => "installing".to_string(),
-        UpdateStatus::Error(error) => format!("error:{error}"),
-    }
-}
-
 pub fn init(cx: &mut App) {
+    threadlane_ui_automation::init(cx);
     threadlane_ui_github::view::init(cx);
     cx.bind_keys([
         KeyBinding::new("cmd-k", ToggleCommandPalette, None),
@@ -177,6 +167,7 @@ pub struct WorkspaceView {
     sidebar: Entity<SidebarView>,
     chat_list: Entity<ChatListView>,
     github: Entity<GitHubView>,
+    automations: Entity<AutomationsView>,
     settings: Entity<SettingsView>,
     right_panel: Entity<RightPanelView>,
     fallback_terminal: Option<Entity<TerminalView>>,
@@ -306,6 +297,8 @@ impl WorkspaceView {
         let sidebar = cx.new(|cx| SidebarView::new(model.clone(), window, cx));
         let chat_list = cx.new(|cx| ChatListView::new(model.clone(), window, cx));
         let github = cx.new(|cx| GitHubView::new(model.clone(), window, cx));
+        let automations = cx.new(|cx| AutomationsView::new(model.clone(), cx));
+        let mut automation_updates = model.update(cx, |state, _| state.start_automations());
         let settings = cx.new(|cx| SettingsView::new(model.clone(), window, cx));
         let right_panel = cx.new(|cx| RightPanelView::new(model.clone(), window, cx));
         let sidebar_resizable_state = cx.new(|_cx| ResizableState::default());
@@ -327,6 +320,21 @@ impl WorkspaceView {
 
         let model_clone = model.clone();
         let view = cx.new(|cx| {
+            cx.spawn_in(window, async move |this, cx| {
+                let mut last_notification = None;
+                while automation_updates.changed().await.is_ok() {
+                    let projection = automation_updates.borrow_and_update().clone();
+                    if this.update_in(cx, |this: &mut Self, window, cx| {
+                        if let Some((id, message)) = &projection.notification {
+                            if last_notification.as_ref() != Some(id) {
+                                window.push_notification(message.clone(), cx);
+                                last_notification = Some(id.clone());
+                            }
+                        }
+                        this.model.update(cx, |state, cx| { state.apply_automation_projection(projection); cx.notify(); });
+                    }).is_err() { break; }
+                }
+            }).detach();
             let focus_handle = cx.focus_handle();
             focus_handle.focus(window, cx);
             let sub = cx.observe(&model_clone, move |this: &mut Self, model, cx| {
@@ -430,12 +438,7 @@ impl WorkspaceView {
                         }
                         for UpdaterEvent::Status(status) in updater_events {
                             this.model.update(cx, |state, cx| {
-                                let new_key = update_notice_key(&status);
-                                let old_key = update_notice_key(&state.update_status);
                                 state.update_status = status;
-                                if new_key != old_key {
-                                    state.update_notice_dismissed = false;
-                                }
                                 cx.notify();
                             });
                         }
@@ -458,6 +461,7 @@ impl WorkspaceView {
                 sidebar,
                 chat_list,
                 github,
+                automations,
                 settings,
                 right_panel,
                 fallback_terminal: None,
@@ -832,6 +836,9 @@ impl WorkspaceView {
                 .detach();
             }
             "git" => self.open_git_review(cx),
+            "automations" => {
+                self.model.update(cx, |state, cx| { controller::dispatch(state, AppAction::OpenAutomations); cx.notify(); });
+            }
             "github" => {
                 model.update(cx, |state, cx| {
                     open_github_from_palette(state, || cx.notify());
@@ -1060,156 +1067,40 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn render_update_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let status = {
-            let state = self.model.read(cx);
-            if state.update_notice_dismissed {
-                return None;
+    fn activate_update(
+        &mut self,
+        _: &threadlane_ui_sidebar::ActivateUpdate,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Read current state at activation, not a stale render snapshot. Publish the
+        // busy state synchronously so repeated clicks cannot start duplicate jobs.
+        let status = self.model.read(cx).update_status.clone();
+        let next = match &status {
+            UpdateStatus::Available(info) => UpdateStatus::Downloading {
+                version: info.version.clone(),
+                progress: 0.0,
+            },
+            UpdateStatus::ReadyToInstall { .. } => UpdateStatus::Installing,
+            UpdateStatus::Idle | UpdateStatus::UpToDate | UpdateStatus::Error(_) => {
+                UpdateStatus::Checking
             }
-            state.update_status.clone()
+            _ => return,
         };
-
-        let (title, detail) = match &status {
-            UpdateStatus::Available(info) => (
-                format!("Threadlane {} is available", info.version),
-                "Download the verified update in the background.".to_string(),
-            ),
-            UpdateStatus::Downloading { progress, .. } => (
-                "Downloading update".to_string(),
-                format!("{}% complete", (progress.clamp(0.0, 1.0) * 100.0).round()),
-            ),
-            UpdateStatus::ReadyToInstall { info, .. } => (
-                format!("Threadlane {} is ready", info.version),
-                "Install the update and relaunch Threadlane.".to_string(),
-            ),
-            UpdateStatus::Installing => (
-                "Installing update".to_string(),
-                "Threadlane will relaunch when installation finishes.".to_string(),
-            ),
-            UpdateStatus::Error(error) => {
-                let truncated: String = error.chars().take(160).collect();
-                let suffix = if error.chars().count() > 160 {
-                    "…"
-                } else {
-                    ""
-                };
-                ("Update failed".to_string(), format!("{truncated}{suffix}"))
-            }
-            _ => return None,
-        };
-        let error_details: Option<String> = match &status {
-            UpdateStatus::Error(error) => Some(error.clone()),
-            _ => None,
-        };
-
-        let action = match &status {
-            UpdateStatus::Available(info) => {
-                let tx = self.updater_tx.clone();
-                let info = info.clone();
-                Some(
-                    Button::new("update-download")
-                        .label("Download")
-                        .primary()
-                        .tooltip(format!("Download Threadlane {}", info.version))
-                        .on_click(move |_event, _window, _cx| {
-                            updater::download(info.clone(), tx.clone());
-                        }),
-                )
-            }
+        self.model.update(cx, |state, cx| {
+            state.update_status = next;
+            cx.notify();
+        });
+        match status {
+            UpdateStatus::Available(info) => updater::download(info, self.updater_tx.clone()),
             UpdateStatus::ReadyToInstall { info, bytes } => {
-                let tx = self.updater_tx.clone();
-                let info = info.clone();
-                let bytes = bytes.clone();
-                let version = info.version.clone();
-                Some(
-                    Button::new("update-install")
-                        .label("Install and relaunch")
-                        .primary()
-                        .tooltip(format!("Install Threadlane {version} and relaunch"))
-                        .on_click(move |_event, _window, _cx| {
-                            updater::install(info.clone(), bytes.clone(), tx.clone());
-                        }),
-                )
+                updater::install(info, bytes, self.updater_tx.clone())
             }
-            UpdateStatus::Error(_) => {
-                let tx = self.updater_tx.clone();
-                Some(
-                    Button::new("update-retry")
-                        .label("Retry")
-                        .outline()
-                        .tooltip("Check for updates again")
-                        .on_click(move |_event, _window, _cx| updater::check(tx.clone())),
-                )
+            UpdateStatus::Idle | UpdateStatus::UpToDate | UpdateStatus::Error(_) => {
+                updater::check(self.updater_tx.clone())
             }
-            _ => None,
-        };
-        let theme = cx.theme().colors;
-        let model = self.model.clone();
-
-        Some(
-            div()
-                .absolute()
-                .right_4()
-                .bottom_4()
-                .w(rems(26.25))
-                .rounded_lg()
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.title_bar)
-                .p_4()
-                .flex()
-                .items_center()
-                .gap_3()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme.foreground)
-                                .child(title),
-                        )
-                        .child(
-                            div()
-                                .mt_1()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(detail),
-                        ),
-                )
-                .children(action)
-                .children(error_details.map(|details| {
-                    Button::new("update-copy-error")
-                        .label("Copy details")
-                        .ghost()
-                        .xsmall()
-                        .tooltip("Copy the complete update error")
-                        .on_click(move |_event, _window, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(details.clone()));
-                        })
-                }))
-                .children(
-                    matches!(status, UpdateStatus::Available(_) | UpdateStatus::Error(_)).then(
-                        || {
-                            Button::new("update-dismiss")
-                                .accessibility_label("Dismiss update notice")
-                                .icon(IconName::Close)
-                                .tooltip("Dismiss")
-                                .ghost()
-                                .xsmall()
-                                .on_click(move |_event, _window, cx| {
-                                    model.update(cx, |state, cx| {
-                                        state.update_notice_dismissed = true;
-                                        cx.notify();
-                                    });
-                                })
-                        },
-                    ),
-                )
-                .into_any_element(),
-        )
+            _ => unreachable!(),
+        }
     }
 
     fn render_command_palette(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1217,7 +1108,7 @@ impl WorkspaceView {
         let model = self.model.clone();
         let state = model.read(cx);
 
-        let commands: [(&str, &str, &str, Icon, &[&str], &str); 21] = [
+        let commands: [(&str, &str, &str, Icon, &[&str], &str); 22] = [
             (
                 "New Task",
                 "Start a fresh session",
@@ -1312,6 +1203,14 @@ impl WorkspaceView {
                 "git",
                 Icon::default().path("icons/git/commit.svg"),
                 &["git", "diff", "review", "commit", "stage"],
+                "",
+            ),
+            (
+                "Automations",
+                "Schedule recurring prompts and review runs",
+                "automations",
+                Icon::from(IconName::Calendar),
+                &["automation", "schedule", "recurring", "runs"],
                 "",
             ),
             (
@@ -2435,6 +2334,7 @@ impl Render for WorkspaceView {
         let central_content = match workspace_page {
             WorkspacePage::Chat => chat_page_content.into_any_element(),
             WorkspacePage::GitHub => self.github.clone().into_any_element(),
+            WorkspacePage::Automations => self.automations.clone().into_any_element(),
             WorkspacePage::Settings => self.settings.clone().into_any_element(),
         };
         let page_content = if workspace_page != WorkspacePage::Settings && show_sidebar {
@@ -2501,6 +2401,10 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::toggle_terminal_action))
             .on_action(cx.listener(Self::begin_new_task_action))
             .on_action(cx.listener(Self::open_settings_action))
+            .on_action(cx.listener(Self::activate_update))
+            .on_action(cx.listener(|this, _: &threadlane_ui_settings::ActivateUpdate, window, cx| {
+                this.activate_update(&threadlane_ui_sidebar::ActivateUpdate, window, cx);
+            }))
             .on_action(cx.listener(Self::cancel_active_generation_action))
             .on_action(cx.listener(Self::select_chat_tab_action))
             .on_action(cx.listener(Self::select_trajectory_tab_action))
@@ -2563,7 +2467,6 @@ impl Render for WorkspaceView {
                 self.command_palette_open
                     .then(|| self.render_command_palette(cx)),
             )
-            .children(self.render_update_notice(cx))
     }
 }
 

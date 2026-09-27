@@ -6,6 +6,8 @@
 //! `Entity<AppState>`, so they live here (rather than in GPUI-free
 //! `threadlane-ui-catalog`); the workspace shell imports them directly.
 
+gpui::actions!(threadlane_settings, [ActivateUpdate]);
+
 mod view;
 
 pub use view::SettingsView;

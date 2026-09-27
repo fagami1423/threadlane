@@ -6,10 +6,10 @@
 //! directly.
 
 use threadlane_protocol::browser::{
-    ActTarget, BrowserBridge, BrowserCommand, BROWSER_ACT_TOOL, BROWSER_BACK_TOOL,
-    BROWSER_CONSOLE_LOGS_TOOL, BROWSER_CURRENT_URL_TOOL, BROWSER_EVALUATE_TOOL,
+    ActTarget, BrowserBridge, BrowserCommand, BrowserTabAction, BROWSER_ACT_TOOL,
+    BROWSER_BACK_TOOL, BROWSER_CONSOLE_LOGS_TOOL, BROWSER_CURRENT_URL_TOOL, BROWSER_EVALUATE_TOOL,
     BROWSER_NAVIGATE_TOOL, BROWSER_RELOAD_TOOL, BROWSER_SCREENSHOT_TOOL, BROWSER_SNAPSHOT_TOOL,
-    BROWSER_WAIT_TOOL,
+    BROWSER_TABS_TOOL, BROWSER_WAIT_TOOL,
 };
 
 use async_trait::async_trait;
@@ -24,6 +24,11 @@ pub struct BrowserToolExecutor {
     bridge: BrowserBridge,
 }
 
+/// Appended to screenshot capture failures so the model adapts (snapshot or a
+/// different URL) instead of retrying the identical capture: one session
+/// retried the same TIFF-extraction failure 7 times verbatim.
+const SCREENSHOT_FAILURE_GUIDANCE: &str = "Screenshot capture failed; do not retry the identical screenshot. Use `browser_snapshot` for page structure instead, or navigate to a different URL first.";
+
 impl BrowserToolExecutor {
     pub fn new(bridge: BrowserBridge) -> Self {
         Self { bridge }
@@ -32,6 +37,20 @@ impl BrowserToolExecutor {
 
 fn browser_tool_definitions() -> Arc<[AgentToolDefinition]> {
     vec![
+        AgentToolDefinition::new(
+            BROWSER_TABS_TOOL,
+            "Manage embedded browser tabs: list, open a URL/search in a new selected tab, select an existing tab, or close it. Returns stable tab IDs, URLs, and active_tab_id. Other browser tools operate on the selected tab; use them sequentially and take a fresh browser_snapshot after selecting. Closing the last tab resets it to the default page.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "open", "select", "close"]},
+                    "url": {"type": "string", "description": "Required for open: URL, host, or search phrase."},
+                    "tab_id": {"type": "integer", "minimum": 1, "description": "Required for select/close: stable ID returned by browser_tabs, not a tab index."}
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+        ),
         AgentToolDefinition::new(
             BROWSER_NAVIGATE_TOOL,
             "Navigate the embedded browser panel to a URL or search query (host-like text gets https://, plain phrases become a web search, same as the address bar). The page stays visible to the user in the Browser tab. Use this to look at docs, search the web, or open the user's local dev server.",
@@ -199,6 +218,10 @@ impl ToolExecutor for BrowserToolExecutor {
 
     async fn execute_tool(&self, name: &str, args: &str) -> Option<Result<String, String>> {
         let command = match name {
+            BROWSER_TABS_TOOL => match parse_tabs_command(args) {
+                Ok(command) => command,
+                Err(error) => return Some(Err(error)),
+            },
             BROWSER_NAVIGATE_TOOL => {
                 let parsed: serde_json::Value = serde_json::from_str(args)
                     .map_err(|error| format!("Invalid {BROWSER_NAVIGATE_TOOL} arguments: {error}"))
@@ -314,7 +337,7 @@ impl ToolExecutor for BrowserToolExecutor {
                     }
                     Some(Ok(ToolOutput::from(payload)))
                 }
-                Err(err) => Some(Err(err)),
+                Err(err) => Some(Err(format!("{err} {SCREENSHOT_FAILURE_GUIDANCE}"))),
             }
         } else {
             self.execute_tool(name, args)
@@ -322,6 +345,42 @@ impl ToolExecutor for BrowserToolExecutor {
                 .map(|result| result.map(ToolOutput::from))
         }
     }
+}
+
+fn parse_tabs_command(args: &str) -> Result<BrowserCommand, String> {
+    let parsed: serde_json::Value = serde_json::from_str(args)
+        .map_err(|error| format!("Invalid {BROWSER_TABS_TOOL} arguments: {error}"))?;
+    let action = match parsed.get("action").and_then(|v| v.as_str()) {
+        Some("list") => BrowserTabAction::List,
+        Some("open") => {
+            let url = parsed
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .ok_or("`browser_tabs` open requires a non-empty `url`.")?;
+            BrowserTabAction::Open {
+                url: url.to_string(),
+            }
+        }
+        Some(action @ ("select" | "close")) => {
+            let tab_id = parsed
+                .get("tab_id")
+                .and_then(|v| v.as_u64())
+                .and_then(|id| usize::try_from(id).ok())
+                .filter(|id| *id > 0)
+                .ok_or(
+                    "`browser_tabs` select/close requires a positive integer `tab_id` from list.",
+                )?;
+            if action == "select" {
+                BrowserTabAction::Select { tab_id }
+            } else {
+                BrowserTabAction::Close { tab_id }
+            }
+        }
+        _ => return Err("`browser_tabs` action must be list, open, select, or close.".into()),
+    };
+    Ok(BrowserCommand::Tabs { action })
 }
 
 /// Validate `browser_act` arguments into a panel command.
@@ -383,6 +442,77 @@ fn parse_act_command(args: &str) -> Result<BrowserCommand, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tabs_validate_actions_and_stable_ids() {
+        assert!(matches!(
+            parse_tabs_command(r#"{"action":"list"}"#).unwrap(),
+            BrowserCommand::Tabs {
+                action: BrowserTabAction::List
+            }
+        ));
+        assert!(
+            matches!(parse_tabs_command(r#"{"action":"open","url":" example.com "}"#).unwrap(), BrowserCommand::Tabs { action: BrowserTabAction::Open { url } } if url == "example.com")
+        );
+        assert!(matches!(
+            parse_tabs_command(r#"{"action":"select","tab_id":42}"#).unwrap(),
+            BrowserCommand::Tabs {
+                action: BrowserTabAction::Select { tab_id: 42 }
+            }
+        ));
+        assert!(matches!(
+            parse_tabs_command(r#"{"action":"close","tab_id":7}"#).unwrap(),
+            BrowserCommand::Tabs {
+                action: BrowserTabAction::Close { tab_id: 7 }
+            }
+        ));
+        for args in [
+            "{",
+            "{}",
+            r#"{"action":"unknown"}"#,
+            r#"{"action":"open","url":" "}"#,
+            r#"{"action":"select"}"#,
+            r#"{"action":"close","tab_id":0}"#,
+            r#"{"action":"select","tab_id":-1}"#,
+            r#"{"action":"select","tab_id":1.5}"#,
+            r#"{"action":"select","tab_id":"1"}"#,
+        ] {
+            assert!(parse_tabs_command(args).is_err(), "accepted {args}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tabs_round_trip_and_invalid_arguments() {
+        let bridge = BrowserBridge::channel();
+        let mut rx = bridge.take_receiver().unwrap();
+        let executor = BrowserToolExecutor::new(bridge);
+        assert!(executor
+            .execute_tool(BROWSER_TABS_TOOL, "{")
+            .await
+            .unwrap()
+            .is_err());
+        assert!(rx.try_recv().is_err());
+        let task = tokio::spawn(async move {
+            executor
+                .execute_tool(BROWSER_TABS_TOOL, r#"{"action":"select","tab_id":42}"#)
+                .await
+        });
+        let request = rx.recv().await.unwrap();
+        assert!(matches!(
+            request.command,
+            BrowserCommand::Tabs {
+                action: BrowserTabAction::Select { tab_id: 42 }
+            }
+        ));
+        request
+            .reply
+            .send(Ok(r#"{"active_tab_id":42}"#.into()))
+            .unwrap();
+        assert_eq!(
+            task.await.unwrap().unwrap().unwrap(),
+            r#"{"active_tab_id":42}"#
+        );
+    }
+
     #[tokio::test]
     async fn unavailable_bridge_reports_helpfully() {
         let executor = BrowserToolExecutor::new(BrowserBridge::unavailable());
@@ -440,6 +570,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                BROWSER_TABS_TOOL,
                 BROWSER_NAVIGATE_TOOL,
                 BROWSER_BACK_TOOL,
                 BROWSER_RELOAD_TOOL,
@@ -535,5 +666,29 @@ mod tests {
         }
         req.reply.send(Ok("waited".into())).expect("reply");
         assert_eq!(t2.await.unwrap().unwrap().unwrap(), "waited");
+    }
+
+    #[tokio::test]
+    async fn screenshot_failure_steers_away_from_verbatim_retry() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let executor = BrowserToolExecutor::new(BrowserBridge::new(tx));
+        let task = tokio::spawn(async move {
+            executor
+                .execute_tool_with_output_in_workspace(BROWSER_SCREENSHOT_TOOL, "{}", None)
+                .await
+        });
+        let req = rx.recv().await.expect("req");
+        assert!(matches!(req.command, BrowserCommand::Screenshot));
+        req.reply
+            .send(Err("Failed to extract TIFF from snapshot image.".into()))
+            .expect("reply");
+        let err = task
+            .await
+            .expect("task")
+            .expect("handled")
+            .expect_err("screenshot failure must be Err");
+        assert!(err.contains("Failed to extract TIFF"), "lost cause: {err}");
+        assert!(err.contains("browser_snapshot"), "no alternative: {err}");
+        assert!(err.contains("do not retry"), "no retry guard: {err}");
     }
 }
