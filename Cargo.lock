@@ -8755,6 +8755,7 @@ dependencies = [
  "threadlane-git",
  "threadlane-ui-state",
  "threadlane-ui-theme",
+ "threadlane-updater",
 ]
 
 [[package]]

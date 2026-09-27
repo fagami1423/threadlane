@@ -7,7 +7,7 @@
 
 use gpui::actions;
 
-actions!(threadlane_sidebar, [BeginNewTask]);
+actions!(threadlane_sidebar, [BeginNewTask, ActivateUpdate]);
 
 mod view;
 
