@@ -1,5 +1,65 @@
 # Changelog
 
+## [0.1.28](https://github.com/wheregmis/threadlane/compare/v0.1.27...v0.1.28) (2026-09-26)
+
+
+### Bug Fixes
+
+* **tools,runtime,browser:** steer model away from verbatim-retry waste loops ([7a96180](https://github.com/wheregmis/threadlane/commit/7a961808dd01e26a543f23c09123d09907e6e56b))
+
+## [0.1.27](https://github.com/wheregmis/threadlane/compare/v0.1.26...v0.1.27) (2026-09-26)
+
+
+### Features
+
+* Add persistent process diagnostics ([771fa56](https://github.com/wheregmis/threadlane/commit/771fa568260ca71ccb964a7c80028e8e9dab30d0))
+
+
+### Bug Fixes
+
+* expose create_automation in the filtered tool schema ([4e67e52](https://github.com/wheregmis/threadlane/commit/4e67e52879f3e485a8c4baf1be7a0f2764bd5334))
+* **runtime:** expose all registered tools to the model by default ([25c1668](https://github.com/wheregmis/threadlane/commit/25c1668e67babd6ffb00093cab7f15d010efc871))
+* **ui:** Preserve agent activity panel space ([942f162](https://github.com/wheregmis/threadlane/commit/942f162c049a3673bc035e2fcba9428634b28ae8))
+
+## [0.1.26](https://github.com/wheregmis/threadlane/compare/v0.1.25...v0.1.26) (2026-09-26)
+
+
+### Features
+
+* **automations:** add durable sidebar automations ([e108f3e](https://github.com/wheregmis/threadlane/commit/e108f3e6dbf8f225fa01ddbc8815edf66466addb))
+* **automations:** add durable sidebar automations ([801adda](https://github.com/wheregmis/threadlane/commit/801addaa5106bb3d117bfbde3d9e6dc63cba7ebc))
+* **automations:** create scheduled tasks from chat ([1dae746](https://github.com/wheregmis/threadlane/commit/1dae7465b6ed7231e8ed00616ca7c082eb34bcee))
+* **browser:** expose existing browser tabs to agents ([86114d4](https://github.com/wheregmis/threadlane/commit/86114d4a3f4aaaa27788a638618079bc95ab2193))
+* **browser:** let agents manage multiple browser tabs ([de0b316](https://github.com/wheregmis/threadlane/commit/de0b316a69e8b8b8c968bda62f5b6bdbd8689f1c))
+* **chat:** show queued messages above the composer ([f2705e2](https://github.com/wheregmis/threadlane/commit/f2705e2df81de07f69b6bd887cb6ac81fb905af1))
+* **chat:** show queued messages above the composer ([4426780](https://github.com/wheregmis/threadlane/commit/44267803fdb3d4cc935389188ac21e2d9efe384b))
+
+
+### Bug Fixes
+
+* **automations:** bound reviewed history and keep dispatch resilient ([cd6a8ba](https://github.com/wheregmis/threadlane/commit/cd6a8bacafe23e364833927e141454daca011cf9))
+* **automations:** preserve schedules and project-scoped defaults ([5435128](https://github.com/wheregmis/threadlane/commit/5435128f1909725dbdab653037ed9975d4e5c43d))
+* **browser:** preserve unsaved editor work during agent tab operations ([b800329](https://github.com/wheregmis/threadlane/commit/b800329c013240fb8f4834a461960d99c139a90f))
+* **chat:** reset transcript list when queue filtering changes rows ([cbd2935](https://github.com/wheregmis/threadlane/commit/cbd29350dd1b64bcd0b391f87f9b9fde39106c09))
+
+## [0.1.25](https://github.com/wheregmis/threadlane/compare/v0.1.24...v0.1.25) (2026-09-26)
+
+
+### Features
+
+* **agents:** add resizable split between overview and detail ([dd5e0f1](https://github.com/wheregmis/threadlane/commit/dd5e0f1f46f26376dc6f78c2e02e0b640db695a0))
+* **agents:** show agent status and task in panel ([23eb745](https://github.com/wheregmis/threadlane/commit/23eb745d893693ec3d8664e7f8632cbda0d3369a))
+* **terminal:** add display options for font, spacing, and background ([f8cd307](https://github.com/wheregmis/threadlane/commit/f8cd307e9725d90df0c7ee34b49c87df43d2a47a))
+* **ui:** add GitHub sidebar navigation ([9df5424](https://github.com/wheregmis/threadlane/commit/9df5424b3bca54a52985195cdf01eab444b693be))
+* **ui:** Redesign agents panel with profile tabs ([e025219](https://github.com/wheregmis/threadlane/commit/e0252196f048cc5e8ae8ea90799e3e5a058a9751))
+
+
+### Bug Fixes
+
+* **agents:** select available agent and clarify panel labels ([c18780c](https://github.com/wheregmis/threadlane/commit/c18780ca07fdb39ec4b9b1a26b48fd26c493b538))
+* **github:** Keep PR code view responsive ([54aa3a9](https://github.com/wheregmis/threadlane/commit/54aa3a971e0e6a650ded366dbea57ee8c753a5ff))
+* **ui:** improve agents panel profile layout ([ac62e47](https://github.com/wheregmis/threadlane/commit/ac62e47a5404860076b3d08f496ef0375aaab73c))
+
 ## [0.1.24](https://github.com/wheregmis/threadlane/compare/v0.1.23...v0.1.24) (2026-09-26)
 
 
