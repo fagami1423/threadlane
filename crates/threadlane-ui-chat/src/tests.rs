@@ -2702,6 +2702,116 @@ fn environment_section_renders_without_git_data(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+fn environment_git_shortcuts_follow_checkout(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    cx.update(gpui_component::init);
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::default();
+        state.is_new_task = false;
+        state.active_work_dir = Some("/project".into());
+        state.active_session_id = None;
+        state.git_statuses.insert(
+            "/project".into(),
+            threadlane_git::GitStatus {
+                branch: Some("feature".into()),
+                remote: Some("git@github.com:owner/repo.git".into()),
+                ahead: 2,
+                behind: 1,
+                pr: Some(threadlane_git::GitHubPrInfo {
+                    number: 271,
+                    url: "https://github.com/owner/repo/pull/271".into(),
+                    title: "Environment".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        state
+    });
+    let retained_model = model.clone();
+    let (chat, cx) =
+        cx.add_window_view(move |window, cx| super::ChatListView::new(model, window, cx));
+    chat.update(cx, |chat, cx| {
+        chat.set_environment_width(gpui::px(1200.), gpui::px(16.), cx)
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    for selector in [
+        "environment-git-actions",
+        "environment-repository",
+        "environment-pr",
+        "environment-sync",
+    ] {
+        assert!(cx.debug_bounds(selector).is_some(), "missing {selector}");
+    }
+    let repository = cx.debug_bounds("environment-repository").unwrap();
+    cx.simulate_click(repository.center(), gpui::Modifiers::default());
+    retained_model.read_with(cx, |state, _| {
+        assert_eq!(
+            state.workspace_page,
+            threadlane_ui_state::WorkspacePage::GitHub
+        );
+    });
+    retained_model.update(cx, |state, cx| {
+        let status = state
+            .git_statuses
+            .get_mut(std::path::Path::new("/project"))
+            .unwrap();
+        status.remote = None;
+        status.ahead = 0;
+        status.behind = 0;
+        status.pr.as_mut().unwrap().url = "file:///private/file".into();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("environment-git-actions").is_some());
+    for selector in [
+        "environment-repository",
+        "environment-pr",
+        "environment-sync",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_none(),
+            "unavailable {selector}"
+        );
+    }
+    retained_model.update(cx, |state, cx| {
+        state.active_work_dir = Some("/other".into());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    for selector in [
+        "environment-git-actions",
+        "environment-repository",
+        "environment-pr",
+        "environment-sync",
+    ] {
+        assert!(cx.debug_bounds(selector).is_none(), "stale {selector}");
+    }
+}
+
+#[test]
+fn environment_changes_summary_handles_missing_clean_binary_and_large_totals() {
+    use super::environment_changes_label;
+    assert_eq!(environment_changes_label(None), "Git status unavailable");
+    let mut status = threadlane_git::GitStatus::default();
+    assert_eq!(
+        environment_changes_label(Some(&status)),
+        "No uncommitted changes"
+    );
+    status.files.push(threadlane_git::GitFile::default());
+    assert_eq!(environment_changes_label(Some(&status)), "1 changed file");
+    status.files[0].additions = u32::MAX;
+    status.files[0].deletions = 3;
+    status.files.push(status.files[0].clone());
+    assert_eq!(
+        environment_changes_label(Some(&status)),
+        "2 changed files · +8589934590 −6"
+    );
+}
+
+#[gpui::test]
 fn trajectory_toolbar_filters_are_reachable(cx: &mut gpui::TestAppContext) {
     use gpui::AppContext as _;
     use std::collections::BTreeMap;

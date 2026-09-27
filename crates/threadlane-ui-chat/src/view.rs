@@ -34,6 +34,30 @@ use super::markdown::*;
 use super::trajectory::*;
 use super::transcript::*;
 
+fn environment_changes_label(status: Option<&threadlane_git::GitStatus>) -> String {
+    let Some(status) = status else {
+        return "Git status unavailable".into();
+    };
+    let summary = match status.files.len() {
+        0 => "No uncommitted changes".to_string(),
+        1 => "1 changed file".to_string(),
+        count => format!("{count} changed files"),
+    };
+    let (added, removed) = status
+        .files
+        .iter()
+        .fold((0_u64, 0_u64), |(added, removed), file| {
+            (
+                added + u64::from(file.additions),
+                removed + u64::from(file.deletions),
+            )
+        });
+    if added > 0 || removed > 0 {
+        format!("{summary} · +{added} −{removed}")
+    } else {
+        summary
+    }
+}
 fn editor_target_matches_active_work_dir(target: &Path, active: Option<&Path>) -> bool {
     active == Some(target)
 }
@@ -1164,13 +1188,7 @@ impl ChatListView {
                 }
                 .into()
             });
-        let changes = status
-            .map(|status| match status.files.len() {
-                0 => "No uncommitted changes".to_string(),
-                1 => "1 changed file".to_string(),
-                count => format!("{count} changed files"),
-            })
-            .unwrap_or_else(|| "Git status unavailable".into());
+        let changes = environment_changes_label(status);
         let model = self.model.clone();
         let theme = cx.theme();
         // Button's built-in icon/label wrapper centers its contents independently.
@@ -1225,15 +1243,15 @@ impl ChatListView {
                     .small()
                     .w_full()
                     .justify_start()
-                    .accessibility_label(branch.clone())
+                    .accessibility_label(format!("Manage branches: {branch}"))
                     .child(action_content(
                         Icon::default().path("icons/git/branch.svg"),
                         branch.clone(),
                     ))
-                    .tooltip(branch)
-                    .disabled(checkout.is_none())
+                    .tooltip(format!("Manage branches: {branch}"))
+                    .disabled(status.is_none())
                     .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(crate::OpenWorkspaceReview), cx)
+                        window.dispatch_action(Box::new(crate::OpenWorkspaceBranches), cx)
                     }),
             )
             .child(
@@ -1251,6 +1269,80 @@ impl ChatListView {
                         window.dispatch_action(Box::new(crate::OpenWorkspaceReview), cx)
                     }),
             )
+            .children(status.map(|status| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .children((status.ahead > 0 || status.behind > 0).then(|| {
+                        div()
+                            .debug_selector(|| "environment-sync".into())
+                            .px_2()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("{} ahead · {} behind", status.ahead, status.behind))
+                    }))
+                    .child(
+                        Button::new("environment-git-actions")
+                            .debug_selector(|| "environment-git-actions".into())
+                            .ghost()
+                            .small()
+                            .w_full()
+                            .justify_start()
+                            .accessibility_label("Git actions: review, commit, push, or pull")
+                            .tooltip("Review, commit, push, or pull in Git review")
+                            .child(action_content(
+                                Icon::default().path("icons/git/branch.svg"),
+                                "Git actions".into(),
+                            ))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(crate::OpenWorkspaceReview), cx)
+                            }),
+                    )
+                    .children(status.remote.as_ref().map(|_| {
+                        let model = self.model.clone();
+                        Button::new("environment-repository")
+                            .debug_selector(|| "environment-repository".into())
+                            .ghost()
+                            .small()
+                            .w_full()
+                            .justify_start()
+                            .accessibility_label("Repository: open GitHub workspace")
+                            .tooltip("Open GitHub workspace")
+                            .child(action_content(
+                                Icon::new(IconName::Folder),
+                                "Repository".into(),
+                            ))
+                            .on_click(move |_, _, cx| {
+                                model.update(cx, |state, cx| {
+                                    controller::dispatch(state, AppAction::OpenGitHub);
+                                    cx.notify();
+                                });
+                            })
+                    }))
+                    .children(
+                        status
+                            .pr
+                            .as_ref()
+                            .filter(|pr| {
+                                pr.url.starts_with("https://") || pr.url.starts_with("http://")
+                            })
+                            .map(|pr| {
+                                div()
+                                    .debug_selector(|| "environment-pr".into())
+                                    .px_2()
+                                    .min_w_0()
+                                    .child(
+                                        gpui_component::link::Link::new("environment-pr-link")
+                                            .href(pr.url.clone())
+                                            .child(div().min_w_0().truncate().child(format!(
+                                                "PR #{} · {}",
+                                                pr.number, pr.title
+                                            ))),
+                                    )
+                            }),
+                    )
+            }))
             .child(
                 div()
                     .mt_1()
