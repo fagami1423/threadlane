@@ -4643,7 +4643,7 @@ impl ChatListView {
             div()
                 .debug_selector(|| "question-card".into())
                 .w_full()
-                .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
+                .max_w(rems(QUESTION_CARD_MAX_WIDTH))
                 .mx_auto()
                 .flex_none()
                 .px_4()
@@ -4652,7 +4652,7 @@ impl ChatListView {
                 .child(
                     div()
                         .w_full()
-                        .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
+                        .max_w(rems(QUESTION_CARD_MAX_WIDTH))
                         .mx_auto()
                         .px_3()
                         .py_2()
