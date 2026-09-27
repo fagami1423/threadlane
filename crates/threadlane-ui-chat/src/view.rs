@@ -531,7 +531,7 @@ impl ChatListView {
                             )
                         };
                         if is_active {
-                            this.current_tab = CentralTab::Editor;
+                            this.set_tab(CentralTab::Editor, cx);
                             this.editor.update(cx, |editor, cx| {
                                 editor.open_file(project, &path, cx);
                             });
@@ -550,7 +550,7 @@ impl ChatListView {
                             )
                         };
                         if is_active {
-                            this.current_tab = CentralTab::Editor;
+                            this.set_tab(CentralTab::Editor, cx);
                             this.editor.update(cx, |editor, cx| {
                                 editor.open_diff(&path, &content, cx);
                             });
@@ -929,9 +929,10 @@ impl ChatListView {
         };
 
         div()
-            .h(rems(3.25))
+            .min_h(rems(3.25))
             .flex_none()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap_3()
             .px_4()
@@ -1000,15 +1001,31 @@ impl ChatListView {
                             })
                     })),
             )
-            .when(self.current_tab == CentralTab::Chat, |el| el.child(
-                Button::new("conversation-find-open").debug_selector(|| "conversation-find-open".into()).label("Find in conversation…")
-                    .ghost().small()
-                    .accessibility_label(if cfg!(target_os = "macos") { "Find in conversation (⌘F)" } else { "Find in conversation (Ctrl+F)" })
-                    .tooltip(if cfg!(target_os = "macos") { "Find in conversation (⌘F)" } else { "Find in conversation (Ctrl+F)" })
-                    .on_click(cx.listener(|this, _, window, cx| this.open_conversation_find(&FindInConversation, window, cx)))
-            ))
+            .when(self.current_tab == CentralTab::Chat, |el| {
+                el.child(
+                    Button::new("conversation-find-open")
+                        .debug_selector(|| "conversation-find-open".into())
+                        .icon(IconName::Search)
+                        .ghost()
+                        .small()
+                        .accessibility_label(if cfg!(target_os = "macos") {
+                            "Find in conversation (⌘F)"
+                        } else {
+                            "Find in conversation (Ctrl+F)"
+                        })
+                        .tooltip(if cfg!(target_os = "macos") {
+                            "Find in conversation (⌘F)"
+                        } else {
+                            "Find in conversation (Ctrl+F)"
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_conversation_find(&FindInConversation, window, cx)
+                        })),
+                )
+            })
             .child(
                 Button::new("central-tab-chat")
+                    .debug_selector(|| "central-tab-chat".into())
                     .label("Chat")
                     .tooltip("Chat (⌘1)")
                     .accessibility_label("Chat (⌘1)")
@@ -1019,6 +1036,7 @@ impl ChatListView {
             )
             .child(
                 Button::new("central-tab-trajectory")
+                    .debug_selector(|| "central-tab-trajectory".into())
                     .label("Trajectory")
                     .tooltip("Trajectory (⌘2)")
                     .accessibility_label("Trajectory (⌘2)")
@@ -1031,6 +1049,7 @@ impl ChatListView {
             )
             .child(
                 Button::new("central-tab-editor")
+                    .debug_selector(|| "central-tab-editor".into())
                     .label(editor_label.clone())
                     .tooltip("Editor (⌘3)")
                     .accessibility_label(format!(
@@ -6635,14 +6654,14 @@ impl ChatListView {
                     .child("Activity details")
                     .child(
                         Button::new("progress-open-trajectory")
+                            .debug_selector(|| "progress-open-trajectory".into())
                             .label("Open trajectory")
                             .icon(IconName::ChevronRight)
                             .ghost()
                             .xsmall()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.progress_summary_expanded = false;
-                                this.current_tab = CentralTab::Trajectory;
-                                cx.notify();
+                                this.set_tab(CentralTab::Trajectory, cx);
                             })),
                     ),
             );

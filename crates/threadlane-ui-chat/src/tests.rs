@@ -2817,6 +2817,18 @@ fn conversation_find_literal_unicode_excerpts_and_wraparound() {
         assert!(hits[0].excerpt.chars().count() <= 162);
     }
     assert!(super::find_conversation_messages(&messages, false, ".+").is_empty());
+    let spaced = vec![find_message("spaced", MessageRole::User, "alpha beta")];
+    assert_eq!(
+        super::find_conversation_messages(&spaced, false, "alpha ").len(),
+        1
+    );
+    assert_eq!(
+        super::find_conversation_messages(&spaced, false, " beta").len(),
+        1
+    );
+    for query in [" alpha", "beta ", "   "] {
+        assert!(super::find_conversation_messages(&spaced, false, query).is_empty());
+    }
     assert_eq!(super::next_find_match(None, 3, false), Some(0));
     assert_eq!(super::next_find_match(None, 3, true), Some(2));
     assert_eq!(super::next_find_match(Some(2), 3, false), Some(0));
@@ -2971,6 +2983,83 @@ fn conversation_find_keyboard_offscreen_streaming_and_close(cx: &mut gpui::TestA
         generation,
         "unrelated notifications must not scan"
     );
+    // Start a refresh, then replace its source before the debounce expires.
+    retained.update(cx, |state, _| {
+        state.is_generating = true;
+        std::sync::Arc::make_mut(&mut state.messages)[199].content = "stream A".into();
+    });
+    chat.update(cx, |chat, cx| chat.refresh_conversation_find(false, cx));
+    let scan_source = retained.update(cx, |state, _| {
+        std::sync::Arc::make_mut(&mut state.messages)[199].content = "needle stream B".into();
+        state.messages.clone()
+    });
+    // Tick only until the task captures B, leaving its background scan in flight.
+    for _ in 0..1000 {
+        cx.executor().tick();
+        cx.dispatcher
+            .scheduler()
+            .clock()
+            .advance(std::time::Duration::from_millis(120));
+        if chat.read_with(cx, |chat, _| {
+            chat.find_source
+                .as_ref()
+                .is_some_and(|(source, _, _)| std::sync::Arc::ptr_eq(source, &scan_source))
+        }) {
+            break;
+        }
+    }
+    let generation = chat.read_with(cx, |chat, _| {
+        assert!(std::sync::Arc::ptr_eq(
+            &chat.find_source.as_ref().unwrap().0,
+            &scan_source
+        ));
+        assert!(chat.find_pending);
+        assert_eq!(chat.find_results.len(), 2);
+        chat.find_generation
+    });
+    retained.update(cx, |state, cx| {
+        std::sync::Arc::make_mut(&mut state.messages)[199].content = "needle stream C".into();
+        cx.notify();
+    });
+    for _ in 0..1000 {
+        cx.executor().tick();
+        if chat.read_with(cx, |chat, _| chat.find_generation != generation) {
+            break;
+        }
+    }
+    chat.read_with(cx, |chat, cx| {
+        assert!(
+            chat.find_generation > generation,
+            "stale scan must schedule a refresh"
+        );
+        assert!(chat.find_pending, "latest scan has not completed yet");
+        assert_eq!(
+            chat.find_results.len(),
+            3,
+            "completed B scan must be published"
+        );
+        assert!(chat.find_results[2].excerpt.contains("stream B"));
+        assert!(chat
+            .conversation_find_status(cx)
+            .contains("3 matching messages"));
+    });
+    // Enter must still navigate while C is pending, using B's validated row IDs.
+    cx.update(|window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("enter").unwrap(), cx);
+    });
+    assert_eq!(
+        chat.read_with(cx, |chat, _| chat.find_selected.clone()),
+        Some("m199".into())
+    );
+    cx.update(|window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("shift-enter").unwrap(), cx);
+    });
+    assert_eq!(
+        chat.read_with(cx, |chat, _| chat.find_selected.clone()),
+        Some("m150".into())
+    );
+    assert!(chat.read_with(cx, |chat, _| chat.find_pending));
+    cx.run_until_parked();
     let mut settled_during_stream = false;
     for i in 0..12 {
         retained.update(cx, |state, cx| {
@@ -3031,6 +3120,28 @@ fn conversation_find_keyboard_offscreen_streaming_and_close(cx: &mut gpui::TestA
             );
         })
     });
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-f"
+    } else {
+        "ctrl-f"
+    });
+    chat.update(cx, |chat, cx| {
+        chat.progress_summary_expanded = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let open = cx
+        .debug_bounds("progress-open-trajectory")
+        .expect("trajectory action visible");
+    cx.simulate_click(open.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, _| {
+        assert_eq!(chat.current_tab, super::CentralTab::Trajectory);
+        assert!(!chat.find_open);
+        assert!(chat.find_results.is_empty());
+        assert!(chat.find_task.is_none());
+    });
+
 }
 
 #[gpui::test]
@@ -3343,6 +3454,9 @@ fn conversation_find_controls_fit_themes_narrow_panes_and_large_text(
                 cx.run_until_parked();
                 cx.update(|window, cx| window.draw(cx).clear(cx));
                 for selector in [
+                    "central-tab-chat",
+                    "central-tab-trajectory",
+                    "central-tab-editor",
                     "conversation-find-open",
                     "conversation-find-previous",
                     "conversation-find-next",
@@ -3350,8 +3464,15 @@ fn conversation_find_controls_fit_themes_narrow_panes_and_large_text(
                 ] {
                     let bounds = cx.debug_bounds(selector).expect("find control visible");
                     assert!(bounds.size.width > gpui::px(0.));
+                    let right_edge = if selector.starts_with("central-tab-")
+                        || selector == "conversation-find-open"
+                    {
+                        width - font * 8. // Header reserves pr_32 for workspace controls.
+                    } else {
+                        width
+                    };
                     assert!(
-                        bounds.left() >= gpui::px(0.) && bounds.right() <= gpui::px(width),
+                        bounds.left() >= gpui::px(0.) && bounds.right() <= gpui::px(right_edge),
                         "{selector} overflows at width {width}, font {font}: {bounds:?}"
                     );
                 }

@@ -86,8 +86,8 @@ pub fn find_conversation_messages(
     generating: bool,
     query: &str,
 ) -> Vec<ConversationMatch> {
-    let query = query.trim().to_lowercase();
-    if query.is_empty() {
+    let query = query.to_lowercase();
+    if query.trim().is_empty() {
         return Vec::new();
     }
     build_transcript_rows(messages, generating)

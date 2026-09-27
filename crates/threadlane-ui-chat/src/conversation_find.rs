@@ -144,7 +144,9 @@ impl ChatListView {
         let generation = self.find_generation;
         self.find_task = None;
         self.find_source = Some((source.clone(), generating, loading));
-        self.find_results.clear();
+        if explicit_query || loading {
+            self.find_results.clear();
+        }
         self.find_pending = !self.find_query.trim().is_empty() && !loading;
         cx.notify();
         if !self.find_pending {
@@ -190,16 +192,16 @@ impl ChatListView {
                 {
                     return;
                 }
-                if !Arc::ptr_eq(&state.messages, &source)
-                    || state.is_generating != generating
-                    || state.active_session_is_loading()
-                {
+                if state.active_session_is_loading() {
                     this.find_pending = false;
                     this.find_task = None;
                     this.refresh_conversation_find(false, cx);
                     return;
                 }
+                let stale =
+                    !Arc::ptr_eq(&state.messages, &source) || state.is_generating != generating;
                 this.find_pending = false;
+                this.find_task = None;
                 this.find_results = results;
                 // A reconciled ID is not the same message, even if text matches.
                 if !this
@@ -209,8 +211,11 @@ impl ChatListView {
                 {
                     this.find_selected = None;
                 }
-                if explicit_query {
+                if explicit_query && !stale {
                     this.navigate_conversation_find(false, cx);
+                }
+                if stale {
+                    this.refresh_conversation_find(false, cx);
                 }
                 cx.notify();
             });
@@ -220,7 +225,7 @@ impl ChatListView {
     fn find_ready(&self, cx: &App) -> bool {
         let state = self.model.read(cx);
         self.find_open
-            && !self.find_pending
+            && !self.find_results.is_empty()
             && !state.active_session_is_loading()
             && !state
                 .session_status
@@ -231,12 +236,6 @@ impl ChatListView {
                     state.active_work_dir.clone(),
                     state.active_session_id.clone(),
                 )
-            && self
-                .find_source
-                .as_ref()
-                .is_some_and(|(source, generating, _)| {
-                    Arc::ptr_eq(source, &state.messages) && *generating == state.is_generating
-                })
     }
 
     pub(super) fn navigate_conversation_find(&mut self, previous: bool, cx: &mut Context<Self>) {
@@ -255,8 +254,8 @@ impl ChatListView {
         let generating = state.is_generating;
         self.sync_transcript_rows(messages, generating, false);
         let hit = &self.find_results[index];
-        // The result belongs to this exact source snapshot. Validate its row
-        // identity instead of treating a message index as a row index.
+        // Results may precede the latest streamed snapshot. Validate row identity
+        // before navigating so a replaced message can never be selected.
         let row = hit.row_index;
         if !matches!(self.transcript_rows.get(row),
             Some(TranscriptRow::Message(index)) if self.transcript_messages[*index].id == hit.message_id)
@@ -309,7 +308,7 @@ impl ChatListView {
             error.clone()
         } else if self.find_query.trim().is_empty() {
             "Type to find a message".to_owned()
-        } else if self.find_pending {
+        } else if self.find_pending && self.find_results.is_empty() {
             "Searching…".to_owned()
         } else if self.find_results.is_empty() {
             "No matching messages".to_owned()
@@ -333,7 +332,7 @@ impl ChatListView {
             .find_results
             .iter()
             .position(|hit| Some(&hit.message_id) == self.find_selected.as_ref());
-        let disabled = !self.find_ready(cx) || self.find_results.is_empty();
+        let disabled = !self.find_ready(cx);
         div()
             .key_context("ConversationFind")
             .flex()
