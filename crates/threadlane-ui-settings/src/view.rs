@@ -20,6 +20,19 @@ use threadlane_ui_state::{actions::AppAction, controller};
 use threadlane_updater::{current_version, UpdateStatus};
 use threadlane_wasi::packages::{ExtensionRecord, ExtensionScope};
 
+fn update_controls(status: &UpdateStatus) -> (&'static str, &'static str, bool) {
+    match status {
+        UpdateStatus::Idle => ("Not checked yet", "Check for updates", false),
+        UpdateStatus::UpToDate => ("Up to date", "Check for updates", false),
+        UpdateStatus::Checking => ("Checking for updates…", "Checking…", true),
+        UpdateStatus::Available(_) => ("Update available", "Download update", false),
+        UpdateStatus::Downloading { .. } => ("Downloading update…", "Downloading…", true),
+        UpdateStatus::ReadyToInstall { .. } => ("Ready to restart", "Restart to update", false),
+        UpdateStatus::Installing => ("Installing update…", "Installing…", true),
+        UpdateStatus::Error(_) => ("Update failed", "Retry update check", false),
+    }
+}
+
 /// Fixed palette for the Appearance page's miniature theme previews. These
 /// depict the dark/light themes as static illustrations (audited exception to
 /// the token rule: the preview must show its own theme, not the active one),
@@ -805,15 +818,8 @@ impl SettingsView {
         let project_count = state.projects.len();
         let auto_address_pr_reviews_enabled = state.auto_address_pr_reviews_enabled;
         let toggle_view_auto_address = cx.entity().downgrade();
-        let update_status_label = match &state.update_status {
-            UpdateStatus::Checking => "Checking for updates...",
-            UpdateStatus::Available(_) => "Update available",
-            UpdateStatus::Downloading { .. } => "Downloading update...",
-            UpdateStatus::ReadyToInstall { .. } => "Ready to restart",
-            UpdateStatus::Installing => "Installing update...",
-            UpdateStatus::Error(_) => "Update check failed",
-            _ => "Up to date",
-        };
+        let (update_status_label, update_action_label, update_busy) =
+            update_controls(&state.update_status);
 
         div()
             .mt_5()
@@ -953,6 +959,20 @@ impl SettingsView {
                                     .text_color(theme.muted_foreground)
                                     .child("Signed native desktop application release channel."),
                             ),
+                    )
+                    .child(
+                        Button::new("settings-update")
+                            .label(update_action_label)
+                            .accessibility_label(update_action_label)
+                            .tooltip(update_action_label)
+                            .outline()
+                            .small()
+                            .flex_none()
+                            .loading(update_busy)
+                            .disabled(update_busy)
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(crate::ActivateUpdate), cx);
+                            }),
                     ),
             )
             .child(
@@ -3092,5 +3112,41 @@ impl Render for SettingsView {
                             .child(content),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::update_controls;
+    use threadlane_updater::UpdateStatus;
+
+    #[test]
+    fn manual_update_check_is_available_before_and_after_a_check() {
+        assert_eq!(
+            update_controls(&UpdateStatus::Idle),
+            ("Not checked yet", "Check for updates", false)
+        );
+        assert_eq!(
+            update_controls(&UpdateStatus::UpToDate),
+            ("Up to date", "Check for updates", false)
+        );
+        assert_eq!(
+            update_controls(&UpdateStatus::Error("offline".into())),
+            ("Update failed", "Retry update check", false)
+        );
+    }
+
+    #[test]
+    fn active_updates_cannot_be_interrupted_by_manual_checks() {
+        for status in [
+            UpdateStatus::Checking,
+            UpdateStatus::Downloading {
+                version: "1.2.3".into(),
+                progress: 0.5,
+            },
+            UpdateStatus::Installing,
+        ] {
+            assert!(update_controls(&status).2);
+        }
     }
 }

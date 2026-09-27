@@ -11,15 +11,17 @@ use gpui_component::checkbox::Checkbox;
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
+use gpui_component::progress::Progress;
 use gpui_component::spinner::Spinner;
 use gpui_component::theme::ActiveTheme;
 use gpui_component::tooltip::Tooltip;
-use gpui_component::{Icon, IconName, Selectable, Sizable, WindowExt};
+use gpui_component::{Disableable, Icon, IconName, Selectable, Sizable, WindowExt};
 
 use threadlane_ui_state::{
     AppState, GitHubTab, SessionAttention, SessionInfo, TrajectoryEntry, WorkspacePage,
 };
 use threadlane_ui_state::{actions::AppAction, controller};
+use threadlane_updater::UpdateStatus;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionRemovalKind {
@@ -455,12 +457,38 @@ fn format_time_ago(timestamp: u64, now: u64) -> String {
     }
 }
 
+fn update_control_label(status: &UpdateStatus) -> Option<String> {
+    Some(match status {
+        UpdateStatus::Idle | UpdateStatus::UpToDate => return None,
+        UpdateStatus::Checking => "Checking for updates".into(),
+        UpdateStatus::Available(info) => format!("Download Threadlane {}", info.version),
+        UpdateStatus::Downloading { version, progress } => format!(
+            "Downloading Threadlane {version}: {}%",
+            (progress.clamp(0.0, 1.0) * 100.0).round()
+        ),
+        UpdateStatus::ReadyToInstall { info, .. } => {
+            format!("Restart to install Threadlane {}", info.version)
+        }
+        UpdateStatus::Installing => "Installing update; Threadlane will restart".into(),
+        UpdateStatus::Error(error) => {
+            let detail: String = error.chars().take(160).collect();
+            let suffix = if error.chars().count() > 160 {
+                "…"
+            } else {
+                ""
+            };
+            format!("Update failed: {detail}{suffix}. Retry update check")
+        }
+    })
+}
+
 pub struct SidebarView {
     model: Entity<AppState>,
     search_input: Entity<InputState>,
     /// Hash of the model state the sidebar renders; lets the observer skip
     /// notifications for streaming updates that cannot change any row.
     history_fingerprint: u64,
+    update_label: Option<String>,
     /// Flattened, sorted rows cached per fingerprint for the virtual list.
     history_cache: Option<(u64, Vec<HistoryRow>)>,
     attention_filter: Option<SessionAttention>,
@@ -627,7 +655,9 @@ impl SidebarView {
 
         let sub1 = cx.observe(&model, |this, model, cx| {
             let fingerprint = sidebar_fingerprint(model.read(cx), now_unix_secs());
-            if this.history_fingerprint != fingerprint {
+            let update_label = update_control_label(&model.read(cx).update_status);
+            if this.history_fingerprint != fingerprint || this.update_label != update_label {
+                this.update_label = update_label;
                 this.history_fingerprint = fingerprint;
                 cx.notify();
             }
@@ -649,8 +679,10 @@ impl SidebarView {
         );
 
         let history_fingerprint = sidebar_fingerprint(model.read(cx), now_unix_secs());
+        let update_label = update_control_label(&model.read(cx).update_status);
         Self {
             model,
+            update_label,
             search_input,
             history_fingerprint,
             attention_filter: None,
@@ -1689,39 +1721,106 @@ impl SidebarView {
             })
     }
 
+    fn render_update_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let status = &self.model.read(cx).update_status;
+        let label = update_control_label(status)?;
+        let busy = matches!(
+            status,
+            UpdateStatus::Checking | UpdateStatus::Downloading { .. } | UpdateStatus::Installing
+        );
+        let icon = if matches!(
+            status,
+            UpdateStatus::Available(_) | UpdateStatus::Downloading { .. }
+        ) {
+            "icons/download.svg"
+        } else {
+            "icons/refresh-cw.svg"
+        };
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_1()
+                .child(
+                    Button::new("sidebar-update")
+                        .debug_selector(|| "sidebar-update".into())
+                        .icon(Icon::default().path(icon))
+                        .small()
+                        .ghost()
+                        .accessibility_label(label.clone())
+                        .tooltip(label.clone())
+                        .loading(busy)
+                        .disabled(busy)
+                        .when(matches!(status, UpdateStatus::Error(_)), |button| {
+                            button.text_color(cx.theme().danger)
+                        })
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(crate::ActivateUpdate), cx)
+                        }),
+                )
+                .when(busy, |control| {
+                    control.child(
+                        Progress::new("sidebar-update-progress")
+                            .accessibility_label(label)
+                            .xsmall()
+                            .w_8()
+                            .loading(!matches!(status, UpdateStatus::Downloading { .. }))
+                            .value(match status {
+                                UpdateStatus::Downloading { progress, .. } => {
+                                    progress.clamp(0.0, 1.0) * 100.0
+                                }
+                                _ => 0.0,
+                            }),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let settings_model = self.model.clone();
         let theme = cx.theme().colors;
         let settings_selected =
             self.model.read(cx).workspace_page == threadlane_ui_state::WorkspacePage::Settings;
 
-        div().flex_none().px_3().py_2().child(
-            Button::new("sidebar-settings")
-                .debug_selector(|| "sidebar-settings".into())
-                .accessibility_label("Open settings")
-                .tooltip("Open settings")
-                .child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .justify_start()
-                        .gap_2()
-                        .child(IconName::Settings)
-                        .child("Settings"),
-                )
-                .ghost()
-                .selected(settings_selected)
-                .w_full()
-                .justify_start()
-                .text_color(theme.muted_foreground)
-                .on_click(move |_event, _window, cx| {
-                    settings_model.update(cx, |state, cx| {
-                        controller::dispatch(state, AppAction::OpenSettings);
-                        cx.notify();
-                    });
-                }),
-        )
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .child(
+                Button::new("sidebar-settings")
+                    .debug_selector(|| "sidebar-settings".into())
+                    .accessibility_label("Open settings")
+                    .tooltip("Open settings")
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_start()
+                            .gap_2()
+                            .child(IconName::Settings)
+                            .child("Settings"),
+                    )
+                    .ghost()
+                    .selected(settings_selected)
+                    .flex_1()
+                    .min_w_0()
+                    .justify_start()
+                    .text_color(theme.muted_foreground)
+                    .on_click(move |_event, _window, cx| {
+                        settings_model.update(cx, |state, cx| {
+                            controller::dispatch(state, AppAction::OpenSettings);
+                            cx.notify();
+                        });
+                    }),
+            )
+            .children(self.render_update_control(cx))
     }
 
     fn render_github_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1999,6 +2098,122 @@ mod tests {
     use std::collections::HashMap;
     use threadlane_git::GitHubPrInfo;
     use threadlane_ui_state::{SessionAttention, SessionHealth, SessionInfo};
+
+    #[gpui::test]
+    fn update_control_stays_beside_settings_and_tracks_progress(cx: &mut gpui::TestAppContext) {
+        use gpui::*;
+        use threadlane_ui_state::AppState;
+        use threadlane_updater::UpdateStatus;
+
+        struct Footer(
+            Entity<super::SidebarView>,
+            std::rc::Rc<std::cell::Cell<usize>>,
+            FocusHandle,
+        );
+        impl Render for Footer {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let activations = self.1.clone();
+                div()
+                    .track_focus(&self.2)
+                    .on_action(move |_: &crate::ActivateUpdate, _, _| {
+                        activations.set(activations.get() + 1);
+                    })
+                    .child(self.0.update(cx, |sidebar, cx| {
+                        div()
+                            .tab_group()
+                            .w(rems(13.9375))
+                            .child(sidebar.render_footer(cx))
+                    }))
+            }
+        }
+
+        cx.update(gpui_component::init);
+        let model = cx.new(|_| AppState::default());
+        let activations = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let sidebar = cx.new(|cx| super::SidebarView::new(model.clone(), window, cx));
+            let footer = cx.new(|cx| {
+                let focus = cx.focus_handle();
+                window.focus(&focus, cx);
+                Footer(sidebar, activations.clone(), focus)
+            });
+            gpui_component::Root::new(footer, window, cx)
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("sidebar-update").is_none());
+
+        for status in [
+            UpdateStatus::Downloading {
+                version: "9.9.9".into(),
+                progress: 0.25,
+            },
+            UpdateStatus::Downloading {
+                version: "9.9.9".into(),
+                progress: 0.75,
+            },
+            UpdateStatus::Checking,
+            UpdateStatus::Installing,
+            UpdateStatus::Error("offline".into()),
+        ] {
+            model.update(cx, |state, cx| {
+                state.update_status = status;
+                cx.notify();
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let settings = cx.debug_bounds("sidebar-settings").unwrap();
+            let update = cx
+                .debug_bounds("sidebar-update")
+                .expect("update belongs in sidebar footer");
+            assert!(update.left() >= settings.right());
+            assert!(update.right() <= px(223.0));
+            cx.simulate_click(update.center(), Modifiers::default());
+        }
+        assert_eq!(activations.get(), 1, "busy controls must not activate");
+        cx.update(|window, cx| {
+            window.blur(cx);
+            window.focus_next(cx); // Settings
+            window.focus_next(cx); // Retry update
+            window.draw(cx).clear(cx);
+        });
+        let keystroke = Keystroke::parse("enter").unwrap();
+        cx.simulate_event(KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(KeyUpEvent { keystroke });
+        assert_eq!(
+            activations.get(),
+            2,
+            "update action must support keyboard activation"
+        );
+        model.update(cx, |state, cx| {
+            state.update_status = UpdateStatus::UpToDate;
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("sidebar-update").is_none());
+    }
+
+    #[test]
+    fn update_progress_label_preserves_version_and_bounds_percentage() {
+        use threadlane_updater::UpdateStatus;
+        for (progress, percentage) in [(-0.5, 0), (0.25, 25), (0.75, 75), (1.5, 100)] {
+            assert_eq!(
+                super::update_control_label(&UpdateStatus::Downloading {
+                    version: "9.9.9".into(),
+                    progress,
+                })
+                .unwrap(),
+                format!("Downloading Threadlane 9.9.9: {percentage}%")
+            );
+        }
+        assert!(super::update_control_label(&UpdateStatus::Idle).is_none());
+        assert!(super::update_control_label(&UpdateStatus::UpToDate).is_none());
+        let label = super::update_control_label(&UpdateStatus::Error("界".repeat(1000))).unwrap();
+        assert!(label.chars().count() < 220);
+        assert!(label.ends_with("…. Retry update check"));
+    }
 
     fn session(id: &str) -> SessionInfo {
         SessionInfo {

@@ -269,10 +269,10 @@ A normal `cargo run` may be unsuitable for testing installation: update installa
 - `THREADLANE_UPDATER_PUBLIC_KEY` and `THREADLANE_UPDATER_ENDPOINT` are compile-time environment values through `option_env!`.
 - Never hardcode private updater keys or passwords.
 - Update checks and downloads may run from `cargo run`; installation must remain restricted to a packaged app bundle.
-- Trigger an update check in the background on every application launch. Reveal notice UI only for an available or active update flow.
+- Trigger an update check in the background on every application launch. Reveal the compact sidebar update control only for an available or active update flow.
 - Keep updater lifecycle states explicit: idle, checking, available, up to date, downloading, ready to install, installing, and error.
 - Preserve target-version context during download progress.
-- Download/install progress belongs in the dedicated notice UI, not as repeated system messages in the conversation.
+- Download/install progress belongs beside Settings in the sidebar, not in a floating notice over the composer or repeated system messages in the conversation. Track updater redraws separately from the session-history fingerprint so progress updates do not rebuild the history cache.
 - Keep status copy concise and truncate unbounded release notes or errors before placing them in compact UI.
 
 ## WASI Extensions
