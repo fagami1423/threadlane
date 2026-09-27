@@ -1057,7 +1057,9 @@ impl WorkspaceView {
                 progress: 0.0,
             },
             UpdateStatus::ReadyToInstall { .. } => UpdateStatus::Installing,
-            UpdateStatus::Error(_) => UpdateStatus::Checking,
+            UpdateStatus::Idle | UpdateStatus::UpToDate | UpdateStatus::Error(_) => {
+                UpdateStatus::Checking
+            }
             _ => return,
         };
         self.model.update(cx, |state, cx| {
@@ -1069,7 +1071,9 @@ impl WorkspaceView {
             UpdateStatus::ReadyToInstall { info, bytes } => {
                 updater::install(info, bytes, self.updater_tx.clone())
             }
-            UpdateStatus::Error(_) => updater::check(self.updater_tx.clone()),
+            UpdateStatus::Idle | UpdateStatus::UpToDate | UpdateStatus::Error(_) => {
+                updater::check(self.updater_tx.clone())
+            }
             _ => unreachable!(),
         }
     }
@@ -2364,6 +2368,9 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::begin_new_task_action))
             .on_action(cx.listener(Self::open_settings_action))
             .on_action(cx.listener(Self::activate_update))
+            .on_action(cx.listener(|this, _: &threadlane_ui_settings::ActivateUpdate, window, cx| {
+                this.activate_update(&threadlane_ui_sidebar::ActivateUpdate, window, cx);
+            }))
             .on_action(cx.listener(Self::cancel_active_generation_action))
             .on_action(cx.listener(Self::select_chat_tab_action))
             .on_action(cx.listener(Self::select_trajectory_tab_action))
