@@ -1334,6 +1334,66 @@ pub fn create_worktree(
     Ok(())
 }
 
+/// Creates a fresh branch from an explicit commit; never attaches an existing branch.
+pub fn create_worktree_from(
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<(), GitError> {
+    validate_branch_name(repo, branch)?;
+    // Resolve before creating anything. `--end-of-options` also rejects option injection.
+    let commit = command(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{base}^{{commit}}"),
+        ],
+    )?;
+    let path = path
+        .to_str()
+        .ok_or_else(|| GitError::new(repo, "Invalid worktree path"))?;
+    command(
+        repo,
+        &["worktree", "add", "-b", branch, path, commit.trim()],
+    )?;
+    Ok(())
+}
+
+/// Local and fetched remote branches suitable as worktree starting points.
+pub fn worktree_bases(repo: &Path) -> Result<(String, Vec<String>), GitError> {
+    let branches: Vec<String> = command(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )?
+    .lines()
+    .filter(|line| !line.ends_with("/HEAD"))
+    .map(str::to_owned)
+    .collect();
+    let default = command(
+        repo,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    )
+    .ok()
+    .map(|s| s.trim().to_owned())
+    .or_else(|| discover_default_branch(repo))
+    .or_else(|| current_branch(repo).ok().flatten())
+    .ok_or_else(|| GitError::new(repo, "Commit a change before creating a worktree"))?;
+    Ok((default, branches))
+}
+
 /// Removes an existing Git worktree.
 pub fn remove_worktree(
     repo_path: &Path,

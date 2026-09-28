@@ -72,8 +72,11 @@ pub fn dispatch(state: &mut AppState, action: AppAction) {
             }
         }
         AppAction::SendPromptWithImages { text, images } => {
-            if let Err(error) = state.send_prompt_with_images(text, images) {
+            if let Err(error) = state.send_prompt_with_images(text.clone(), images.clone()) {
                 state.session_status = Some(error);
+                state
+                    .requested_composer_inserts
+                    .push(crate::RequestedComposerInsert { text, images });
             }
         }
         AppAction::StageBusyMessage { text, images } => {

@@ -1314,3 +1314,45 @@ fn issue_mutations_validate_before_spawning_gh() {
     // Empty label edits are no-ops without spawning gh.
     assert!(edit_github_issue_labels(dir.path(), 1, &[], &[]).is_ok());
 }
+
+#[test]
+fn worktree_from_selected_base_preserves_checkout_and_rejects_bad_refs() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    run_git(root, &["init", "-q", "-b", "main"]);
+    run_git(root, &["config", "user.email", "test@example.com"]);
+    run_git(root, &["config", "user.name", "Threadlane"]);
+    fs::write(root.join("file.txt"), "main").unwrap();
+    run_git(root, &["add", "file.txt"]);
+    run_git(root, &["commit", "-qm", "base"]);
+    run_git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    run_git(
+        root,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    run_git(root, &["checkout", "-qb", "unrelated"]);
+    fs::write(root.join("file.txt"), "unrelated").unwrap();
+    run_git(root, &["commit", "-qam", "unrelated"]);
+    fs::write(root.join("file.txt"), "local edits").unwrap();
+    let (default, bases) = worktree_bases(root).unwrap();
+    assert_eq!(default, "origin/main");
+    assert!(bases.contains(&"main".into()) && bases.contains(&"origin/main".into()));
+    let checkout = root.join("checkout");
+    create_worktree_from(root, &checkout, "worktree/fix-login", &default).unwrap();
+    assert_eq!(
+        fs::read_to_string(checkout.join("file.txt")).unwrap(),
+        "main"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("file.txt")).unwrap(),
+        "local edits"
+    );
+    assert_eq!(current_branch(root).unwrap().as_deref(), Some("unrelated"));
+    assert!(create_worktree_from(root, &root.join("bad"), "worktree/new", "--help").is_err());
+    assert!(!root.join("bad").exists());
+    assert!(create_worktree_from(root, &root.join("other"), "worktree/fix-login", "main").is_err());
+}
