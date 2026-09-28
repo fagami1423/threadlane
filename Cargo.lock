@@ -8811,6 +8811,7 @@ dependencies = [
  "tempfile",
  "threadlane-coding-agent",
  "threadlane-git",
+ "threadlane-ui-catalog",
  "threadlane-ui-state",
  "threadlane-ui-theme",
  "threadlane-updater",

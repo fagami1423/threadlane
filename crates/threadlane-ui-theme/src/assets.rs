@@ -24,6 +24,7 @@ impl AssetSource for Assets {
             "icons/archive.svg" => Some(include_bytes!("../assets/icons/archive.svg")),
             "icons/crosshair.svg" => Some(include_bytes!("../assets/icons/crosshair.svg")),
             "icons/lock.svg" => Some(include_bytes!("../assets/icons/lock.svg")),
+            "icons/pin.svg" => Some(include_bytes!("../assets/icons/pin.svg")),
             "icons/tabs/trajectory.svg" => {
                 Some(include_bytes!("../assets/icons/tabs/trajectory.svg"))
             }
@@ -35,7 +36,12 @@ impl AssetSource for Assets {
             "icons/git/branch.svg" => Some(include_bytes!("../assets/icons/git/branch.svg")),
             "icons/git/comments.svg" => Some(include_bytes!("../assets/icons/git/comments.svg")),
             "icons/git/issue.svg" => Some(include_bytes!("../assets/icons/git/issue.svg")),
-            "icons/git/pull-request.svg" => Some(include_bytes!("../assets/icons/git/pull-request.svg")),
+            "icons/git/pull-request.svg" => {
+                Some(include_bytes!("../assets/icons/git/pull-request.svg"))
+            }
+            "icons/threadlane.svg" | "icons/threadlane-logo.svg" => {
+                Some(include_bytes!("../assets/icons/threadlane.svg"))
+            }
             _ => None,
         };
 
@@ -59,6 +65,7 @@ impl AssetSource for Assets {
                 "icons/archive.svg",
                 "icons/crosshair.svg",
                 "icons/lock.svg",
+                "icons/pin.svg",
                 "icons/tabs/trajectory.svg",
                 "icons/tabs/chat.svg",
                 "icons/tabs/editor.svg",
@@ -69,11 +76,38 @@ impl AssetSource for Assets {
                 "icons/git/comments.svg",
                 "icons/git/issue.svg",
                 "icons/git/pull-request.svg",
+                "icons/threadlane.svg",
+                "icons/threadlane-logo.svg",
             ]
             .into_iter()
             .filter(|asset| asset.starts_with(path))
             .map(SharedString::from),
         );
         Ok(assets)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loads_all_custom_assets() {
+        let assets = Assets;
+        assert!(
+            assets
+                .load("icons/git/pull-request.svg")
+                .unwrap()
+                .is_some(),
+            "pull-request.svg must load"
+        );
+        assert!(
+            assets.load("icons/git/issue.svg").unwrap().is_some(),
+            "issue.svg must load"
+        );
+        assert!(
+            assets.load("icons/threadlane.svg").unwrap().is_some(),
+            "threadlane.svg must load"
+        );
     }
 }
