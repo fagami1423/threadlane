@@ -49,7 +49,11 @@ pub fn dispatch(state: &mut AppState, action: AppAction) {
         AppAction::TogglePinSession {
             work_dir,
             session_id,
-        } => state.toggle_pinned_session(work_dir, session_id),
+        } => {
+            if let Err(error) = state.toggle_pinned_session(work_dir, session_id) {
+                state.session_status = Some(error);
+            }
+        }
         AppAction::BeginNewTask => state.begin_new_task(),
         AppAction::SelectDraftProject(path) => state.select_draft_project(path),
         AppAction::SelectWorkMode(mode) => state.set_work_mode(mode),

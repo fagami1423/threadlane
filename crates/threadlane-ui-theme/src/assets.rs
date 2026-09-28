@@ -24,6 +24,7 @@ impl AssetSource for Assets {
             "icons/archive.svg" => Some(include_bytes!("../assets/icons/archive.svg")),
             "icons/crosshair.svg" => Some(include_bytes!("../assets/icons/crosshair.svg")),
             "icons/lock.svg" => Some(include_bytes!("../assets/icons/lock.svg")),
+            "icons/pin.svg" => Some(include_bytes!("../assets/icons/pin.svg")),
             "icons/tabs/trajectory.svg" => {
                 Some(include_bytes!("../assets/icons/tabs/trajectory.svg"))
             }
@@ -64,6 +65,7 @@ impl AssetSource for Assets {
                 "icons/archive.svg",
                 "icons/crosshair.svg",
                 "icons/lock.svg",
+                "icons/pin.svg",
                 "icons/tabs/trajectory.svg",
                 "icons/tabs/chat.svg",
                 "icons/tabs/editor.svg",

@@ -134,25 +134,63 @@ impl Default for AppState {
     }
 }
 
+fn persist_pinned_sessions(work_dir: &Path, pinned_ids: &[&str]) -> Result<(), String> {
+    let threadlane_dir = work_dir.join(".threadlane");
+    std::fs::create_dir_all(&threadlane_dir).map_err(|e| e.to_string())?;
+    let path = threadlane_dir.join("pinned_sessions.json");
+    let temporary_path = threadlane_dir.join(format!("pinned_sessions.{}.tmp", std::process::id()));
+    let json = serde_json::to_string_pretty(pinned_ids).map_err(|e| e.to_string())?;
+    std::fs::write(&temporary_path, json).map_err(|e| e.to_string())?;
+    std::fs::rename(temporary_path, path).map_err(|e| e.to_string())
+}
+
+fn load_pinned_sessions_from_dir(work_dir: &Path, pins: &mut HashSet<(PathBuf, String)>) {
+    let pinned_file = work_dir.join(".threadlane/pinned_sessions.json");
+    if let Ok(content) = std::fs::read_to_string(&pinned_file) {
+        if let Ok(ids) = serde_json::from_str::<Vec<String>>(&content) {
+            pins.retain(|(w, _)| w != work_dir);
+            for id in ids {
+                pins.insert((work_dir.to_path_buf(), id));
+            }
+        }
+    }
+}
+
 impl AppState {
-    pub fn toggle_pinned_session(&mut self, work_dir: PathBuf, session_id: String) {
-        let key = (work_dir.clone(), session_id);
-        if self.pinned_sessions.contains(&key) {
+    pub(crate) fn load_pinned_sessions(&mut self, work_dir: &Path) {
+        load_pinned_sessions_from_dir(work_dir, &mut self.pinned_sessions);
+    }
+
+    pub fn toggle_pinned_session(
+        &mut self,
+        work_dir: PathBuf,
+        session_id: String,
+    ) -> Result<(), String> {
+        let key = (work_dir.clone(), session_id.clone());
+        let is_currently_pinned = self.pinned_sessions.contains(&key);
+        let project_pinned: Vec<&str> = if is_currently_pinned {
+            self.pinned_sessions
+                .iter()
+                .filter(|(w, id)| *w == work_dir && id.as_str() != session_id)
+                .map(|(_, id)| id.as_str())
+                .collect()
+        } else {
+            self.pinned_sessions
+                .iter()
+                .filter(|(w, _)| *w == work_dir)
+                .map(|(_, id)| id.as_str())
+                .chain(std::iter::once(session_id.as_str()))
+                .collect()
+        };
+
+        persist_pinned_sessions(&work_dir, &project_pinned)?;
+
+        if is_currently_pinned {
             self.pinned_sessions.remove(&key);
         } else {
             self.pinned_sessions.insert(key);
         }
-        let threadlane_dir = work_dir.join(".threadlane");
-        let _ = std::fs::create_dir_all(&threadlane_dir);
-        let project_pinned: Vec<&str> = self
-            .pinned_sessions
-            .iter()
-            .filter(|(w, _)| w == &work_dir)
-            .map(|(_, id)| id.as_str())
-            .collect();
-        if let Ok(json) = serde_json::to_string_pretty(&project_pinned) {
-            let _ = std::fs::write(threadlane_dir.join("pinned_sessions.json"), json);
-        }
+        Ok(())
     }
 
     pub fn is_session_pinned(&self, work_dir: &Path, session_id: &str) -> bool {
@@ -269,14 +307,7 @@ impl AppState {
 
         let mut pinned_sessions = HashSet::new();
         for p in &registry_projects {
-            let pinned_file = p.path.join(".threadlane/pinned_sessions.json");
-            if let Ok(content) = std::fs::read_to_string(&pinned_file) {
-                if let Ok(ids) = serde_json::from_str::<Vec<String>>(&content) {
-                    for id in ids {
-                        pinned_sessions.insert((p.path.clone(), id));
-                    }
-                }
-            }
+            load_pinned_sessions_from_dir(&p.path, &mut pinned_sessions);
         }
 
         for (i, p) in registry_projects.iter().enumerate() {
@@ -303,6 +334,14 @@ impl AppState {
                 sessions,
                 is_expanded: true,
             });
+        }
+        for project in &project_infos {
+            load_pinned_sessions_from_dir(&project.work_dir, &mut pinned_sessions);
+            for session in &project.sessions {
+                if session.work_dir != project.work_dir {
+                    load_pinned_sessions_from_dir(&session.work_dir, &mut pinned_sessions);
+                }
+            }
         }
         let openai_key = threadlane_auth::openai_auth::load_openai_api_key()
             .or_else(|| std::env::var("OPENAI_API_KEY").ok())
@@ -818,6 +857,12 @@ impl AppState {
         if generation != self.session_refresh_generation {
             return false;
         }
+        self.load_pinned_sessions(&work_dir);
+        for session in &sessions {
+            if session.work_dir != work_dir {
+                self.load_pinned_sessions(&session.work_dir);
+            }
+        }
         let active_project = self.active_work_dir.as_ref() == Some(&work_dir);
         let active_session_id = self.active_session_id.clone();
         let selected_session_missing = {
@@ -890,6 +935,7 @@ impl AppState {
             .map_err(|error| format!("Could not recreate worktree: {error}"))?;
 
         let sessions = discover_sessions_in_project(&work_dir);
+        self.load_pinned_sessions(&work_dir);
         let recreated = sessions
             .iter()
             .any(|candidate| candidate.id == session_id && candidate.worktree_available);
@@ -1510,6 +1556,24 @@ impl AppState {
             .active_session_projection_key()
             .is_some_and(|key| self.in_flight_hydrations.contains_key(&key))
     }
+    pub fn active_session_info(&self) -> Option<&SessionInfo> {
+        let work_dir = self.active_work_dir.as_ref()?;
+        let session_id = self.active_session_id.as_deref()?;
+        self.projects
+            .iter()
+            .find(|project| &project.work_dir == work_dir)
+            .and_then(|project| {
+                project
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+            })
+    }
+
+    pub fn active_session_attention(&self) -> Option<SessionAttention> {
+        self.active_session_info()
+            .map(|session| self.session_attention(session))
+    }
 
     pub fn take_pending_hydrations(&mut self) -> Vec<SessionHydrationRequest> {
         let requests = std::mem::take(&mut self.pending_hydrations);
@@ -1543,16 +1607,20 @@ impl AppState {
         self.deferred_stream_events.remove(session_id);
         self.pending_composer_messages.remove(session_id);
         let pin_key = (work_dir.to_path_buf(), session_id.to_string());
-        if self.pinned_sessions.remove(&pin_key) {
-            let threadlane_dir = work_dir.join(".threadlane");
+        let was_pinned = self.pinned_sessions.contains(&pin_key);
+        let mut pin_error = None;
+        if was_pinned {
             let project_pinned: Vec<&str> = self
                 .pinned_sessions
                 .iter()
-                .filter(|(w, _)| w == work_dir)
+                .filter(|(w, id)| *w == work_dir && id.as_str() != session_id)
                 .map(|(_, id)| id.as_str())
                 .collect();
-            if let Ok(json) = serde_json::to_string_pretty(&project_pinned) {
-                let _ = std::fs::write(threadlane_dir.join("pinned_sessions.json"), json);
+            if let Err(error) = persist_pinned_sessions(work_dir, &project_pinned) {
+                tracing::warn!("failed to update pinned sessions during removal: {error}");
+                pin_error = Some(error);
+            } else {
+                self.pinned_sessions.remove(&pin_key);
             }
         }
         self.acp_config_options
@@ -1563,11 +1631,15 @@ impl AppState {
             .find(|project| project.work_dir == work_dir)
         {
             project.sessions = discover_sessions_in_project(work_dir);
+            self.load_pinned_sessions(work_dir);
         }
 
         let removed_active = self.active_work_dir.as_deref() == Some(work_dir)
             && self.active_session_id.as_deref() == Some(session_id);
         if !removed_active {
+            if let Some(error) = pin_error {
+                self.session_status = Some(format!("Failed to update pinned sessions: {error}"));
+            }
             return;
         }
 
@@ -1576,7 +1648,9 @@ impl AppState {
         self.messages = Arc::new(Vec::new());
         self.active_plan = SessionPlan::default();
         self.is_generating = false;
-        self.session_status = None;
+        self.session_status = pin_error
+            .as_ref()
+            .map(|error| format!("Failed to update pinned sessions: {error}"));
         let next_session = self
             .projects
             .iter()
@@ -1585,6 +1659,9 @@ impl AppState {
             .map(|session| (session.work_dir.clone(), session.id.clone()));
         if let Some((next_work_dir, next_session_id)) = next_session {
             let _ = self.select_session(next_work_dir, next_session_id);
+            if let Some(error) = pin_error {
+                self.session_status = Some(format!("Failed to update pinned sessions: {error}"));
+            }
         }
     }
 
@@ -1893,6 +1970,12 @@ impl AppState {
                     .map(|session| session.id.clone())
             });
 
+        self.load_pinned_sessions(&canonical);
+        for session in &discovered_sessions {
+            if session.work_dir != canonical {
+                self.load_pinned_sessions(&session.work_dir);
+            }
+        }
         if let Some(project) = self
             .projects
             .iter_mut()
@@ -1902,14 +1985,6 @@ impl AppState {
             project.sessions = discovered_sessions;
             project.is_expanded = true;
         } else {
-            let pinned_file = canonical.join(".threadlane/pinned_sessions.json");
-            if let Ok(content) = std::fs::read_to_string(&pinned_file) {
-                if let Ok(ids) = serde_json::from_str::<Vec<String>>(&content) {
-                    for id in ids {
-                        self.pinned_sessions.insert((canonical.clone(), id));
-                    }
-                }
-            }
             self.projects.push(ProjectInfo {
                 name: record.name,
                 sessions: discovered_sessions,
@@ -1996,6 +2071,7 @@ impl AppState {
             .find(|project| project.work_dir == work_dir)
         {
             project.sessions = discover_sessions_in_project(&work_dir);
+            self.load_pinned_sessions(&work_dir);
         }
         let _ = self.select_session(work_dir, session_id.clone());
         self.is_new_task = false;
