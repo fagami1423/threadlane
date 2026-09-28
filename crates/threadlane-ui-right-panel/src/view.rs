@@ -1528,9 +1528,16 @@ impl RightPanelView {
         let selected_index = selected_surface.unwrap_or(0);
         div()
             .flex_none()
-            .pt(threadlane_ui_theme::WINDOW_CONTROLS_CLEARANCE)
-            .pb_2()
+            // Same 3rem bar as the chat header so the surface tabs sit on
+            // one continuous line with Chat/Trajectory/Editor. The traffic
+            // -lights clearance doesn't apply here: this panel is top-right,
+            // where the workspace floats its overlay buttons (command
+            // palette + panel toggle) instead, so clear those on the right.
+            .min_h(rems(3.0))
+            .flex()
+            .items_center()
             .px_3()
+            .pr(rems(5.5))
             .border_b_1()
             .border_color(theme.title_bar_border)
             .bg(theme.title_bar)
@@ -1539,6 +1546,7 @@ impl RightPanelView {
                     .flex()
                     .items_center()
                     .gap_1()
+                    .w_full()
                     .child(
                         TabBar::new("right-panel-surface-tabs")
                             .underline()

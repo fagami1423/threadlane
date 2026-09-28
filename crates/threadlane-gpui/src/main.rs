@@ -80,9 +80,12 @@ fn main() {
         .detach();
 
         let options = WindowOptions {
+            // Default to a real workspace size: the shell needs ~264px of
+            // sidebar plus ~448px of center content before the sidebar even
+            // shows, and the review panel wants ~768px of viewport on top.
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
-                size(px(1100.0), px(720.0)),
+                size(px(1440.0), px(900.0)),
                 cx,
             ))),
             titlebar: Some(TitlebarOptions {

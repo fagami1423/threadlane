@@ -3816,7 +3816,7 @@ impl ChatListView {
                                     "message-edit-{}",
                                     msg.id
                                 )))
-                                .label("Edit")
+                                .icon(Icon::default().path("icons/square-pen.svg"))
                                 .xsmall()
                                 .ghost()
                                 .tooltip("Load this message into the composer to edit and resend")
@@ -7139,8 +7139,7 @@ impl Render for ChatListView {
                                                                     "jump-to-latest".into()
                                                                 })
                                                                 .icon(IconName::ArrowDown)
-                                                                .label("Jump to latest")
-                                                                .small()
+                                                                .size_8()
                                                                 .secondary()
                                                                 .rounded_full()
                                                                 .shadow_md()
