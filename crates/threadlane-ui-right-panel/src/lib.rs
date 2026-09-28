@@ -6,6 +6,7 @@
 mod browser;
 mod agents;
 mod draft_pr;
+mod pr_generation;
 #[cfg(test)]
 mod tests;
 mod types;

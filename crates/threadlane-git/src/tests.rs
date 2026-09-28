@@ -1314,3 +1314,33 @@ fn issue_mutations_validate_before_spawning_gh() {
     // Empty label edits are no-ops without spawning gh.
     assert!(edit_github_issue_labels(dir.path(), 1, &[], &[]).is_ok());
 }
+
+#[test]
+fn draft_pr_diff_uses_selected_base_and_excludes_uncommitted_changes() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    run_git(root, &["init", "-q", "-b", "base"]);
+    run_git(root, &["config", "user.email", "test@example.com"]);
+    run_git(root, &["config", "user.name", "Threadlane"]);
+    fs::write(root.join("file.txt"), "base\n").unwrap();
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-qm", "base"]);
+    run_git(root, &["checkout", "-qb", "feature"]);
+    fs::write(root.join("file.txt"), "committed feature\n").unwrap();
+    run_git(root, &["commit", "-qam", "feature"]);
+    let diff = draft_pr_diff(root, "base").unwrap();
+    assert!(diff.contains("+committed feature"));
+    assert!(diff.contains("-base"));
+    assert!(draft_pr_diff(root, "feature").unwrap().is_empty());
+    fs::write(root.join("file.txt"), "staged edit\n").unwrap();
+    run_git(root, &["add", "."]);
+    fs::write(root.join("file.txt"), "unstaged edit\n").unwrap();
+    fs::write(root.join("untracked.txt"), "untracked\n").unwrap();
+    assert_eq!(draft_pr_diff(root, "base").unwrap(), diff);
+    // A remote-only base must work, too.
+    run_git(root, &["update-ref", "refs/remotes/origin/base", "base"]);
+    run_git(root, &["branch", "-D", "base"]);
+    assert_eq!(draft_pr_diff(root, "base").unwrap(), diff);
+    assert!(draft_pr_diff(root, "missing").is_err());
+    assert!(draft_pr_diff(root, "--output=oops").is_err());
+}
