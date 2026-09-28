@@ -276,17 +276,7 @@ impl CodingSessionHarness {
         }
         let run_id = self.unique_run_id("subagent-run")?;
         let source_leaf_id = lane_state.leaf_id.clone();
-        if let Err(error) = self.store.start_operation_on_lane(
-            lane,
-            &run_id,
-            source_leaf_id.clone(),
-            OperationIntent::Run,
-        ) {
-            return Err(error.to_string());
-        }
-        self.store
-            .drive_to_completion()
-            .map_err(|error| error.to_string())?;
+        // Prompt acceptance commits the operation and prompt together.
         let prompt_message = AgentMessage::user(prompt.to_owned(), Vec::new());
         let assistant_entry_id = self
             .store
