@@ -57,6 +57,41 @@ fn close_command_palette(open: &mut bool, previous_focus: &mut Option<FocusHandl
     }
 }
 
+fn open_active_close_confirmation(
+    window: &mut Window,
+    cx: &mut App,
+    model: Entity<AppState>,
+    work: Vec<threadlane_ui_state::ActiveCloseWork>,
+) {
+    let mut list = work.iter().take(8).map(|item| format!("{} — {} · {}", item.title, item.project, item.status)).collect::<Vec<_>>();
+    if work.len() > list.len() { list.push(format!("…and {} more", work.len() - list.len())); }
+    let description = format!(
+        "Closing this window quits Threadlane and interrupts its active work. External commands may not stop immediately.\n\n{}",
+        list.join("\n")
+    );
+    window.open_alert_dialog(cx, move |dialog, _, _| {
+        let expected: Vec<_> = work.iter().map(|item| item.identity.clone()).collect();
+        let current_model = model.clone();
+        dialog.title("Close Threadlane while work is active?")
+            .description(description.clone())
+            .confirm()
+            .show_cancel(true)
+            .ok_text("Close anyway")
+            .ok_variant(gpui_component::button::ButtonVariant::Danger)
+            .on_ok(move |_, window, cx| {
+                let current_work = current_model.read(cx).active_close_work();
+                let current: Vec<_> = current_work.iter().map(|item| item.identity.clone()).collect();
+                if threadlane_ui_state::close_work_needs_refresh(&current, &expected) {
+                    window.close_dialog(cx);
+                    open_active_close_confirmation(window, cx, current_model.clone(), current_work);
+                    return true;
+                }
+                window.remove_window();
+                true
+            })
+    });
+}
+
 fn open_github_from_palette(state: &mut AppState, notify: impl FnOnce()) {
     controller::dispatch(state, AppAction::OpenGitHub);
     notify();
@@ -504,47 +539,10 @@ impl WorkspaceView {
                     return false;
                 }
 
-                let displayed = work.clone();
-                let model = weak_view.update(cx, |view, _| view.model.clone()).ok();
-                let Some(model) = model else {
+                let Some(model) = weak_view.update(cx, |view, _| view.model.clone()).ok() else {
                     return false;
                 };
-                let mut list = work
-                    .iter()
-                    .take(8)
-                    .map(|item| format!("{} — {} · {}", item.title, item.project, item.status))
-                    .collect::<Vec<_>>();
-                if work.len() > list.len() {
-                    list.push(format!("…and {} more", work.len() - list.len()));
-                }
-                let description = format!(
-                    "Closing this window quits Threadlane and interrupts its active work. External commands may not stop immediately.\n\n{}",
-                    list.join("\n")
-                );
-                window.open_alert_dialog(cx, move |dialog, _, _| {
-                    let expected: Vec<_> = displayed.iter().map(|item| item.identity.clone()).collect();
-                    let current_model = model.clone();
-                    dialog
-                        .title("Close Threadlane while work is active?")
-                        .description(description.clone())
-                        .confirm()
-                        .show_cancel(true)
-                        .ok_text("Close anyway")
-                        .ok_variant(gpui_component::button::ButtonVariant::Danger)
-                        .on_ok(move |_, window, cx| {
-                            let current: Vec<_> = current_model
-                                .read(cx)
-                                .active_close_work()
-                                .into_iter()
-                                .map(|item| item.identity)
-                                .collect();
-                            if current != expected {
-                                return false;
-                            }
-                            window.remove_window();
-                            true
-                        })
-                });
+                open_active_close_confirmation(window, cx, model, work);
                 false
             });
             let hydration_requests = view

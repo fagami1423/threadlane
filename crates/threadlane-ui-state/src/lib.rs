@@ -23,7 +23,7 @@ pub mod updater;
 #[cfg(any(test, feature = "test-support"))]
 mod test_support;
 
-pub use app_state::{ActiveCloseWork, AppState};
+pub use app_state::{close_work_needs_refresh, ActiveCloseWork, AppState};
 pub use events::{next_event_batch, next_event_batch_capped};
 pub use types::{
     hash_session_identity, ChatMessageInfo, ChatStreamEvent, MessageRole, RequestedComposerInsert,

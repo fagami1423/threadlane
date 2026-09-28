@@ -40,6 +40,10 @@ pub fn active_automation_status(status: threadlane_automation::RunStatus) -> Opt
     }
 }
 
+pub fn close_work_needs_refresh(current: &[String], disclosed: &[String]) -> bool {
+    current.iter().any(|identity| !disclosed.contains(identity))
+}
+
 pub struct AppState {
     pub automation_service: Option<Arc<crate::automation::AutomationService>>,
     pub automations: crate::automation::Projection,

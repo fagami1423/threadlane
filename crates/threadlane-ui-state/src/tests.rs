@@ -11,7 +11,18 @@ use threadlane_runtime::harness::{
     OperationIntent, OperationOutcome, ProviderOutcome, Record, SessionStore, TraceString,
 };
 
-
+#[test]
+fn close_work_refresh_is_required_only_for_undisclosed_identities() {
+    assert!(!close_work_needs_refresh(
+        &["a".into()],
+        &["a".into(), "b".into()]
+    ));
+    assert!(!close_work_needs_refresh(&[], &["a".into()]));
+    assert!(close_work_needs_refresh(
+        &["a".into(), "new".into()],
+        &["a".into()]
+    ));
+}
 #[test]
 fn active_close_work_includes_only_live_automation_runs() {
     use threadlane_automation::RunStatus;
@@ -21,6 +32,75 @@ fn active_close_work_includes_only_live_automation_runs() {
     assert_eq!(active_automation_status(RunStatus::WaitingAnswer), Some("Needs an answer"));
     assert_eq!(active_automation_status(RunStatus::Queued), None);
     assert_eq!(active_automation_status(RunStatus::Succeeded), None);
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().to_path_buf();
+    let session_file = project.join(".threadlane/sessions/active.jsonl");
+    std::fs::create_dir_all(session_file.parent().unwrap()).unwrap();
+    let session = test_session("active", &session_file);
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.projects.push(ProjectInfo {
+        name: "project".into(),
+        work_dir: project.clone(),
+        sessions: vec![session.clone()],
+        is_expanded: true,
+    });
+    let runtime = state.ensure_session_runtime(
+        session.runtime_work_dir.clone(),
+        session_file.clone(),
+    );
+    runtime.begin_generation().unwrap();
+
+    let definition = threadlane_automation::Definition {
+        id: "test".into(),
+        revision: 1,
+        name: "Test".into(),
+        prompt: "Test".into(),
+        project: project.clone(),
+        model: "model".into(),
+        effort: "medium".into(),
+        worktree: false,
+        schedule: threadlane_automation::Schedule::Manual,
+        enabled: false,
+        notify_all: false,
+        anchor: 0,
+        next_at: None,
+        failures: 0,
+        paused_reason: None,
+    };
+    let make_run = |id: &str, status: RunStatus, session_file: Option<PathBuf>| {
+        threadlane_automation::Run {
+            id: id.into(),
+            definition: definition.clone(),
+            scheduled_for: None,
+            created_at: 0,
+            finished_at: None,
+            status,
+            session_id: id.into(),
+            session_file,
+            error: None,
+            reviewed: false,
+        }
+    };
+    let mut projection = crate::automation::Projection::default();
+    projection.snapshot.runs.extend([
+        make_run("duplicate", RunStatus::Running, Some(session_file.clone())),
+        make_run("standalone", RunStatus::WaitingAnswer, None),
+        make_run("queued", RunStatus::Queued, None),
+    ]);
+    state.apply_automation_projection(projection);
+
+    let work = state.active_close_work();
+    let identity = session_file.display().to_string();
+    assert_eq!(work.len(), 2);
+    assert_eq!(
+        work.iter().filter(|item| item.identity == identity).count(),
+        1
+    );
+    assert!(work.iter().any(|item| {
+        item.identity == "automation:standalone" && item.status == "Needs an answer"
+    }));
+    assert!(!work.iter().any(|item| item.identity == "automation:queued"));
 }
 #[test]
 fn automation_projection_refreshes_each_changed_project_once() {
