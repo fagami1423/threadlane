@@ -4446,3 +4446,24 @@ fn pr_review_actions_reject_missing_checkout_without_dispatch_or_tracking() {
     assert!(state.pr_review_tracking.is_empty());
     assert!(state.session_runtimes.is_empty());
 }
+
+#[test]
+fn toggle_and_persist_pinned_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let work_dir = dir.path().to_path_buf();
+    let mut state = AppState::default();
+
+    assert!(!state.is_session_pinned(&work_dir, "session-1"));
+    state.toggle_pinned_session(work_dir.clone(), "session-1".into());
+    assert!(state.is_session_pinned(&work_dir, "session-1"));
+
+    let pinned_file = work_dir.join(".threadlane/pinned_sessions.json");
+    let content = std::fs::read_to_string(&pinned_file).expect("read pinned file");
+    assert!(content.contains("session-1"));
+
+    state.toggle_pinned_session(work_dir.clone(), "session-1".into());
+    assert!(!state.is_session_pinned(&work_dir, "session-1"));
+
+    let content_after = std::fs::read_to_string(&pinned_file).expect("read pinned file after unpin");
+    assert!(!content_after.contains("session-1"));
+}

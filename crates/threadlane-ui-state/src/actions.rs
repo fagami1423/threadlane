@@ -23,6 +23,10 @@ pub enum AppAction {
     },
     ToggleProject(PathBuf),
     SetSidebarProjectFilter(Option<PathBuf>),
+    TogglePinSession {
+        work_dir: PathBuf,
+        session_id: String,
+    },
     BeginNewTask,
     SelectDraftProject(PathBuf),
     SelectWorkMode(crate::WorkMode),

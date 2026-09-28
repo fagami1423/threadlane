@@ -320,8 +320,28 @@ fn build_diagnostic_export(
     }))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SidebarQuickFilter {
+    Pinned,
+    NeedsYou,
+    Working,
+    Ready,
+}
+
+impl SidebarQuickFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pinned => "Pinned",
+            Self::NeedsYou => "Needs you",
+            Self::Working => "Working",
+            Self::Ready => "Ready",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DateGroup {
+    Pinned,
     NeedsYou,
     Working,
     Today,
@@ -364,13 +384,24 @@ fn history_query_matches(
         || dir_name.contains(query)
 }
 
+#[cfg(test)]
 fn flatten_history_sessions(
-    mut sessions: Vec<(SessionInfo, SessionAttention)>,
+    sessions: Vec<(SessionInfo, SessionAttention)>,
     now: u64,
 ) -> Vec<HistoryRow> {
-    sessions.sort_by(|(left, left_attention), (right, right_attention)| {
-        let left_group = history_group(*left_attention, left.updated_at, now);
-        let right_group = history_group(*right_attention, right.updated_at, now);
+    flatten_history_sessions_with_pins(
+        sessions.into_iter().map(|(s, a)| (s, a, false)).collect(),
+        now,
+    )
+}
+
+fn flatten_history_sessions_with_pins(
+    mut sessions: Vec<(SessionInfo, SessionAttention, bool)>,
+    now: u64,
+) -> Vec<HistoryRow> {
+    sessions.sort_by(|(left, left_attention, left_pinned), (right, right_attention, right_pinned)| {
+        let left_group = history_group_with_pin(*left_pinned, *left_attention, left.updated_at, now);
+        let right_group = history_group_with_pin(*right_pinned, *right_attention, right.updated_at, now);
         left_group
             .rank()
             .cmp(&right_group.rank())
@@ -380,8 +411,8 @@ fn flatten_history_sessions(
 
     let mut rows = Vec::with_capacity(sessions.len() + DateGroup::COUNT);
     let mut previous_group = None;
-    for (session, attention) in sessions {
-        let group = history_group(attention, session.updated_at, now);
+    for (session, attention, pinned) in sessions {
+        let group = history_group_with_pin(pinned, attention, session.updated_at, now);
         if previous_group != Some(group) {
             rows.push(HistoryRow::Group(group));
             previous_group = Some(group);
@@ -392,10 +423,11 @@ fn flatten_history_sessions(
 }
 
 impl DateGroup {
-    const COUNT: usize = 6;
+    const COUNT: usize = 7;
 
     fn label(self) -> &'static str {
         match self {
+            Self::Pinned => "Pinned",
             Self::NeedsYou => "Needs you",
             Self::Working => "Working",
             Self::Today => "Today",
@@ -407,12 +439,13 @@ impl DateGroup {
 
     fn rank(self) -> u8 {
         match self {
-            Self::NeedsYou => 0,
-            Self::Working => 1,
-            Self::Today => 2,
-            Self::Yesterday => 3,
-            Self::ThisWeek => 4,
-            Self::Older => 5,
+            Self::Pinned => 0,
+            Self::NeedsYou => 1,
+            Self::Working => 2,
+            Self::Today => 3,
+            Self::Yesterday => 4,
+            Self::ThisWeek => 5,
+            Self::Older => 6,
         }
     }
 }
@@ -444,6 +477,19 @@ fn history_group(attention: SessionAttention, timestamp: u64, now: u64) -> DateG
         SessionAttention::NeedsYou => DateGroup::NeedsYou,
         SessionAttention::Working => DateGroup::Working,
         SessionAttention::Ready | SessionAttention::Idle => get_date_group(timestamp, now),
+    }
+}
+
+fn history_group_with_pin(
+    is_pinned: bool,
+    attention: SessionAttention,
+    timestamp: u64,
+    now: u64,
+) -> DateGroup {
+    if is_pinned {
+        DateGroup::Pinned
+    } else {
+        history_group(attention, timestamp, now)
     }
 }
 
@@ -491,7 +537,7 @@ pub struct SidebarView {
     update_label: Option<String>,
     /// Flattened, sorted rows cached per fingerprint for the virtual list.
     history_cache: Option<(u64, Vec<HistoryRow>)>,
-    attention_filter: Option<SessionAttention>,
+    quick_filter: Option<SidebarQuickFilter>,
     history_list_state: ListState,
     _subscriptions: Vec<Subscription>,
 }
@@ -565,6 +611,10 @@ fn sidebar_fingerprint(state: &AppState, now: u64) -> u64 {
     state.github_tab.hash(&mut hasher);
     state.automations.snapshot.revision.hash(&mut hasher);
     state.sidebar_project_filter.hash(&mut hasher);
+    for (work_dir, id) in &state.pinned_sessions {
+        work_dir.hash(&mut hasher);
+        id.hash(&mut hasher);
+    }
     for byte in state.search_query.trim().bytes() {
         hasher.write_u8(byte.to_ascii_lowercase());
     }
@@ -685,7 +735,7 @@ impl SidebarView {
             update_label,
             search_input,
             history_fingerprint,
-            attention_filter: None,
+            quick_filter: None,
             history_cache: None,
             history_list_state: ListState::new(0, ListAlignment::Top, window.rem_size() * 4.5),
             _subscriptions: vec![sub1, sub2],
@@ -979,11 +1029,11 @@ impl SidebarView {
     fn has_history_filters(&self, state: &AppState) -> bool {
         !state.search_query.trim().is_empty()
             || state.sidebar_project_filter.is_some()
-            || self.attention_filter.is_some()
+            || self.quick_filter.is_some()
     }
 
     fn clear_history_filters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.attention_filter = None;
+        self.quick_filter = None;
         self.search_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
             input.focus(window, cx);
@@ -1011,6 +1061,7 @@ impl SidebarView {
             .map(|project| project.sessions.len())
             .sum::<usize>();
         let mut attention_counts = [0usize; 3];
+        let mut pinned_count = 0;
         for project in &state.projects {
             if state
                 .sidebar_project_filter
@@ -1020,6 +1071,9 @@ impl SidebarView {
                 continue;
             }
             for session in &project.sessions {
+                if state.is_session_pinned(&session.work_dir, &session.id) {
+                    pinned_count += 1;
+                }
                 match state.session_attention(session) {
                     SessionAttention::NeedsYou => attention_counts[0] += 1,
                     SessionAttention::Working => attention_counts[1] += 1,
@@ -1029,7 +1083,7 @@ impl SidebarView {
             }
         }
 
-        let selected_filter = self.attention_filter;
+        let selected_filter = self.quick_filter;
         let sidebar = cx.entity().downgrade();
         let has_filters = self.has_history_filters(state);
 
@@ -1074,7 +1128,7 @@ impl SidebarView {
                     .child(
                         Button::new("sidebar-status-filter")
                             .debug_selector(|| "sidebar-status-filter".into())
-                            .label(selected_filter.map_or("All statuses", SessionAttention::label))
+                            .label(selected_filter.map_or("All statuses", SidebarQuickFilter::label))
                             .accessibility_label("Filter tasks by status")
                             .tooltip("Filter tasks by status")
                             .small()
@@ -1086,15 +1140,19 @@ impl SidebarView {
                                 for (filter, label) in [
                                     (None, format!("All statuses · {session_count}")),
                                     (
-                                        Some(SessionAttention::NeedsYou),
+                                        Some(SidebarQuickFilter::Pinned),
+                                        format!("Pinned · {pinned_count}"),
+                                    ),
+                                    (
+                                        Some(SidebarQuickFilter::NeedsYou),
                                         format!("Needs you · {}", attention_counts[0]),
                                     ),
                                     (
-                                        Some(SessionAttention::Working),
+                                        Some(SidebarQuickFilter::Working),
                                         format!("Working · {}", attention_counts[1]),
                                     ),
                                     (
-                                        Some(SessionAttention::Ready),
+                                        Some(SidebarQuickFilter::Ready),
                                         format!("Ready · {}", attention_counts[2]),
                                     ),
                                 ] {
@@ -1104,7 +1162,7 @@ impl SidebarView {
                                             .checked(selected_filter == filter)
                                             .on_click(move |_, _, cx| {
                                                 let _ = sidebar.update(cx, |this, cx| {
-                                                    this.attention_filter = filter;
+                                                    this.quick_filter = filter;
                                                     cx.notify();
                                                 });
                                             }),
@@ -1266,6 +1324,10 @@ impl SidebarView {
         let title_work_dir = session.work_dir.clone();
         let title_session_id = session.id.clone();
         let title_model = self.model.clone();
+        let is_pinned = self
+            .model
+            .read(cx)
+            .is_session_pinned(&session.work_dir, &session.id);
         let context_work_dir = session.work_dir.clone();
         let context_session_id = session.id.clone();
         let context_model = self.model.clone();
@@ -1292,8 +1354,9 @@ impl SidebarView {
             .as_deref()
             .map(|branch| format!(", branch {branch}"))
             .unwrap_or_default();
+        let pinned_prefix = if is_pinned { "Pinned, " } else { "" };
         let session_row_label = format!(
-            "{}, project {}, {}, {}{}",
+            "{pinned_prefix}{}, project {}, {}, {}{}",
             session_title,
             project,
             attention.label(),
@@ -1421,6 +1484,33 @@ impl SidebarView {
                 .rounded_full()
                 .text_color(theme.warning)
                 .into_any_element(),
+            );
+        }
+
+        if is_pinned {
+            row2_items.push(
+                div()
+                    .flex_none()
+                    .text_color(theme.muted_foreground.opacity(0.4))
+                    .child("•")
+                    .into_any_element(),
+            );
+            row2_items.push(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .px_1p5()
+                    .py(rems(0.0625))
+                    .rounded_full()
+                    .bg(theme.primary.opacity(0.12))
+                    .border_1()
+                    .border_color(theme.primary.opacity(0.25))
+                    .text_xs()
+                    .font_medium()
+                    .text_color(theme.primary)
+                    .child("Pinned")
+                    .into_any_element(),
             );
         }
 
@@ -1653,6 +1743,9 @@ impl SidebarView {
                 let remove_session_id = context_session_id.clone();
                 let remove_is_worktree = context_is_worktree;
                 let remove_git_branch = context_git_branch.clone();
+                let pin_model = context_model.clone();
+                let pin_work_dir = context_work_dir.clone();
+                let pin_session_id = context_session_id.clone();
 
                 menu.item(PopupMenuItem::new("Open Session").on_click(
                     move |_event, _window, cx| {
@@ -1668,6 +1761,25 @@ impl SidebarView {
                         });
                     },
                 ))
+                .item(
+                    PopupMenuItem::new(if is_pinned {
+                        "Unpin Session"
+                    } else {
+                        "Pin Session"
+                    })
+                    .on_click(move |_event, _window, cx| {
+                        pin_model.update(cx, |state, cx| {
+                            controller::dispatch(
+                                state,
+                                AppAction::TogglePinSession {
+                                    work_dir: pin_work_dir.clone(),
+                                    session_id: pin_session_id.clone(),
+                                },
+                            );
+                            cx.notify();
+                        });
+                    }),
+                )
                 .item({
                     let item = PopupMenuItem::new(if terminal_unavailable {
                         "Open Terminal Here — worktree unavailable"
@@ -2118,16 +2230,35 @@ impl SidebarView {
                     continue;
                 }
                 let attention = state.session_attention(session);
-                if self
-                    .attention_filter
-                    .is_some_and(|filter| filter != attention)
-                {
-                    continue;
+                let is_pinned = state.is_session_pinned(&session.work_dir, &session.id);
+                if let Some(filter) = self.quick_filter {
+                    match filter {
+                        SidebarQuickFilter::Pinned => {
+                            if !is_pinned {
+                                continue;
+                            }
+                        }
+                        SidebarQuickFilter::NeedsYou => {
+                            if attention != SessionAttention::NeedsYou {
+                                continue;
+                            }
+                        }
+                        SidebarQuickFilter::Working => {
+                            if attention != SessionAttention::Working {
+                                continue;
+                            }
+                        }
+                        SidebarQuickFilter::Ready => {
+                            if attention != SessionAttention::Ready {
+                                continue;
+                            }
+                        }
+                    }
                 }
-                sessions.push((session.clone(), attention));
+                sessions.push((session.clone(), attention, is_pinned));
             }
         }
-        flatten_history_sessions(sessions, now)
+        flatten_history_sessions_with_pins(sessions, now)
     }
 
     fn render_history_row(
@@ -2145,6 +2276,12 @@ impl SidebarView {
         {
             Some(HistoryRow::Group(group)) => {
                 let status_dot = match group {
+                    DateGroup::Pinned => Some(
+                        div()
+                            .size(rems(0.4375))
+                            .rounded_full()
+                            .bg(theme.primary),
+                    ),
                     DateGroup::NeedsYou => Some(
                         div()
                             .size(rems(0.4375))
@@ -2209,7 +2346,7 @@ impl SidebarView {
         let now = now_unix_secs();
 
         let mut fingerprint = sidebar_fingerprint(state, now);
-        if let Some(filter) = self.attention_filter {
+        if let Some(filter) = self.quick_filter {
             use std::hash::{Hash, Hasher};
             let mut filter_hasher = std::collections::hash_map::DefaultHasher::new();
             filter.label().hash(&mut filter_hasher);
@@ -2352,9 +2489,10 @@ impl SidebarView {
 #[cfg(test)]
 mod tests {
     use super::{
-        DateGroup, HistoryRow, flatten_history_sessions, format_time_ago, history_query_matches,
-        pr_status_label, pr_status_tooltip, same_history_row_identity, session_pr_info,
-        sidebar_session_fingerprint, sidebar_session_identity,
+        flatten_history_sessions, flatten_history_sessions_with_pins, format_time_ago,
+        history_query_matches, pr_status_label, pr_status_tooltip, same_history_row_identity,
+        session_pr_info, sidebar_session_fingerprint, sidebar_session_identity, DateGroup,
+        HistoryRow,
     };
     use std::collections::HashMap;
     use threadlane_git::GitHubPrInfo;
@@ -2675,6 +2813,39 @@ mod tests {
             &HistoryRow::Session(session("needs-newer"), SessionAttention::Idle)
         ));
         assert!(!same_history_row_identity(&rows[1], &rows[4]));
+    }
+
+    #[test]
+    fn history_rows_prioritize_pinned_sessions_first() {
+        let now = 1_000_000;
+        let mut pinned_idle = session("pinned-idle");
+        pinned_idle.updated_at = now - 90_000;
+        let mut needs_newer = session("needs-newer");
+        needs_newer.updated_at = now - 100;
+        let mut working = session("working");
+        working.updated_at = now - 200;
+
+        let rows = flatten_history_sessions_with_pins(
+            vec![
+                (working, SessionAttention::Working, false),
+                (needs_newer, SessionAttention::NeedsYou, false),
+                (pinned_idle, SessionAttention::Idle, true),
+            ],
+            now,
+        );
+
+        assert!(matches!(rows[0], HistoryRow::Group(DateGroup::Pinned)));
+        assert!(
+            matches!(&rows[1], HistoryRow::Session(item, SessionAttention::Idle) if item.id == "pinned-idle")
+        );
+        assert!(matches!(rows[2], HistoryRow::Group(DateGroup::NeedsYou)));
+        assert!(
+            matches!(&rows[3], HistoryRow::Session(item, SessionAttention::NeedsYou) if item.id == "needs-newer")
+        );
+        assert!(matches!(rows[4], HistoryRow::Group(DateGroup::Working)));
+        assert!(
+            matches!(&rows[5], HistoryRow::Session(item, SessionAttention::Working) if item.id == "working")
+        );
     }
 
     #[test]

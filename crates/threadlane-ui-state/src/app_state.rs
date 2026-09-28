@@ -32,6 +32,7 @@ pub struct AppState {
     /// Presentation-only sidebar filter. `None` keeps the flat list scoped to all projects.
     pub sidebar_project_filter: Option<PathBuf>,
     pub search_query: String,
+    pub pinned_sessions: HashSet<(PathBuf, String)>,
     pub messages: Arc<Vec<ChatMessageInfo>>,
     pub(crate) available_models: Vec<threadlane_ui_catalog::ModelOption>,
     pub active_plan: SessionPlan,
@@ -134,6 +135,30 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn toggle_pinned_session(&mut self, work_dir: PathBuf, session_id: String) {
+        let key = (work_dir.clone(), session_id);
+        if self.pinned_sessions.contains(&key) {
+            self.pinned_sessions.remove(&key);
+        } else {
+            self.pinned_sessions.insert(key);
+        }
+        let threadlane_dir = work_dir.join(".threadlane");
+        let _ = std::fs::create_dir_all(&threadlane_dir);
+        let project_pinned: Vec<&str> = self
+            .pinned_sessions
+            .iter()
+            .filter(|(w, _)| w == &work_dir)
+            .map(|(_, id)| id.as_str())
+            .collect();
+        if let Ok(json) = serde_json::to_string_pretty(&project_pinned) {
+            let _ = std::fs::write(threadlane_dir.join("pinned_sessions.json"), json);
+        }
+    }
+
+    pub fn is_session_pinned(&self, work_dir: &Path, session_id: &str) -> bool {
+        self.pinned_sessions
+            .contains(&(work_dir.to_path_buf(), session_id.to_string()))
+    }
     pub fn issue_branch_name(number: u64, title: &str, suffix: &str) -> String {
         let slug = title
             .chars()
@@ -242,6 +267,18 @@ impl AppState {
             }
         }
 
+        let mut pinned_sessions = HashSet::new();
+        for p in &registry_projects {
+            let pinned_file = p.path.join(".threadlane/pinned_sessions.json");
+            if let Ok(content) = std::fs::read_to_string(&pinned_file) {
+                if let Ok(ids) = serde_json::from_str::<Vec<String>>(&content) {
+                    for id in ids {
+                        pinned_sessions.insert((p.path.clone(), id));
+                    }
+                }
+            }
+        }
+
         for (i, p) in registry_projects.iter().enumerate() {
             let sessions = discover_session_stubs_in_project(&p.path);
             let is_active = i == active_project_index;
@@ -323,6 +360,7 @@ impl AppState {
             active_session_id,
             sidebar_project_filter: None,
             search_query: String::new(),
+            pinned_sessions,
             messages: Arc::new(messages),
             available_models,
             active_plan: SessionPlan::default(),
@@ -1504,6 +1542,19 @@ impl AppState {
         self.pending_questions.remove(session_id);
         self.deferred_stream_events.remove(session_id);
         self.pending_composer_messages.remove(session_id);
+        let pin_key = (work_dir.to_path_buf(), session_id.to_string());
+        if self.pinned_sessions.remove(&pin_key) {
+            let threadlane_dir = work_dir.join(".threadlane");
+            let project_pinned: Vec<&str> = self
+                .pinned_sessions
+                .iter()
+                .filter(|(w, _)| w == work_dir)
+                .map(|(_, id)| id.as_str())
+                .collect();
+            if let Ok(json) = serde_json::to_string_pretty(&project_pinned) {
+                let _ = std::fs::write(threadlane_dir.join("pinned_sessions.json"), json);
+            }
+        }
         self.acp_config_options
             .remove(&Self::projection_key(session_id, &session_file));
         if let Some(project) = self
@@ -1851,6 +1902,14 @@ impl AppState {
             project.sessions = discovered_sessions;
             project.is_expanded = true;
         } else {
+            let pinned_file = canonical.join(".threadlane/pinned_sessions.json");
+            if let Ok(content) = std::fs::read_to_string(&pinned_file) {
+                if let Ok(ids) = serde_json::from_str::<Vec<String>>(&content) {
+                    for id in ids {
+                        self.pinned_sessions.insert((canonical.clone(), id));
+                    }
+                }
+            }
             self.projects.push(ProjectInfo {
                 name: record.name,
                 sessions: discovered_sessions,

@@ -84,3 +84,28 @@ impl AssetSource for Assets {
         Ok(assets)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loads_all_custom_assets() {
+        let assets = Assets;
+        assert!(
+            assets
+                .load("icons/git/pull-request.svg")
+                .unwrap()
+                .is_some(),
+            "pull-request.svg must load"
+        );
+        assert!(
+            assets.load("icons/git/issue.svg").unwrap().is_some(),
+            "issue.svg must load"
+        );
+        assert!(
+            assets.load("icons/threadlane.svg").unwrap().is_some(),
+            "threadlane.svg must load"
+        );
+    }
+}

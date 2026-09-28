@@ -15,7 +15,6 @@ actions!(
     threadlane_workspace,
     [
         ToggleCommandPalette,
-        ToggleSidebar,
         ToggleRightPanel,
         ToggleTerminal,
         OpenSettings,
@@ -26,9 +25,9 @@ actions!(
         FocusComposer,
     ]
 );
-// `BeginNewTask` is shared with the sidebar's new-task buttons, so the
-// action type lives in `threadlane-ui-sidebar`.
-use threadlane_ui_sidebar::BeginNewTask;
+// `BeginNewTask` and `ToggleSidebar` are shared with the sidebar, so the
+// action types live in `threadlane-ui-sidebar`.
+use threadlane_ui_sidebar::{BeginNewTask, ToggleSidebar};
 use threadlane_git::GitStatus;
 
 use threadlane_ui_state::{actions::AppAction, controller};
