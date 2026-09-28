@@ -97,6 +97,100 @@ fn recover_abort_terminates_suspended_foreground_run_without_prior_cancel() {
         .unwrap();
 }
 
+#[test]
+fn recover_abort_cancels_pending_retry_after_reload() {
+    for interrupted_abort in [false, true] {
+        let (_dir, path) = temp_session();
+        let mut harness = CodingSessionHarness::open(&path).unwrap();
+        harness
+            .begin_run("timed-out", AgentMessage::user("first", vec![]))
+            .unwrap();
+        harness
+            .append_message(AgentMessage::Assistant {
+                content: Some("work already done".into()),
+                tool_calls: None,
+                stop_reason: None,
+                deferred_handle: None,
+            })
+            .unwrap();
+        harness
+            .schedule_retry("timed-out", "provider timeout")
+            .unwrap();
+        if interrupted_abort {
+            harness.request_abort().unwrap();
+            // Older builds committed the abort entry, then faulted before
+            // OperationFinished because the retry was still pending.
+            let seq = harness.next_seq();
+            let parent_id = harness.store.preferred_leaf("main");
+            harness
+                .store
+                .append_entry_gated(HarnessEntry {
+                    id: "entry-timed-out-aborted".into(),
+                    parent_id,
+                    lane: "main".into(),
+                    seq,
+                    timestamp: seq,
+                    message: AgentMessage::Assistant {
+                        content: Some("Run aborted.".into()),
+                        tool_calls: None,
+                        stop_reason: Some("aborted".into()),
+                        deferred_handle: None,
+                    },
+                    surface_op: threadlane_runtime::harness::SurfaceOperation::Append,
+                    terminate: false,
+                })
+                .unwrap();
+            harness.store.drive_to_completion().unwrap();
+        }
+        drop(harness);
+        let original = fs::read(&path).unwrap();
+        let mut reopened = CodingSessionHarness::open(&path).unwrap();
+        assert!(reopened.recover_abort().unwrap());
+        assert!(!reopened.recover_abort().unwrap());
+        drop(reopened);
+
+        let mut reopened = CodingSessionHarness::open(&path).unwrap();
+        let state = Reducer::reduce(&reopened.store).unwrap();
+        let main = state.lane("main").unwrap();
+        assert!(main.open_operation.is_none());
+        assert!(!main.abort_requested);
+        assert_eq!(reopened.store.records().iter().filter(|record| matches!(record,
+            HarnessRecord::OperationFinished { run_id, outcome: OperationOutcome::Aborted, .. }
+                if run_id == "timed-out"
+        )).count(), 1);
+        reopened
+            .begin_run("next-run", AgentMessage::user("continue", vec![]))
+            .unwrap();
+        assert!(fs::read(&path).unwrap().starts_with(&original));
+    }
+}
+
+#[test]
+fn pending_retry_requires_explicit_abort_to_finish() {
+    for (requested, outcome) in [
+        (false, OperationOutcome::Aborted),
+        (true, OperationOutcome::Completed),
+        (true, OperationOutcome::Failed),
+    ] {
+        let (_dir, path) = temp_session();
+        let mut harness = CodingSessionHarness::open(&path).unwrap();
+        harness
+            .begin_run("retry-run", AgentMessage::user("first", vec![]))
+            .unwrap();
+        harness
+            .schedule_retry("retry-run", "provider timeout")
+            .unwrap();
+        if requested {
+            harness.request_abort().unwrap();
+        }
+        let error = harness.finish_run("retry-run", outcome, None).unwrap_err();
+        assert!(
+            error.contains("operation finished while a retry is scheduled"),
+            "{error}"
+        );
+    }
+}
+
 fn boundary_request(overflow_recovery: bool) -> ProviderBoundaryRequest {
     ProviderBoundaryRequest {
         attempt: 1,
