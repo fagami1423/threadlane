@@ -135,6 +135,10 @@ impl CodingAgent {
         ScheduledWorkExecution::Completed(self.run_scheduled_agent_work().await)
     }
 
+    pub(crate) fn has_scheduled_work(&self) -> bool {
+        self.agent_work.next().is_some()
+    }
+
     pub(crate) fn work_handle(&self) -> CodingAgentWorkHandle {
         self.agent_work
             .set_acp_model(threadlane_acp_engine::is_acp_model(&self.agent.model()));
