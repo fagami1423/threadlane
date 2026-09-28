@@ -515,7 +515,7 @@ impl WorkspaceView {
                 sidebar_resizable_state,
                 right_panel_resizable_state,
                 bottom_panel_resizable_state,
-                preferred_panel_sizes: [13.5, 22.0, 14.0],
+                preferred_panel_sizes: [16.5, 22.0, 14.0],
                 panel_layout: None,
                 git_event_tx,
                 updater_tx,
@@ -1932,7 +1932,7 @@ impl Render for WorkspaceView {
         let rem = window.rem_size();
         let viewport = window.viewport_size();
         let sidebar_width = self.sidebar_resizable_state.read(cx).sizes().first()
-            .copied().unwrap_or(rem * 13.5).clamp(rem * 12.0, rem * 18.0);
+            .copied().unwrap_or(rem * 16.5).clamp(rem * 12.0, rem * 18.0);
         let required_content = if self.right_panel_visible { rem * 48.0 } else { rem * 28.0 };
         let show_sidebar = !self.sidebar_collapsed && viewport.width >= sidebar_width + required_content;
         let review_focus = self.right_panel_visible && viewport.width < rem * 48.0;
@@ -2408,7 +2408,7 @@ impl Render for WorkspaceView {
                 }))
                 .child(
                     resizable_panel()
-                        .size(rem * 13.5)
+                        .size(rem * 16.5)
                         .size_range(rem * 12.0..rem * 18.0)
                         .child(self.sidebar.clone()),
                 )

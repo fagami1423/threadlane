@@ -9,7 +9,6 @@ use gpui::*;
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::dialog::DialogButtonProps;
-use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_component::progress::Progress;
 use gpui_component::spinner::Spinner;
@@ -320,25 +319,6 @@ fn build_diagnostic_export(
     }))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SidebarQuickFilter {
-    Pinned,
-    NeedsYou,
-    Working,
-    Ready,
-}
-
-impl SidebarQuickFilter {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Pinned => "Pinned",
-            Self::NeedsYou => "Needs you",
-            Self::Working => "Working",
-            Self::Ready => "Ready",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DateGroup {
     Pinned,
@@ -530,14 +510,12 @@ fn update_control_label(status: &UpdateStatus) -> Option<String> {
 
 pub struct SidebarView {
     model: Entity<AppState>,
-    search_input: Entity<InputState>,
     /// Hash of the model state the sidebar renders; lets the observer skip
     /// notifications for streaming updates that cannot change any row.
     history_fingerprint: u64,
     update_label: Option<String>,
     /// Flattened, sorted rows cached per fingerprint for the virtual list.
     history_cache: Option<(u64, Vec<HistoryRow>)>,
-    quick_filter: Option<SidebarQuickFilter>,
     history_list_state: ListState,
     _subscriptions: Vec<Subscription>,
 }
@@ -714,8 +692,6 @@ fn pr_status_tooltip(pr: &threadlane_git::GitHubPrInfo) -> String {
 
 impl SidebarView {
     pub fn new(model: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search sessions…"));
-
         let sub1 = cx.observe(&model, |this, model, cx| {
             let fingerprint = sidebar_fingerprint(model.read(cx), now_unix_secs());
             let update_label = update_control_label(&model.read(cx).update_status);
@@ -726,32 +702,15 @@ impl SidebarView {
             }
         });
 
-        let model_clone = model.clone();
-        let sub2 = cx.subscribe_in(
-            &search_input,
-            window,
-            move |_this, search_input, event: &InputEvent, _window, cx| {
-                if matches!(event, InputEvent::Change) {
-                    let query = search_input.read(cx).value().to_string();
-                    model_clone.update(cx, |state, cx| {
-                        state.search_query = query;
-                        cx.notify();
-                    });
-                }
-            },
-        );
-
         let history_fingerprint = sidebar_fingerprint(model.read(cx), now_unix_secs());
         let update_label = update_control_label(&model.read(cx).update_status);
         Self {
             model,
             update_label,
-            search_input,
             history_fingerprint,
-            quick_filter: None,
             history_cache: None,
             history_list_state: ListState::new(0, ListAlignment::Top, window.rem_size() * 4.5),
-            _subscriptions: vec![sub1, sub2],
+            _subscriptions: vec![sub1],
         }
     }
 
@@ -762,19 +721,19 @@ impl SidebarView {
         div()
             .flex()
             .flex_col()
-            .gap(rems(0.375))
-            .px_3()
+            .gap_2()
+            .px_2p5()
             .pt(threadlane_ui_theme::WINDOW_CONTROLS_CLEARANCE)
-            .pb_1()
+            .pb_1p5()
             .bg(theme.title_bar)
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .px_1()
+                    .px_1p5()
                     .pt_1()
-                    .pb_1p5()
+                    .pb_2()
                     .child(
                         div()
                             .flex()
@@ -782,18 +741,18 @@ impl SidebarView {
                             .gap_2()
                             .child(
                                 div()
-                                    .size(rems(1.25))
-                                    .rounded_md()
-                                    .bg(theme.primary.opacity(0.14))
+                                    .size(rems(1.5))
+                                    .rounded_lg()
+                                    .bg(theme.primary.opacity(0.12))
                                     .border_1()
-                                    .border_color(theme.primary.opacity(0.28))
+                                    .border_color(theme.primary.opacity(0.2))
                                     .flex()
                                     .items_center()
                                     .justify_center()
                                     .child(
                                         Icon::default()
                                             .path("icons/threadlane.svg")
-                                            .size_3p5()
+                                            .size_4()
                                             .text_color(theme.primary),
                                     ),
                             )
@@ -811,6 +770,9 @@ impl SidebarView {
                         let is_generating = state.is_generating
                             || active_attention == Some(SessionAttention::Working);
 
+                        // The header stays clean when idle: Ready is already
+                        // visible on the session card and chat header, so only
+                        // Loading / Working / Needs-you surface here.
                         if is_loading {
                             div()
                                 .flex()
@@ -830,6 +792,7 @@ impl SidebarView {
                                         .text_color(theme.muted_foreground)
                                         .child("Loading"),
                                 )
+                                .into_any_element()
                         } else if is_generating {
                             div()
                                 .flex()
@@ -849,6 +812,7 @@ impl SidebarView {
                                         .text_color(theme.info)
                                         .child("Working"),
                                 )
+                                .into_any_element()
                         } else if active_attention == Some(SessionAttention::NeedsYou) {
                             div()
                                 .flex()
@@ -873,54 +837,9 @@ impl SidebarView {
                                         .text_color(theme.warning)
                                         .child("Needs you"),
                                 )
-                        } else if active_attention == Some(SessionAttention::Ready) {
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1p5()
-                                .px_2()
-                                .py(rems(0.0625))
-                                .rounded_full()
-                                .bg(theme.success.opacity(0.12))
-                                .border_1()
-                                .border_color(theme.success.opacity(0.25))
-                                .child(
-                                    div()
-                                        .size(rems(0.375))
-                                        .rounded_full()
-                                        .bg(theme.success),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_medium()
-                                        .text_color(theme.success)
-                                        .child("Ready"),
-                                )
+                                .into_any_element()
                         } else {
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1p5()
-                                .px_2()
-                                .py(rems(0.0625))
-                                .rounded_full()
-                                .bg(theme.muted.opacity(0.35))
-                                .border_1()
-                                .border_color(theme.border.opacity(0.2))
-                                .child(
-                                    div()
-                                        .size(rems(0.375))
-                                        .rounded_full()
-                                        .bg(theme.success),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_medium()
-                                        .text_color(theme.muted_foreground)
-                                        .child("Ready"),
-                                )
+                            Empty.into_any_element()
                         }
                     }),
             )
@@ -937,28 +856,31 @@ impl SidebarView {
                             .items_center()
                             .gap_2()
                             .w_full()
-                            .px_0p5()
-                            .py(rems(0.0625))
+                            .px_2()
+                            .py_1p5()
+                            .rounded_xl()
+                            .bg(theme.primary.opacity(0.1))
+                            .border_1()
+                            .border_color(theme.primary.opacity(0.18))
+                            .hover(|style| style.bg(theme.primary.opacity(0.14)))
                             .child(
                                 div()
-                                    .size_6()
-                                    .rounded_md()
-                                    .bg(theme.primary.opacity(0.14))
-                                    .border_1()
-                                    .border_color(theme.primary.opacity(0.25))
+                                    .size_5()
+                                    .rounded_lg()
+                                    .bg(theme.primary.opacity(0.16))
                                     .flex()
                                     .items_center()
                                     .justify_center()
                                     .child(
                                         Icon::new(IconName::Plus)
-                                            .size_4()
+                                            .size_3p5()
                                             .text_color(theme.primary),
                                     ),
                             )
                             .child(
                                 div()
                                     .flex_1()
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .font_weight(FontWeight::SEMIBOLD)
                                     .text_sm()
                                     .text_color(theme.foreground)
                                     .child("New task"),
@@ -966,14 +888,12 @@ impl SidebarView {
                             .child(
                                 div()
                                     .px_1p5()
-                                    .py(rems(0.0625))
-                                    .rounded_sm()
-                                    .bg(theme.muted.opacity(0.7))
-                                    .border_1()
-                                    .border_color(theme.border.opacity(0.3))
+                                    .py(rems(0.125))
+                                    .rounded_md()
+                                    .bg(theme.muted.opacity(0.5))
                                     .text_xs()
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.muted_foreground)
+                                    .text_color(theme.muted_foreground.opacity(0.85))
                                     .child("⌘N"),
                             ),
                     )
@@ -982,34 +902,6 @@ impl SidebarView {
                     }),
             )
             .child(self.render_github_nav(cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .mt_1p5()
-                    .px_2p5()
-                    .h(rems(2.125))
-                    .rounded_md()
-                    .bg(theme.input.opacity(0.35))
-                    .border_1()
-                    .border_color(theme.border.opacity(0.25))
-                    .hover(|style| style.border_color(theme.border.opacity(0.5)))
-                    .text_color(theme.muted_foreground)
-                    .child(
-                        Icon::new(IconName::Search)
-                            .xsmall()
-                            .text_color(theme.muted_foreground.opacity(0.65)),
-                    )
-                    .child(
-                        div().flex_1().child(
-                            Input::new(&self.search_input)
-                                .appearance(false)
-                                .bordered(false)
-                                .aria_label("Search sessions"),
-                        ),
-                    ),
-            )
     }
 
 
@@ -1054,8 +946,6 @@ impl SidebarView {
             .child(
                 div().min_w_0().flex_1().child(
                     Button::new("sidebar-project-filter")
-                        .icon(IconName::Folder)
-                        .label(selected_label.clone())
                         .accessibility_label(format!(
                             "Filter sessions by project: {selected_label}"
                         ))
@@ -1066,6 +956,29 @@ impl SidebarView {
                         .small()
                         .w_full()
                         .justify_start()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .w_full()
+                                .min_w_0()
+                                .child(
+                                    Icon::new(IconName::Folder)
+                                        .size_3p5()
+                                        .text_color(theme.foreground),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme.foreground)
+                                        .child(selected_label.clone()),
+                                ),
+                        )
                         .dropdown_menu(move |menu, _window, _cx| {
                             let all_model = filter_model.clone();
                             let total_sessions: usize =
@@ -1134,214 +1047,15 @@ impl SidebarView {
     }
 
     fn has_history_filters(&self, state: &AppState) -> bool {
-        !state.search_query.trim().is_empty()
-            || state.sidebar_project_filter.is_some()
-            || self.quick_filter.is_some()
+        state.sidebar_project_filter.is_some()
     }
 
-    fn clear_history_filters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.quick_filter = None;
-        self.search_input.update(cx, |input, cx| {
-            input.set_value("", window, cx);
-            input.focus(window, cx);
-        });
+    fn clear_history_filters(&mut self, cx: &mut Context<Self>) {
         self.model.update(cx, |state, cx| {
-            state.search_query.clear();
             controller::dispatch(state, AppAction::SetSidebarProjectFilter(None));
             cx.notify();
         });
         cx.notify();
-    }
-
-    fn render_history_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        let state = self.model.read(cx);
-        let session_count = state
-            .projects
-            .iter()
-            .filter(|project| {
-                state
-                    .sidebar_project_filter
-                    .as_ref()
-                    .is_none_or(|selected| &project.work_dir == selected)
-            })
-            .map(|project| project.sessions.len())
-            .sum::<usize>();
-        let mut attention_counts = [0usize; 3];
-        let mut pinned_count = 0;
-        for project in &state.projects {
-            if state
-                .sidebar_project_filter
-                .as_ref()
-                .is_some_and(|selected| &project.work_dir != selected)
-            {
-                continue;
-            }
-            for session in &project.sessions {
-                if state.is_session_pinned(&session.work_dir, &session.id) {
-                    pinned_count += 1;
-                }
-                match state.session_attention(session) {
-                    SessionAttention::NeedsYou => attention_counts[0] += 1,
-                    SessionAttention::Working => attention_counts[1] += 1,
-                    SessionAttention::Ready => attention_counts[2] += 1,
-                    SessionAttention::Idle => {}
-                }
-            }
-        }
-
-        let selected_filter = self.quick_filter;
-        let sidebar = cx.entity().downgrade();
-        let has_filters = self.has_history_filters(state);
-
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .px_3()
-            .pt_2()
-            .pb_1()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .w_full()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(theme.muted_foreground.opacity(0.85))
-                                    .child("TASKS"),
-                            )
-                            .child(
-                                div()
-                                    .px_1p5()
-                                    .py(rems(0.03125))
-                                    .rounded_full()
-                                    .bg(theme.muted.opacity(0.6))
-                                    .text_xs()
-                                    .font_medium()
-                                    .text_color(theme.muted_foreground)
-                                    .child(session_count.to_string()),
-                            ),
-                    )
-                    .children(has_filters.then(|| {
-                        Button::new("sidebar-clear-filters")
-                            .debug_selector(|| "sidebar-clear-filters".into())
-                            .label("Clear filters")
-                            .tooltip("Clear search, project, and status filters")
-                            .xsmall()
-                            .ghost()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.clear_history_filters(window, cx);
-                            }))
-                    })),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "sidebar-status-filter".into())
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_1()
-                    .children(
-                        [
-                            (None, "All", session_count, None),
-                            (
-                                Some(SidebarQuickFilter::NeedsYou),
-                                "Needs You",
-                                attention_counts[0],
-                                Some(theme.warning),
-                            ),
-                            (
-                                Some(SidebarQuickFilter::Working),
-                                "Working",
-                                attention_counts[1],
-                                Some(theme.primary),
-                            ),
-                            (
-                                Some(SidebarQuickFilter::Ready),
-                                "Ready",
-                                attention_counts[2],
-                                Some(theme.success),
-                            ),
-                            (
-                                Some(SidebarQuickFilter::Pinned),
-                                "Pinned",
-                                pinned_count,
-                                Some(theme.primary),
-                            ),
-                        ]
-                        .into_iter()
-                        .map(|(filter, label, count, accent)| {
-                            let sidebar = sidebar.clone();
-                            let is_selected = selected_filter == filter;
-                            let btn_id = format!("filter-{}", label.to_lowercase().replace(' ', "-"));
-                            Button::new(SharedString::from(btn_id.clone()))
-                                .debug_selector(move || btn_id.clone().into())
-                                .ghost()
-                                .xsmall()
-                                .compact()
-                                .selected(is_selected)
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .font_medium()
-                                                .text_color(if is_selected {
-                                                    theme.foreground
-                                                } else {
-                                                    theme.muted_foreground
-                                                })
-                                                .child(label),
-                                        )
-                                        .child(
-                                            div()
-                                                .px_1()
-                                                .py(rems(0.03125))
-                                                .rounded_full()
-                                                .bg(if is_selected {
-                                                    theme.muted.opacity(0.8)
-                                                } else {
-                                                    theme.muted.opacity(0.4)
-                                                })
-                                                .text_xs()
-                                                .font_medium()
-                                                .text_color(if let Some(c) = accent {
-                                                    if count > 0 {
-                                                        c
-                                                    } else {
-                                                        theme.muted_foreground
-                                                    }
-                                                } else {
-                                                    theme.muted_foreground
-                                                })
-                                                .child(count.to_string()),
-                                        ),
-                                )
-                                .on_click(move |_event, _window, cx| {
-                                    let _ = sidebar.update(cx, |this, cx| {
-                                        this.quick_filter = if is_selected && filter.is_some() {
-                                            None
-                                        } else {
-                                            filter
-                                        };
-                                        cx.notify();
-                                    });
-                                })
-                        }),
-                    ),
-            )
     }
 
     fn render_session_card(
@@ -1362,19 +1076,17 @@ impl SidebarView {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(rems(0.25))
-                    .px_2()
-                    .py(rems(0.0625))
+                    .gap_1()
+                    .px_1p5()
+                    .py(rems(0.125))
                     .rounded_full()
-                    .bg(theme.warning.opacity(0.15))
-                    .border_1()
-                    .border_color(theme.warning.opacity(0.28))
+                    .bg(theme.warning.opacity(0.12))
                     .text_color(theme.warning)
-                    .child(div().size(rems(0.375)).rounded_full().bg(theme.warning))
+                    .child(div().size(rems(0.3125)).rounded_full().bg(theme.warning))
                     .child(
                         div()
                             .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_weight(FontWeight::SEMIBOLD)
                             .child(attention.label()),
                     )
                     .into_any_element(),
@@ -1384,19 +1096,17 @@ impl SidebarView {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(rems(0.25))
-                    .px_2()
-                    .py(rems(0.0625))
+                    .gap_1()
+                    .px_1p5()
+                    .py(rems(0.125))
                     .rounded_full()
-                    .bg(theme.info.opacity(0.12))
-                    .border_1()
-                    .border_color(theme.info.opacity(0.25))
+                    .bg(theme.info.opacity(0.1))
                     .text_color(theme.foreground)
                     .child(Spinner::new().xsmall().color(theme.info))
                     .child(
                         div()
                             .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_weight(FontWeight::SEMIBOLD)
                             .child(attention.label()),
                     )
                     .into_any_element(),
@@ -1404,15 +1114,13 @@ impl SidebarView {
             SessionAttention::Ready => Some(
                 div()
                     .flex_none()
-                    .px_2()
-                    .py(rems(0.0625))
+                    .px_1p5()
+                    .py(rems(0.125))
                     .rounded_full()
-                    .bg(theme.muted.opacity(0.45))
-                    .border_1()
-                    .border_color(theme.border.opacity(0.2))
+                    .bg(theme.muted.opacity(0.35))
                     .text_xs()
                     .font_medium()
-                    .text_color(theme.muted_foreground)
+                    .text_color(theme.muted_foreground.opacity(0.9))
                     .child(attention.label())
                     .into_any_element(),
             ),
@@ -1587,33 +1295,32 @@ impl SidebarView {
             )
         });
 
-        let mut row2_items = Vec::new();
-        row2_items.push(
+        // Three-row card: title / context (where) / signals (what needs
+        // attention). The old single wrapping meta row crammed project,
+        // branch, git, PR, pinned, and status into one line with bullet
+        // separators. Splitting keeps each row single-purpose and lets
+        // quiet sessions collapse back to two rows.
+        let mut context_items = Vec::new();
+        let mut signal_items = Vec::new();
+        context_items.push(
             div()
                 .flex()
                 .flex_1()
                 .min_w_0()
                 .items_center()
                 .gap_1()
-                .text_color(theme.muted_foreground)
+                .text_color(theme.muted_foreground.opacity(0.85))
                 .child(
                     Icon::new(IconName::Folder)
                         .xsmall()
-                        .text_color(theme.muted_foreground.opacity(0.6)),
+                        .text_color(theme.muted_foreground.opacity(0.55)),
                 )
                 .child(div().min_w_0().truncate().child(project))
                 .into_any_element(),
         );
 
         if let Some(pr_chips) = pr_meta {
-            row2_items.push(
-                div()
-                    .flex_none()
-                    .text_color(theme.muted_foreground.opacity(0.4))
-                    .child("•")
-                    .into_any_element(),
-            );
-            row2_items.push(pr_chips.into_any_element());
+            signal_items.push(pr_chips.into_any_element());
         }
 
         if session.is_worktree && !session.worktree_available {
@@ -1622,7 +1329,7 @@ impl SidebarView {
                 "Worktree unavailable\nBranch: '{branch_display}'\nNot checked out locally\nRecorded path: {}\nSession history remains available",
                 session.runtime_work_dir.display()
             );
-            row2_items.push(
+            context_items.push(
                 Button::new(SharedString::from(format!(
                     "session-worktree-{}",
                     session.id
@@ -1636,34 +1343,23 @@ impl SidebarView {
                 .ghost()
                 .xsmall()
                 .bg(theme.warning.opacity(0.12))
-                .border_1()
-                .border_color(theme.warning.opacity(0.25))
                 .rounded_full()
                 .text_color(theme.warning)
                 .into_any_element(),
             );
         } else if let Some(branch) = session.git_branch.as_deref() {
             let branch_tooltip = format!("Branch: {branch}");
-            row2_items.push(
-                div()
-                    .flex_none()
-                    .text_color(theme.muted_foreground.opacity(0.4))
-                    .child("•")
-                    .into_any_element(),
-            );
-            row2_items.push(
+            context_items.push(
                 div()
                     .id(SharedString::from(format!("session-branch-badge-{}", session.id)))
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(rems(0.1875))
+                    .gap_1()
                     .px_1p5()
-                    .py(rems(0.0625))
+                    .py(rems(0.125))
                     .rounded_full()
-                    .bg(theme.muted.opacity(0.35))
-                    .border_1()
-                    .border_color(theme.border.opacity(0.2))
+                    .bg(theme.muted.opacity(0.3))
                     .tooltip(move |window, cx| Tooltip::new(branch_tooltip.clone()).build(window, cx))
                     .child(
                         Icon::default()
@@ -1690,26 +1386,17 @@ impl SidebarView {
                 let additions: u32 = git.files.iter().map(|f| f.additions).sum();
                 let deletions: u32 = git.files.iter().map(|f| f.deletions).sum();
                 let git_tooltip = format!("{changed_count} changed files (+{additions} -{deletions})");
-                row2_items.push(
-                    div()
-                        .flex_none()
-                        .text_color(theme.muted_foreground.opacity(0.4))
-                        .child("•")
-                        .into_any_element(),
-                );
-                row2_items.push(
+                signal_items.push(
                     div()
                         .id(SharedString::from(format!("session-git-badge-{}", session.id)))
                         .flex()
                         .flex_none()
                         .items_center()
-                        .gap(rems(0.25))
+                        .gap_1()
                         .px_1p5()
-                        .py(rems(0.0625))
+                        .py(rems(0.125))
                         .rounded_full()
-                        .bg(theme.muted.opacity(0.35))
-                        .border_1()
-                        .border_color(theme.border.opacity(0.2))
+                        .bg(theme.muted.opacity(0.3))
                         .tooltip(move |window, cx| Tooltip::new(git_tooltip.clone()).build(window, cx))
                         .child(
                             div()
@@ -1755,25 +1442,16 @@ impl SidebarView {
         }
 
         if is_pinned {
-            row2_items.push(
-                div()
-                    .flex_none()
-                    .text_color(theme.muted_foreground.opacity(0.4))
-                    .child("•")
-                    .into_any_element(),
-            );
-            row2_items.push(
+            signal_items.push(
                 div()
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(rems(0.1875))
+                    .gap_1()
                     .px_1p5()
-                    .py(rems(0.0625))
+                    .py(rems(0.125))
                     .rounded_full()
-                    .bg(theme.primary.opacity(0.12))
-                    .border_1()
-                    .border_color(theme.primary.opacity(0.25))
+                    .bg(theme.primary.opacity(0.1))
                     .text_xs()
                     .font_medium()
                     .text_color(theme.primary)
@@ -1786,12 +1464,12 @@ impl SidebarView {
         let (bg_color, border_color) = if is_active {
             (
                 theme.sidebar_accent,
-                theme.primary.opacity(0.45),
+                theme.primary.opacity(0.28),
             )
         } else {
             (
                 gpui::transparent_black(),
-                theme.border.opacity(0.18),
+                gpui::transparent_black(),
             )
         };
 
@@ -1805,8 +1483,8 @@ impl SidebarView {
             .flex()
             .items_stretch()
             .w_full()
-            .my(rems(0.0625))
-            .rounded_lg()
+            .my(rems(0.1875))
+            .rounded_xl()
             .bg(bg_color)
             .border_1()
             .border_color(border_color)
@@ -1815,19 +1493,19 @@ impl SidebarView {
                     .child(
                         div()
                             .absolute()
-                            .left_0()
-                            .top(rems(0.25))
-                            .bottom(rems(0.25))
-                            .w(rems(0.1875))
-                            .rounded_r_full()
-                            .bg(theme.primary),
+                            .left_1()
+                            .top(rems(0.5))
+                            .bottom(rems(0.5))
+                            .w(px(2.0))
+                            .rounded_full()
+                            .bg(theme.primary.opacity(0.9)),
                     )
             })
             .hover(|style| {
                 style.bg(if is_active {
                     theme.sidebar_accent
                 } else {
-                    theme.list_hover
+                    theme.list_hover.opacity(0.7)
                 })
             })
             .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
@@ -1844,27 +1522,16 @@ impl SidebarView {
                     cx.notify();
                 });
             })
-            .when(is_active, |this| {
-                this.child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top(rems(0.375))
-                        .bottom(rems(0.375))
-                        .w(rems(0.1875))
-                        .rounded_r_full()
-                        .bg(theme.primary),
-                )
-            })
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .gap(rems(0.25))
-                    .px_2p5()
-                    .py_2()
+                    .gap_1p5()
+                    .pl_3p5()
+                    .pr_3()
+                    .py_2p5()
                     .child(
                         div()
                             .flex()
@@ -2051,13 +1718,24 @@ impl SidebarView {
                         div()
                             .flex()
                             .items_center()
-                            .gap_1p5()
+                            .gap_2()
                             .text_xs()
                             .min_w_0()
-                            .flex_wrap()
-                            .children(row2_items)
-                            .children(status_indicator),
-                    ),
+                            .children(context_items),
+                    )
+                    .when(!signal_items.is_empty() || status_indicator.is_some(), |el| {
+                        el.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .text_xs()
+                                .min_w_0()
+                                .flex_wrap()
+                                .children(signal_items)
+                                .children(status_indicator),
+                        )
+                    }),
             )
             .context_menu(move |menu, _window, _cx| {
                 let open_model = context_model.clone();
@@ -2450,89 +2128,139 @@ impl SidebarView {
         let prs_selected = state.workspace_page == WorkspacePage::GitHub
             && state.github_tab == GitHubTab::PullRequests;
 
+        // Two-row nav: Automations gets its own full row, Issues and PRs
+        // share the second row. All three crammed in one row truncated
+        // labels at the default sidebar width.
         div()
             .w_full()
-            .p(rems(0.1875))
-            .rounded_lg()
-            .bg(theme.muted.opacity(0.35))
-            .border_1()
-            .border_color(theme.border.opacity(0.25))
             .flex()
-            .items_center()
-            .gap(rems(0.25))
+            .flex_col()
+            .gap_1p5()
             .child(
-                Button::new("sidebar-automations")
-                    .debug_selector(|| "sidebar-automations".into())
-                    .accessibility_label(format!("Automations, {attention} runs need attention"))
-                    .tooltip("Automations")
-                    .ghost()
-                    .xsmall()
-                    .compact()
-                    .flex_1()
-                    .selected(automations_selected)
+                div()
+                    .w_full()
+                    .p_1()
+                    .rounded_xl()
+                    .bg(theme.muted.opacity(0.28))
+                    .flex()
+                    .items_center()
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap_1()
+                        Button::new("sidebar-automations")
+                            .debug_selector(|| "sidebar-automations".into())
+                            .accessibility_label(format!(
+                                "Automations, {attention} runs need attention"
+                            ))
+                            .tooltip("Automations")
+                            .ghost()
+                            .xsmall()
+                            .compact()
                             .w_full()
-                            .child(Icon::from(IconName::Calendar).size_3p5())
-                            .child(div().text_xs().font_medium().child("Autos"))
-                            .children((attention > 0).then(|| {
+                            .selected(automations_selected)
+                            .child(
                                 div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_start()
+                                    .gap_2()
+                                    .w_full()
                                     .px_1()
-                                    .py(rems(0.03125))
-                                    .rounded_full()
-                                    .bg(theme.warning.opacity(0.2))
-                                    .border_1()
-                                    .border_color(theme.warning.opacity(0.35))
-                                    .text_xs()
-                                    .font_bold()
-                                    .text_color(theme.warning)
-                                    .child(attention.to_string())
-                            })),
-                    )
-                    .on_click(move |_, _, cx| {
-                        automation_model.update(cx, |state, cx| {
-                            controller::dispatch(state, AppAction::OpenAutomations);
-                            cx.notify();
-                        });
+                                    .child(
+                                        Icon::from(IconName::Calendar)
+                                            .size_3p5()
+                                            .text_color(theme.foreground),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme.foreground)
+                                            .child("Automations"),
+                                    )
+                                    .children((attention > 0).then(|| {
+                                        div()
+                                            .px_1()
+                                            .py(rems(0.03125))
+                                            .rounded_full()
+                                            .bg(theme.warning.opacity(0.2))
+                                            .text_xs()
+                                            .font_bold()
+                                            .text_color(theme.warning)
+                                            .child(attention.to_string())
+                                    })),
+                            )
+                            .on_click(move |_, _, cx| {
+                                automation_model.update(cx, |state, cx| {
+                                    controller::dispatch(state, AppAction::OpenAutomations);
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .p_1()
+                    .rounded_xl()
+                    .bg(theme.muted.opacity(0.28))
+                    .flex()
+                    .items_center()
+                    .child({
+                        let model = self.model.clone();
+                        Button::new("sidebar-issues")
+                            .debug_selector(|| "sidebar-issues".into())
+                            .accessibility_label(if issues_selected {
+                                "Open GitHub issues, current view"
+                            } else {
+                                "Open GitHub issues"
+                            })
+                            .tooltip("Issues")
+                            .ghost()
+                            .xsmall()
+                            .compact()
+                            .w_full()
+                            .selected(issues_selected)
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_start()
+                                    .gap_2()
+                                    .w_full()
+                                    .px_1()
+                                    .child(
+                                        Icon::default()
+                                            .path("icons/git/issue.svg")
+                                            .size_3p5()
+                                            .text_color(theme.foreground),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme.foreground)
+                                            .child("Issues"),
+                                    ),
+                            )
+                            .on_click(move |_event, _window, cx| {
+                                model.update(cx, |state, cx| {
+                                    controller::dispatch(
+                                        state,
+                                        AppAction::OpenGitHubTab(GitHubTab::Issues),
+                                    );
+                                    cx.notify();
+                                });
+                            })
                     }),
             )
-            .child({
-                let model = self.model.clone();
-                Button::new("sidebar-issues")
-                    .debug_selector(|| "sidebar-issues".into())
-                    .accessibility_label(if issues_selected {
-                        "Open GitHub issues, current view"
-                    } else {
-                        "Open GitHub issues"
-                    })
-                    .tooltip("Issues")
-                    .ghost()
-                    .xsmall()
-                    .compact()
-                    .flex_1()
-                    .selected(issues_selected)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap_1()
-                            .w_full()
-                            .child(Icon::default().path("icons/git/issue.svg").size_3p5())
-                            .child(div().text_xs().font_medium().child("Issues")),
-                    )
-                    .on_click(move |_event, _window, cx| {
-                        model.update(cx, |state, cx| {
-                            controller::dispatch(state, AppAction::OpenGitHubTab(GitHubTab::Issues));
-                            cx.notify();
-                        });
-                    })
-            })
-            .child({
+            .child(
+                div()
+                    .w_full()
+                    .p_1()
+                    .rounded_xl()
+                    .bg(theme.muted.opacity(0.28))
+                    .flex()
+                    .items_center()
+                    .child({
                 let model = self.model.clone();
                 Button::new("sidebar-pull-requests")
                     .debug_selector(|| "sidebar-pull-requests".into())
@@ -2545,25 +2273,35 @@ impl SidebarView {
                     .ghost()
                     .xsmall()
                     .compact()
-                    .flex_1()
+                    .w_full()
                     .selected(prs_selected)
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .gap_1()
+                            .justify_start()
+                            .gap_2()
                             .w_full()
-                            .child(Icon::default().path("icons/git/pull-request.svg").size_3p5())
-                            .child(div().text_xs().font_medium().child("PRs"))
+                            .px_1()
+                            .child(
+                                Icon::default()
+                                    .path("icons/git/pull-request.svg")
+                                    .size_3p5()
+                                    .text_color(theme.foreground),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.foreground)
+                                    .child("PRs"),
+                            )
                             .children((open_prs > 0).then(|| {
                                 div()
                                     .px_1()
                                     .py(rems(0.03125))
                                     .rounded_full()
                                     .bg(theme.primary.opacity(0.2))
-                                    .border_1()
-                                    .border_color(theme.primary.opacity(0.35))
                                     .text_xs()
                                     .font_bold()
                                     .text_color(theme.primary)
@@ -2579,7 +2317,8 @@ impl SidebarView {
                             cx.notify();
                         });
                     })
-            })
+                    })
+            )
     }
 
     /// Filter, group, and sort sessions for the history list. Only runs when
@@ -2622,30 +2361,6 @@ impl SidebarView {
                 }
                 let attention = state.session_attention(session);
                 let is_pinned = state.is_session_pinned(&session.work_dir, &session.id);
-                if let Some(filter) = self.quick_filter {
-                    match filter {
-                        SidebarQuickFilter::Pinned => {
-                            if !is_pinned {
-                                continue;
-                            }
-                        }
-                        SidebarQuickFilter::NeedsYou => {
-                            if attention != SessionAttention::NeedsYou {
-                                continue;
-                            }
-                        }
-                        SidebarQuickFilter::Working => {
-                            if attention != SessionAttention::Working {
-                                continue;
-                            }
-                        }
-                        SidebarQuickFilter::Ready => {
-                            if attention != SessionAttention::Ready {
-                                continue;
-                            }
-                        }
-                    }
-                }
                 sessions.push((session.clone(), attention, is_pinned));
             }
         }
@@ -2750,13 +2465,7 @@ impl SidebarView {
         let has_filters = self.has_history_filters(state);
         let now = now_unix_secs();
 
-        let mut fingerprint = sidebar_fingerprint(state, now);
-        if let Some(filter) = self.quick_filter {
-            use std::hash::{Hash, Hasher};
-            let mut filter_hasher = std::collections::hash_map::DefaultHasher::new();
-            filter.label().hash(&mut filter_hasher);
-            fingerprint ^= filter_hasher.finish();
-        }
+        let fingerprint = sidebar_fingerprint(state, now);
         self.history_fingerprint = fingerprint;
         let cache_matches = self
             .history_cache
@@ -2833,7 +2542,7 @@ impl SidebarView {
                                 .text_color(theme.muted_foreground)
                                 .text_center()
                                 .child(if has_filters {
-                                    "Try adjusting or clearing your filters"
+                                    "Try a different project"
                                 } else {
                                     "Start a new session to begin coding"
                                 }),
@@ -2843,12 +2552,12 @@ impl SidebarView {
                     this.child(
                         Button::new("empty-history-clear-filters")
                             .debug_selector(|| "empty-history-clear-filters".into())
-                            .label("Clear filters")
-                            .tooltip("Clear search, project, and status filters")
+                            .label("Clear filter")
+                            .tooltip("Clear project filter")
                             .outline()
                             .small()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.clear_history_filters(window, cx);
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.clear_history_filters(cx);
                             })),
                     )
                 })
@@ -2870,6 +2579,7 @@ impl SidebarView {
         div()
             .relative()
             .size_full()
+            .pt_2()
             .child(
                 list(
                     self.history_list_state.clone(),
@@ -3435,7 +3145,6 @@ impl Render for SidebarView {
             .bg(theme.title_bar)
             .child(self.render_header(cx))
             .child(self.render_project_filter(cx))
-            .child(self.render_history_header(cx))
             .child(div().flex_1().min_h_0().child(self.render_history(cx)))
             .child(self.render_footer(cx))
     }
