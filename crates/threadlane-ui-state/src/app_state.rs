@@ -21,6 +21,25 @@ use crate::projection::*;
 pub use crate::types::*;
 use threadlane_runtime::harness::{tool_activity_display_summary, tool_activity_summary};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveCloseWork {
+    pub identity: String,
+    pub title: String,
+    pub project: String,
+    pub status: String,
+}
+
+pub fn active_automation_status(status: threadlane_automation::RunStatus) -> Option<&'static str> {
+    use threadlane_automation::RunStatus;
+    match status {
+        RunStatus::Starting => Some("Starting"),
+        RunStatus::Running => Some("Running"),
+        RunStatus::WaitingPermission => Some("Needs permission"),
+        RunStatus::WaitingAnswer => Some("Needs an answer"),
+        RunStatus::Queued | RunStatus::Succeeded | RunStatus::Failed | RunStatus::Cancelled | RunStatus::Interrupted => None,
+    }
+}
+
 pub struct AppState {
     pub automation_service: Option<Arc<crate::automation::AutomationService>>,
     pub automations: crate::automation::Projection,
@@ -481,6 +500,39 @@ impl AppState {
         state
     }
 
+    pub fn active_close_work(&self) -> Vec<ActiveCloseWork> {
+        let mut work = Vec::new();
+        let mut session_files = HashSet::new();
+        for (session_file, runtime) in &self.session_runtimes {
+            let active = runtime.is_generating() || matches!(runtime.status(), threadlane_coding_agent::controller::SessionStatus::Working);
+            let session = self.projects.iter().flat_map(|project| &project.sessions).find(|session| session.session_file == *session_file);
+            let session_id = session.map(|session| session.id.as_str());
+            let permission = session_id.is_some_and(|id| self.pending_permissions.contains_key(id));
+            let question = session_id.is_some_and(|id| self.pending_questions.contains_key(id));
+            if !active && !permission && !question { continue; }
+            let project = session.and_then(|session| self.projects.iter().find(|project| project.sessions.iter().any(|item| item.session_file == session.session_file)));
+            work.push(ActiveCloseWork {
+                identity: session_file.display().to_string(),
+                title: session.map(|session| if session.title.trim().is_empty() { "Untitled session".into() } else { session.title.clone() }).unwrap_or_else(|| "Active session".into()),
+                project: project.map(|project| project.name.clone()).unwrap_or_else(|| session_file.parent().unwrap_or(Path::new("")).display().to_string()),
+                status: if permission { "Needs permission" } else if question { "Needs an answer" } else { "Running" }.into(),
+            });
+            session_files.insert(session_file.clone());
+        }
+        for run in &self.automations.snapshot.runs {
+            let Some(status) = active_automation_status(run.status) else { continue; };
+            if run.session_file.as_ref().is_some_and(|file| session_files.contains(file)) { continue; }
+            let session = run.session_file.as_ref().and_then(|file| self.projects.iter().flat_map(|project| &project.sessions).find(|session| session.session_file == *file));
+            work.push(ActiveCloseWork {
+                identity: run.session_file.as_ref().map(|file| file.display().to_string()).unwrap_or_else(|| format!("automation:{}", run.id)),
+                title: session.map(|session| session.title.clone()).filter(|title| !title.trim().is_empty()).unwrap_or_else(|| run.definition.name.clone()),
+                project: self.projects.iter().find(|project| project.work_dir == run.definition.project).map(|project| project.name.clone()).unwrap_or_else(|| run.definition.project.display().to_string()),
+                status: status.into(),
+            });
+        }
+        work.sort_by(|a, b| a.identity.cmp(&b.identity));
+        work
+    }
     pub(crate) fn messages_mut(&mut self) -> &mut Vec<ChatMessageInfo> {
         Arc::make_mut(&mut self.messages)
     }

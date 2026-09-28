@@ -486,6 +486,67 @@ impl WorkspaceView {
             }
         });
         view.update(cx, |view, cx| {
+            let weak_view = cx.weak_entity();
+            window.on_window_should_close(cx, move |window, cx| {
+                if cx.windows().len() != 1 {
+                    return true;
+                }
+                let Some(work) = weak_view
+                    .update(cx, |view, cx| view.model.read(cx).active_close_work())
+                    .ok()
+                else {
+                    return true;
+                };
+                if work.is_empty() {
+                    return true;
+                }
+                if window.has_active_dialog(cx) {
+                    return false;
+                }
+
+                let displayed = work.clone();
+                let model = weak_view.update(cx, |view, _| view.model.clone()).ok();
+                let Some(model) = model else {
+                    return false;
+                };
+                let mut list = work
+                    .iter()
+                    .take(8)
+                    .map(|item| format!("{} — {} · {}", item.title, item.project, item.status))
+                    .collect::<Vec<_>>();
+                if work.len() > list.len() {
+                    list.push(format!("…and {} more", work.len() - list.len()));
+                }
+                let description = format!(
+                    "Closing this window quits Threadlane and interrupts its active work. External commands may not stop immediately.\n\n{}",
+                    list.join("\n")
+                );
+                window.open_alert_dialog(cx, move |dialog, _, _| {
+                    let expected: Vec<_> = displayed.iter().map(|item| item.identity.clone()).collect();
+                    let current_model = model.clone();
+                    dialog
+                        .title("Close Threadlane while work is active?")
+                        .description(description.clone())
+                        .confirm()
+                        .show_cancel(true)
+                        .ok_text("Close anyway")
+                        .ok_variant(gpui_component::button::ButtonVariant::Danger)
+                        .on_ok(move |_, window, cx| {
+                            let current: Vec<_> = current_model
+                                .read(cx)
+                                .active_close_work()
+                                .into_iter()
+                                .map(|item| item.identity)
+                                .collect();
+                            if current != expected {
+                                return false;
+                            }
+                            window.remove_window();
+                            true
+                        })
+                });
+                false
+            });
             let hydration_requests = view
                 .model
                 .update(cx, |state, _cx| state.take_pending_hydrations());

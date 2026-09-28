@@ -11,6 +11,17 @@ use threadlane_runtime::harness::{
     OperationIntent, OperationOutcome, ProviderOutcome, Record, SessionStore, TraceString,
 };
 
+
+#[test]
+fn active_close_work_includes_only_live_automation_runs() {
+    use threadlane_automation::RunStatus;
+    assert_eq!(active_automation_status(RunStatus::Starting), Some("Starting"));
+    assert_eq!(active_automation_status(RunStatus::Running), Some("Running"));
+    assert_eq!(active_automation_status(RunStatus::WaitingPermission), Some("Needs permission"));
+    assert_eq!(active_automation_status(RunStatus::WaitingAnswer), Some("Needs an answer"));
+    assert_eq!(active_automation_status(RunStatus::Queued), None);
+    assert_eq!(active_automation_status(RunStatus::Succeeded), None);
+}
 #[test]
 fn automation_projection_refreshes_each_changed_project_once() {
     let mut state = AppState::load_from_registry(vec![]);
