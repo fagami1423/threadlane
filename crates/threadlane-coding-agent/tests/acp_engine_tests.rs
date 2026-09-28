@@ -1049,6 +1049,7 @@ async fn controller_scheduler_supervisor_forwards_permission_events() {
     })
     .await
     .expect("supervisor must forward the permission request");
+    assert!(controller.scheduled_work_active());
     assert!(controller.resolve_permission(&request.id, PermissionDecision::AllowOnce));
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -1062,6 +1063,7 @@ async fn controller_scheduler_supervisor_forwards_permission_events() {
     })
     .await
     .expect("supervised work completes after permission resolution");
+    assert!(!controller.scheduled_work_active());
     handle.shutdown().await;
 }
 

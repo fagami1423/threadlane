@@ -66,6 +66,21 @@ impl Drop for SchedulerSupervisorLease {
     }
 }
 
+struct ScheduledWorkLease(Arc<AtomicBool>);
+
+impl ScheduledWorkLease {
+    fn new(active: Arc<AtomicBool>) -> Self {
+        active.store(true, Ordering::SeqCst);
+        Self(active)
+    }
+}
+
+impl Drop for ScheduledWorkLease {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 impl Drop for SchedulerSupervisorHandle {
     fn drop(&mut self) {
         if let Some(stop) = self.stop.take() {
@@ -139,6 +154,7 @@ pub struct SessionController {
     pub harness_error: Option<String>,
     is_generating: AtomicBool,
     scheduler_supervisor_active: Arc<AtomicBool>,
+    scheduled_work_active: Arc<AtomicBool>,
     status: Mutex<SessionStatus>,
 }
 impl SessionController {
@@ -207,6 +223,7 @@ impl SessionController {
             harness_error,
             is_generating: AtomicBool::new(false),
             scheduler_supervisor_active: Arc::new(AtomicBool::new(false)),
+            scheduled_work_active: Arc::new(AtomicBool::new(false)),
             status: Mutex::new(status),
         })
     }
@@ -233,6 +250,10 @@ impl SessionController {
 
     pub fn is_generating(&self) -> bool {
         self.is_generating.load(Ordering::SeqCst)
+    }
+
+    pub fn scheduled_work_active(&self) -> bool {
+        self.scheduled_work_active.load(Ordering::SeqCst)
     }
 
     pub fn status(&self) -> SessionStatus {
@@ -292,6 +313,7 @@ impl SessionController {
         let agent = self.agent.clone();
         let work_handle = self.work_handle.clone();
         let active = self.scheduler_supervisor_active.clone();
+        let scheduled_work_active = self.scheduled_work_active.clone();
         threadlane_provider::exec::get_runtime().spawn(async move {
             let _lease = SchedulerSupervisorLease(active);
             loop {
@@ -301,6 +323,10 @@ impl SessionController {
                 }
                 let outcome = {
                     let mut agent = agent.lock().await;
+                    let work_active = agent.has_scheduled_work();
+                    let _work_lease = work_active.then(|| {
+                        ScheduledWorkLease::new(scheduled_work_active.clone())
+                    });
                     let mut events = agent.subscribe();
                     let execution = agent.execute_scheduled_work();
                     tokio::pin!(execution);

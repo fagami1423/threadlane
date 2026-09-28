@@ -508,7 +508,12 @@ impl AppState {
         let mut work = Vec::new();
         let mut session_files = HashSet::new();
         for (session_file, runtime) in &self.session_runtimes {
-            let active = runtime.is_generating() || matches!(runtime.status(), threadlane_coding_agent::controller::SessionStatus::Working);
+            let active = runtime.is_generating()
+                || runtime.scheduled_work_active()
+                || matches!(
+                    runtime.status(),
+                    threadlane_coding_agent::controller::SessionStatus::Working
+                );
             let session = self.projects.iter().flat_map(|project| &project.sessions).find(|session| session.session_file == *session_file);
             let session_id = session.map(|session| session.id.as_str());
             let permission = session_id.is_some_and(|id| self.pending_permissions.contains_key(id));
