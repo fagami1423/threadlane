@@ -491,6 +491,11 @@ impl WorkspaceView {
                 cx.notify();
             });
 
+            let command_state_sub =
+                cx.observe(&command_state, |_this: &mut Self, _command_state, cx| {
+                    cx.notify();
+                });
+
             Self {
                 focus_handle,
                 rendered_page: model.read(cx).workspace_page,
@@ -520,7 +525,7 @@ impl WorkspaceView {
                 git_event_tx,
                 updater_tx,
                 pending_terminal_close: None,
-                _subscriptions: vec![sub, right_panel_sub],
+                _subscriptions: vec![sub, right_panel_sub, command_state_sub],
             }
         });
         view.update(cx, |view, cx| {
