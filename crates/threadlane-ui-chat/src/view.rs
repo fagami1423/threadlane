@@ -251,11 +251,12 @@ fn render_chat_error(id: &str, error: &str, model: &Entity<AppState>, cx: &App) 
     div().w_full().my_2().px_4().child(
         div()
             .w_full()
-            .p_3()
-            .rounded(cx.theme().radius)
+            .p_3p5()
+            .rounded_xl()
             .bg(theme.danger.opacity(0.08))
             .border_1()
             .border_color(theme.danger.opacity(0.4))
+            .shadow_sm()
             .child(
                 div()
                     .text_sm()
@@ -282,6 +283,7 @@ fn render_chat_error(id: &str, error: &str, model: &Entity<AppState>, cx: &App) 
                         Button::new(SharedString::from(format!("chat-error-retry-{id}")))
                             .label("Retry")
                             .small()
+                            .rounded_md()
                             .tooltip("Resend the last message")
                             .accessibility_label("Resend the last message")
                             .debug_selector(|| "chat-error-retry".into())
@@ -301,6 +303,7 @@ fn render_chat_error(id: &str, error: &str, model: &Entity<AppState>, cx: &App) 
                             .label("Settings…")
                             .accessibility_label("Open provider settings")
                             .small()
+                            .rounded_md()
                             .tooltip("Open provider settings")
                             .debug_selector(|| "chat-error-settings".into())
                             .on_click(move |_, _, cx| {
@@ -316,6 +319,7 @@ fn render_chat_error(id: &str, error: &str, model: &Entity<AppState>, cx: &App) 
                             .accessibility_label("Copy full error to clipboard")
                             .ghost()
                             .small()
+                            .rounded_md()
                             .tooltip("Copy full error to clipboard")
                             .debug_selector(|| "chat-error-copy".into())
                             .on_click(move |_, window, cx| {
@@ -915,13 +919,15 @@ impl ChatListView {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap_1()
-                    .px_2()
-                    .py(rems(0.09375))
+                    .gap_1p5()
+                    .px_2p5()
+                    .py_0p5()
                     .rounded_full()
-                    .bg(theme.warning.opacity(0.15))
+                    .bg(theme.warning.opacity(0.12))
+                    .border_1()
+                    .border_color(theme.warning.opacity(0.3))
                     .text_color(theme.warning)
-                    .child(div().size(rems(0.375)).rounded_full().bg(theme.warning))
+                    .child(div().size_1p5().rounded_full().bg(theme.warning))
                     .child(
                         div()
                             .text_xs()
@@ -936,12 +942,15 @@ impl ChatListView {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap_1()
-                    .px_2()
-                    .py(rems(0.09375))
+                    .gap_1p5()
+                    .px_2p5()
+                    .py_0p5()
                     .rounded_full()
                     .bg(theme.muted)
+                    .border_1()
+                    .border_color(theme.border.opacity(0.4))
                     .text_color(theme.muted_foreground)
+                    .child(div().size_1p5().rounded_full().bg(theme.success))
                     .child(
                         div()
                             .text_xs()
@@ -976,6 +985,12 @@ impl ChatListView {
                     .justify_start()
                     .min_w_0()
                     .child(
+                        Icon::default()
+                            .path("icons/tabs/chat.svg")
+                            .size_4()
+                            .text_color(theme.primary),
+                    )
+                    .child(
                         div()
                             .id("chat-header-title")
                             .truncate()
@@ -1009,6 +1024,7 @@ impl ChatListView {
                             ))
                             .ghost()
                             .xsmall()
+                            .rounded_md()
                             .on_click(move |_, _, cx| {
                                 if let Some(work_dir) = active_work_dir.clone() {
                                     model.update(cx, |state, cx| {
@@ -1055,6 +1071,7 @@ impl ChatListView {
                     .accessibility_label("Chat (⌘1)")
                     .ghost()
                     .small()
+                    .rounded_md()
                     .selected(self.current_tab == CentralTab::Chat)
                     .on_click(cx.listener(|this, _, _, cx| this.set_tab(CentralTab::Chat, cx))),
             )
@@ -1066,6 +1083,7 @@ impl ChatListView {
                     .accessibility_label("Trajectory (⌘2)")
                     .ghost()
                     .small()
+                    .rounded_md()
                     .selected(self.current_tab == CentralTab::Trajectory)
                     .on_click(
                         cx.listener(|this, _, _, cx| this.set_tab(CentralTab::Trajectory, cx)),
@@ -1086,6 +1104,7 @@ impl ChatListView {
                     ))
                     .ghost()
                     .small()
+                    .rounded_md()
                     .selected(self.current_tab == CentralTab::Editor)
                     .on_click(cx.listener(|this, _, _, cx| this.set_tab(CentralTab::Editor, cx))),
             )
@@ -1418,12 +1437,18 @@ impl ChatListView {
                 .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
                 .mx_auto()
                 .px_4()
-                .py_1()
+                .py_1p5()
                 .flex()
                 .items_center()
                 .gap_2()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
+                .child(
+                    Icon::default()
+                        .path("icons/git/compare.svg")
+                        .xsmall()
+                        .text_color(cx.theme().muted_foreground),
+                )
                 .child(format!(
                     "Workspace changes · {count} {}",
                     if count == 1 { "file" } else { "files" }
@@ -1435,6 +1460,7 @@ impl ChatListView {
                         .label("Review")
                         .ghost()
                         .small()
+                        .rounded_full()
                         .accessibility_label(format!(
                             "Review {count} uncommitted {}",
                             if count == 1 { "change" } else { "changes" }
@@ -1502,8 +1528,9 @@ impl ChatListView {
                     .trigger(
                         Button::new("session-plan-tracker")
                             .debug_selector(|| "session-plan-tracker".into())
-                            .ghost()
+                            .secondary()
                             .small()
+                            .rounded_full()
                             .label(format!(
                                 "Plan · {completed}/{total} · {}",
                                 truncate_plan_step(&display_step, 42)
@@ -1532,7 +1559,12 @@ impl ChatListView {
                             .debug_selector(|| "session-plan-details".into())
                             .w(rems(32.0))
                             .max_w(rems(CHAT_CONTENT_MAX_WIDTH - 2.0))
-                            .p_2()
+                            .p_3()
+                            .rounded_xl()
+                            .border_1()
+                            .border_color(colors.border.opacity(0.8))
+                            .bg(colors.popover)
+                            .shadow_lg()
                             .flex()
                             .flex_col()
                             .gap_2()
@@ -1541,7 +1573,7 @@ impl ChatListView {
                                     .flex_none()
                                     .pb_2()
                                     .border_b_1()
-                                    .border_color(colors.border)
+                                    .border_color(colors.border.opacity(0.4))
                                     .text_sm()
                                     .text_color(colors.muted_foreground)
                                     .child(explanation)
@@ -1652,11 +1684,11 @@ impl ChatListView {
                 div()
                     .ml(rems(1.625))
                     .mt_1()
-                    .p_2()
+                    .p_2p5()
                     .max_h(rems(15.0))
-                    .rounded_md()
+                    .rounded_lg()
                     .border_1()
-                    .border_color(theme.border)
+                    .border_color(theme.border.opacity(0.5))
                     .bg(theme.title_bar)
                     .text_xs()
                     .text_color(theme.muted_foreground)
@@ -3158,21 +3190,22 @@ impl ChatListView {
         div()
             .w_full()
             .my_2()
-            .rounded_lg()
+            .rounded_xl()
             .border_1()
-            .border_color(theme.border)
+            .border_color(theme.border.opacity(0.6))
             .bg(theme.title_bar)
             .overflow_hidden()
+            .shadow_sm()
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
                     .px_3()
-                    .py_1p5()
-                    .bg(theme.secondary)
+                    .py_2()
+                    .bg(theme.secondary.opacity(0.5))
                     .border_b_1()
-                    .border_color(theme.border)
+                    .border_color(theme.border.opacity(0.5))
                     .child(
                         div()
                             .flex()
@@ -3190,6 +3223,9 @@ impl ChatListView {
                                     .id(SharedString::from(format!(
                                         "code-path-{msg_id}-{block_index}"
                                     )))
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
                                     .truncate()
@@ -3200,6 +3236,11 @@ impl ChatListView {
                                                 .build(window, cx)
                                         }
                                     })
+                                    .child(
+                                        Icon::new(IconName::File)
+                                            .xsmall()
+                                            .text_color(theme.muted_foreground),
+                                    )
                                     .child(path)
                             })),
                     )
@@ -3366,8 +3407,9 @@ impl ChatListView {
             .ghost()
             .small()
             .w_full()
-            .px_2()
-            .rounded_lg()
+            .px_3()
+            .py_2()
+            .rounded_none()
             .flex()
             .items_center()
             .justify_between()
@@ -3421,14 +3463,11 @@ impl ChatListView {
 
         let detail = is_expanded.then(|| {
             let container = div()
-                .mx_2()
-                .mb_2()
-                .p_2p5()
+                .p_3()
                 .max_h(rems(21.25))
-                .rounded_md()
                 .border_t_1()
-                .border_color(theme.border.opacity(0.4))
-                .bg(theme.secondary.opacity(0.3))
+                .border_color(theme.border.opacity(0.35))
+                .bg(theme.background.opacity(0.4))
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .overflow_y_scrollbar();
@@ -3447,10 +3486,11 @@ impl ChatListView {
             div()
                 .w_full()
                 .min_w_0()
-                .rounded_lg()
+                .rounded_xl()
                 .border_1()
-                .border_color(theme.border.opacity(0.6))
-                .bg(theme.title_bar)
+                .border_color(theme.border.opacity(0.4))
+                .bg(theme.muted.opacity(0.2))
+                .overflow_hidden()
                 .child(header)
                 .children(detail)
                 .into_any_element(),
@@ -3566,9 +3606,10 @@ impl ChatListView {
             .ghost()
             .small()
             .w_full()
-            .px_2()
-            .rounded_md()
-            .bg(theme.list_hover)
+            .px_3()
+            .py_1p5()
+            .rounded_none()
+            .bg(theme.muted.opacity(0.1))
             .flex()
             .items_center()
             .justify_between()
@@ -3629,10 +3670,11 @@ impl ChatListView {
             div()
                 .flex()
                 .flex_col()
-                .pl_2()
-                .mt_1()
-                .border_l_2()
-                .border_color(theme.list_active_border.opacity(0.65))
+                .px_2p5()
+                .py_1()
+                .border_t_1()
+                .border_color(theme.border.opacity(0.3))
+                .bg(theme.background.opacity(0.3))
                 .children(tool_rows)
         });
 
@@ -3642,6 +3684,11 @@ impl ChatListView {
                 .min_w_0()
                 .flex()
                 .flex_col()
+                .rounded_xl()
+                .border_1()
+                .border_color(theme.border.opacity(0.4))
+                .bg(theme.muted.opacity(0.15))
+                .overflow_hidden()
                 .child(header)
                 .children(detail_rows)
                 .into_any_element(),
@@ -3733,9 +3780,13 @@ impl ChatListView {
                         div()
                             .min_w_0()
                             .max_w(rems(USER_BUBBLE_MAX_WIDTH))
-                            .p_3()
-                            .rounded_lg()
+                            .px_4()
+                            .py_2p5()
+                            .rounded_2xl()
+                            .border_1()
+                            .border_color(theme.border.opacity(0.4))
                             .bg(theme.secondary)
+                            .shadow_sm()
                             .text_sm()
                             .text_color(theme.secondary_foreground)
                             .child({
@@ -4006,6 +4057,14 @@ impl ChatListView {
                     ))
             });
 
+        let suggestions = [
+            ("Explore repository", "Explore repository architecture and key workflows"),
+            ("Plan feature", "Plan an end-to-end feature implementation"),
+            ("Run tests", "Run the test suite and diagnose any issues"),
+            ("Review changes", "Review uncommitted git status and diffs"),
+        ];
+        let input_state = self.input_state.clone();
+
         div()
             .flex_1()
             .min_h_0()
@@ -4014,28 +4073,71 @@ impl ChatListView {
             .items_center()
             .justify_center()
             .gap_3()
+            .px_4()
             .pb_16()
             .child(
                 div()
                     .id("new-task-mark")
                     .aria_label("Threadlane")
-                    .p_3()
-                    .rounded_full()
-                    .bg(theme.accent)
-                    .text_2xl()
-                    .text_color(theme.accent_foreground)
-                    .child(IconName::Asterisk),
+                    .size(rems(3.5))
+                    .rounded_2xl()
+                    .bg(theme.accent.opacity(0.16))
+                    .border_1()
+                    .border_color(theme.accent.opacity(0.4))
+                    .shadow_sm()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(theme.primary)
+                    .child(
+                        Icon::default()
+                            .path("icons/threadlane.svg")
+                            .size_7(),
+                    ),
             )
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
+                    .justify_center()
                     .gap_2()
-                    .text_lg()
-                    .font_weight(FontWeight::MEDIUM)
+                    .text_xl()
+                    .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.foreground)
                     .child("What should we build in")
                     .child(project_picker),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("Describe a goal, plan changes, or ask questions about your project."),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .justify_center()
+                    .gap_2()
+                    .max_w(rems(36.0))
+                    .mt_3()
+                    .children(suggestions.into_iter().map(|(label, prompt)| {
+                        let input = input_state.clone();
+                        let prompt_str = prompt.to_string();
+                        Button::new(SharedString::from(format!("suggestion-{label}")))
+                            .label(label)
+                            .tooltip(prompt)
+                            .outline()
+                            .small()
+                            .rounded_full()
+                            .on_click(move |_event, window, cx| {
+                                input.update(cx, |input, cx| {
+                                    input.set_value(&prompt_str, window, cx);
+                                    input.focus(window, cx);
+                                });
+                            })
+                    })),
             )
             .into_any_element()
     }
@@ -4503,6 +4605,7 @@ impl ChatListView {
             Button::new(id)
                 .label(label)
                 .xsmall()
+                .rounded_md()
                 .when(primary, |button| button.primary())
                 .when(danger, |button| button.danger())
                 .on_click(cx.listener(move |this, _event, _window, cx| {
@@ -4528,12 +4631,13 @@ impl ChatListView {
                         .w_full()
                         .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
                         .mx_auto()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
+                        .px_3p5()
+                        .py_2p5()
+                        .rounded_xl()
                         .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.title_bar)
+                        .border_color(theme.warning.opacity(0.4))
+                        .bg(theme.secondary.opacity(0.35))
+                        .shadow_sm()
                         .flex()
                         .flex_wrap()
                         .items_center()
@@ -4559,7 +4663,7 @@ impl ChatListView {
                                         .text_color(theme.muted_foreground)
                                         .truncate()
                                         .child(request.detail),
-                                ),
+                                )
                         )
                         .child(
                             Button::new("permission-details-btn")
@@ -4568,6 +4672,7 @@ impl ChatListView {
                                 .accessibility_label("View full command & arguments")
                                 .ghost()
                                 .xsmall()
+                                .rounded_md()
                                 .tooltip("View full command & arguments")
                                 .on_click(cx.listener(move |this, _event, window, cx| {
                                     this.open_permission_details(&button_request_id, window, cx);
@@ -4675,7 +4780,8 @@ impl ChatListView {
                         })
                         .label(option_label.clone())
                         .small()
-                        .ghost()
+                        .outline()
+                        .rounded_full()
                         .selected(is_selected)
                         .tooltip(if is_selected {
                             "Selected — activate to remove"
@@ -4761,12 +4867,13 @@ impl ChatListView {
                         .w_full()
                         .max_w(rems(QUESTION_CARD_MAX_WIDTH))
                         .mx_auto()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
+                        .px_3p5()
+                        .py_3()
+                        .rounded_xl()
                         .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.title_bar)
+                        .border_color(theme.border.opacity(0.8))
+                        .bg(theme.popover)
+                        .shadow_md()
                         .flex()
                         .flex_col()
                         .gap_2()
@@ -4807,6 +4914,7 @@ impl ChatListView {
                                         .accessibility_label("Dismiss without answering")
                                         .ghost()
                                         .small()
+                                        .rounded_lg()
                                         .tooltip("Dismiss without answering")
                                         .on_click(cx.listener(|this, _event, _window, cx| {
                                             this.dismiss_active_question(cx);
@@ -4823,6 +4931,7 @@ impl ChatListView {
                                         })
                                         .small()
                                         .primary()
+                                        .rounded_lg()
                                         .disabled(!has_answer)
                                         .tooltip(if has_answer {
                                             "Send the selected answers"
@@ -5197,6 +5306,7 @@ impl ChatListView {
             .dropdown_caret(true)
             .outline()
             .xsmall()
+            .rounded_full()
             // Duplicate folder names are indistinguishable by label alone:
             // cap the width, keep the full path in the tooltip.
             .max_w(rems(10.0))
@@ -5272,6 +5382,7 @@ impl ChatListView {
             .dropdown_caret(true)
             .outline()
             .xsmall()
+            .rounded_full()
             .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, window, _cx| {
                 let menu = menu.check_side(gpui_component::Side::Right);
                 let local_model = work_mode_model.clone();
@@ -5332,6 +5443,7 @@ impl ChatListView {
                 .tooltip("Manage workspace skills")
                 .xsmall()
                 .outline()
+                .rounded_full()
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.model.update(cx, |state, cx| {
                         controller::dispatch(state, AppAction::OpenSettings);
@@ -5356,6 +5468,9 @@ impl ChatListView {
                     .id("composer-branch")
                     .min_w_0()
                     .flex_1()
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .truncate()
@@ -5365,6 +5480,12 @@ impl ChatListView {
                             gpui_component::tooltip::Tooltip::new(branch.clone()).build(window, cx)
                         }
                     })
+                    .child(
+                        Icon::default()
+                            .path("icons/git/branch.svg")
+                            .xsmall()
+                            .text_color(theme.muted_foreground),
+                    )
                     .child(branch)
             }));
 
@@ -6001,10 +6122,10 @@ impl ChatListView {
                 div()
                     .w(rems(21.25))
                     .p_4()
-                    .rounded_lg()
+                    .rounded_xl()
                     .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.background)
+                    .border_color(theme.border.opacity(0.8))
+                    .bg(theme.popover)
                     .shadow_lg()
                     .flex()
                     .flex_col()
@@ -6090,6 +6211,9 @@ impl ChatListView {
                     })
                     .child(
                         div()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(theme.border.opacity(0.4))
                             .text_xs()
                             .text_color(theme.muted_foreground)
                             .child("Context is compacted automatically when needed. Percent reflects the current model request."),
@@ -6262,6 +6386,7 @@ impl ChatListView {
                 .tooltip(stash_unavailable_reason.unwrap_or("Stash draft"))
                 .ghost()
                 .small()
+                .rounded_lg()
                 .disabled(stash_unavailable_reason.is_some())
                 .on_click(move |_event, window, cx| {
                     if let Some(session_id) = &do_stash_session_id {
@@ -6341,13 +6466,15 @@ impl ChatListView {
                     .flex()
                     .flex_col()
                     .justify_between()
-                    .p_2p5()
-                    .rounded_xl()
+                    .px_3p5()
+                    .pt_3()
+                    .pb_2p5()
+                    .rounded_2xl()
                     .border_1()
-                    .border_color(theme.input)
+                    .border_color(theme.border.opacity(0.8))
                     .bg(theme.popover)
                     .shadow_md()
-                    .hover(|style| style.border_color(theme.muted_foreground.opacity(0.5)))
+                    .hover(|style| style.border_color(theme.border))
                     .on_action(cx.listener(Self::paste_composer_clipboard))
                     .when(slash_completion_active, |composer| {
                         composer
@@ -6381,10 +6508,10 @@ impl ChatListView {
                             .items_center()
                             .gap_2()
                             .flex_wrap()
-                            .mt_1()
-                            .pt_1()
+                            .mt_1p5()
+                            .pt_2()
                             .border_t_1()
-                            .border_color(theme.border.opacity(0.55))
+                            .border_color(theme.border.opacity(0.35))
                             .child(
                                 div()
                                     .flex()
@@ -6418,6 +6545,7 @@ impl ChatListView {
                                             .icon(IconName::Plus)
                                             .label("Queue")
                                             .small()
+                                            .rounded_lg()
                                             .secondary()
                                             .disabled(!has_prompt)
                                             .accessibility_label("Queue message for next turn")
@@ -6443,6 +6571,7 @@ impl ChatListView {
                                             .icon(IconName::ArrowRight)
                                             .label("Steer")
                                             .small()
+                                            .rounded_lg()
                                             .primary()
                                             .disabled(!has_prompt || !supports_live_steering)
                                             .accessibility_label("Steer current turn with message")
@@ -6468,6 +6597,7 @@ impl ChatListView {
                                             .icon(IconName::CircleX)
                                             .accessibility_label("Stop generation")
                                             .small()
+                                            .rounded_lg()
                                             .danger()
                                             .tooltip("Stop generation (Esc)")
                                             .on_click(cx.listener(move |_this, _event, _window, cx| {
@@ -6485,6 +6615,7 @@ impl ChatListView {
                                 vec![
                                     Button::new("send-btn")
                                         .small()
+                                        .rounded_lg()
                                         .icon(IconName::ArrowUp)
                                         .accessibility_label(if needs_provider {
                                             "Connect a model provider in Settings before sending"
@@ -6605,13 +6736,13 @@ impl ChatListView {
             .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
             .mx_auto()
             .px_4()
-            .py_1p5()
+            .py_2()
             .flex()
             .flex_col()
             .gap_1()
             .border_t_1()
-            .border_color(theme.border.opacity(0.6))
-            .bg(theme.background);
+            .border_color(theme.border.opacity(0.4))
+            .bg(theme.secondary.opacity(0.3));
 
         let header_row = div()
             .flex()
@@ -7008,8 +7139,12 @@ impl Render for ChatListView {
                                                                 .debug_selector(|| {
                                                                     "jump-to-latest".into()
                                                                 })
+                                                                .icon(IconName::ArrowDown)
                                                                 .label("Jump to latest")
                                                                 .small()
+                                                                .secondary()
+                                                                .rounded_full()
+                                                                .shadow_md()
                                                                 .accessibility_label(
                                                                     "Jump to latest message",
                                                                 )
