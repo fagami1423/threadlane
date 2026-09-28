@@ -7,6 +7,7 @@ use super::draft_pr::{
     draft_pr_prefill, DraftPrAttemptState, DraftPrCompletion, DraftPrContextKey, DraftPrFields,
     DraftPrRemoteResult,
 };
+use super::pr_generation::{generation_prompt, PrField};
 use super::types::{
     can_create_pull_request, can_publish_branch, discard_options,
     message_generated_matches_active_project, selection_bar_discard_options, DiscardOption,
@@ -16,6 +17,22 @@ use super::view::{retain_review_selection, scan_project_tree, RightPanelView};
 
 fn paths(values: &[&str]) -> HashSet<String> {
     values.iter().map(|value| (*value).to_string()).collect()
+}
+
+#[test]
+fn pr_generation_prompt_targets_only_the_requested_field_and_caps_context() {
+    let title = generation_prompt(PrField::Title, "diff");
+    assert!(title.contains("pull request title"));
+    assert!(title.contains("Current working-tree diff:\ndiff"));
+    assert!(!title.contains("Markdown pull request description"));
+
+    let description = generation_prompt(PrField::Description, "diff");
+    assert!(description.contains("Markdown pull request description"));
+    assert!(!description.contains("pull request title"));
+
+    let oversized = "x".repeat(30_000);
+    assert!(generation_prompt(PrField::Title, &oversized).len() < 300);
+    assert!(generation_prompt(PrField::Description, &oversized).len() < 25_000);
 }
 
 #[test]
