@@ -7,17 +7,11 @@ pub(super) enum PrField {
 }
 
 pub(super) fn generation_prompt(field: PrField, diff: &str) -> String {
-    let (request, limit) = match field {
-        PrField::Title => (
-            "Return only a concise pull request title (maximum 72 characters).",
-            72,
-        ),
-        PrField::Description => (
-            "Return a concise Markdown pull request description covering the change and tests. Do not include a title.",
-            12_000,
-        ),
+    let request = match field {
+        PrField::Title => "Return only a concise pull request title (maximum 72 characters).",
+        PrField::Description => "Return a concise Markdown pull request description covering the change and tests. Do not include a title. Do not claim tests passed without evidence.",
     };
-    let diff: String = diff.chars().take(limit * 2).collect();
+    let diff: String = diff.chars().take(24_000).collect();
     format!("{request}\n\nCurrent working-tree diff:\n{diff}")
 }
 

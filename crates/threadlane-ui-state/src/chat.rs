@@ -274,3 +274,120 @@ use threadlane_runtime::titles::normalize_session_title;
         );
     }
 }
+
+/// A side request: never adds messages or permits tool execution.
+pub async fn generate_text(
+    model: String,
+    work_dir: PathBuf,
+    instruction: String,
+    prompt: String,
+) -> Result<String, String> {
+    if model.trim().is_empty() {
+        return Err("Select a model before regenerating text.".into());
+    }
+    if let Some(agent_id) = threadlane_acp_engine::acp_agent_id(&model) {
+        threadlane_acp_engine::generate_text(
+            threadlane_project::default_global_threadlane_dir(),
+            work_dir,
+            agent_id,
+            &instruction,
+            &prompt,
+        )
+        .await
+    } else {
+        let (key, account) = threadlane_coding_agent::credentials::provider_credentials(&model);
+        provider_client_for(key, account)
+            .generate_text(&model, &instruction, &prompt)
+            .await
+    }
+}
+
+pub fn conversation_title_prompt(messages: &[crate::ChatMessageInfo]) -> String {
+    let text = messages
+        .iter()
+        .filter(|m| {
+            matches!(
+                m.role,
+                crate::MessageRole::User | crate::MessageRole::Assistant
+            )
+        })
+        .map(|m| format!("{:?}: {}", m.role, m.content))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    // Keep recent conversation, not reasoning or tool output.
+    let skip = text.chars().count().saturating_sub(24_000);
+    text.chars().skip(skip).collect()
+}
+
+pub fn persist_regenerated_title(
+    session_file: &std::path::Path,
+    raw: &str,
+) -> Result<String, String> {
+    let title = normalize_session_title(raw);
+    if title.is_empty() {
+        return Err("The model returned an empty title.".into());
+    }
+    if !session_file.is_file() {
+        return Err("The session no longer exists.".into());
+    }
+    let mut store = JsonlStore::open(session_file).map_err(|e| e.to_string())?;
+    store.set_name(&title).map_err(|e| e.to_string())?;
+    Ok(title)
+}
+
+#[cfg(test)]
+mod regeneration_tests {
+    use super::{conversation_title_prompt, persist_regenerated_title};
+    use crate::{ChatMessageInfo, MessageRole};
+    use threadlane_runtime::harness::{JsonlStore, SessionStore};
+
+    fn message(role: MessageRole, content: String) -> ChatMessageInfo {
+        ChatMessageInfo {
+            id: "message".into(),
+            role,
+            content,
+            tool_activities: vec![],
+            streaming: false,
+            reasoning_content: Some("private reasoning".into()),
+            reasoning_expanded: false,
+        }
+    }
+
+    #[test]
+    fn regeneration_context_keeps_recent_conversation_and_excludes_internal_messages() {
+        let messages = vec![
+            message(MessageRole::User, "é".repeat(30_000)),
+            message(MessageRole::System, "hidden system data".into()),
+            message(MessageRole::Assistant, "Latest answer".into()),
+            message(MessageRole::User, "Latest request".into()),
+        ];
+        let prompt = conversation_title_prompt(&messages);
+        assert_eq!(prompt.chars().count(), 24_000);
+        assert!(prompt.contains("Assistant: Latest answer"));
+        assert!(prompt.ends_with("User: Latest request"));
+        assert!(!prompt.contains("hidden system data"));
+        assert!(!prompt.contains("private reasoning"));
+    }
+
+    #[test]
+    fn regenerated_title_replaces_existing_name_but_rejects_empty_or_deleted_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let mut store = JsonlStore::open(&path).unwrap();
+        store.set_name("Old title").unwrap();
+        drop(store);
+        let title = persist_regenerated_title(&path, "New title").unwrap();
+        assert_eq!(
+            JsonlStore::open_read_only(&path).unwrap().name(),
+            Some(title)
+        );
+        assert!(persist_regenerated_title(&path, "  ").is_err());
+        assert_eq!(
+            JsonlStore::open_read_only(&path).unwrap().name().as_deref(),
+            Some("New title")
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert!(persist_regenerated_title(&path, "Should not recreate").is_err());
+        assert!(!path.exists());
+    }
+}

@@ -30,8 +30,10 @@ fn pr_generation_prompt_targets_only_the_requested_field_and_caps_context() {
     assert!(description.contains("Markdown pull request description"));
     assert!(!description.contains("pull request title"));
 
+    let meaningful_diff = format!("{}\n+important change", "x".repeat(500));
+    assert!(generation_prompt(PrField::Title, &meaningful_diff).contains("+important change"));
     let oversized = "x".repeat(30_000);
-    assert!(generation_prompt(PrField::Title, &oversized).len() < 300);
+    assert!(generation_prompt(PrField::Title, &oversized).len() < 25_000);
     assert!(generation_prompt(PrField::Description, &oversized).len() < 25_000);
 }
 

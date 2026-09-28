@@ -599,7 +599,7 @@ pub async fn generate_commit_message(
     .await
 }
 
-async fn generate_text(
+pub async fn generate_text(
     global_dir: Option<PathBuf>,
     work_dir: PathBuf,
     agent_id: &str,
