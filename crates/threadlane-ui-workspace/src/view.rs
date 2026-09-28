@@ -83,7 +83,10 @@ fn open_active_close_confirmation(
                 let current: Vec<_> = current_work.iter().map(|item| item.identity.clone()).collect();
                 if threadlane_ui_state::close_work_needs_refresh(&current, &expected) {
                     window.close_dialog(cx);
-                    open_active_close_confirmation(window, cx, current_model.clone(), current_work);
+                    let model = current_model.clone();
+                    window.defer(cx, move |window, cx| {
+                        open_active_close_confirmation(window, cx, model, current_work.clone());
+                    });
                     return true;
                 }
                 window.remove_window();
