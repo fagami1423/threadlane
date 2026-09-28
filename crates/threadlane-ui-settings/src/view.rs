@@ -345,6 +345,29 @@ impl SettingsView {
         }
     }
 
+    /// Open the existing settings page for a static command-palette destination.
+    pub fn open_search_destination(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.page = match id {
+            "general" => SettingsPage::General,
+            "appearance" => SettingsPage::Appearance,
+            "keybindings" => SettingsPage::Keybindings,
+            "providers" => SettingsPage::Providers,
+            "fusion" | "subagents" => SettingsPage::Subagents,
+            "skills" => SettingsPage::Skills,
+            "extensions" => SettingsPage::Extensions,
+            "acp-agents" => SettingsPage::AcpAgents,
+            _ => return,
+        };
+        match self.page {
+            SettingsPage::Providers => self.refresh_providers_snapshot(),
+            SettingsPage::Skills => { self.capability_status = None; self.refresh_skills(cx); }
+            SettingsPage::Extensions => { self.capability_status = None; self.refresh_extensions(cx); }
+            SettingsPage::AcpAgents => { self.capability_status = None; self.refresh_acp(cx); }
+            _ => {}
+        }
+        cx.notify();
+    }
+
     fn active_project(&self, cx: &App) -> Option<std::path::PathBuf> {
         self.model.read(cx).active_work_dir.clone()
     }

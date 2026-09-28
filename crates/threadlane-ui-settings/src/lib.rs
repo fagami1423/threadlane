@@ -8,7 +8,9 @@
 
 gpui::actions!(threadlane_settings, [ActivateUpdate]);
 
+mod search;
 mod view;
+pub use search::{SETTINGS_SEARCH_ITEMS, SettingsSearchItem};
 
 pub use view::SettingsView;
 

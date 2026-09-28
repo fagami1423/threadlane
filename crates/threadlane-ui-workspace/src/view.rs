@@ -491,6 +491,11 @@ impl WorkspaceView {
                 cx.notify();
             });
 
+            let command_state_sub =
+                cx.observe(&command_state, |_this: &mut Self, _command_state, cx| {
+                    cx.notify();
+                });
+
             Self {
                 focus_handle,
                 rendered_page: model.read(cx).workspace_page,
@@ -520,7 +525,7 @@ impl WorkspaceView {
                 git_event_tx,
                 updater_tx,
                 pending_terminal_close: None,
-                _subscriptions: vec![sub, right_panel_sub],
+                _subscriptions: vec![sub, right_panel_sub, command_state_sub],
             }
         });
         view.update(cx, |view, cx| {
@@ -1415,6 +1420,39 @@ impl WorkspaceView {
         }
 
         let mut session_entries = Vec::new();
+        let settings_query = !self.command_state.read(cx).query(cx).trim().is_empty();
+        let settings_entries = if settings_query {
+            threadlane_ui_settings::SETTINGS_SEARCH_ITEMS
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let mut settings_group = CommandGroup::new().label("Settings");
+        for item in threadlane_ui_settings::SETTINGS_SEARCH_ITEMS.iter() {
+            let title = item.title;
+            let subtitle = format!("Settings · {}", item.page);
+            let keywords = item.keywords;
+            settings_group = settings_group.item(
+                CommandItem::new()
+                    .label(title)
+                    .icon(IconName::Settings)
+                    .keywords(keywords.iter().copied())
+                    .child(move |_window, cx| {
+                        let colors = cx.theme().colors;
+                        v_flex()
+                            .gap_0p5()
+                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(colors.muted_foreground)
+                                    .child(subtitle.clone()),
+                            )
+                    }),
+            );
+        }
         let mut sessions_group = CommandGroup::new().label("Sessions");
         for project in &state.projects {
             for session in &project.sessions {
@@ -1486,10 +1524,11 @@ impl WorkspaceView {
                     .child(
                         Command::new(&self.command_state)
                             .bordered(false)
-                            .placeholder("Type a command or search sessions…")
+                            .placeholder("Search commands, settings, or sessions…")
                             .max_h(rems(26.25))
                             .group(recent_group)
                             .group(commands_group)
+                            .when(settings_query, |command| command.group(settings_group))
                             .group(sessions_group)
                             .on_cancel(move |window, cx| {
                                 let _ = view_cancel.update(cx, |this, cx| {
@@ -1500,6 +1539,20 @@ impl WorkspaceView {
                             .on_confirm(move |index, window, cx| {
                                 let _ = view.update(cx, |this, cx| {
                                     close_command_palette(&mut this.command_palette_open, &mut this.command_palette_previous_focus, window, cx);
+                                    let sessions_section = if settings_query { 3 } else { 2 };
+                                    if index.section == 2 && settings_query {
+                                        if let Some(id) = settings_entries.get(index.row) {
+                                            this.model.update(cx, |state, cx| {
+                                                controller::dispatch(state, AppAction::OpenSettings);
+                                                cx.notify();
+                                            });
+                                            this.settings.update(cx, |settings, cx| {
+                                                settings.open_search_destination(id, cx)
+                                            });
+                                            cx.notify();
+                                            return;
+                                        }
+                                    }
                                     if index.section == 0 {
                                         if let Some(action_key) =
                                             this.recent_palette_actions.get(index.row)
@@ -1512,7 +1565,7 @@ impl WorkspaceView {
                                         {
                                             this.execute_palette_action(action_key, window, cx);
                                         }
-                                    } else if index.section == 2 {
+                                    } else if index.section == sessions_section {
                                         if let Some((work_dir, session_id)) =
                                             session_entries.get(index.row)
                                         {
