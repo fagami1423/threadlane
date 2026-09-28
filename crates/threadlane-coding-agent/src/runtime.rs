@@ -441,10 +441,10 @@ impl CodingAgent {
         let route = threadlane_orchestrator::evaluate_fusion_prompt(prompt, &sidekick);
         let route_note = match route {
             threadlane_orchestrator::FusionDecision::DelegateToSidekick { reason } => {
-                format!(" Initial route: delegate ({reason}).")
+                format!(" Keyword hint: consider delegation ({reason}); main validates the route.")
             }
             threadlane_orchestrator::FusionDecision::KeepOnMain { reason } => {
-                format!(" Initial route: main keeps it ({reason}).")
+                format!(" Keyword hint: investigate on main ({reason}); delegate after scope is clear.")
             }
         };
         Ok(format!(
@@ -453,10 +453,7 @@ impl CodingAgent {
     }
 
     /// Snapshot the armed Fusion main directive for this prompt, including
-    /// the classifier's initial triage. The triage suffix is what makes the
-    /// keyword router behavioral: the main agent reads the initial route in
-    /// its own context and dispatches the turn accordingly, instead of every
-    /// prompt entering the same unguided path.
+    /// an advisory keyword hint. The lead chooses the route after investigation.
     fn fusion_directive_for_prompt(&self, prompt: &str) -> Option<String> {
         let sidekick = self
             .fusion
