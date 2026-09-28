@@ -36,7 +36,7 @@ pub use super::types::{
 };
 
 pub struct RightPanelView {
-    model: Entity<AppState>,
+    pub(crate) model: Entity<AppState>,
     agents: Entity<AgentsPanel>,
     active_surface: Option<Surface>,
     visible: bool,

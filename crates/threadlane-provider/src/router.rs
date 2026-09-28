@@ -727,9 +727,24 @@ impl ProviderClient {
             "5. Do not end the subject line with a period.\n",
             "6. Output ONLY the raw commit subject line. Do NOT include quotes, backticks, bullet points, preamble, or markdown formatting."
         );
-        let prompt = Arc::new(format!(
-            "{instructions}\n\nHere is the diff of the changes:\n\n{diff}"
-        ));
+        let text = self.generate_text(&model, instructions, diff).await?;
+        let message = normalize_commit_message(&text);
+        if message.is_empty() {
+            Err("The model returned an empty commit message".into())
+        } else {
+            Ok(message)
+        }
+    }
+
+    /// Tool-free, bounded text generation using the selected provider.
+    pub async fn generate_text(
+        &self,
+        model: &str,
+        instructions: &str,
+        prompt: &str,
+    ) -> Result<String, String> {
+        let model = model.to_owned();
+        let prompt = Arc::new(prompt.to_owned());
         let instructions_str = instructions.to_string();
         let model_for_payload = model.clone();
         let payload = PayloadSource::lazy(model.clone(), move |format| {
@@ -755,7 +770,7 @@ impl ProviderClient {
                             {"role": "system", "content": instructions_str},
                             {"role": "user", "content": prompt.as_str()}
                         ],
-                        "max_tokens": 256,
+                        "max_tokens": 2048,
                         "stream": true
                     }),
                 }
@@ -767,29 +782,39 @@ impl ProviderClient {
             client.stream_chat_completion(payload, None, event_tx).await;
         });
 
-        let mut text = String::new();
-        let mut error = None;
-        while let Some(event) = event_rx.recv().await {
-            match event {
-                StreamEvent::ContentToken(token) => text.push_str(&token),
-                StreamEvent::Error(message) => error = Some(message),
-                StreamEvent::Finished { .. }
-                | StreamEvent::ReasoningToken(_)
-                | StreamEvent::ToolCallStart { .. }
-                | StreamEvent::ToolCallArgsDelta { .. } => {}
+        let received = tokio::time::timeout(TITLE_REQUEST_TIMEOUT, async {
+            let mut text = String::new();
+            let mut error = None;
+            while let Some(event) = event_rx.recv().await {
+                match event {
+                    StreamEvent::ContentToken(token) => text.push_str(&token),
+                    StreamEvent::Error(message) => error = Some(message),
+                    StreamEvent::Finished { .. }
+                    | StreamEvent::ReasoningToken(_)
+                    | StreamEvent::ToolCallStart { .. }
+                    | StreamEvent::ToolCallArgsDelta { .. } => {}
+                }
             }
-        }
+            (text, error)
+        })
+        .await;
+        let (text, error) = match received {
+            Ok(result) => result,
+            Err(_) => {
+                stream_task.abort();
+                return Err("Text generation timed out".into());
+            }
+        };
         if stream_task.await.is_err() && error.is_none() {
-            return Err("commit message generation stream terminated unexpectedly".to_owned());
+            return Err("text generation stream terminated unexpectedly".to_owned());
         }
         if let Some(error) = error {
             return Err(error);
         }
-        let message = normalize_commit_message(&text);
-        if message.is_empty() {
-            Err("The model returned an empty commit message".to_owned())
+        if text.trim().is_empty() {
+            Err("The model returned empty text".into())
         } else {
-            Ok(message)
+            Ok(text.trim().to_owned())
         }
     }
 

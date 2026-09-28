@@ -1086,6 +1086,19 @@ pub fn merge(work_dir: &Path, branch: &str) -> Result<String, GitError> {
     command(work_dir, &["merge", "--no-edit", branch])
 }
 
+/// Changes the PR contains, from the selected base's merge base through HEAD.
+/// Prefer the fetched remote base; neither the index nor working tree is included.
+pub fn draft_pr_diff(work_dir: &Path, base: &str) -> Result<String, GitError> {
+    let base = validate_branch_name(work_dir, base)?;
+    let remote = format!("refs/remotes/origin/{base}");
+    let base_ref = if command(work_dir, &["rev-parse", "--verify", &remote]).is_ok() {
+        remote
+    } else {
+        format!("refs/heads/{base}")
+    };
+    command(work_dir, &["diff", "--stat", "--patch", &format!("{base_ref}...HEAD"), "--"])
+}
+
 pub fn diff_branch(work_dir: &Path, branch: &str) -> Result<String, GitError> {
     let branch = validate_branch_name(work_dir, branch)?;
     command(

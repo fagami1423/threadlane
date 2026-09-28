@@ -28,11 +28,9 @@ fn initialize_runtime(
     cell: &OnceLock<Result<Runtime, String>>,
     build: impl FnOnce() -> std::io::Result<Runtime>,
 ) -> Result<&Runtime, String> {
-    cell.get_or_init(|| {
-        build().map_err(|error| format!("Unable to start the model runtime: {error}"))
-    })
-    .as_ref()
-    .map_err(Clone::clone)
+    cell.get_or_init(|| build().map_err(|error| format!("Unable to start the model runtime: {error}")))
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 #[cfg(test)]
@@ -50,10 +48,7 @@ mod tests {
     #[test]
     fn runtime_initialization_reuses_the_successful_runtime() {
         let cell = OnceLock::new();
-        let first = initialize_runtime(&cell, || {
-            tokio::runtime::Builder::new_current_thread().build()
-        })
-        .unwrap();
+        let first = initialize_runtime(&cell, || tokio::runtime::Builder::new_current_thread().build()).unwrap();
         let second = initialize_runtime(&cell, || panic!("must reuse runtime")).unwrap();
         assert!(std::ptr::eq(first, second));
     }
