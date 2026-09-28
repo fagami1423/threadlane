@@ -10,7 +10,7 @@ use threadlane_coding_agent::controller::SessionRuntime;
 use crate::ChatStreamEvent;
 
 pub fn executor() -> Result<&'static tokio::runtime::Runtime, String> {
-    Ok(threadlane_provider::exec::get_runtime())
+    threadlane_provider::exec::try_get_runtime()
 }
 
 pub(crate) fn execute_prompt(

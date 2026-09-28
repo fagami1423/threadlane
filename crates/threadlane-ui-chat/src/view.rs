@@ -908,7 +908,15 @@ impl ChatListView {
         }
         let model = state.selected_model.clone();
         let work_dir = session.runtime_work_dir.clone();
-        let task = threadlane_ui_state::chat::executor().unwrap().spawn(async move {
+        let runtime = match threadlane_ui_state::chat::executor() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.title_error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        let task = runtime.spawn(async move {
             threadlane_ui_state::chat::generate_text(model, work_dir,
                 "Return only a concise session title, maximum 42 Unicode characters. No Markdown, explanations or tools.".into(), prompt).await
         });
@@ -7048,6 +7056,7 @@ impl Render for ChatListView {
         };
         let session_changed = session_key != self.last_session_key;
         if session_changed {
+            self.title_error = None;
             self.clear_conversation_find();
             self.markdown_cache_namespace = session_key
                 .as_ref()

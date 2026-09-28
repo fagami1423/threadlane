@@ -23,7 +23,7 @@ fn paths(values: &[&str]) -> HashSet<String> {
 fn pr_generation_prompt_targets_only_the_requested_field_and_caps_context() {
     let title = generation_prompt(PrField::Title, "diff");
     assert!(title.contains("pull request title"));
-    assert!(title.contains("Current working-tree diff:\ndiff"));
+    assert!(title.contains("PR base-to-HEAD diff:\ndiff"));
     assert!(!title.contains("Markdown pull request description"));
 
     let description = generation_prompt(PrField::Description, "diff");
