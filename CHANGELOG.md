@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.1.30](https://github.com/wheregmis/threadlane/compare/v0.1.29...v0.1.30) (2026-09-28)
+
+
+### Features
+
+* refine sidebar ([34aeb9d](https://github.com/wheregmis/threadlane/commit/34aeb9ddb444cbd229e73456921b5c54147f84a6))
+* **sidebar:** add pins and quick filters ([bb55fd5](https://github.com/wheregmis/threadlane/commit/bb55fd59a8d7ff91314babf7dc88a676f24397ce))
+* **sidebar:** add pins and quick filters ([f704732](https://github.com/wheregmis/threadlane/commit/f70473287497fc5137124b8cac0c9a7416600fd7))
+* **sidebar:** add session status filters and activity badges ([df5314c](https://github.com/wheregmis/threadlane/commit/df5314cd034405d7f0254f76e2d75e12441e373e))
+* **ui:** improve workspace layout and compact chat controls ([775f05e](https://github.com/wheregmis/threadlane/commit/775f05eac3823c4e02738f3b34fbe84f76f1c4a2))
+* **ui:** refresh sidebar styling and branding ([6ce435d](https://github.com/wheregmis/threadlane/commit/6ce435d375d0d619217e097aba537b37444ba737))
+
+
+### Bug Fixes
+
+* defer refreshed close confirmation ([d70faa9](https://github.com/wheregmis/threadlane/commit/d70faa9d5b636c2fa4a75363aca219e5ca36f523))
+* refresh active work close confirmation ([24eb8c1](https://github.com/wheregmis/threadlane/commit/24eb8c106453db410c078b75dc01f794bd5a9aca))
+* **ui:** include scheduled turns in close warning ([35f71d1](https://github.com/wheregmis/threadlane/commit/35f71d1789ba05b069d9b10b4bf9d1ec675db0c5))
+
+
+### Maintenance
+
+* Remove obsolete Fusion enhancement notes ([5309273](https://github.com/wheregmis/threadlane/commit/53092732d8e1c043d9baf829da36c297ddb7b605))
+
 ## [0.1.29](https://github.com/wheregmis/threadlane/compare/v0.1.28...v0.1.29) (2026-09-27)
 
 
