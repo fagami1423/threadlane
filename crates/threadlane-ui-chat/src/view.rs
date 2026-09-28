@@ -1401,19 +1401,31 @@ impl ChatListView {
                                 window.dispatch_action(Box::new(crate::OpenWorkspaceReview), cx)
                             }),
                     )
-                    .children(status.remote.as_ref().map(|_| {
+                    .children(status.remote.as_ref().map(|remote| {
                         let model = self.model.clone();
+                        let repository = remote
+                            .trim()
+                            .trim_end_matches('/')
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or_default()
+                            .trim_end_matches(".git");
+                        let repository = if repository.is_empty() {
+                            "GitHub repository"
+                        } else {
+                            repository
+                        };
                         Button::new("environment-repository")
                             .debug_selector(|| "environment-repository".into())
                             .ghost()
                             .small()
                             .w_full()
                             .justify_start()
-                            .accessibility_label("Repository: open GitHub workspace")
-                            .tooltip("Open GitHub workspace")
+                            .accessibility_label(format!("{repository}: open GitHub workspace"))
+                            .tooltip(format!("Open GitHub workspace for {repository}"))
                             .child(action_content(
-                                Icon::new(IconName::Folder),
-                                "Repository".into(),
+                                Icon::new(IconName::Github),
+                                repository.to_owned().into(),
                             ))
                             .on_click(move |_, _, cx| {
                                 model.update(cx, |state, cx| {

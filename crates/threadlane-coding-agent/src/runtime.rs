@@ -441,10 +441,10 @@ impl CodingAgent {
         let route = threadlane_orchestrator::evaluate_fusion_prompt(prompt, &sidekick);
         let route_note = match route {
             threadlane_orchestrator::FusionDecision::DelegateToSidekick { reason } => {
-                format!(" Initial route: delegate ({reason}).")
+                format!(" Keyword hint: consider delegation ({reason}); main validates the route.")
             }
             threadlane_orchestrator::FusionDecision::KeepOnMain { reason } => {
-                format!(" Initial route: main keeps it ({reason}).")
+                format!(" Keyword hint: investigate on main ({reason}); delegate after scope is clear.")
             }
         };
         Ok(format!(
@@ -453,10 +453,7 @@ impl CodingAgent {
     }
 
     /// Snapshot the armed Fusion main directive for this prompt, including
-    /// the classifier's initial triage. The triage suffix is what makes the
-    /// keyword router behavioral: the main agent reads the initial route in
-    /// its own context and dispatches the turn accordingly, instead of every
-    /// prompt entering the same unguided path.
+    /// an advisory keyword hint. The lead chooses the route after investigation.
     fn fusion_directive_for_prompt(&self, prompt: &str) -> Option<String> {
         let sidekick = self
             .fusion
@@ -1541,6 +1538,43 @@ impl CodingAgent {
         input: &str,
         images: Vec<ImageAttachment>,
     ) -> Option<Result<String, String>> {
+        let first_entry = self.harness.as_ref().map_or(0, |h| h.store.entries().len());
+        let result = self.handle_input_inner(input, images).await;
+        if let Some(Err(error)) = &result {
+            // Pre-acceptance failures have no finish_harness_run to persist them.
+            // Save them before the surface reloads its durable transcript.
+            if let Some(journal) = self.harness.as_mut() {
+                let message = AgentMessage::Custom {
+                    custom_type: "agent_error".into(),
+                    payload: serde_json::json!({ "error": error }),
+                };
+                let persisted = journal.ensure_fresh().and_then(|()| {
+                    if !journal
+                        .store
+                        .entries()
+                        .iter()
+                        .skip(first_entry)
+                        .any(|entry| entry.lane == "main" && entry.message == message)
+                    {
+                        journal.append_message(message)?;
+                    }
+                    Ok(())
+                });
+                if let Err(persistence_error) = persisted {
+                    return Some(Err(format!(
+                        "{error}\nCould not save error: {persistence_error}"
+                    )));
+                }
+            }
+        }
+        result
+    }
+
+    async fn handle_input_inner(
+        &mut self,
+        input: &str,
+        images: Vec<ImageAttachment>,
+    ) -> Option<Result<String, String>> {
         self.cancellation.clear_cancellation_guard();
         if let Err(error) = self.recover_interrupted_subagent_lanes().await {
             return Some(Err(error));
@@ -1552,23 +1586,16 @@ impl CodingAgent {
             });
             return Some(Err(error));
         }
-        let adopted_harness_run = self
-            .harness_run_id
-            .lock()
-            .ok()
-            .is_some_and(|run_id| run_id.is_some());
-        if !adopted_harness_run || threadlane_acp_engine::is_acp_model(&self.agent.model()) {
-            if let Some(journal) = self.harness.as_mut() {
-                match journal.recover_abort() {
-                    Ok(_) => {}
-                    Err(error) => return Some(Err(format!("Harness Error: {error}"))),
-                }
+        // This entry point accepts a new prompt; adopted runs execute through
+        // execute_accepted_run. Stop drops the old future before its cleanup,
+        // so reconcile its journal and clear its stale handle for every provider.
+        if let Some(journal) = self.harness.as_mut() {
+            if let Err(error) = journal.recover_abort() {
+                return Some(Err(format!("Harness Error: {error}")));
             }
-            // ACP never adopts an already accepted native runtime run. A
-            // dropped turn can leave this handle behind after Stop.
-            if let Ok(mut run_id) = self.harness_run_id.lock() {
-                *run_id = None;
-            }
+        }
+        if let Ok(mut run_id) = self.harness_run_id.lock() {
+            *run_id = None;
         }
         *self
             .dispatch_parent_leaf
@@ -2357,6 +2384,7 @@ mod compaction_sync_tests {
     #[derive(Clone, Default)]
     struct RecordingProvider {
         refreshed: Arc<Mutex<Vec<(String, Option<String>)>>>,
+        block_once: Arc<Mutex<Option<Arc<tokio::sync::Notify>>>>,
     }
 
     #[async_trait]
@@ -2366,6 +2394,14 @@ mod compaction_sync_tests {
             _request: RuntimeRequest,
             events: tokio::sync::mpsc::Sender<RuntimeStreamEvent>,
         ) {
+            let started = self.block_once.lock().unwrap().take();
+            if let Some(started) = started {
+                started.notify_one();
+                std::future::pending::<()>().await;
+            }
+            let _ = events
+                .send(RuntimeStreamEvent::ContentToken("done".into()))
+                .await;
             let _ = events
                 .send(RuntimeStreamEvent::Finished {
                     tool_calls: vec![],
@@ -2406,6 +2442,7 @@ mod compaction_sync_tests {
         let refreshed = Arc::new(Mutex::new(Vec::new()));
         let provider = Arc::new(RecordingProvider {
             refreshed: refreshed.clone(),
+            ..Default::default()
         });
         let mut agent = CodingAgent::new_with_provider(
             CodingAgentOptions {
@@ -2969,6 +3006,133 @@ mod compaction_sync_tests {
             .unwrap()
             .queued
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn stopped_native_turn_accepts_next_prompt_on_same_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let started = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(RecordingProvider::default());
+        *provider.block_once.lock().unwrap() = Some(started.clone());
+        let agent = CodingAgent::new_with_provider(
+            CodingAgentOptions {
+                api_key: "test-key".into(),
+                account_id: None,
+                model: "test-model".into(),
+                work_dir: dir.path().to_path_buf(),
+                session_file: Some(path.clone()),
+                system_prompt: SystemPromptConfig::default(),
+                agent_config: None,
+                coding_config: None,
+                browser: BrowserBridge::unavailable(),
+            },
+            provider,
+        );
+        let cancellation = agent.cancellation_handle();
+        let agent = Arc::new(tokio::sync::Mutex::new(agent));
+        let running = agent.clone();
+        let turn = tokio::spawn(async move {
+            running
+                .lock()
+                .await
+                .handle_input_with_images("initial", vec![])
+                .await
+        });
+        cancellation.track_active_run(turn.abort_handle()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        cancellation.cancel().unwrap();
+        assert!(turn.await.unwrap_err().is_cancelled());
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            agent
+                .lock()
+                .await
+                .handle_input_with_images("continue", vec![])
+                .await
+        })
+        .await
+        .unwrap();
+        assert!(result.is_none(), "resume failed: {result:?}");
+        drop(agent);
+        let store = JsonlStore::open(&path).unwrap();
+        let outcomes: Vec<_> = store
+            .records()
+            .iter()
+            .filter_map(|record| match record {
+                Record::OperationFinished { outcome, .. } => Some(outcome.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            outcomes,
+            [OperationOutcome::Aborted, OperationOutcome::Completed]
+        );
+        let prompts: Vec<_> = store
+            .model_context("main")
+            .unwrap()
+            .messages()
+            .into_iter()
+            .filter_map(|message| match message {
+                AgentMessage::User { content } => Some(content),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prompts, ["initial", "continue"]);
+    }
+
+    #[tokio::test]
+    async fn pre_acceptance_error_survives_transcript_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut agent = CodingAgent::new_with_provider(
+            CodingAgentOptions {
+                api_key: "test-key".into(),
+                account_id: None,
+                model: "test-model".into(),
+                work_dir: dir.path().to_path_buf(),
+                session_file: Some(path.clone()),
+                system_prompt: SystemPromptConfig::default(),
+                agent_config: None,
+                coding_config: None,
+                browser: BrowserBridge::unavailable(),
+            },
+            Arc::new(RecordingProvider::default()),
+        );
+        agent.harness_journal_error = Some("cannot accept prompt".into());
+        let expected = "Harness Error: cannot accept prompt";
+        assert_eq!(
+            agent.handle_input_with_images("continue", vec![]).await,
+            Some(Err(expected.into()))
+        );
+        drop(agent);
+        let store = JsonlStore::open(&path).unwrap();
+        let errors: Vec<_> = store
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.message {
+                AgentMessage::Custom {
+                    custom_type,
+                    payload,
+                } if custom_type == "agent_error" => payload["error"].as_str(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors, [expected]);
+        let messages: Vec<_> = store
+            .entries()
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect();
+        let projected = threadlane_runtime::harness::project_chat_messages(&messages);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(
+            projected[0].role,
+            threadlane_runtime::harness::UiMessageRole::Error
+        );
+        assert_eq!(projected[0].content, expected);
     }
 
     impl LongToolLoopProvider {

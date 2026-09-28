@@ -150,17 +150,14 @@ impl FusionDecision {
         matches!(self, Self::DelegateToSidekick { .. })
     }
 
-    /// Model-visible triage note appended to the Fusion main directive for
-    /// this prompt. This is what makes the keyword router behavioral rather
-    /// than advisory: the main agent reads the initial route in its own
-    /// context and dispatches the turn accordingly.
+    /// Advisory triage only: the lead validates scope and risk from evidence.
     pub fn directive_suffix(&self) -> String {
         match self {
             Self::DelegateToSidekick { reason } => format!(
-                "\nInitial triage for this task: DELEGATE ({reason}). Open with the plan, hand implementation and verification to the sidekick, then review."
+                "\nInitial keyword hint: CONSIDER DELEGATION ({reason}). This is advisory, not a routing instruction or calibrated confidence. Validate scope, risk, and acceptance criteria from code evidence before choosing who implements."
             ),
             Self::KeepOnMain { reason } => format!(
-                "\nInitial triage for this task: KEEP ON MAIN ({reason}). Do the implementation yourself; use the sidekick only for isolated mechanical subtasks."
+                "\nInitial keyword hint: INVESTIGATE ON MAIN ({reason}). This is advisory, not a routing instruction or calibrated confidence. After investigation, delegate any well-defined work whose scope, risk, and acceptance criteria are understood."
             ),
         }
     }
@@ -306,8 +303,10 @@ pub fn build_fusion_main_directive(sidekick_model: &str) -> String {
         "\n\n{FUSION_MAIN_HEADER}\n\
          Sidekick model: {sidekick_model}\n\
          You are the frontier main agent. Take MINIMAL direct actions and only read what is absolutely necessary.\n\
-         For delegated tasks, first ask the sidekick to explore the code and return only relevant file snippets. Use those findings to make the plan. Then hand mechanical implementation and verification (edits, tests, lint) to the sidekick `{sidekick_model}` via `subagent` with `wait=false` when work can proceed independently; supervise it with `hub read` and `hub wait`.\n\
-         Review the resulting diff yourself. If it needs substantial edits, send precise feedback with `hub revive` on the same lane, then review again.\n\
+         Investigate enough to understand scope and risk before choosing a route. Keep exploration that determines architecture, security, or product intent on main unless the sidekick has demonstrated it can handle that work. Delegate bounded fact-finding and mechanical implementation to `{sidekick_model}`. State a short evidence-based routing reason; keyword hints never override findings.\n\
+         Every delegation brief must include: objective, constraints, owned files (or read-only scope), acceptance checks, and unresolved decisions. Ask the sidekick to surface missing requirements rather than guess. Use `subagent` with `wait=false` when work can proceed independently; supervise with `hub read` and `hub wait`.\n\
+         Reuse the same lane with `hub revive` for related follow-ups; include changed assumptions and plan updates after parent compaction. Revalidate the child's findings against current files before relying on them.\n\
+         Review the resulting diff and acceptance-check evidence yourself; a completed child run is not an accepted result. If it needs substantial edits, send precise feedback with `hub revive` on the same lane, then review again.\n\
          Make tiny corrections found during review yourself; do not launch a fresh child for a one-line fix.\n\
          Own the significant decisions yourself: the plan (`update_plan`), interpretation of ambiguity (`ask_question` — never let the sidekick guess intent), and the final review before delivery.\n\
          Keep your own context lean; let the sidekick gather its own context in its lane.\n\
@@ -323,7 +322,8 @@ pub fn build_fusion_sidekick_directive() -> String {
         "\n\n{FUSION_SIDEKICK_HEADER}\n\
          You are the cost-effective sidekick agent. Own mechanical implementation and verification: read, edit, run tests, and report back.\n\
          Do not re-plan the task or guess at ambiguous intent — surface questions through your lane output so the frontier main agent decides.\n\
-         Verify every change with the relevant checks before reporting; keep the summary concrete (files changed, commands run, outputs)."
+         Follow the delegation brief's objective, constraints, owned files, and acceptance checks. Before editing on a follow-up, revalidate relevant files and flag stale assumptions.\n\
+         Verify every change with the relevant checks before reporting. Return completion evidence: files changed, acceptance checks with commands and results (including failures or checks not run), unresolved decisions, and remaining risks. Do not claim acceptance on behalf of the lead."
     )
 }
 
@@ -368,20 +368,23 @@ mod tests {
     }
 
     #[test]
-    fn triage_suffix_is_behavioral_not_advisory() {
+    fn triage_is_advisory_even_for_risky_mechanical_wording() {
         let delegate = evaluate_fusion_prompt(
             "Remove the deprecated auth module and run the full suite",
             "flash",
         );
         let suffix = delegate.directive_suffix();
-        assert!(suffix.contains("DELEGATE"));
+        assert!(suffix.contains("CONSIDER DELEGATION"));
+        assert!(suffix.contains("advisory"));
+        assert!(suffix.contains("code evidence"));
         assert!(suffix.contains("flash"));
         let keep = evaluate_fusion_prompt(
             "Add a team selector to the search bar (cross-team search), gated on a flag",
             "flash",
         );
         let suffix = keep.directive_suffix();
-        assert!(suffix.contains("KEEP ON MAIN"));
+        assert!(suffix.contains("INVESTIGATE ON MAIN"));
+        assert!(suffix.contains("delegate any well-defined work"));
     }
 
     #[test]
@@ -439,8 +442,12 @@ mod tests {
         assert!(main.contains("update_plan"));
         assert!(main.contains("wait=false"));
         assert!(main.contains("hub revive"));
+        assert!(main.contains("owned files"));
+        assert!(main.contains("acceptance checks"));
         let side = build_fusion_sidekick_directive();
         assert!(side.contains(FUSION_SIDEKICK_HEADER));
+        assert!(side.contains("checks not run"));
+        assert!(side.contains("remaining risks"));
     }
 
     #[test]

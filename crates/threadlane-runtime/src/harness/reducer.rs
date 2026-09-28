@@ -402,7 +402,7 @@ impl ReductionContext {
             Record::AbortRequested { run_id, .. } => {
                 require_open(lane, run_id)?;
             }
-            Record::OperationFinished { run_id, .. } => {
+            Record::OperationFinished { run_id, outcome, .. } => {
                 require_open(lane, run_id)?;
                 if aux
                     .and_then(|aux| aux.incomplete_tools_by_run.get(run_id))
@@ -414,7 +414,12 @@ impl ReductionContext {
                         "operation finished with an incomplete tool batch".into(),
                     ));
                 }
-                if lane.is_some_and(|lane| lane.retry.is_some()) {
+                // Explicit cancellation also cancels a pending retry. Applying
+                // OperationFinished clears both states, including on replay.
+                if lane.is_some_and(|lane| {
+                    lane.retry.is_some()
+                        && !(lane.abort_requested && *outcome == OperationOutcome::Aborted)
+                }) {
                     return Err(ReduceError::InvalidRecord(
                         "operation finished while a retry is scheduled".into(),
                     ));

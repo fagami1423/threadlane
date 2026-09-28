@@ -1528,54 +1528,57 @@ impl RightPanelView {
         let selected_index = selected_surface.unwrap_or(0);
         div()
             .flex_none()
-            // Same 3rem bar as the chat header so the surface tabs sit on
-            // one continuous line with Chat/Trajectory/Editor. The traffic
-            // -lights clearance doesn't apply here: this panel is top-right,
-            // where the workspace floats its overlay buttons (command
-            // palette + panel toggle) instead, so clear those on the right.
-            .min_h(rems(3.0))
+            // Keep the top 3rem clear for the workspace's floating overlay
+            // buttons. Surface controls occupy a separate small row below it.
             .flex()
-            .items_center()
-            .px_3()
-            .pr(rems(5.5))
+            .flex_col()
             .border_b_1()
             .border_color(theme.title_bar_border)
             .bg(theme.title_bar)
+            .child(div().h(rems(3.0)).flex_none())
             .child(
                 div()
+                    .flex_none()
+                    .min_h(rems(2.0))
                     .flex()
                     .items_center()
-                    .gap_1()
-                    .w_full()
+                    .px_3()
                     .child(
-                        TabBar::new("right-panel-surface-tabs")
-                            .underline()
-                            .small()
-                            .selected_index(selected_index)
-                            .children(surfaces.iter().map(|surface| {
-                                Tab::new()
-                                    .label(surface.label())
-                                    .aria_label(format!("{} panel", surface.label()))
-                            }))
-                            .on_click(cx.listener(move |this, ix, _window, cx| {
-                                if let Some(surface) = Surface::all().get(*ix).copied() {
-                                    this.open_surface(surface, cx);
-                                }
-                            })),
-                    )
-                    .child(div().flex_1())
-                    .children((self.active_surface != Some(Surface::Agents)).then(|| {
-                        Button::new("right-panel-refresh")
-                            .accessibility_label("Refresh surface")
-                            .icon(Icon::default().path("icons/refresh-cw.svg"))
-                            .tooltip("Refresh surface")
-                            .ghost()
-                            .xsmall()
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.refresh_active_surface();
-                                cx.notify();
-                            }))
-                    })),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .w_full()
+                        .child(
+                            TabBar::new("right-panel-surface-tabs")
+                                .underline()
+                                .small()
+                                .selected_index(selected_index)
+                                .children(surfaces.iter().map(|surface| {
+                                    Tab::new()
+                                        .label(surface.label())
+                                        .aria_label(format!("{} panel", surface.label()))
+                                }))
+                                .on_click(cx.listener(move |this, ix, _window, cx| {
+                                    if let Some(surface) = Surface::all().get(*ix).copied() {
+                                        this.open_surface(surface, cx);
+                                    }
+                                })),
+                        )
+                        .child(div().flex_1())
+                        .children((self.active_surface != Some(Surface::Agents)).then(|| {
+                            Button::new("right-panel-refresh")
+                                .accessibility_label("Refresh surface")
+                                .icon(Icon::default().path("icons/refresh-cw.svg"))
+                                .tooltip("Refresh surface")
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.refresh_active_surface();
+                                    cx.notify();
+                                }))
+                        })),
+                ),
             )
     }
 

@@ -827,8 +827,9 @@ pub(crate) async fn revive_subagent_lane(
                 _ => None,
             });
             let safe = previous.as_ref().is_some_and(|event| {
-                event.get("compaction_generation").and_then(serde_json::Value::as_u64)
-                    == Some(state.compaction_generation)
+                // Parent compaction does not change the child's durable history.
+                state.sidekick_model == req.model
+                    && context.child_model == req.model
                     && event.get("model").and_then(serde_json::Value::as_str) == Some(req.model.as_str())
                     && event.get("workspace").and_then(serde_json::Value::as_str)
                         == context.work_dir.to_str()
@@ -836,7 +837,7 @@ pub(crate) async fn revive_subagent_lane(
                         == Some(false)
             });
             if !safe {
-                return Err("Fusion lane context is stale after compaction, workspace, or model change; start a new child".into());
+                return Err("Fusion lane workspace, isolation, or model changed; start a new child".into());
             }
         }
         let (identity, accepted) = journal.resume_subagent_lane(&req.lane_name, &prompt)?;
@@ -875,7 +876,7 @@ pub(crate) async fn revive_subagent_lane(
         isolation: None,
     });
     let candidates = discover_agents(&context.work_dir, AgentScope::Both).agents;
-    let config = candidates
+    let mut config = candidates
         .into_iter()
         .find(|candidate| candidate.name == req.agent)
         .unwrap_or_else(|| AgentDefinition {
@@ -890,6 +891,8 @@ pub(crate) async fn revive_subagent_lane(
             source: threadlane_skills::agents::AgentSource::Project,
             file_path: context.work_dir.clone(),
         });
+    // Revival reconstructs the runtime, so reinstall the same sidekick contract.
+    config.system_prompt.push_str(&threadlane_orchestrator::build_fusion_sidekick_directive());
     let permit = context
         .semaphore
         .clone()
@@ -1811,17 +1814,18 @@ mod result_tests {
     }
 
     #[tokio::test]
-    async fn fusion_revival_rejects_compacted_lane_context() {
+    async fn fusion_revival_preserves_child_history_after_parent_compaction() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         let mut journal = CodingSessionHarness::open(&path).unwrap();
-        let mut state = threadlane_orchestrator::FusionState::new(
-            "main".into(),
-            "test-model".into(),
-            None,
-        );
+        let mut state =
+            threadlane_orchestrator::FusionState::new("main".into(), "test-model".into(), None);
         journal
-            .set_fact("main", "fusion_state", serde_json::to_string(&state).unwrap())
+            .set_fact(
+                "main",
+                "fusion_state",
+                serde_json::to_string(&state).unwrap(),
+            )
             .unwrap();
         let child = journal.start_subagent_lane("worker", "edit", None).unwrap();
         journal
@@ -1859,13 +1863,76 @@ mod result_tests {
             .unwrap();
         state.compaction_generation = 1;
         journal
-            .set_fact("main", "fusion_state", serde_json::to_string(&state).unwrap())
+            .set_fact(
+                "main",
+                "fusion_state",
+                serde_json::to_string(&state).unwrap(),
+            )
             .unwrap();
         drop(journal);
-        let context = test_context(dir.path().to_path_buf(), path, None);
+        // Parent compaction is safe, but a different model or workspace is not.
+        for (model, work_dir) in [
+            ("changed-model", dir.path().to_path_buf()),
+            ("test-model", dir.path().join("different-workspace")),
+        ] {
+            let error = revive_subagent_lane(
+                ReviveLaneRequest {
+                    lane_name: child.identity.lane_name.clone(),
+                    agent: "worker".into(),
+                    task: "edit".into(),
+                    model: model.into(),
+                    message: "continue".into(),
+                },
+                test_context(work_dir, path.clone(), None),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("changed"), "{error}");
+        }
+        // Isolated worktrees still need their own recovery/integration path.
+        let mut journal = CodingSessionHarness::open(&path).unwrap();
+        let audit = |isolated| {
+            serde_json::json!({
+                "kind": "delegation", "model": "test-model", "workspace": dir.path(),
+                "isolated_workspace": isolated, "compaction_generation": 0,
+            })
+        };
+        journal
+            .record_fusion_audit(
+                &child.identity.lane_name,
+                Some(&child.identity.run_id),
+                audit(true),
+            )
+            .unwrap();
         let error = revive_subagent_lane(
             ReviveLaneRequest {
-                lane_name: child.identity.lane_name,
+                lane_name: child.identity.lane_name.clone(),
+                agent: "worker".into(),
+                task: "edit".into(),
+                model: "test-model".into(),
+                message: "continue".into(),
+            },
+            test_context(dir.path().into(), path.clone(), None),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("isolation"));
+        journal
+            .record_fusion_audit(
+                &child.identity.lane_name,
+                Some(&child.identity.run_id),
+                audit(false),
+            )
+            .unwrap();
+        drop(journal);
+        let mut context = test_context(dir.path().to_path_buf(), path.clone(), None);
+        context.child_run_override = Some((
+            Duration::from_secs(1),
+            Arc::new(|_| Box::pin(async { Ok(success("continued")) })),
+        ));
+        let result = revive_subagent_lane(
+            ReviveLaneRequest {
+                lane_name: child.identity.lane_name.clone(),
                 agent: "worker".into(),
                 task: "edit".into(),
                 model: "test-model".into(),
@@ -1874,8 +1941,31 @@ mod result_tests {
             context,
         )
         .await
-        .unwrap_err();
-        assert!(error.contains("stale"), "{error}");
+        .unwrap();
+        assert!(result.contains("Revived lane"));
+        let replay = CodingSessionHarness::open(&path).unwrap();
+        assert!(replay.store.entries().iter().any(|entry| {
+            entry.lane == child.identity.lane_name
+                && matches!(&entry.message,
+                AgentMessage::Assistant { content: Some(content), .. } if content == "done")
+        }));
+        assert_eq!(
+            replay
+                .store
+                .records()
+                .iter()
+                .filter(|record| matches!(record,
+                    threadlane_runtime::harness::Record::OperationStarted { lane, .. }
+                        if lane == &child.identity.lane_name
+                ))
+                .count(),
+            2
+        );
+        assert!(replay.store.records().iter().any(|record| matches!(record,
+            threadlane_runtime::harness::Record::FactSet { lane, value, .. }
+                if lane == &child.identity.lane_name && value.contains("revive")
+                    && value.contains("\"compaction_generation\":1")
+        )));
     }
 
     #[tokio::test]
