@@ -2737,6 +2737,7 @@ fn environment_git_shortcuts_follow_checkout(cx: &mut gpui::TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     for selector in [
         "environment-git-actions",
+        "environment-commit-and-push",
         "environment-repository",
         "environment-pr",
         "environment-sync",
@@ -2807,6 +2808,7 @@ fn environment_git_shortcuts_follow_checkout(cx: &mut gpui::TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     for selector in [
         "environment-git-actions",
+        "environment-commit-and-push",
         "environment-repository",
         "environment-pr",
         "environment-sync",
@@ -3780,4 +3782,142 @@ fn worktree_base_picker_is_scoped_to_new_worktree_tasks(cx: &mut gpui::TestAppCo
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(cx.debug_bounds("composer-worktree-base").is_none());
+}
+
+#[gpui::test]
+fn environment_git_menu_dispatches_commands_and_dismisses(cx: &mut gpui::TestAppContext) {
+    use gpui::{
+        AppContext as _, InteractiveElement as _, ParentElement as _,
+        StatefulInteractiveElement as _, Styled as _,
+    };
+    struct Host {
+        focus: gpui::FocusHandle,
+        chat: gpui::Entity<super::ChatListView>,
+        selected: std::rc::Rc<std::cell::Cell<&'static str>>,
+    }
+    impl gpui::Render for Host {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::div()
+                .id("environment-host")
+                .track_focus(&self.focus)
+                .role(gpui::Role::Application)
+                .size_full()
+                .flex()
+                .on_action(cx.listener(|this, _: &crate::OpenWorkspaceCommit, _, _| {
+                    this.selected.set("commit")
+                }))
+                .on_action(cx.listener(|this, _: &crate::PullWorkspaceBranch, _, _| {
+                    this.selected.set("pull")
+                }))
+                .on_action(cx.listener(|this, _: &crate::PushWorkspaceBranch, _, _| {
+                    this.selected.set("push")
+                }))
+                .on_action(
+                    cx.listener(|this, _: &crate::CreateWorkspacePullRequest, _, _| {
+                        this.selected.set("pr")
+                    }),
+                )
+                .on_action(cx.listener(|this, _: &crate::CreateWorkspaceBranch, _, _| {
+                    this.selected.set("branch")
+                }))
+                .child(self.chat.clone())
+        }
+    }
+    cx.update(gpui_component::init);
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::default();
+        state.is_new_task = false;
+        state.active_work_dir = Some("/project".into());
+        state.active_session_id = None;
+        let mut file = threadlane_git::GitFile::default();
+        file.path = "changed.rs".into();
+        state.git_statuses.insert(
+            "/project".into(),
+            threadlane_git::GitStatus {
+                branch: Some("feature".into()),
+                remote: Some("git@github.com:owner/repo.git".into()),
+                files: vec![file],
+                ..Default::default()
+            },
+        );
+        state
+    });
+    let retained_model = model.clone();
+    let selected = std::rc::Rc::new(std::cell::Cell::new(""));
+    let captured = selected.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| {
+            let mut chat = super::ChatListView::new(model, window, cx);
+            chat.environment_available = true;
+            chat
+        });
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
+        let host = cx.new(|_| Host {
+            chat,
+            selected: captured,
+            focus,
+        });
+        gpui_component::Root::new(host, window, cx)
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let commit = cx.debug_bounds("environment-commit-and-push").unwrap();
+    cx.simulate_click(commit.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(selected.replace(""), "commit");
+
+    for (index, command) in ["commit", "pull", "push", "pr", "branch"]
+        .into_iter()
+        .enumerate()
+    {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let menu = cx.debug_bounds("environment-git-actions").unwrap();
+        cx.simulate_click(menu.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        for _ in 0..=index {
+            cx.simulate_keystrokes("down");
+        }
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(selected.replace(""), command);
+    }
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let menu = cx.debug_bounds("environment-git-actions").unwrap();
+    cx.simulate_click(menu.center(), gpui::Modifiers::default());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(selected.get(), "", "Escape must not dispatch a Git action");
+
+    retained_model.update(cx, |state, cx| {
+        let status = state
+            .git_statuses
+            .get_mut(std::path::Path::new("/project"))
+            .unwrap();
+        status.files.clear();
+        status.remote = None;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let commit = cx.debug_bounds("environment-commit-and-push").unwrap();
+    cx.simulate_click(commit.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(selected.get(), "", "A clean checkout cannot start a commit");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let menu = cx.debug_bounds("environment-git-actions").unwrap();
+    cx.simulate_click(menu.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    // The first Down selects the disabled first row; the next skips remote-only actions.
+    cx.simulate_keystrokes("down down enter");
+    cx.run_until_parked();
+    assert_eq!(
+        selected.replace(""),
+        "branch",
+        "A local-only checkout offers branch creation, not remote operations"
+    );
 }

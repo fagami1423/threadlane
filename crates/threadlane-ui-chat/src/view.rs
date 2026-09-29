@@ -1386,20 +1386,76 @@ impl ChatListView {
                             .child(format!("{} ahead · {} behind", status.ahead, status.behind))
                     }))
                     .child(
+                        Button::new("environment-commit-and-push")
+                            .debug_selector(|| "environment-commit-and-push".into())
+                            .outline()
+                            .small()
+                            .w_full()
+                            .justify_start()
+                            .accessibility_label("Review changes to commit and push")
+                            .tooltip(
+                                "Select files and enter a message before committing and pushing",
+                            )
+                            .disabled(status.files.is_empty())
+                            .child(action_content(
+                                Icon::default().path("icons/git/commit.svg"),
+                                "Commit and push…".into(),
+                            ))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(crate::OpenWorkspaceCommit), cx)
+                            }),
+                    )
+                    .child(
                         Button::new("environment-git-actions")
                             .debug_selector(|| "environment-git-actions".into())
                             .ghost()
                             .small()
                             .w_full()
                             .justify_start()
-                            .accessibility_label("Git actions: review, commit, push, or pull")
-                            .tooltip("Review, commit, push, or pull in Git review")
+                            .accessibility_label("Git actions")
+                            .tooltip("Commit, pull, push, create a pull request or branch")
                             .child(action_content(
-                                Icon::default().path("icons/git/branch.svg"),
+                                Icon::default().path("icons/git/actions.svg"),
                                 "Git actions".into(),
                             ))
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(crate::OpenWorkspaceReview), cx)
+                            .dropdown_menu({
+                                let model = self.model.clone();
+                                move |menu, _, cx| {
+                                    let state = model.read(cx);
+                                    let status = state
+                                        .active_git_work_dir()
+                                        .and_then(|dir| state.git_statuses.get(&dir));
+                                    let has_changes = status.is_some_and(|s| !s.files.is_empty());
+                                    let can_sync = status.is_some_and(|s| {
+                                        s.remote.is_some() && s.branch.is_some() && !s.detached
+                                    });
+                                    menu.item(
+                                        PopupMenuItem::new("Commit…")
+                                            .disabled(!has_changes)
+                                            .action(Box::new(crate::OpenWorkspaceCommit)),
+                                    )
+                                    .item(
+                                        PopupMenuItem::new("Pull")
+                                            .disabled(!can_sync)
+                                            .action(Box::new(crate::PullWorkspaceBranch)),
+                                    )
+                                    .item(
+                                        PopupMenuItem::new("Push")
+                                            .disabled(!can_sync)
+                                            .action(Box::new(crate::PushWorkspaceBranch)),
+                                    )
+                                    .separator()
+                                    .item(
+                                        PopupMenuItem::new("Create draft PR…")
+                                            .disabled(!can_sync)
+                                            .action(Box::new(crate::CreateWorkspacePullRequest)),
+                                    )
+                                    .item(
+                                        PopupMenuItem::new("Create branch…")
+                                            .disabled(status.is_none())
+                                            .action(Box::new(crate::CreateWorkspaceBranch)),
+                                    )
+                                }
                             }),
                     )
                     .children(status.remote.as_ref().map(|remote| {

@@ -13,6 +13,11 @@ gpui::actions!(
     [
         OpenWorkspaceReview,
         OpenWorkspaceBranches,
+        OpenWorkspaceCommit,
+        PullWorkspaceBranch,
+        PushWorkspaceBranch,
+        CreateWorkspacePullRequest,
+        CreateWorkspaceBranch,
         OpenWorkspaceFiles,
         OpenWorkspaceAgents
     ]

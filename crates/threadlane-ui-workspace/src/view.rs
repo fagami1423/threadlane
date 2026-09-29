@@ -2499,22 +2499,73 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::toggle_command_palette))
             .on_action(cx.listener(Self::toggle_sidebar_action))
             .on_action(cx.listener(Self::toggle_right_panel_action))
-            .on_action(cx.listener(|this, _: &threadlane_ui_chat::OpenWorkspaceReview, _, cx| {
-                this.open_git_review(cx);
-            }))
-            .on_action(cx.listener(|this, _: &threadlane_ui_chat::OpenWorkspaceBranches, _, cx| {
-                this.open_git_branches(cx);
-            }))
-            .on_action(cx.listener(|this, _: &threadlane_ui_chat::OpenWorkspaceFiles, _, cx| {
-                this.right_panel_visible = true;
-                this.right_panel.update(cx, |panel, cx| {
-                    panel.open_surface(threadlane_ui_right_panel::Surface::Files, cx);
-                });
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &threadlane_ui_chat::OpenWorkspaceAgents, _, cx| {
-                this.open_agents_panel(cx);
-            }))
+            .on_action(
+                cx.listener(|this, _: &threadlane_ui_chat::OpenWorkspaceReview, _, cx| {
+                    this.open_git_review(cx);
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _: &threadlane_ui_chat::OpenWorkspaceBranches, _, cx| {
+                    this.open_git_branches(cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &threadlane_ui_chat::OpenWorkspaceCommit, window, cx| {
+                    this.open_git_review(cx);
+                    this.right_panel
+                        .update(cx, |panel, cx| panel.open_commit(window, cx));
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &threadlane_ui_chat::PullWorkspaceBranch, window, cx| {
+                    this.open_git_review(cx);
+                    this.right_panel.update(cx, |panel, cx| {
+                        panel.run_git_action(
+                            threadlane_ui_right_panel::GitAction::Pull,
+                            window,
+                            cx,
+                        );
+                    });
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &threadlane_ui_chat::PushWorkspaceBranch, window, cx| {
+                    this.open_git_review(cx);
+                    this.right_panel.update(cx, |panel, cx| {
+                        panel.run_git_action(
+                            threadlane_ui_right_panel::GitAction::Push,
+                            window,
+                            cx,
+                        );
+                    });
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &threadlane_ui_chat::CreateWorkspacePullRequest, window, cx| {
+                    this.open_git_review(cx);
+                    this.right_panel
+                        .update(cx, |panel, cx| panel.open_draft_pr_dialog(window, cx));
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &threadlane_ui_chat::CreateWorkspaceBranch, window, cx| {
+                    this.open_git_new_branch(window, cx);
+                },
+            ))
+            .on_action(
+                cx.listener(|this, _: &threadlane_ui_chat::OpenWorkspaceFiles, _, cx| {
+                    this.right_panel_visible = true;
+                    this.right_panel.update(cx, |panel, cx| {
+                        panel.open_surface(threadlane_ui_right_panel::Surface::Files, cx);
+                    });
+                    cx.notify();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &threadlane_ui_chat::OpenWorkspaceAgents, _, cx| {
+                    this.open_agents_panel(cx);
+                }),
+            )
             .on_action(cx.listener(Self::toggle_terminal_action))
             .on_action(cx.listener(Self::begin_new_task_action))
             .on_action(cx.listener(Self::open_settings_action))
