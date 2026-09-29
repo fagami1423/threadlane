@@ -1595,7 +1595,7 @@ impl RightPanelView {
                         .w_full()
                         .child(
                             TabBar::new("right-panel-surface-tabs")
-                                .underline()
+                                .segmented()
                                 .small()
                                 .selected_index(selected_index)
                                 .children(surfaces.iter().map(|surface| {
@@ -3907,7 +3907,7 @@ impl RightPanelView {
             .px_3()
             .child(
                 TabBar::new("review-sub-tabs")
-                    .underline()
+                    .segmented()
                     .small()
                     .selected_index(if changes_active { 0 } else { 1 })
                     .children(vec![

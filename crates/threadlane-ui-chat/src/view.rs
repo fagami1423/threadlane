@@ -7,7 +7,9 @@ use std::time::Duration;
 use base64::Engine as _;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::button::{Button, ButtonVariants, Toggle, ToggleVariants};
+use gpui_component::button::{
+    Button, ButtonCustomVariant, ButtonVariants, Toggle, ToggleVariants,
+};
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_component::notification::Notification;
@@ -930,6 +932,10 @@ impl ChatListView {
         } else {
             "Editor".to_string()
         };
+        let segment_style = ButtonCustomVariant::new(cx)
+            .color(theme.muted.opacity(0.45))
+            .hover(theme.secondary)
+            .active(theme.secondary_active);
 
         let status_badge = match active_attention {
             SessionAttention::NeedsYou => Some(
@@ -1045,13 +1051,16 @@ impl ChatListView {
                         })),
                 )
             })
+            // Segmented control (t3code/synara pattern): muted segment chips
+            // with the active surface raised; kept as direct children so the
+            // header's flex_wrap can still stack them on narrow widths.
             .child(
                 Button::new("central-tab-chat")
                     .debug_selector(|| "central-tab-chat".into())
                     .label("Chat")
                     .tooltip("Chat (⌘1)")
                     .accessibility_label("Chat (⌘1)")
-                    .ghost()
+                    .custom(segment_style)
                     .small()
                     .rounded_full()
                     .selected(self.current_tab == CentralTab::Chat)
@@ -1063,7 +1072,7 @@ impl ChatListView {
                     .label("Trajectory")
                     .tooltip("Trajectory (⌘2)")
                     .accessibility_label("Trajectory (⌘2)")
-                    .ghost()
+                    .custom(segment_style)
                     .small()
                     .rounded_full()
                     .selected(self.current_tab == CentralTab::Trajectory)
@@ -1084,7 +1093,7 @@ impl ChatListView {
                             String::new()
                         }
                     ))
-                    .ghost()
+                    .custom(segment_style)
                     .small()
                     .rounded_full()
                     .selected(self.current_tab == CentralTab::Editor)
@@ -4100,11 +4109,27 @@ impl ChatListView {
                     ))
             });
 
-        let suggestions = [
-            ("Explore repository", "Explore repository architecture and key workflows"),
-            ("Plan feature", "Plan an end-to-end feature implementation"),
-            ("Run tests", "Run the test suite and diagnose any issues"),
-            ("Review changes", "Review uncommitted git status and diffs"),
+        let suggestions: [(SharedString, &str, Icon); 4] = [
+            (
+                "Explore repository".into(),
+                "Explore repository architecture and key workflows",
+                Icon::from(IconName::Search),
+            ),
+            (
+                "Plan feature".into(),
+                "Plan an end-to-end feature implementation",
+                Icon::default().path("icons/square-pen.svg"),
+            ),
+            (
+                "Run tests".into(),
+                "Run the test suite and diagnose any issues",
+                Icon::from(IconName::Play),
+            ),
+            (
+                "Review changes".into(),
+                "Review uncommitted git status and diffs",
+                Icon::default().path("icons/git/compare.svg"),
+            ),
         ];
         let input_state = self.input_state.clone();
 
@@ -4115,19 +4140,18 @@ impl ChatListView {
             .flex_col()
             .items_center()
             .justify_center()
-            .gap_3()
+            .gap_4()
             .px_4()
             .pb_16()
             .child(
                 div()
                     .id("new-task-mark")
                     .aria_label("Threadlane")
-                    .size(rems(3.5))
+                    .size(rems(4.))
                     .rounded_2xl()
-                    .bg(theme.accent.opacity(0.16))
+                    .bg(theme.accent.opacity(0.10))
                     .border_1()
-                    .border_color(theme.accent.opacity(0.4))
-                    .shadow_sm()
+                    .border_color(theme.accent.opacity(0.22))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -4135,7 +4159,7 @@ impl ChatListView {
                     .child(
                         Icon::default()
                             .path("icons/threadlane.svg")
-                            .size_7(),
+                            .size_8(),
                     ),
             )
             .child(
@@ -4163,12 +4187,13 @@ impl ChatListView {
                     .flex_wrap()
                     .justify_center()
                     .gap_2()
-                    .max_w(rems(36.0))
-                    .mt_3()
-                    .children(suggestions.into_iter().map(|(label, prompt)| {
+                    .max_w(rems(40.0))
+                    .mt_4()
+                    .children(suggestions.into_iter().map(|(label, prompt, icon)| {
                         let input = input_state.clone();
                         let prompt_str = prompt.to_string();
                         Button::new(SharedString::from(format!("suggestion-{label}")))
+                            .icon(icon)
                             .label(label)
                             .tooltip(prompt)
                             .outline()
