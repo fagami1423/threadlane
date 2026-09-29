@@ -37,6 +37,9 @@ pub use super::types::{
 pub struct RightPanelView {
     pub(crate) model: Entity<AppState>,
     agents: Entity<AgentsPanel>,
+    /// Live trajectory surface mounted from the workspace (owned by
+    /// threadlane-ui-chat; injected type-erased to keep this crate chat-free).
+    trajectory_view: Option<AnyView>,
     active_surface: Option<Surface>,
     visible: bool,
     project: Option<PathBuf>,
@@ -281,6 +284,7 @@ impl RightPanelView {
         let mut panel = Self {
             model,
             agents,
+            trajectory_view: None,
             active_surface: None,
             visible: false,
             project: None,
@@ -537,6 +541,13 @@ impl RightPanelView {
         base_input.update(cx, |input, cx| input.focus(window, cx));
     }
 
+    /// Mounts the workspace-owned trajectory surface. `AnyView` keeps this
+    /// crate independent of threadlane-ui-chat while letting the same live
+    /// view render inside the right panel.
+    pub fn set_trajectory_view(&mut self, view: AnyView) {
+        self.trajectory_view = Some(view);
+    }
+
     pub fn open_surface(&mut self, surface: Surface, cx: &mut Context<Self>) {
         self.sync_project(cx);
         if self.active_surface != Some(surface) {
@@ -561,6 +572,9 @@ impl RightPanelView {
         let tx = self.event_tx.clone();
         std::thread::spawn(move || match surface {
             Surface::Agents => {}
+            Surface::Trajectory => {
+                // Renders live off AppState; nothing to fetch.
+            }
             Surface::Files => {
                 let nodes = scan_project_tree(&project, 500);
                 let _ = tx.send(PanelEvent::FilesLoaded { project, nodes });
@@ -1610,7 +1624,7 @@ impl RightPanelView {
                                 })),
                         )
                         .child(div().flex_1())
-                        .children((self.active_surface != Some(Surface::Agents)).then(|| {
+                        .children((!matches!(self.active_surface, Some(Surface::Agents | Surface::Trajectory))).then(|| {
                             Button::new("right-panel-refresh")
                                 .accessibility_label("Refresh surface")
                                 .icon(Icon::default().path("icons/refresh-cw.svg"))
@@ -5463,7 +5477,10 @@ impl Render for RightPanelView {
         self.sync_pending_document(window, cx);
         let theme = cx.theme().colors;
         let unavailable_non_browser = self.worktree_unavailable
-            && !matches!(self.active_surface, Some(Surface::Browser | Surface::Agents));
+            && !matches!(
+                self.active_surface,
+                Some(Surface::Browser | Surface::Agents | Surface::Trajectory)
+            );
         let body = if unavailable_non_browser {
             self.render_empty(
                 "Worktree unavailable",
@@ -5473,6 +5490,13 @@ impl Render for RightPanelView {
         } else {
             match self.active_surface {
                 None => self.render_chooser(cx).into_any_element(),
+                Some(Surface::Trajectory) => self
+                    .trajectory_view
+                    .clone()
+                    .map(|view| view.into_any_element())
+                    .unwrap_or_else(|| {
+                        self.render_empty("Trajectory", "Trajectory is unavailable", cx)
+                    }),
                 Some(Surface::Agents) => self.agents.clone().into_any_element(),
                 Some(Surface::Review) if self.document_title.is_some() => self.render_files(cx),
                 Some(Surface::Review) => self.render_review(window, cx),
