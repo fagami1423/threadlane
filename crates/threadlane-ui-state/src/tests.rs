@@ -4653,6 +4653,10 @@ fn worktree_setup_failure_and_cancellation_are_scoped_to_the_session() {
         state.requested_composer_inserts.last().unwrap().text,
         "Fix login"
     );
+    assert!(!file.exists());
+    assert!(state.projects[0].sessions.is_empty());
+    assert!(discover_sessions_in_project(&setup.project).is_empty());
+    crate::worktree_setup::persist_request(&setup).unwrap();
     // A live worker keeps ownership until completion, even after the UI returns to a draft.
     setup
         .cancelled
@@ -4664,7 +4668,44 @@ fn worktree_setup_failure_and_cancellation_are_scoped_to_the_session() {
     assert!(state
         .remove_session(setup.project.clone(), id.clone(), true)
         .is_err());
+    assert!(file.exists());
+    // Simulate creation finishing after cancellation but before the worker acknowledgement.
+    run_git(&setup.project, &["init", "-q", "-b", "main"]);
+    run_git(
+        &setup.project,
+        &["config", "user.email", "test@example.com"],
+    );
+    run_git(&setup.project, &["config", "user.name", "Test"]);
+    run_git(
+        &setup.project,
+        &["commit", "--allow-empty", "-qm", "initial"],
+    );
+    let branch = "worktree/fix-login-setup";
+    threadlane_git::create_worktree_from(&setup.project, &setup.worktree, branch, "main").unwrap();
+    let commit = threadlane_git::list_commits(&setup.worktree, 1).unwrap()[0]
+        .sha
+        .clone();
+    for (key, value) in [
+        ("git_branch", branch),
+        ("worktree_setup_commit", commit.as_str()),
+    ] {
+        threadlane_coding_agent::harness::CodingSessionHarness::append_fact_to_path(
+            &file, "main", key, value, None,
+        )
+        .unwrap();
+    }
+    std::fs::write(setup.worktree.join("user.txt"), "keep me").unwrap();
+    assert!(crate::worktree_setup::cleanup_cancelled(&setup).is_err());
+    assert!(file.exists());
+    std::fs::remove_file(setup.worktree.join("user.txt")).unwrap();
     state.finish_worktree_setup(&id, Err("late result".into()));
+    assert!(!file.exists());
+    assert!(!setup.worktree.exists());
+    assert!(discover_sessions_in_project(&setup.project).is_empty());
+    assert!(!threadlane_git::worktree_bases(&setup.project)
+        .unwrap()
+        .1
+        .contains(&branch.to_string()));
     assert!(!state.worktree_setups.contains_key(&id));
     assert!(state.active_session_id.is_none());
     assert!(state.session_status.is_none());

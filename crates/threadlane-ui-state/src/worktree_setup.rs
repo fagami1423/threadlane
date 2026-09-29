@@ -142,7 +142,17 @@ pub(crate) fn start(
                         &request.base,
                     )
                     .map_err(|e| e.to_string())?;
-                    for (key, value) in [("git_branch", branch), ("worktree_base", request.base)] {
+                    let commit = threadlane_git::list_commits(&request.worktree, 1)
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .next()
+                        .ok_or("Prepared worktree has no commit")?
+                        .sha;
+                    for (key, value) in [
+                        ("git_branch", branch),
+                        ("worktree_base", request.base),
+                        ("worktree_setup_commit", commit),
+                    ] {
                         threadlane_coding_agent::harness::CodingSessionHarness::append_fact_to_path(
                             &request.session_file, "main", key, &value, None,
                         ).map_err(|e| e.to_string())?;
@@ -249,6 +259,43 @@ pub(crate) fn recover(session: &SessionInfo) -> Option<WorktreeSetup> {
     setup.error =
         Some("Setup was interrupted. Retry to continue, or cancel to recover your message.".into());
     Some(setup)
+}
+
+/// Only discard an unstarted session and the unchanged checkout recorded by its creator.
+pub(crate) fn cleanup_cancelled(setup: &WorktreeSetup) -> Result<(), String> {
+    let store = JsonlStore::open_read_only(&setup.session_file).map_err(|e| e.to_string())?;
+    if !store.entries().is_empty() {
+        return Err("The session has recorded work; keep it for manual cleanup".into());
+    }
+    let facts = store.facts();
+    let branch = facts.get("git_branch");
+    if setup.worktree.exists() {
+        let current = threadlane_git::current_branch(&setup.worktree).map_err(|e| e.to_string())?;
+        if branch.is_none() || current.as_ref() != branch {
+            return Err(
+                "The checkout is not owned by this setup; keep it for manual cleanup".into(),
+            );
+        }
+        let commit = threadlane_git::list_commits(&setup.worktree, 1).map_err(|e| e.to_string())?;
+        if facts.get("worktree_setup_commit") != commit.first().map(|c| &c.sha) {
+            return Err("The checkout has changed; keep it for manual cleanup".into());
+        }
+        let dirty = threadlane_git::inspect(&setup.worktree)
+            .map_err(|e| e.to_string())?
+            .files
+            .iter()
+            .any(|file| !(file.is_untracked() && file.path.starts_with(".threadlane/")));
+        if dirty {
+            return Err("The checkout contains changes; keep it for manual cleanup".into());
+        }
+        threadlane_git::remove_worktree(&setup.project, &setup.worktree, true)
+            .map_err(|e| e.to_string())?;
+        // The branch still points at the original setup commit, verified above.
+        threadlane_git::delete_branch(&setup.project, branch.unwrap(), true)
+            .map_err(|e| e.to_string())?;
+    }
+    drop(store);
+    std::fs::remove_file(&setup.session_file).map_err(|e| e.to_string())
 }
 
 pub(crate) fn clear_request(setup: &WorktreeSetup) {

@@ -2292,6 +2292,26 @@ impl AppState {
         }
     }
 
+    fn cleanup_cancelled_worktree(&mut self, setup: &crate::worktree_setup::WorktreeSetup) {
+        self.drop_session_runtime(&setup.session_file);
+        self.worktree_setups.remove(&setup.session_id);
+        match crate::worktree_setup::cleanup_cancelled(setup) {
+            Ok(()) => {
+                if let Some(project) = self
+                    .projects
+                    .iter_mut()
+                    .find(|p| p.work_dir == setup.project)
+                {
+                    project.sessions.retain(|s| s.id != setup.session_id);
+                }
+            }
+            Err(error) => {
+                self.session_status = Some(format!("Could not clean up cancelled setup: {error}"));
+            }
+        }
+        self.request_session_refresh(&setup.project);
+    }
+
     fn finish_worktree_setup(
         &mut self,
         id: &str,
@@ -2302,12 +2322,12 @@ impl AppState {
         };
         let active = self.active_session_id.as_deref() == Some(id);
         if setup.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-            self.worktree_setups.remove(id);
-            self.request_session_refresh(&setup.project);
+            drop(result);
             if active {
                 self.is_generating = false;
                 self.session_status = Some("Worktree setup cancelled".into());
             }
+            self.cleanup_cancelled_worktree(&setup);
             return;
         }
         let result = result.and_then(|prepared| {
@@ -4539,7 +4559,13 @@ impl AppState {
                     if self.is_new_task && self.active_work_dir.as_ref() == Some(&project) {
                         match result {
                             Ok((default, branches)) => {
-                                self.draft_worktree_base.get_or_insert(default);
+                                if !self
+                                    .draft_worktree_base
+                                    .as_ref()
+                                    .is_some_and(|base| branches.contains(base))
+                                {
+                                    self.draft_worktree_base = Some(default);
+                                }
                                 self.draft_worktree_bases = branches;
                             }
                             Err(error) => {
@@ -5289,6 +5315,9 @@ impl AppState {
                 self.begin_new_task();
                 self.draft_worktree_base = Some(setup.base.clone());
                 self.set_work_mode(WorkMode::Worktree);
+                if setup.error.is_some() {
+                    self.cleanup_cancelled_worktree(&setup);
+                }
                 self.requested_composer_inserts
                     .push(RequestedComposerInsert {
                         text: setup.text,

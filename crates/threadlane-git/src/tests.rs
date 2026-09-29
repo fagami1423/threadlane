@@ -1386,3 +1386,49 @@ fn worktree_from_selected_base_preserves_checkout_and_rejects_bad_refs() {
     assert!(!root.join("bad").exists());
     assert!(create_worktree_from(root, &root.join("other"), "worktree/fix-login", "main").is_err());
 }
+
+#[test]
+fn worktree_bases_refreshes_refs_and_selects_only_existing_defaults() {
+    let remote = tempdir().unwrap();
+    let local = tempdir().unwrap();
+    run_git(remote.path(), &["init", "-q", "-b", "main"]);
+    run_git(remote.path(), &["config", "user.email", "test@example.com"]);
+    run_git(remote.path(), &["config", "user.name", "Test"]);
+    run_git(
+        remote.path(),
+        &["commit", "--allow-empty", "-qm", "initial"],
+    );
+    run_git(remote.path(), &["branch", "obsolete"]);
+    run_git(local.path(), &["init", "-q", "-b", "trunk"]);
+    assert!(worktree_bases(local.path()).is_err());
+    run_git(local.path(), &["config", "user.email", "test@example.com"]);
+    run_git(local.path(), &["config", "user.name", "Test"]);
+    run_git(local.path(), &["commit", "--allow-empty", "-qm", "local"]);
+    assert_eq!(worktree_bases(local.path()).unwrap().0, "trunk");
+    run_git(
+        local.path(),
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
+    assert_eq!(worktree_bases(local.path()).unwrap().0, "origin/main");
+    run_git(remote.path(), &["branch", "-D", "obsolete"]);
+    run_git(remote.path(), &["branch", "new-base"]);
+    run_git(remote.path(), &["commit", "--allow-empty", "-qm", "moved"]);
+    let (default, branches) = worktree_bases(local.path()).unwrap();
+    assert_eq!(default, "origin/main");
+    assert!(branches.contains(&"origin/new-base".to_string()));
+    assert!(!branches.contains(&"origin/obsolete".to_string()));
+    assert_eq!(
+        command(local.path(), &["rev-parse", "origin/main"]).unwrap(),
+        command(remote.path(), &["rev-parse", "HEAD"]).unwrap()
+    );
+    run_git(
+        local.path(),
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "/nonexistent/threadlane-test-remote",
+        ],
+    );
+    assert_eq!(worktree_bases(local.path()).unwrap(), (default, branches));
+}

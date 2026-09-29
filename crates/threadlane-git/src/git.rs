@@ -1377,6 +1377,8 @@ pub fn create_worktree_from(
 
 /// Local and fetched remote branches suitable as worktree starting points.
 pub fn worktree_bases(repo: &Path) -> Result<(String, Vec<String>), GitError> {
+    // This runs on the setup worker; retain cached bases when offline.
+    let _ = fetch(repo);
     let branches: Vec<String> = command(
         repo,
         &[
@@ -1401,8 +1403,20 @@ pub fn worktree_bases(repo: &Path) -> Result<(String, Vec<String>), GitError> {
     )
     .ok()
     .map(|s| s.trim().to_owned())
-    .or_else(|| discover_default_branch(repo))
-    .or_else(|| current_branch(repo).ok().flatten())
+    .filter(|name| branches.contains(name))
+    .or_else(|| {
+        discover_default_branch(repo).and_then(|name| {
+            [format!("origin/{name}"), name]
+                .into_iter()
+                .find(|candidate| branches.contains(candidate))
+        })
+    })
+    .or_else(|| {
+        current_branch(repo)
+            .ok()
+            .flatten()
+            .filter(|name| branches.contains(name))
+    })
     .ok_or_else(|| GitError::new(repo, "Commit a change before creating a worktree"))?;
     Ok((default, branches))
 }
