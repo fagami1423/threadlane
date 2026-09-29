@@ -1816,6 +1816,102 @@ fn completed_activity_disclosure_renders_interactive_tool_rows(cx: &mut gpui::Te
 
 }
 
+// Check the painted content masks, not only the outer button bounds: Button's
+// inner label clips children even when the disclosure itself has enough height.
+#[gpui::test]
+fn transcript_disclosure_badges_are_not_vertically_clipped(cx: &mut gpui::TestAppContext) {
+    use gpui::{AppContext as _, ParentElement as _, Styled as _};
+    use gpui_component::ActiveTheme as _;
+
+    struct Harness {
+        chat: gpui::Entity<super::ChatListView>,
+        message: ChatMessageInfo,
+    }
+    impl gpui::Render for Harness {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            self.chat.update(cx, |chat, cx| {
+                gpui::div()
+                    .size_full()
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .children(chat.render_reasoning_block(&self.message, cx))
+                    .children(chat.render_tool_activities_block(
+                        &self.message.id,
+                        &self.message.tool_activities,
+                        cx,
+                    ))
+            })
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let model = cx.new(|_| threadlane_ui_state::AppState::default());
+    let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let capture = holder.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        let host = cx.new(|_| Harness {
+            chat,
+            message: ChatMessageInfo {
+                id: "disclosure-layout".into(),
+                role: MessageRole::Assistant,
+                content: String::new(),
+                tool_activities: (0..2)
+                    .map(|index| ToolActivityInfo {
+                        id: format!("tool-{index}"),
+                        category: "Completed".into(),
+                        title: "read_file".into(),
+                        display_summary: "Read source file".into(),
+                        detail: "Source content".into(),
+                        is_expanded: false,
+                    })
+                    .collect(),
+                streaming: false,
+                reasoning_content: Some("Reasoning detail.".into()),
+                reasoning_expanded: false,
+            },
+        });
+        *capture.borrow_mut() = Some(host.clone());
+        gpui_component::Root::new(host, window, cx)
+    });
+    let host = holder.borrow_mut().take().unwrap();
+
+    for font_size in [14.0, 16.0, 20.0] {
+        for width in [320.0, 800.0] {
+            for expanded in [false, true] {
+                cx.update(|_, cx| {
+                    gpui_component::Theme::global_mut(cx).font_size = gpui::px(font_size);
+                });
+                host.update(cx, |host, cx| {
+                    host.message.reasoning_expanded = expanded;
+                    host.message.streaming = expanded;
+                    cx.notify();
+                });
+                cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(800.0)));
+                cx.run_until_parked();
+                cx.update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    let badges = window.painted_quads().into_iter()
+                        .filter(|quad| quad.background == gpui::Background::from(cx.theme().secondary))
+                        .collect::<Vec<_>>();
+                    assert_eq!(badges.len(), 2, "both disclosure badges must be painted");
+                    for badge in badges {
+                        let visible = badge.bounds.intersect(&badge.content_mask.bounds);
+                        assert_eq!(visible.size.height, badge.bounds.size.height,
+                            "badge clipped at font={font_size}, width={width}, expanded={expanded}: {badge:?}");
+                    }
+                });
+            }
+        }
+    }
+}
+
 #[gpui::test]
 fn reasoning_disclosure_supports_keyboard_and_pauses_following(cx: &mut gpui::TestAppContext) {
     use gpui::AppContext as _;
