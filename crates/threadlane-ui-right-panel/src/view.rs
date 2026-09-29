@@ -1517,7 +1517,7 @@ impl RightPanelView {
             .flex_none()
             .px_3()
             .py_1p5()
-            .bg(theme.muted.opacity(0.12))
+            .bg(theme.list_head)
             .text_xs()
             .child(
                 div()
@@ -2057,6 +2057,9 @@ impl RightPanelView {
             .document_title
             .as_deref()
             .is_some_and(|title| title == format!("Review · {path}").as_str());
+        // Row actions reveal on hover/focus (same trailing-slot pattern as the
+        // sidebar's hover actions); keep them visible when the row is engaged.
+        let actions_reveal = is_selected || is_open;
 
         let (status_color, status_bg) = match file.status_char() {
             'A' | '?' => (theme.success, theme.success.opacity(0.15)),
@@ -2073,6 +2076,9 @@ impl RightPanelView {
                 .accessibility_label("Unstage file")
                 .ghost()
                 .xsmall()
+                .opacity(if actions_reveal { 1.0 } else { 0.0 })
+                .group_hover("review-file-row", |style| style.opacity(1.0))
+                .focus_visible(|style| style.opacity(1.0))
                 .tooltip("Unstage file")
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.run_git_action(GitAction::UnstageFile(stage_path.clone()), window, cx);
@@ -2083,6 +2089,9 @@ impl RightPanelView {
                 .accessibility_label("Stage file")
                 .ghost()
                 .xsmall()
+                .opacity(if actions_reveal { 1.0 } else { 0.0 })
+                .group_hover("review-file-row", |style| style.opacity(1.0))
+                .focus_visible(|style| style.opacity(1.0))
                 .tooltip("Stage file")
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.run_git_action(GitAction::StageFile(stage_path.clone()), window, cx);
@@ -2096,6 +2105,9 @@ impl RightPanelView {
             .accessibility_label("Discard changes")
             .ghost()
             .xsmall()
+            .opacity(if actions_reveal { 1.0 } else { 0.0 })
+            .group_hover("review-file-row", |style| style.opacity(1.0))
+            .focus_visible(|style| style.opacity(1.0))
             .tooltip("Discard changes")
             .on_click(cx.listener(move |_this, _, window, cx| {
                 Self::handle_discard_option(
@@ -2112,6 +2124,9 @@ impl RightPanelView {
             .accessibility_label("Open diff")
             .ghost()
             .xsmall()
+            .opacity(if actions_reveal { 1.0 } else { 0.0 })
+            .group_hover("review-file-row", |style| style.opacity(1.0))
+            .focus_visible(|style| style.opacity(1.0))
             .tooltip("Open diff")
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_file_diff(diff_path_btn.clone(), cx);
@@ -2119,6 +2134,7 @@ impl RightPanelView {
 
         div()
             .id(row_id)
+            .group("review-file-row")
             .h_8()
             .mx_2()
             .px_2()
@@ -2586,8 +2602,8 @@ impl RightPanelView {
             .py_2()
             .gap_2()
             .border_b_1()
-            .border_color(theme.border.opacity(0.8))
-            .bg(theme.muted.opacity(0.18))
+            .border_color(theme.border)
+            .bg(theme.list_head)
             .child(
                 Button::new("git-branch-selector-btn")
                     .accessibility_label(format!("Manage branches, current branch {branch}"))
@@ -2675,11 +2691,13 @@ impl RightPanelView {
                 .flex()
                 .flex_col()
                 .gap_1p5()
-                .px_3()
-                .py_2p5()
-                .border_b_1()
-                .border_color(theme.border.opacity(0.7))
-                .bg(theme.muted.opacity(0.16))
+                .mx_3()
+                .my_2()
+                .p_2p5()
+                .rounded_lg()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.group_box)
                 .child(
                     Button::new("pr-card-toggle")
                         .accessibility_label(if pr_expanded {
@@ -2917,7 +2935,7 @@ impl RightPanelView {
         let diff_ratio_bar = (total_delta > 0).then(|| {
             let add_pct = Self::diff_addition_percent(total_additions_all, total_deletions_all);
             let del_pct = 100.0 - add_pct;
-            div().px_3().py_1().child(
+            div().px_3().py_0p5().child(
                 div()
                     .w_full()
                     .h(rems(0.25))
@@ -3003,7 +3021,7 @@ impl RightPanelView {
                                 .items_center()
                                 .gap_0p5()
                                 .rounded_md()
-                                .bg(theme.muted.opacity(0.4))
+                                .bg(theme.tab_bar_segmented)
                                 .p_0p5()
                                 .child(
                                     Button::new("review-view-list")
@@ -3098,7 +3116,9 @@ impl RightPanelView {
                         .justify_between()
                         .px_3()
                         .py_1()
-                        .bg(theme.muted.opacity(0.12))
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .bg(theme.list_head)
                         .text_xs()
                         .child(
                             div()
@@ -3215,6 +3235,13 @@ impl RightPanelView {
                         .child("No changes"),
                 )
                 .child(
+                    div()
+                        .mt_1()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("Working tree is clean"),
+                )
+                .child(div().mt_3().child(
                     Button::new("refresh-clean-review")
                         .label("Refresh review")
                         .ghost()
@@ -3224,7 +3251,7 @@ impl RightPanelView {
                         .on_click(cx.listener(|this, _event, _window, _cx| {
                             this.refresh_active_surface();
                         })),
-                )
+                ))
                 .into_any_element()
         } else if self.review_view_mode == ReviewViewMode::Tree {
             let filtered = self.filtered_review_files(cx);
@@ -3642,7 +3669,7 @@ impl RightPanelView {
                     .rounded_lg()
                     .border_1()
                     .border_color(theme.border)
-                    .bg(theme.muted.opacity(0.5))
+                    .bg(theme.group_box)
                     .flex()
                     .flex_col()
                     .gap_1p5()
@@ -4071,20 +4098,16 @@ impl RightPanelView {
                         .id(SharedString::from(format!("commit-{sha}")))
                         .flex()
                         .flex_col()
-                        .mx_2()
+                        .mx_3()
                         .my_0p5()
-                        .rounded_md()
+                        .rounded_lg()
                         .border_1()
                         .border_color(if is_expanded {
                             theme.primary.opacity(0.6)
                         } else {
-                            theme.border.opacity(0.3)
+                            theme.border
                         })
-                        .bg(if is_expanded {
-                            theme.muted.opacity(0.4)
-                        } else {
-                            theme.title_bar.opacity(0.5)
-                        })
+                        .bg(theme.group_box)
                         .child(
                             Button::new(SharedString::from(format!("commit-header-{sha}")))
                                 .accessibility_label(format!(
@@ -4348,7 +4371,7 @@ impl RightPanelView {
                     .py_2()
                     .border_b_1()
                     .border_color(theme.border)
-                    .bg(theme.title_bar.opacity(0.3))
+                    .bg(theme.title_bar)
                     .child(
                         div()
                             .flex()
@@ -4359,7 +4382,7 @@ impl RightPanelView {
                             .rounded_md()
                             .border_1()
                             .border_color(theme.border)
-                            .bg(theme.background)
+                            .bg(theme.input)
                             .child(
                                 div()
                                     .size(rems(0.875))
