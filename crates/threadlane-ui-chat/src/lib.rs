@@ -1,5 +1,6 @@
 mod composer;
 mod context_meter;
+mod image_preview;
 mod markdown;
 mod trajectory;
 mod transcript;

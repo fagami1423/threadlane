@@ -4065,3 +4065,35 @@ fn environment_git_menu_dispatches_commands_and_dismisses(cx: &mut gpui::TestApp
         "A local-only checkout offers branch creation, not remote operations"
     );
 }
+
+
+#[test]
+fn staged_image_decoder_converts_png_pixels_to_gpui_bgra() {
+    use base64::Engine as _;
+
+    let rgba = image::RgbaImage::from_pixel(1, 1, image::Rgba([10, 20, 30, 255]));
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .unwrap();
+    let attachment = threadlane_protocol::ImageAttachment {
+        display_name: "test.png".into(),
+        data_url: format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(encoded.into_inner())
+        ),
+    };
+
+    let decoded = super::decode_staged_image(&attachment).unwrap();
+    assert_eq!(decoded.as_bytes(0).unwrap(), &[30, 20, 10, 255]);
+}
+
+#[test]
+fn staged_image_decoder_rejects_non_image_data_urls() {
+    let attachment = threadlane_protocol::ImageAttachment {
+        display_name: "invalid.png".into(),
+        data_url: "data:text/plain;base64,aGVsbG8=".into(),
+    };
+
+    assert!(super::decode_staged_image(&attachment).is_err());
+}
