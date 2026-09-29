@@ -19,7 +19,7 @@ use gpui_component::tag::{Tag, TagVariant};
 use gpui_component::text::{TextView, TextViewState};
 use gpui_component::tree::{Tree, TreeEvent, TreeItem, TreeState};
 use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, WindowExt};
-use threadlane_git::{GitBranchInfo, GitCommitInfo, GitFile, GitStatus};
+use threadlane_git::{can_create_pull_request, GitBranchInfo, GitCommitInfo, GitFile, GitStatus};
 
 use threadlane_project::watcher::WorkspaceWatcher;
 use threadlane_ui_state::AppState;
@@ -29,10 +29,9 @@ use super::agents::AgentsPanel;
 use super::browser::BrowserView;
 use super::draft_pr::{DraftPrContextKey, DraftPrDialogView, draft_pr_prefill};
 pub use super::types::{
-    DiscardOption, FileNode, GitAction, PanelEvent, ReviewTab, ReviewViewMode, Surface,
-    can_create_pull_request, can_publish_branch, detect_language, discard_options,
-    message_generated_matches_active_project, normalize_generated_commit_message,
-    selection_bar_discard_options,
+    can_publish_branch, detect_language, discard_options, message_generated_matches_active_project,
+    normalize_generated_commit_message, selection_bar_discard_options, DiscardOption, FileNode,
+    GitAction, PanelEvent, ReviewTab, ReviewViewMode, Surface,
 };
 
 pub struct RightPanelView {
@@ -414,6 +413,16 @@ impl RightPanelView {
         self.open_surface(Surface::Review, cx);
     }
 
+    pub fn open_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_review(cx);
+        self.close_document(cx);
+        self.review_tab = ReviewTab::Changes;
+        self.commit_amend = false;
+        self.commit_message_input
+            .update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
     pub fn open_branch_popover(&mut self, cx: &mut Context<Self>) {
         self.open_surface(Surface::Review, cx);
         self.branch_popover_open = true;
@@ -481,7 +490,17 @@ impl RightPanelView {
             .flatten()
     }
 
-    fn open_draft_pr_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_draft_pr_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_project(cx);
+        if self.git_busy {
+            return;
+        }
+        // The hidden panel may still hold status for an earlier branch in this checkout.
+        let status = self
+            .project
+            .as_ref()
+            .and_then(|project| self.model.read(cx).git_statuses.get(project).cloned());
+        self.replace_git_status(status);
         let Some(key) = self.draft_pr_creation_key() else {
             let message = "Publish this named branch and refresh pull request status before creating a draft.";
             self.git_feedback = Some(message.into());
@@ -519,6 +538,7 @@ impl RightPanelView {
     }
 
     pub fn open_surface(&mut self, surface: Surface, cx: &mut Context<Self>) {
+        self.sync_project(cx);
         if self.active_surface != Some(surface) {
             self.close_document(cx);
         }
@@ -5935,6 +5955,115 @@ mod browser_editor_safety_tests {
                     assert!(panel.browser.is_none());
                 }
             }
+        });
+    }
+}
+
+#[cfg(test)]
+mod environment_shortcut_tests {
+    use super::RightPanelView;
+    use crate::{ReviewTab, Surface};
+    use gpui::{AppContext, Focusable, TestAppContext};
+    use gpui_component::{Root, WindowExt};
+    use threadlane_ui_state::AppState;
+
+    #[gpui::test]
+    fn environment_commit_opens_changes_and_focuses_summary_without_committing(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let model = cx.new(|_| AppState::default());
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let capture = captured.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let panel = cx.new(|cx| RightPanelView::new(model, window, cx));
+            *capture.borrow_mut() = Some(panel.clone());
+            Root::new(panel, window, cx)
+        });
+        let panel = captured.borrow_mut().take().unwrap();
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.active_surface = Some(Surface::Review);
+                panel.review_tab = ReviewTab::History;
+                panel.document_title = Some("Review · changed.rs".into());
+                panel.commit_amend = true;
+                panel.open_commit(window, cx);
+                assert_eq!(panel.active_surface, Some(Surface::Review));
+                assert_eq!(panel.review_tab, ReviewTab::Changes);
+                assert!(panel.document_title.is_none());
+                assert!(
+                    !panel.commit_amend,
+                    "Commit must not inherit an earlier amend selection"
+                );
+                assert!(!panel.git_busy, "Opening the commit UI must not run Git");
+                assert!(panel
+                    .commit_message_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window));
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn environment_pr_uses_current_checkout_before_hidden_panel_renders(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let model = cx.new(|_| {
+            let mut state = AppState::default();
+            state.active_work_dir = None;
+            state.active_session_id = None;
+            state
+        });
+        let retained = model.clone();
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let capture = captured.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let panel = cx.new(|cx| RightPanelView::new(model, window, cx));
+            *capture.borrow_mut() = Some(panel.clone());
+            Root::new(panel, window, cx)
+        });
+        let panel = captured.borrow_mut().take().unwrap();
+        cx.update(|window, cx| {
+            retained.update(cx, |state, _| {
+                state.active_work_dir = Some("/current-checkout".into());
+                state.git_statuses.insert(
+                    "/current-checkout".into(),
+                    threadlane_git::GitStatus {
+                        branch: Some("feature".into()),
+                        remote: Some("git@github.com:owner/repo.git".into()),
+                        has_upstream: true,
+                        pr_ready: true,
+                        pr_lookup_available: true,
+                        ..Default::default()
+                    },
+                );
+            });
+            panel.update(cx, |panel, cx| {
+                panel.project = Some("/previous-checkout".into());
+                panel.open_draft_pr_dialog(window, cx);
+                let key = panel.draft_pr_creation_key().unwrap();
+                assert_eq!(key.project, std::path::PathBuf::from("/current-checkout"));
+                assert_eq!(key.branch, "feature");
+                assert!(!panel.git_busy);
+            });
+            assert!(
+                window.has_active_dialog(cx),
+                "The existing draft PR form opens without a second click"
+            );
+            window.close_dialog(cx);
+            retained.update(cx, |state, _| {
+                state
+                    .git_statuses
+                    .get_mut(std::path::Path::new("/current-checkout"))
+                    .unwrap()
+                    .branch = Some("new-feature".into());
+            });
+            panel.update(cx, |panel, cx| {
+                panel.open_draft_pr_dialog(window, cx);
+                assert_eq!(panel.draft_pr_creation_key().unwrap().branch, "new-feature");
+            });
+            assert!(window.has_active_dialog(cx));
+            window.close_dialog(cx);
         });
     }
 }
