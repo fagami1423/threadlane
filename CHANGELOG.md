@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.1.31](https://github.com/wheregmis/threadlane/compare/v0.1.30...v0.1.31) (2026-09-29)
+
+
+### Features
+
+* add session title and draft PR field regeneration ([5ec81c7](https://github.com/wheregmis/threadlane/commit/5ec81c7cf95bc1249368eb363981281d6a4cf87d))
+* **right-panel:** add PR field generation prompts and diff helpers ([a87723a](https://github.com/wheregmis/threadlane/commit/a87723ad2b4272e20e69751feb29689fbe9e8087))
+* **right-panel:** add PR field generation prompts and diff helpers ([7e48aed](https://github.com/wheregmis/threadlane/commit/7e48aedf2eee226f5ba791b4a1597a1a9b9ad907))
+
+
+### Bug Fixes
+
+* address PR generation review feedback ([fee9c45](https://github.com/wheregmis/threadlane/commit/fee9c45dc61460e261034d72c313dd315147f212))
+* **workspace:** observe command palette query changes ([552f17d](https://github.com/wheregmis/threadlane/commit/552f17dbc7f0c3847f1e136b9ada0bbee5f11137))
+
+
+### Maintenance
+
+* some ui nits ([1f631f5](https://github.com/wheregmis/threadlane/commit/1f631f5de1120dcc7ea414c20ab31d1823585d33))
+
 ## [0.1.30](https://github.com/wheregmis/threadlane/compare/v0.1.29...v0.1.30) (2026-09-28)
 
 
