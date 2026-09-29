@@ -277,3 +277,20 @@ impl GitFile {
         }
     }
 }
+
+/// Whether the current checkout is ready to open a new draft pull request.
+pub fn can_create_pull_request(worktree_available: bool, status: Option<&GitStatus>) -> bool {
+    worktree_available
+        && status.is_some_and(|status| {
+            status.pr_ready
+                && !status.detached
+                && status
+                    .branch
+                    .as_deref()
+                    .is_some_and(|branch| !branch.trim().is_empty())
+                && status.remote.is_some()
+                && status.has_upstream
+                && status.pr_lookup_available
+                && status.pr.is_none()
+        })
+}

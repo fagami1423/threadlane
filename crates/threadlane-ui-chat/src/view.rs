@@ -1436,7 +1436,10 @@ impl ChatListView {
                                     )
                                     .item(
                                         PopupMenuItem::new("Pull")
-                                            .disabled(!can_sync)
+                                            .disabled(
+                                                !can_sync
+                                                    || !status.is_some_and(|s| s.has_upstream),
+                                            )
                                             .action(Box::new(crate::PullWorkspaceBranch)),
                                     )
                                     .item(
@@ -1447,7 +1450,10 @@ impl ChatListView {
                                     .separator()
                                     .item(
                                         PopupMenuItem::new("Create draft PR…")
-                                            .disabled(!can_sync)
+                                            .disabled(!threadlane_git::can_create_pull_request(
+                                                state.active_git_work_dir().is_some(),
+                                                status,
+                                            ))
                                             .action(Box::new(crate::CreateWorkspacePullRequest)),
                                     )
                                     .item(

@@ -18,22 +18,6 @@ pub fn nonempty(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
 }
 
-pub fn can_create_pull_request(
-    worktree_available: bool,
-    status: Option<&GitStatus>,
-) -> bool {
-    worktree_available
-        && status.is_some_and(|status| {
-            status.pr_ready
-                && !status.detached
-                && status.branch.as_deref().and_then(nonempty).is_some()
-                && status.remote.is_some()
-                && status.has_upstream
-                && status.pr_lookup_available
-                && status.pr.is_none()
-        })
-}
-
 pub fn message_generated_matches_active_project(
     origin: &Path,
     active: Option<&Path>,

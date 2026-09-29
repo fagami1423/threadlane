@@ -19,7 +19,7 @@ use gpui_component::tag::{Tag, TagVariant};
 use gpui_component::text::{TextView, TextViewState};
 use gpui_component::tree::{Tree, TreeEvent, TreeItem, TreeState};
 use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, WindowExt};
-use threadlane_git::{GitBranchInfo, GitCommitInfo, GitFile, GitStatus};
+use threadlane_git::{can_create_pull_request, GitBranchInfo, GitCommitInfo, GitFile, GitStatus};
 
 use threadlane_project::watcher::WorkspaceWatcher;
 use threadlane_ui_state::AppState;
@@ -29,10 +29,9 @@ use super::agents::AgentsPanel;
 use super::browser::BrowserView;
 use super::draft_pr::{DraftPrContextKey, DraftPrDialogView, draft_pr_prefill};
 pub use super::types::{
-    DiscardOption, FileNode, GitAction, PanelEvent, ReviewTab, ReviewViewMode, Surface,
-    can_create_pull_request, can_publish_branch, detect_language, discard_options,
-    message_generated_matches_active_project, normalize_generated_commit_message,
-    selection_bar_discard_options,
+    can_publish_branch, detect_language, discard_options, message_generated_matches_active_project,
+    normalize_generated_commit_message, selection_bar_discard_options, DiscardOption, FileNode,
+    GitAction, PanelEvent, ReviewTab, ReviewViewMode, Surface,
 };
 
 pub struct RightPanelView {
@@ -496,14 +495,12 @@ impl RightPanelView {
         if self.git_busy {
             return;
         }
-        // The environment can open this before the hidden review panel has loaded.
-        if self.git_status.is_none() {
-            let status = self
-                .project
-                .as_ref()
-                .and_then(|project| self.model.read(cx).git_statuses.get(project).cloned());
-            self.replace_git_status(status);
-        }
+        // The hidden panel may still hold status for an earlier branch in this checkout.
+        let status = self
+            .project
+            .as_ref()
+            .and_then(|project| self.model.read(cx).git_statuses.get(project).cloned());
+        self.replace_git_status(status);
         let Some(key) = self.draft_pr_creation_key() else {
             let message = "Publish this named branch and refresh pull request status before creating a draft.";
             self.git_feedback = Some(message.into());
@@ -6053,6 +6050,19 @@ mod environment_shortcut_tests {
                 window.has_active_dialog(cx),
                 "The existing draft PR form opens without a second click"
             );
+            window.close_dialog(cx);
+            retained.update(cx, |state, _| {
+                state
+                    .git_statuses
+                    .get_mut(std::path::Path::new("/current-checkout"))
+                    .unwrap()
+                    .branch = Some("new-feature".into());
+            });
+            panel.update(cx, |panel, cx| {
+                panel.open_draft_pr_dialog(window, cx);
+                assert_eq!(panel.draft_pr_creation_key().unwrap().branch, "new-feature");
+            });
+            assert!(window.has_active_dialog(cx));
             window.close_dialog(cx);
         });
     }

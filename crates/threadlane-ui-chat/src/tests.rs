@@ -3840,6 +3840,9 @@ fn environment_git_menu_dispatches_commands_and_dismisses(cx: &mut gpui::TestApp
             threadlane_git::GitStatus {
                 branch: Some("feature".into()),
                 remote: Some("git@github.com:owner/repo.git".into()),
+                has_upstream: true,
+                pr_ready: true,
+                pr_lookup_available: true,
                 files: vec![file],
                 ..Default::default()
             },
@@ -3892,6 +3895,51 @@ fn environment_git_menu_dispatches_commands_and_dismisses(cx: &mut gpui::TestApp
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     assert_eq!(selected.get(), "", "Escape must not dispatch a Git action");
+
+    for blocked in ["upstream", "commits", "lookup", "existing-pr"] {
+        retained_model.update(cx, |state, cx| {
+            let status = state
+                .git_statuses
+                .get_mut(std::path::Path::new("/project"))
+                .unwrap();
+            status.has_upstream = blocked != "upstream";
+            status.pr_ready = blocked != "commits";
+            status.pr_lookup_available = blocked != "lookup";
+            status.pr = (blocked == "existing-pr").then(Default::default);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let menu = cx.debug_bounds("environment-git-actions").unwrap();
+        cx.simulate_click(menu.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_keystrokes(if blocked == "upstream" {
+            "down down enter"
+        } else {
+            "down down down enter"
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            selected.replace(""),
+            "push",
+            "Push stays enabled; Pull requires upstream"
+        );
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let menu = cx.debug_bounds("environment-git-actions").unwrap();
+        cx.simulate_click(menu.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_keystrokes(if blocked == "upstream" {
+            "down down down enter"
+        } else {
+            "down down down down enter"
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            selected.replace(""),
+            "branch",
+            "PR creation must be skipped for {blocked}"
+        );
+    }
 
     retained_model.update(cx, |state, cx| {
         let status = state

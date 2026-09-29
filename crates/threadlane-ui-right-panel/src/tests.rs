@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use threadlane_git::GitStatus;
+use threadlane_git::{can_create_pull_request, GitStatus};
 
 use super::draft_pr::{
     draft_pr_prefill, DraftPrAttemptState, DraftPrCompletion, DraftPrContextKey, DraftPrFields,
@@ -9,9 +9,8 @@ use super::draft_pr::{
 };
 use super::pr_generation::{generation_prompt, PrField};
 use super::types::{
-    can_create_pull_request, can_publish_branch, discard_options,
-    message_generated_matches_active_project, selection_bar_discard_options, DiscardOption,
-    GitAction,
+    can_publish_branch, discard_options, message_generated_matches_active_project,
+    selection_bar_discard_options, DiscardOption, GitAction,
 };
 use super::view::{retain_review_selection, scan_project_tree, RightPanelView};
 
