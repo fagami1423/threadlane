@@ -31,7 +31,7 @@ use threadlane_ui_sidebar::{BeginNewTask, ToggleSidebar};
 use threadlane_git::GitStatus;
 
 use threadlane_ui_state::{actions::AppAction, controller};
-use threadlane_ui_chat::ChatListView;
+use threadlane_ui_chat::{ChatListView, TrajectoryView};
 use threadlane_ui_github::GitHubView;
 use threadlane_ui_automation::AutomationsView;
 use gpui_component::WindowExt;
@@ -338,6 +338,12 @@ impl WorkspaceView {
         let mut automation_updates = model.update(cx, |state, _| state.start_automations());
         let settings = cx.new(|cx| SettingsView::new(model.clone(), window, cx));
         let right_panel = cx.new(|cx| RightPanelView::new(model.clone(), window, cx));
+        // The trajectory is a chat-crate view hosted by the right panel;
+        // injected as AnyView so the panel crate stays chat-free.
+        let trajectory_view = cx.new(|cx| TrajectoryView::new(model.clone(), window, cx));
+        right_panel.update(cx, |panel, _cx| {
+            panel.set_trajectory_view(trajectory_view.clone().into());
+        });
         let sidebar_resizable_state = cx.new(|_cx| ResizableState::default());
         let right_panel_resizable_state = cx.new(|_cx| ResizableState::default());
         let bottom_panel_resizable_state = cx.new(|_cx| ResizableState::default());
@@ -647,6 +653,18 @@ impl WorkspaceView {
         self.right_panel_visible = true;
         self.right_panel.update(cx, |panel, cx| {
             panel.open_surface(threadlane_ui_right_panel::Surface::Agents, cx);
+        });
+        cx.notify();
+    }
+
+    fn open_trajectory_panel(&mut self, cx: &mut Context<Self>) {
+        self.model.update(cx, |state, cx| {
+            state.workspace_page = WorkspacePage::Chat;
+            cx.notify();
+        });
+        self.right_panel_visible = true;
+        self.right_panel.update(cx, |panel, cx| {
+            panel.open_surface(threadlane_ui_right_panel::Surface::Trajectory, cx);
         });
         cx.notify();
     }
@@ -1607,17 +1625,6 @@ impl WorkspaceView {
         });
         let dirty_count = git_status.map_or(0, |s| s.files.len());
 
-        // An external ACP agent chooses its own model, so the selection alone
-        // does not say what actually ran; show what the agent reports.
-        let model_name = match (
-            state.selected_model.is_empty(),
-            state.active_acp_model_label(),
-        ) {
-            (true, _) => "default".to_string(),
-            (false, Some(agent_model)) => format!("{} · {agent_model}", state.selected_model),
-            (false, None) => state.selected_model.clone(),
-        };
-
         let active_project = state
             .active_work_dir
             .as_ref()
@@ -1719,18 +1726,6 @@ impl WorkspaceView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(
-                        Button::new("status-model-badge")
-                            .icon(IconName::Cpu)
-                            .label("Model")
-                            .ghost()
-                            .xsmall()
-                            .accessibility_label(format!("Switch model · {model_name}"))
-                            .tooltip(format!("Switch model · {model_name}"))
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.execute_palette_action("model", window, cx);
-                            })),
-                    )
                     .child(
                         Button::new("status-terminal-toggle")
                             .icon(if self.bottom_panel_visible {
@@ -1896,12 +1891,10 @@ impl WorkspaceView {
     fn select_trajectory_tab_action(
         &mut self,
         _: &SelectTrajectoryTab,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.chat_list.update(cx, |chat, cx| {
-            chat.set_tab(threadlane_ui_chat::CentralTab::Trajectory, cx);
-        });
+        self.open_trajectory_panel(cx);
     }
 
     fn select_editor_tab_action(
@@ -2507,6 +2500,11 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(
                 |this, _: &threadlane_ui_chat::OpenWorkspaceBranches, _, cx| {
                     this.open_git_branches(cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &threadlane_ui_chat::OpenWorkspaceTrajectory, _, cx| {
+                    this.open_trajectory_panel(cx);
                 },
             ))
             .on_action(cx.listener(

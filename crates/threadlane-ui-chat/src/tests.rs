@@ -1967,7 +1967,6 @@ fn reasoning_disclosure_supports_keyboard_and_pauses_following(cx: &mut gpui::Te
         window.blur(cx);
         window.focus_next(cx); // Find in conversation
         window.focus_next(cx); // Chat
-        window.focus_next(cx); // Trajectory
         window.focus_next(cx); // Editor
         window.focus_next(cx); // Reasoning
         window.draw(cx).clear(cx);
@@ -2415,10 +2414,10 @@ fn skills_chip_label_uses_singular_for_one_skill() {
 
 #[test]
 fn stats_nouns_use_singular_for_one() {
-    assert_eq!(super::plural_noun(0, "turn", "turns"), "turns");
-    assert_eq!(super::plural_noun(1, "turn", "turns"), "turn");
-    assert_eq!(super::plural_noun(2, "tool call", "tool calls"), "tool calls");
-    assert_eq!(super::plural_noun(1, "anomaly", "anomalies"), "anomaly");
+    assert_eq!(crate::trajectory_view::plural_noun(0, "turn", "turns"), "turns");
+    assert_eq!(crate::trajectory_view::plural_noun(1, "turn", "turns"), "turn");
+    assert_eq!(crate::trajectory_view::plural_noun(2, "tool call", "tool calls"), "tool calls");
+    assert_eq!(crate::trajectory_view::plural_noun(1, "anomaly", "anomalies"), "anomaly");
 }
 
 #[test]
@@ -2699,7 +2698,7 @@ fn trajectory_inspector_tabs_switch_content(cx: &mut gpui::TestAppContext) {
         state
     });
     let (chat, cx) =
-        cx.add_window_view(move |window, cx| super::ChatListView::new(model, window, cx));
+        cx.add_window_view(move |window, cx| crate::TrajectoryView::new(model, window, cx));
     chat.update(cx, |chat, cx| {
         chat.trajectory_cache = Some(TrajectoryRenderCache {
             key: TrajectoryCacheKey {
@@ -2720,7 +2719,6 @@ fn trajectory_inspector_tabs_switch_content(cx: &mut gpui::TestAppContext) {
             summary: TrajectorySummary::default(),
         });
         chat.selected_trajectory_index = Some(0);
-        chat.current_tab = super::CentralTab::Trajectory;
         cx.notify();
     });
     cx.run_until_parked();
@@ -2929,7 +2927,7 @@ fn trajectory_toolbar_filters_are_reachable(cx: &mut gpui::TestAppContext) {
         state
     });
     let (chat, cx) =
-        cx.add_window_view(move |window, cx| super::ChatListView::new(model, window, cx));
+        cx.add_window_view(move |window, cx| crate::TrajectoryView::new(model, window, cx));
     chat.update(cx, |chat, cx| {
         chat.trajectory_cache = Some(TrajectoryRenderCache {
             key: TrajectoryCacheKey {
@@ -2952,7 +2950,6 @@ fn trajectory_toolbar_filters_are_reachable(cx: &mut gpui::TestAppContext) {
             rows: vec![TrajectoryRow::Entry(0)],
             summary: TrajectorySummary::default(),
         });
-        chat.current_tab = super::CentralTab::Trajectory;
         cx.notify();
     });
     cx.run_until_parked();
@@ -3351,7 +3348,8 @@ fn conversation_find_keyboard_offscreen_streaming_and_close(cx: &mut gpui::TestA
     cx.simulate_click(open.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     chat.read_with(cx, |chat, _| {
-        assert_eq!(chat.current_tab, super::CentralTab::Trajectory);
+        assert_eq!(chat.current_tab, super::CentralTab::Chat);
+        assert!(!chat.progress_summary_expanded);
         assert!(!chat.find_open);
         assert!(chat.find_results.is_empty());
         assert!(chat.find_task.is_none());
@@ -3670,7 +3668,6 @@ fn conversation_find_controls_fit_themes_narrow_panes_and_large_text(
                 cx.update(|window, cx| window.draw(cx).clear(cx));
                 for selector in [
                     "central-tab-chat",
-                    "central-tab-trajectory",
                     "central-tab-editor",
                     "conversation-find-open",
                     "conversation-find-previous",
@@ -3774,9 +3771,7 @@ fn conversation_find_loading_failure_and_empty_are_distinct(cx: &mut gpui::TestA
         chat.read_with(cx, |chat, cx| chat.conversation_find_status(cx)),
         "No matching messages"
     );
-    chat.update(cx, |chat, cx| {
-        chat.set_tab(super::CentralTab::Trajectory, cx)
-    });
+    chat.update(cx, |chat, cx| chat.set_tab(super::CentralTab::Editor, cx));
     assert!(!chat.read_with(cx, |chat, _| chat.find_open));
 }
 

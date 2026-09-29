@@ -37,6 +37,9 @@ pub use super::types::{
 pub struct RightPanelView {
     pub(crate) model: Entity<AppState>,
     agents: Entity<AgentsPanel>,
+    /// Live trajectory surface mounted from the workspace (owned by
+    /// threadlane-ui-chat; injected type-erased to keep this crate chat-free).
+    trajectory_view: Option<AnyView>,
     active_surface: Option<Surface>,
     visible: bool,
     project: Option<PathBuf>,
@@ -281,6 +284,7 @@ impl RightPanelView {
         let mut panel = Self {
             model,
             agents,
+            trajectory_view: None,
             active_surface: None,
             visible: false,
             project: None,
@@ -537,6 +541,13 @@ impl RightPanelView {
         base_input.update(cx, |input, cx| input.focus(window, cx));
     }
 
+    /// Mounts the workspace-owned trajectory surface. `AnyView` keeps this
+    /// crate independent of threadlane-ui-chat while letting the same live
+    /// view render inside the right panel.
+    pub fn set_trajectory_view(&mut self, view: AnyView) {
+        self.trajectory_view = Some(view);
+    }
+
     pub fn open_surface(&mut self, surface: Surface, cx: &mut Context<Self>) {
         self.sync_project(cx);
         if self.active_surface != Some(surface) {
@@ -561,6 +572,9 @@ impl RightPanelView {
         let tx = self.event_tx.clone();
         std::thread::spawn(move || match surface {
             Surface::Agents => {}
+            Surface::Trajectory => {
+                // Renders live off AppState; nothing to fetch.
+            }
             Surface::Files => {
                 let nodes = scan_project_tree(&project, 500);
                 let _ = tx.send(PanelEvent::FilesLoaded { project, nodes });
@@ -607,6 +621,43 @@ impl RightPanelView {
                 .background_executor()
                 .spawn(async move {
                     threadlane_git::diff_file(&work_dir, &path)
+                        .unwrap_or_else(|error| format!("Could not load diff: {error}"))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.project.as_ref() == Some(&project)
+                    && this.review_diff_revision == revision
+                    && this.document_title.as_ref() == Some(&title)
+                {
+                    this.pending_document = Some((title, content));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Open one combined diff of every pending change (staged, unstaged, and
+    /// untracked), like t3code's aggregate "View Diff" row.
+    fn open_combined_diff(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        self.review_diff_revision = self.review_diff_revision.wrapping_add(1);
+        let revision = self.review_diff_revision;
+        let title = "Review · All changes".to_string();
+        self.document_title = Some(title.clone());
+        self.editor_state = None;
+        self.editor_subscription = None;
+        self.document_state
+            .update(cx, |state, cx| state.set_text("Loading diff…", cx));
+        cx.spawn(async move |this, cx| {
+            let work_dir = project.clone();
+            let content = cx
+                .background_executor()
+                .spawn(async move {
+                    threadlane_git::worktree_diff(&work_dir)
                         .unwrap_or_else(|error| format!("Could not load diff: {error}"))
                 })
                 .await;
@@ -1503,7 +1554,7 @@ impl RightPanelView {
             .flex_none()
             .px_3()
             .py_1p5()
-            .bg(theme.muted.opacity(0.12))
+            .bg(theme.list_head)
             .text_xs()
             .child(
                 div()
@@ -1595,7 +1646,7 @@ impl RightPanelView {
                         .w_full()
                         .child(
                             TabBar::new("right-panel-surface-tabs")
-                                .underline()
+                                .segmented()
                                 .small()
                                 .selected_index(selected_index)
                                 .children(surfaces.iter().map(|surface| {
@@ -1610,7 +1661,7 @@ impl RightPanelView {
                                 })),
                         )
                         .child(div().flex_1())
-                        .children((self.active_surface != Some(Surface::Agents)).then(|| {
+                        .children((!matches!(self.active_surface, Some(Surface::Agents | Surface::Trajectory))).then(|| {
                             Button::new("right-panel-refresh")
                                 .accessibility_label("Refresh surface")
                                 .icon(Icon::default().path("icons/refresh-cw.svg"))
@@ -2043,6 +2094,7 @@ impl RightPanelView {
             .document_title
             .as_deref()
             .is_some_and(|title| title == format!("Review · {path}").as_str());
+        let (file_icon, file_icon_color) = file_type_icon(&path, &theme);
 
         let (status_color, status_bg) = match file.status_char() {
             'A' | '?' => (theme.success, theme.success.opacity(0.15)),
@@ -2053,54 +2105,20 @@ impl RightPanelView {
 
         let row_id = SharedString::from(format!("review-file-{path}"));
         let stage_path = path.clone();
-        let stage_btn = if is_staged {
-            Button::new(SharedString::from(format!("unstage-btn-{path}")))
-                .icon(IconName::Minus)
-                .accessibility_label("Unstage file")
-                .ghost()
-                .xsmall()
-                .tooltip("Unstage file")
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.run_git_action(GitAction::UnstageFile(stage_path.clone()), window, cx);
-                }))
-        } else {
-            Button::new(SharedString::from(format!("stage-btn-{path}")))
-                .icon(IconName::Plus)
-                .accessibility_label("Stage file")
-                .ghost()
-                .xsmall()
-                .tooltip("Stage file")
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.run_git_action(GitAction::StageFile(stage_path.clone()), window, cx);
-                }))
-        };
-
-        let discard_panel = panel_entity.clone();
-        let discard_path_btn = path.clone();
-        let discard_btn = Button::new(SharedString::from(format!("discard-btn-{path}")))
-            .icon(IconName::Close)
-            .accessibility_label("Discard changes")
-            .ghost()
-            .xsmall()
-            .tooltip("Discard changes")
-            .on_click(cx.listener(move |_this, _, window, cx| {
-                Self::handle_discard_option(
-                    discard_panel.clone(),
-                    DiscardOption::Single(discard_path_btn.clone()),
-                    window,
-                    cx,
-                );
-            }));
-
-        let diff_path_btn = path.clone();
-        let diff_btn = Button::new(SharedString::from(format!("open-diff-btn-{path}")))
-            .icon(IconName::ExternalLink)
-            .accessibility_label("Open diff")
-            .ghost()
-            .xsmall()
-            .tooltip("Open diff")
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_file_diff(diff_path_btn.clone(), cx);
+        // Trailing stage toggle (t3code ChangesView right-edge checkbox): a
+        // checked box means the file is staged.
+        let stage_chk = Checkbox::new(SharedString::from(format!("stage-chk-{path}")))
+            .accessibility_label(if is_staged { "Unstage file" } else { "Stage file" })
+            .checked(is_staged)
+            .small()
+            .tooltip(if is_staged { "Unstage file" } else { "Stage file" })
+            .on_click(cx.listener(move |this, checked, window, cx| {
+                let action = if *checked {
+                    GitAction::StageFile(stage_path.clone())
+                } else {
+                    GitAction::UnstageFile(stage_path.clone())
+                };
+                this.run_git_action(action, window, cx);
             }));
 
         div()
@@ -2125,6 +2143,18 @@ impl RightPanelView {
                 })
             })
             .focus(|row| row.border_color(theme.ring))
+            .child(
+                div()
+                    .flex_none()
+                    .size_5()
+                    .rounded_sm()
+                    .bg(file_icon_color.opacity(0.12))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(file_icon_color)
+                    .child(Icon::new(file_icon).size_3p5()),
+            )
             .child(
                 Checkbox::new(SharedString::from(format!("chk-{path}")))
                     .accessibility_label(format!("Select {path} for Git actions"))
@@ -2167,7 +2197,6 @@ impl RightPanelView {
                                 )
                             }),
                     )
-                    .icon(IconName::File)
                     .accessibility_label(format!(
                         "Review {path}, status {status}, {} additions, {} deletions",
                         file.additions, file.deletions
@@ -2227,9 +2256,7 @@ impl RightPanelView {
                             .child(format!("\u{2212}{}", file.deletions))
                     }))
             }))
-            .child(stage_btn)
-            .child(diff_btn)
-            .child(discard_btn)
+            .child(stage_chk)
             .context_menu({
                 let path = context_path.clone();
                 let absolute_path = absolute_path.clone();
@@ -2572,8 +2599,8 @@ impl RightPanelView {
             .py_2()
             .gap_2()
             .border_b_1()
-            .border_color(theme.border.opacity(0.8))
-            .bg(theme.muted.opacity(0.18))
+            .border_color(theme.border)
+            .bg(theme.list_head)
             .child(
                 Button::new("git-branch-selector-btn")
                     .accessibility_label(format!("Manage branches, current branch {branch}"))
@@ -2661,11 +2688,13 @@ impl RightPanelView {
                 .flex()
                 .flex_col()
                 .gap_1p5()
-                .px_3()
-                .py_2p5()
-                .border_b_1()
-                .border_color(theme.border.opacity(0.7))
-                .bg(theme.muted.opacity(0.16))
+                .mx_3()
+                .my_2()
+                .p_2p5()
+                .rounded_lg()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.group_box)
                 .child(
                     Button::new("pr-card-toggle")
                         .accessibility_label(if pr_expanded {
@@ -2903,7 +2932,7 @@ impl RightPanelView {
         let diff_ratio_bar = (total_delta > 0).then(|| {
             let add_pct = Self::diff_addition_percent(total_additions_all, total_deletions_all);
             let del_pct = 100.0 - add_pct;
-            div().px_3().py_1().child(
+            div().px_3().py_0p5().child(
                 div()
                     .w_full()
                     .h(rems(0.25))
@@ -2989,7 +3018,7 @@ impl RightPanelView {
                                 .items_center()
                                 .gap_0p5()
                                 .rounded_md()
-                                .bg(theme.muted.opacity(0.4))
+                                .bg(theme.tab_bar_segmented)
                                 .p_0p5()
                                 .child(
                                     Button::new("review-view-list")
@@ -3084,7 +3113,9 @@ impl RightPanelView {
                         .justify_between()
                         .px_3()
                         .py_1()
-                        .bg(theme.muted.opacity(0.12))
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .bg(theme.list_head)
                         .text_xs()
                         .child(
                             div()
@@ -3129,7 +3160,22 @@ impl RightPanelView {
                                                 .text_color(theme.danger)
                                                 .child(format!("\u{2212}{selected_deletions}")),
                                         )
-                                }),
+                                })
+                                .child(
+                                    Button::new("view-combined-diff-btn")
+                                        .label(format!(
+                                            "View Diff +{total_additions_all} \u{2212}{total_deletions_all}"
+                                        ))
+                                        .accessibility_label(
+                                            "Open combined diff of all changes",
+                                        )
+                                        .ghost()
+                                        .xsmall()
+                                        .tooltip("Open combined diff of all changes")
+                                        .on_click(cx.listener(|this, _event, _window, cx| {
+                                            this.open_combined_diff(cx);
+                                        })),
+                                ),
                         )
                         .child(
                             div()
@@ -3201,6 +3247,13 @@ impl RightPanelView {
                         .child("No changes"),
                 )
                 .child(
+                    div()
+                        .mt_1()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("Working tree is clean"),
+                )
+                .child(div().mt_3().child(
                     Button::new("refresh-clean-review")
                         .label("Refresh review")
                         .ghost()
@@ -3210,7 +3263,7 @@ impl RightPanelView {
                         .on_click(cx.listener(|this, _event, _window, _cx| {
                             this.refresh_active_surface();
                         })),
-                )
+                ))
                 .into_any_element()
         } else if self.review_view_mode == ReviewViewMode::Tree {
             let filtered = self.filtered_review_files(cx);
@@ -3628,7 +3681,7 @@ impl RightPanelView {
                     .rounded_lg()
                     .border_1()
                     .border_color(theme.border)
-                    .bg(theme.muted.opacity(0.5))
+                    .bg(theme.group_box)
                     .flex()
                     .flex_col()
                     .gap_1p5()
@@ -3907,7 +3960,7 @@ impl RightPanelView {
             .px_3()
             .child(
                 TabBar::new("review-sub-tabs")
-                    .underline()
+                    .segmented()
                     .small()
                     .selected_index(if changes_active { 0 } else { 1 })
                     .children(vec![
@@ -4057,20 +4110,16 @@ impl RightPanelView {
                         .id(SharedString::from(format!("commit-{sha}")))
                         .flex()
                         .flex_col()
-                        .mx_2()
+                        .mx_3()
                         .my_0p5()
-                        .rounded_md()
+                        .rounded_lg()
                         .border_1()
                         .border_color(if is_expanded {
                             theme.primary.opacity(0.6)
                         } else {
-                            theme.border.opacity(0.3)
+                            theme.border
                         })
-                        .bg(if is_expanded {
-                            theme.muted.opacity(0.4)
-                        } else {
-                            theme.title_bar.opacity(0.5)
-                        })
+                        .bg(theme.group_box)
                         .child(
                             Button::new(SharedString::from(format!("commit-header-{sha}")))
                                 .accessibility_label(format!(
@@ -4334,7 +4383,7 @@ impl RightPanelView {
                     .py_2()
                     .border_b_1()
                     .border_color(theme.border)
-                    .bg(theme.title_bar.opacity(0.3))
+                    .bg(theme.title_bar)
                     .child(
                         div()
                             .flex()
@@ -4345,7 +4394,7 @@ impl RightPanelView {
                             .rounded_md()
                             .border_1()
                             .border_color(theme.border)
-                            .bg(theme.background)
+                            .bg(theme.input)
                             .child(
                                 div()
                                     .size(rems(0.875))
@@ -5463,7 +5512,10 @@ impl Render for RightPanelView {
         self.sync_pending_document(window, cx);
         let theme = cx.theme().colors;
         let unavailable_non_browser = self.worktree_unavailable
-            && !matches!(self.active_surface, Some(Surface::Browser | Surface::Agents));
+            && !matches!(
+                self.active_surface,
+                Some(Surface::Browser | Surface::Agents | Surface::Trajectory)
+            );
         let body = if unavailable_non_browser {
             self.render_empty(
                 "Worktree unavailable",
@@ -5473,6 +5525,13 @@ impl Render for RightPanelView {
         } else {
             match self.active_surface {
                 None => self.render_chooser(cx).into_any_element(),
+                Some(Surface::Trajectory) => self
+                    .trajectory_view
+                    .clone()
+                    .map(|view| view.into_any_element())
+                    .unwrap_or_else(|| {
+                        self.render_empty("Trajectory", "Trajectory is unavailable", cx)
+                    }),
                 Some(Surface::Agents) => self.agents.clone().into_any_element(),
                 Some(Surface::Review) if self.document_title.is_some() => self.render_files(cx),
                 Some(Surface::Review) => self.render_review(window, cx),
@@ -5513,6 +5572,29 @@ enum BrowserReply {
 const MAX_BROWSER_EVAL_CHARS: usize = 8_000;
 
 // Keep this aligned with the surface switches in the browser command handlers.
+/// Pick an icon and tint by file type (t3code ChangesView row style).
+fn file_type_icon(path: &str, theme: &gpui_component::theme::ThemeColor) -> (IconName, Hsla) {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "md" | "markdown" | "rst" | "adoc" | "txt" => (IconName::BookOpen, theme.warning),
+        "json" | "jsonc" | "toml" | "yaml" | "yml" | "ini" | "cfg" | "conf" | "xml"
+        | "lock" | "env" => (IconName::Settings, theme.muted_foreground),
+        "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd" => {
+            (IconName::SquareTerminal, theme.success)
+        }
+        "html" | "htm" | "css" | "scss" | "sass" | "less" => (IconName::Globe, theme.info),
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "ico" | "webp" | "bmp" | "avif" => {
+            (IconName::Frame, theme.info)
+        }
+        _ if ext.is_empty() => (IconName::File, theme.muted_foreground),
+        _ => (IconName::FileText, theme.link),
+    }
+}
+
 fn browser_command_reveals_surface(command: &threadlane_protocol::browser::BrowserCommand) -> bool {
     use threadlane_protocol::browser::{BrowserCommand, BrowserTabAction};
     matches!(command,
