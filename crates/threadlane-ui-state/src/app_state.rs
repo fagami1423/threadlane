@@ -52,6 +52,9 @@ pub struct AppState {
     pub active_session_id: Option<String>,
     pub is_new_task: bool,
     pub draft_work_mode: WorkMode,
+    pub draft_worktree_base: Option<String>,
+    pub draft_worktree_bases: Vec<String>,
+    worktree_setups: HashMap<String, crate::worktree_setup::WorktreeSetup>,
     /// Presentation-only sidebar filter. `None` keeps the flat list scoped to all projects.
     pub sidebar_project_filter: Option<PathBuf>,
     pub search_query: String,
@@ -268,9 +271,13 @@ impl AppState {
     }
 
     pub fn active_worktree_unavailable(&self) -> bool {
-        let (Some(work_dir), Some(session_id)) =
-            (self.active_work_dir.as_ref(), self.active_session_id.as_ref())
-        else {
+        if self.active_worktree_setup().is_some() {
+            return false;
+        }
+        let (Some(work_dir), Some(session_id)) = (
+            self.active_work_dir.as_ref(),
+            self.active_session_id.as_ref(),
+        ) else {
             return false;
         };
         self.projects
@@ -419,6 +426,9 @@ impl AppState {
             active_work_dir,
             is_new_task: active_session_id.is_none(),
             draft_work_mode: WorkMode::Local,
+            draft_worktree_base: None,
+            draft_worktree_bases: Vec::new(),
+            worktree_setups: HashMap::new(),
             active_session_id,
             sidebar_project_filter: None,
             search_query: String::new(),
@@ -501,11 +511,31 @@ impl AppState {
                 }),
             });
         }
+        if let Some(setup) = state
+            .active_session_info()
+            .and_then(crate::worktree_setup::recover)
+        {
+            state
+                .pending_hydrations
+                .retain(|p| p.session_id != setup.session_id);
+            state
+                .worktree_setups
+                .insert(setup.session_id.clone(), setup);
+            state.session_status = None;
+        }
         state
     }
 
     pub fn active_close_work(&self) -> Vec<ActiveCloseWork> {
         let mut work = Vec::new();
+        for setup in self.worktree_setups.values().filter(|s| s.error.is_none()) {
+            work.push(ActiveCloseWork {
+                identity: setup.session_file.display().to_string(),
+                title: threadlane_runtime::titles::normalize_session_title(&setup.text),
+                project: setup.project.display().to_string(),
+                status: "Preparing worktree".into(),
+            });
+        }
         let mut session_files = HashSet::new();
         for (session_file, runtime) in &self.session_runtimes {
             let active = runtime.is_generating()
@@ -752,6 +782,11 @@ impl AppState {
     }
 
     pub(crate) fn set_selected_model(&mut self, model: String) {
+        if self.active_worktree_setup().is_some() {
+            self.session_status =
+                Some("Cancel worktree setup before changing agent settings".into());
+            return;
+        }
         if !self.available_models.iter().any(|m| m.id == model) {
             return;
         }
@@ -799,6 +834,11 @@ impl AppState {
     }
 
     pub fn set_reasoning_effort(&mut self, effort: ReasoningEffort) {
+        if self.active_worktree_setup().is_some() {
+            self.session_status =
+                Some("Cancel worktree setup before changing agent settings".into());
+            return;
+        }
         let effort = threadlane_provider::model_registry::effective_effort(
             &self.selected_model,
             effort,
@@ -838,6 +878,11 @@ impl AppState {
     /// rebuilds the live session runtime so the next turn routes through the
     /// new mode; mirrors `set_selected_model`.
     pub fn set_orchestrator_mode(&mut self, mode: OrchestratorMode) {
+        if self.active_worktree_setup().is_some() {
+            self.session_status =
+                Some("Cancel worktree setup before changing agent settings".into());
+            return;
+        }
         let Some(work_dir) = self.active_work_dir.clone() else {
             return;
         };
@@ -1059,6 +1104,8 @@ impl AppState {
         self.active_session_id = None;
         self.is_new_task = true;
         self.draft_work_mode = WorkMode::Local;
+        self.draft_worktree_base = None;
+        self.draft_worktree_bases.clear();
         self.messages = Arc::new(Vec::new());
         self.active_plan = SessionPlan::default();
         self.is_generating = false;
@@ -1074,6 +1121,22 @@ impl AppState {
 
     pub fn set_work_mode(&mut self, mode: WorkMode) {
         self.draft_work_mode = mode;
+        if mode == WorkMode::Worktree {
+            let Some(project) = self.active_work_dir.clone() else {
+                return;
+            };
+            match crate::chat::executor() {
+                Ok(runtime) => {
+                    let tx = self.stream_tx.clone();
+                    runtime.spawn_blocking(move || {
+                        let result =
+                            threadlane_git::worktree_bases(&project).map_err(|e| e.to_string());
+                        let _ = tx.send(ChatStreamEvent::WorktreeBases { project, result });
+                    });
+                }
+                Err(error) => self.session_status = Some(error),
+            }
+        }
     }
 
     pub(crate) fn set_sidebar_project_filter(&mut self, work_dir: Option<PathBuf>) {
@@ -1100,6 +1163,8 @@ impl AppState {
             self.active_session_id = None;
             self.is_new_task = true;
             self.draft_work_mode = WorkMode::Local;
+            self.draft_worktree_base = None;
+            self.draft_worktree_bases.clear();
             self.messages = Arc::new(Vec::new());
             self.active_plan = SessionPlan::default();
             self.is_generating = false;
@@ -1218,6 +1283,29 @@ impl AppState {
             .get(&session_file)
             .is_some_and(|runtime| runtime.is_generating());
         self.session_status = Some("Loading session…".into());
+        if !self.worktree_setups.contains_key(&session_id) {
+            if let Some(setup) = self
+                .active_session_info()
+                .and_then(crate::worktree_setup::recover)
+            {
+                self.worktree_setups.insert(session_id.clone(), setup);
+            }
+        }
+        if let Some(setup) = self.worktree_setups.get(&session_id) {
+            self.is_generating = setup.error.is_none();
+            let text = if setup.images.is_empty() {
+                setup.text.clone()
+            } else {
+                format!(
+                    "{}\n[{} image attachment(s)]",
+                    setup.text,
+                    setup.images.len()
+                )
+            };
+            self.push_optimistic_follow_up(&session_id, text, "pending-user");
+            self.session_status = None;
+            return;
+        }
         let request = SessionHydrationRequest {
             session_id,
             session_file,
@@ -1242,6 +1330,9 @@ impl AppState {
         session_id: String,
         delete_worktree: bool,
     ) -> Result<(), String> {
+        if self.worktree_setups.contains_key(&session_id) {
+            return Err("Cancel worktree setup before archiving or deleting this session".into());
+        }
         let session_file = self.session_file(&work_dir, &session_id);
         if self
             .session_runtimes
@@ -1326,6 +1417,9 @@ impl AppState {
         session_id: String,
         delete_worktree: bool,
     ) -> Result<(), String> {
+        if self.worktree_setups.contains_key(&session_id) {
+            return Err("Cancel worktree setup before archiving or deleting this session".into());
+        }
         let session_file = self.session_file(&work_dir, &session_id);
         if self
             .session_runtimes
@@ -1727,6 +1821,13 @@ impl AppState {
     }
 
     pub fn session_is_generating(&self, session_file: &Path) -> bool {
+        if self
+            .worktree_setups
+            .values()
+            .any(|s| s.session_file == session_file && s.error.is_none())
+        {
+            return true;
+        }
         self.session_runtimes
             .get(session_file)
             .is_some_and(|runtime| runtime.is_generating())
@@ -1916,6 +2017,13 @@ impl AppState {
     }
 
     pub fn session_attention(&self, session: &SessionInfo) -> SessionAttention {
+        if let Some(setup) = self.worktree_setups.get(&session.id) {
+            return if setup.error.is_some() {
+                SessionAttention::NeedsYou
+            } else {
+                SessionAttention::Working
+            };
+        }
         let runtime = self.session_runtimes.get(&session.session_file);
         let runtime_status = runtime.map(|runtime| runtime.status());
         let is_active = self.active_work_dir.as_ref() == Some(&session.work_dir)
@@ -2070,6 +2178,202 @@ impl AppState {
         Ok(())
     }
 
+    pub fn active_worktree_setup(&self) -> Option<&crate::worktree_setup::WorktreeSetup> {
+        self.active_session_id
+            .as_ref()
+            .and_then(|id| self.worktree_setups.get(id))
+    }
+
+    fn start_worktree_task(
+        &mut self,
+        text: String,
+        images: Vec<ImageAttachment>,
+    ) -> Result<(), String> {
+        use crate::worktree_setup::{SetupStage, WorktreeSetup};
+        let project = self
+            .active_work_dir
+            .clone()
+            .ok_or("Select a project first")?;
+        let base = self
+            .draft_worktree_base
+            .clone()
+            .ok_or("Wait for base branches to load, then select a base")?;
+        let model = self.selected_model.clone();
+        let (key, _) = threadlane_coding_agent::credentials::provider_credentials(&model);
+        if key.is_empty() && !threadlane_acp_engine::is_acp_model(&model) {
+            return Err("Configure a model provider before preparing a worktree".into());
+        }
+        let id = format!(
+            "session_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let setup = WorktreeSetup {
+            session_file: project
+                .join(".threadlane/sessions")
+                .join(format!("{id}.jsonl")),
+            worktree: Self::canonical_worktree_dir(&project, &id),
+            project: project.clone(),
+            session_id: id.clone(),
+            base,
+            branch: None,
+            stage: SetupStage::Naming,
+            error: None,
+            text,
+            images,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            model: model.clone(),
+            effort: self.reasoning_effort,
+            acp_config: threadlane_acp_engine::acp_agent_id(&model)
+                .map(|agent| self.take_pending_acp_config(agent))
+                .unwrap_or_default(),
+        };
+        crate::worktree_setup::persist_request(&setup)?;
+        let options = coding_agent_options(
+            project.clone(),
+            setup.session_file.clone(),
+            model,
+            self.model_roles.clone(),
+            self.browser_bridge.clone(),
+        );
+        crate::worktree_setup::start(setup.clone(), options, self.stream_tx.clone())?;
+        if let Some(info) = self.projects.iter_mut().find(|p| p.work_dir == project) {
+            info.sessions.insert(
+                0,
+                SessionInfo {
+                    id: id.clone(),
+                    title: threadlane_runtime::titles::normalize_session_title(&setup.text),
+                    work_dir: project.clone(),
+                    runtime_work_dir: setup.worktree.clone(),
+                    session_file: setup.session_file.clone(),
+                    updated_at: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    health: SessionHealth::Working,
+                    git_branch: None,
+                    github_issue: None,
+                    is_worktree: true,
+                    worktree_available: false,
+                },
+            );
+        }
+        self.worktree_setups.insert(id.clone(), setup);
+        self.select_session(project, id);
+        self.composer_text.clear();
+        Ok(())
+    }
+
+    pub fn retry_worktree_setup(&mut self) {
+        let Some(mut setup) = self
+            .active_worktree_setup()
+            .filter(|s| s.error.is_some())
+            .cloned()
+        else {
+            return;
+        };
+        setup.error = None;
+        setup.stage = crate::worktree_setup::SetupStage::Naming;
+        let options = coding_agent_options(
+            setup.project.clone(),
+            setup.session_file.clone(),
+            setup.model.clone(),
+            self.model_roles.clone(),
+            self.browser_bridge.clone(),
+        );
+        match crate::worktree_setup::start(setup.clone(), options, self.stream_tx.clone()) {
+            Ok(()) => {
+                self.worktree_setups.insert(setup.session_id.clone(), setup);
+                self.is_generating = true;
+            }
+            Err(error) => self.session_status = Some(error),
+        }
+    }
+
+    fn cleanup_cancelled_worktree(&mut self, setup: &crate::worktree_setup::WorktreeSetup) {
+        self.drop_session_runtime(&setup.session_file);
+        self.worktree_setups.remove(&setup.session_id);
+        match crate::worktree_setup::cleanup_cancelled(setup) {
+            Ok(()) => {
+                if let Some(project) = self
+                    .projects
+                    .iter_mut()
+                    .find(|p| p.work_dir == setup.project)
+                {
+                    project.sessions.retain(|s| s.id != setup.session_id);
+                }
+            }
+            Err(error) => {
+                self.session_status = Some(format!("Could not clean up cancelled setup: {error}"));
+            }
+        }
+        self.request_session_refresh(&setup.project);
+    }
+
+    fn finish_worktree_setup(
+        &mut self,
+        id: &str,
+        result: Result<crate::worktree_setup::PreparedWorktree, String>,
+    ) {
+        let Some(setup) = self.worktree_setups.get(id).cloned() else {
+            return;
+        };
+        let active = self.active_session_id.as_deref() == Some(id);
+        if setup.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            drop(result);
+            if active {
+                self.is_generating = false;
+                self.session_status = Some("Worktree setup cancelled".into());
+            }
+            self.cleanup_cancelled_worktree(&setup);
+            return;
+        }
+        let result = result.and_then(|prepared| {
+            let session = prepared.session;
+            if let Some(project) = self
+                .projects
+                .iter_mut()
+                .find(|p| p.work_dir == setup.project)
+            {
+                project.sessions.retain(|s| s.id != id);
+                project.sessions.insert(0, session.clone());
+            }
+            let runtime = self.register_session_runtime(session.session_file, prepared.runtime);
+            crate::chat::execute_prompt(
+                runtime,
+                setup.worktree.clone(),
+                id.to_string(),
+                setup.text.clone(),
+                setup.images.clone(),
+                setup.effort,
+                self.stream_tx.clone(),
+                setup.acp_config.clone(),
+            )
+        });
+        match result {
+            Ok(()) => {
+                crate::worktree_setup::clear_request(&setup);
+                self.worktree_setups.remove(id);
+                if active {
+                    self.is_generating = true;
+                    self.session_status = Some("Working…".into());
+                }
+                self.request_session_refresh(&setup.project);
+            }
+            Err(error) => {
+                if let Some(setup) = self.worktree_setups.get_mut(id) {
+                    setup.error = Some(error);
+                }
+                if active {
+                    self.is_generating = false;
+                    self.session_status = None;
+                }
+            }
+        }
+    }
+
     fn create_new_session(&mut self) -> Result<String, String> {
         let Some(work_dir) = self.active_work_dir.clone() else {
             return Err("No active project directory".into());
@@ -2083,39 +2387,6 @@ impl AppState {
             .as_nanos();
         let session_id = format!("session_{now_nanos}");
         let session_file = sessions_dir.join(format!("{session_id}.jsonl"));
-
-        if self.draft_work_mode == WorkMode::Worktree && threadlane_git::is_git_repo(&work_dir) {
-            let branch = format!("worktree/{session_id}");
-            let worktree_dir = Self::canonical_worktree_dir(&work_dir, &session_id);
-            if let Err(error) = threadlane_git::create_worktree(&work_dir, &worktree_dir, &branch) {
-                tracing::warn!("Failed to create worktree: {error}, falling back to main workdir");
-            } else {
-                for (key, value) in [
-                    ("is_worktree", "true".to_string()),
-                    ("worktree_path", worktree_dir.to_string_lossy().to_string()),
-                    ("git_branch", branch.clone()),
-                ] {
-                    if let Err(error) =
-                        threadlane_coding_agent::harness::CodingSessionHarness::append_fact_to_path(
-                            &session_file,
-                            "main",
-                            key,
-                            &value,
-                            None,
-                        )
-                    {
-                        if let Err(cleanup_error) =
-                            threadlane_git::remove_worktree(&work_dir, &worktree_dir, true)
-                        {
-                            tracing::warn!(
-                                "session setup rollback: worktree remove failed: {cleanup_error}"
-                            );
-                        }
-                        return Err(format!("failed to persist worktree metadata: {error}"));
-                    }
-                }
-            }
-        }
 
         threadlane_coding_agent::harness::CodingSessionHarness::append_fact_to_path(
             &session_file,
@@ -4035,6 +4306,11 @@ impl AppState {
 
     /// Applies one of the selected external agent's settings.
     pub(crate) fn set_acp_config_option(&mut self, config_id: String, value: String) {
+        if self.active_worktree_setup().is_some() {
+            self.session_status =
+                Some("Cancel worktree setup before changing agent settings".into());
+            return;
+        }
         let Some((runtime, session_id)) = self.active_session_runtime() else {
             // No session yet (New task): remember the choice, show it
             // optimistically via the launch-time cache, and apply it to the
@@ -4112,6 +4388,9 @@ impl AppState {
     /// means having one — the same runtime a turn would use, so asking about
     /// settings and then sending a prompt talk to one agent, not two.
     fn active_session_runtime(&mut self) -> Option<(Arc<SessionRuntime>, String)> {
+        if self.active_worktree_setup().is_some() {
+            return None;
+        }
         let work_dir = self.active_work_dir.clone()?;
         let session_id = self.active_session_id.clone()?;
         let session_file = self.session_file(&work_dir, &session_id);
@@ -4276,6 +4555,44 @@ impl AppState {
 
         for event in deferred.chain(events) {
             match event {
+                ChatStreamEvent::WorktreeBases { project, result } => {
+                    if self.is_new_task && self.active_work_dir.as_ref() == Some(&project) {
+                        match result {
+                            Ok((default, branches)) => {
+                                if !self
+                                    .draft_worktree_base
+                                    .as_ref()
+                                    .is_some_and(|base| branches.contains(base))
+                                {
+                                    self.draft_worktree_base = Some(default);
+                                }
+                                self.draft_worktree_bases = branches;
+                            }
+                            Err(error) => {
+                                self.session_status =
+                                    Some(format!("Could not load base branches: {error}"))
+                            }
+                        }
+                        changed = true;
+                    }
+                }
+                ChatStreamEvent::WorktreeProgress {
+                    session_id,
+                    stage,
+                    branch,
+                } => {
+                    if let Some(setup) = self.worktree_setups.get_mut(&session_id) {
+                        setup.stage = stage;
+                        if branch.is_some() {
+                            setup.branch = branch;
+                        }
+                        changed = true;
+                    }
+                }
+                ChatStreamEvent::WorktreePrepared { session_id, result } => {
+                    self.finish_worktree_setup(&session_id, result);
+                    changed = true;
+                }
                 ChatStreamEvent::Agent { session_id, event }
                     if self.active_session_id.as_deref() == Some(&session_id) =>
                 {
@@ -4853,6 +5170,12 @@ impl AppState {
             return Ok(());
         }
 
+        if self.active_worktree_setup().is_some() {
+            return Err("Finish or cancel worktree setup before sending another message".into());
+        }
+        if self.active_session_id.is_none() && self.draft_work_mode == WorkMode::Worktree {
+            return self.start_worktree_task(text, images);
+        }
         if self.active_session_id.is_none() || self.active_work_dir.is_none() {
             self.create_new_session()?;
         }
@@ -4977,6 +5300,32 @@ impl AppState {
     }
 
     pub(crate) fn cancel_generation(&mut self) -> Result<(), String> {
+        if let Some(id) = self.active_session_id.clone() {
+            if let Some(setup) = self.worktree_setups.remove(&id) {
+                crate::worktree_setup::clear_request(&setup);
+                setup
+                    .cancelled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                // Keep the entry until the worker acknowledges cancellation so archive/delete
+                // cannot race a Git subprocess or runtime construction still writing metadata.
+                if setup.error.is_none() {
+                    self.worktree_setups.insert(id, setup.clone());
+                }
+                self.is_generating = false;
+                self.begin_new_task();
+                self.draft_worktree_base = Some(setup.base.clone());
+                self.set_work_mode(WorkMode::Worktree);
+                if setup.error.is_some() {
+                    self.cleanup_cancelled_worktree(&setup);
+                }
+                self.requested_composer_inserts
+                    .push(RequestedComposerInsert {
+                        text: setup.text,
+                        images: setup.images,
+                    });
+                return Ok(());
+            }
+        }
         let (Some(work_dir), Some(session_id)) = (
             self.active_work_dir.as_ref(),
             self.active_session_id.as_ref(),

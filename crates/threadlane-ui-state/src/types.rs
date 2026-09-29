@@ -269,6 +269,19 @@ pub struct SubagentActivityInfo {
 
 #[derive(Clone, Debug)]
 pub enum ChatStreamEvent {
+    WorktreeBases {
+        project: PathBuf,
+        result: Result<(String, Vec<String>), String>,
+    },
+    WorktreeProgress {
+        session_id: String,
+        stage: crate::worktree_setup::SetupStage,
+        branch: Option<String>,
+    },
+    WorktreePrepared {
+        session_id: String,
+        result: Result<crate::worktree_setup::PreparedWorktree, String>,
+    },
     Agent {
         session_id: String,
         event: AgentEvent,

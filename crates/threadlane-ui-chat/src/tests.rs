@@ -3737,3 +3737,47 @@ fn title_error_clears_on_session_switch_and_new_task(cx: &mut gpui::TestAppConte
         assert!(chat.read_with(cx, |chat, _| chat.title_error.is_none()));
     }
 }
+
+#[gpui::test]
+fn worktree_base_picker_is_scoped_to_new_worktree_tasks(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    cx.update(gpui_component::init);
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::default();
+        state.is_new_task = true;
+        state.active_session_id = None;
+        state.pending_hydrations.clear();
+        state.draft_work_mode = threadlane_ui_state::WorkMode::Worktree;
+        state.draft_worktree_base = Some("origin/main".into());
+        state.draft_worktree_bases = vec!["origin/main".into(), "release".into()];
+        state
+    });
+    let retained = model.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        gpui_component::Root::new(chat, window, cx)
+    });
+    for width in [320.0, 800.0] {
+        cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(800.0)));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = cx.debug_bounds("composer-worktree-base").unwrap();
+        assert!(bounds.right() <= gpui::px(width));
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        assert_eq!(
+            retained
+                .read_with(cx, |s, _| s.draft_worktree_base.clone())
+                .as_deref(),
+            Some("origin/main")
+        );
+    }
+    retained.update(cx, |state, cx| {
+        state.draft_work_mode = threadlane_ui_state::WorkMode::Local;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("composer-worktree-base").is_none());
+}

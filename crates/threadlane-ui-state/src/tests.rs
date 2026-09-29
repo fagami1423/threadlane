@@ -4585,3 +4585,129 @@ fn pinned_session_atomic_persistence_and_reload() {
     assert!(state2.is_session_pinned(&work_dir, "session-1"));
     assert!(state2.is_session_pinned(&work_dir, "session-2"));
 }
+
+#[test]
+fn worktree_setup_failure_and_cancellation_are_scoped_to_the_session() {
+    use crate::worktree_setup::{SetupStage, WorktreeSetup};
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().to_path_buf();
+    let id = "session_setup".to_string();
+    let file = project.join(".threadlane/sessions/session_setup.jsonl");
+    let mut state = AppState::load_from_registry(Vec::new());
+    let setup = WorktreeSetup {
+        project: project.clone(),
+        session_id: id.clone(),
+        session_file: file.clone(),
+        worktree: project.join(".threadlane/worktrees/session_setup"),
+        base: "main".into(),
+        branch: None,
+        stage: SetupStage::Naming,
+        error: None,
+        text: "Fix login".into(),
+        images: Vec::new(),
+        model: "test".into(),
+        effort: ReasoningEffort::default(),
+        acp_config: Vec::new(),
+        cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    crate::worktree_setup::persist_request(&setup).unwrap();
+    assert!(JsonlStore::open_read_only(&file)
+        .unwrap()
+        .facts()
+        .get("worktree_setup")
+        .unwrap()
+        .contains("Fix login"));
+    state.projects.push(ProjectInfo {
+        name: "project".into(),
+        work_dir: project.clone(),
+        sessions: discover_sessions_in_project(&project),
+        is_expanded: true,
+    });
+    let recovered = crate::worktree_setup::recover(&state.projects[0].sessions[0]).unwrap();
+    assert_eq!(recovered.text, "Fix login");
+    assert!(recovered.error.as_deref().unwrap().contains("interrupted"));
+    state.worktree_setups.insert(id.clone(), setup.clone());
+    state.select_session_with_persistence(project, id.clone(), false);
+    assert!(state.pending_hydrations.is_empty());
+    assert!(state.is_generating);
+    assert!(state.session_is_generating(&file));
+    state.drain_chat_stream(vec![ChatStreamEvent::WorktreeProgress {
+        session_id: id.clone(),
+        stage: SetupStage::Creating,
+        branch: Some("worktree/fix-login".into()),
+    }]);
+    assert_eq!(
+        state.active_worktree_setup().unwrap().stage,
+        SetupStage::Creating
+    );
+    state.finish_worktree_setup(&id, Err("invalid base".into()));
+    assert!(!state.is_generating);
+    assert_eq!(
+        state.active_worktree_setup().unwrap().error.as_deref(),
+        Some("invalid base")
+    );
+    assert!(state.session_runtimes.is_empty());
+    state.cancel_generation().unwrap();
+    assert!(setup.cancelled.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(
+        state.requested_composer_inserts.last().unwrap().text,
+        "Fix login"
+    );
+    assert!(!file.exists());
+    assert!(state.projects[0].sessions.is_empty());
+    assert!(discover_sessions_in_project(&setup.project).is_empty());
+    crate::worktree_setup::persist_request(&setup).unwrap();
+    // A live worker keeps ownership until completion, even after the UI returns to a draft.
+    setup
+        .cancelled
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    state.worktree_setups.insert(id.clone(), setup.clone());
+    state.select_session_with_persistence(setup.project.clone(), id.clone(), false);
+    state.cancel_generation().unwrap();
+    assert!(state.worktree_setups.contains_key(&id));
+    assert!(state
+        .remove_session(setup.project.clone(), id.clone(), true)
+        .is_err());
+    assert!(file.exists());
+    // Simulate creation finishing after cancellation but before the worker acknowledgement.
+    run_git(&setup.project, &["init", "-q", "-b", "main"]);
+    run_git(
+        &setup.project,
+        &["config", "user.email", "test@example.com"],
+    );
+    run_git(&setup.project, &["config", "user.name", "Test"]);
+    run_git(
+        &setup.project,
+        &["commit", "--allow-empty", "-qm", "initial"],
+    );
+    let branch = "worktree/fix-login-setup";
+    threadlane_git::create_worktree_from(&setup.project, &setup.worktree, branch, "main").unwrap();
+    let commit = threadlane_git::list_commits(&setup.worktree, 1).unwrap()[0]
+        .sha
+        .clone();
+    for (key, value) in [
+        ("git_branch", branch),
+        ("worktree_setup_commit", commit.as_str()),
+    ] {
+        threadlane_coding_agent::harness::CodingSessionHarness::append_fact_to_path(
+            &file, "main", key, value, None,
+        )
+        .unwrap();
+    }
+    std::fs::write(setup.worktree.join("user.txt"), "keep me").unwrap();
+    assert!(crate::worktree_setup::cleanup_cancelled(&setup).is_err());
+    assert!(file.exists());
+    std::fs::remove_file(setup.worktree.join("user.txt")).unwrap();
+    state.finish_worktree_setup(&id, Err("late result".into()));
+    assert!(!file.exists());
+    assert!(!setup.worktree.exists());
+    assert!(discover_sessions_in_project(&setup.project).is_empty());
+    assert!(!threadlane_git::worktree_bases(&setup.project)
+        .unwrap()
+        .1
+        .contains(&branch.to_string()));
+    assert!(!state.worktree_setups.contains_key(&id));
+    assert!(state.active_session_id.is_none());
+    assert!(state.session_status.is_none());
+    assert!(state.session_runtimes.is_empty());
+}

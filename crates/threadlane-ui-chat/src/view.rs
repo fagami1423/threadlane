@@ -613,6 +613,7 @@ impl ChatListView {
                         secondary,
                         shift: false,
                     } => {
+                        if model_clone.read(cx).active_worktree_setup().is_some() { return; }
                         let text = input_state.read(cx).value().to_string();
                         let is_generating = model_clone.read(cx).is_generating;
                         let project_root = model_clone.read(cx).active_work_dir.clone();
@@ -5512,6 +5513,45 @@ impl ChatListView {
                     )
             });
 
+        let base_chip = (is_new_task && effective_work_mode == WorkMode::Worktree).then(|| {
+            let state = self.model.read(cx);
+            let selected = state.draft_worktree_base.clone();
+            let branches = state.draft_worktree_bases.clone();
+            let model = self.model.clone();
+            let label = selected
+                .clone()
+                .unwrap_or_else(|| "Loading branches…".into());
+            Button::new("composer-worktree-base")
+                .debug_selector(|| "composer-worktree-base".into())
+                .max_w(rems(14.0))
+                .label(format!("Base: {label}"))
+                .accessibility_label(format!("Worktree base branch: {label}"))
+                .tooltip("Create the worktree from this branch’s committed changes")
+                .dropdown_caret(true)
+                .ghost()
+                .xsmall()
+                .rounded_full()
+                .disabled(branches.is_empty())
+                .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, _, _| {
+                    let mut menu = menu;
+                    for branch in &branches {
+                        let model = model.clone();
+                        let value = branch.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(branch.clone())
+                                .checked(selected.as_ref() == Some(branch))
+                                .on_click(move |_, _, cx| {
+                                    model.update(cx, |state, cx| {
+                                        state.draft_worktree_base = Some(value.clone());
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                    }
+                    menu
+                })
+        });
+
         let branch = {
             let state = self.model.read(cx);
             state
@@ -5553,10 +5593,12 @@ impl ChatListView {
             .mb_2p5()
             .px_1()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap_1p5()
             .child(project_chip)
             .child(work_mode_chip)
+            .children(base_chip)
             .child(skills_chip)
             .children(branch.map(|branch| {
                 div()
@@ -6509,6 +6551,129 @@ impl ChatListView {
                 })
         };
 
+        let setup_card = self
+            .model
+            .read(cx)
+            .active_worktree_setup()
+            .cloned()
+            .map(|setup| {
+                use threadlane_ui_state::worktree_setup::SetupStage;
+                let retry = self.model.clone();
+                let cancel = self.model.clone();
+                let failed = setup.error.is_some();
+                div()
+                    .flex()
+                    .flex_col()
+                    .id("worktree-setup")
+                    .mb_2()
+                    .p_3()
+                    .gap_2()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.popover)
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(if failed {
+                                "Worktree setup failed"
+                            } else {
+                                "Preparing environment…"
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("Base: {}", setup.base)),
+                    )
+                    .children(
+                        [
+                            SetupStage::Naming,
+                            SetupStage::Creating,
+                            SetupStage::Starting,
+                        ]
+                        .into_iter()
+                        .map(|stage| {
+                            let status = if stage < setup.stage {
+                                "Done"
+                            } else if stage == setup.stage {
+                                if failed {
+                                    "Failed"
+                                } else {
+                                    "In progress"
+                                }
+                            } else {
+                                "Pending"
+                            };
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .text_xs()
+                                .text_color(if stage == setup.stage && failed {
+                                    theme.danger
+                                } else {
+                                    theme.muted_foreground
+                                })
+                                .when(stage == setup.stage && !failed, |row| {
+                                    row.child(gpui_component::spinner::Spinner::new().xsmall())
+                                })
+                                .when(stage < setup.stage, |row| {
+                                    row.child(Icon::new(IconName::Check).xsmall())
+                                })
+                                .child(format!("{} · {status}", stage.label()))
+                        }),
+                    )
+                    .children(
+                        setup
+                            .branch
+                            .as_ref()
+                            .map(|branch| div().text_xs().child(branch.clone())),
+                    )
+                    .children(
+                        setup
+                            .error
+                            .map(|error| div().text_xs().text_color(theme.danger).child(error)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .when(failed, |row| {
+                                row.child(
+                                    Button::new("worktree-setup-retry")
+                                        .label("Retry setup")
+                                        .small()
+                                        .outline()
+                                        .on_click(move |_, _, cx| {
+                                            retry.update(cx, |state, cx| {
+                                                state.retry_worktree_setup();
+                                                cx.notify();
+                                            });
+                                        }),
+                                )
+                            })
+                            .child(
+                                Button::new("worktree-setup-cancel")
+                                    .label("Cancel setup")
+                                    .small()
+                                    .ghost()
+                                    .on_click(move |_, _, cx| {
+                                        cancel.update(cx, |state, cx| {
+                                            controller::dispatch(
+                                                state,
+                                                AppAction::CancelGeneration,
+                                            );
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                    )
+            });
+
         div()
             .w_full()
             .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
@@ -6521,6 +6686,7 @@ impl ChatListView {
             .pb_4()
             .bg(theme.background)
             .children(provider_setup_banner)
+            .children(setup_card)
             .children(session_status.map(|status| {
                 let (summary, needs_provider_settings) = chat_error_summary(&status);
                 let is_error = status.starts_with("Could not")
@@ -6730,7 +6896,7 @@ impl ChatListView {
                                             "Type a message to send"
                                         })
                                         .when(has_prompt && !needs_provider, |b| b.primary())
-                                        .when(!has_prompt || needs_provider, |b| b.ghost().disabled(true))
+                                        .when(!has_prompt || needs_provider || self.model.read(cx).active_worktree_setup().is_some(), |b| b.ghost().disabled(true))
                                         .on_click(cx.listener(move |this, _event, window, cx| {
                                             let text = send_input.read(cx).value().to_string();
                                             if !text.trim().is_empty() || !this.pasted_images.is_empty() {
