@@ -795,6 +795,7 @@ impl SidebarView {
                                 .into_any_element()
                         } else if is_generating {
                             div()
+                                .id("sidebar-working-indicator")
                                 .flex()
                                 .items_center()
                                 .gap(rems(0.25))
@@ -805,13 +806,6 @@ impl SidebarView {
                                 .border_1()
                                 .border_color(theme.info.opacity(0.25))
                                 .child(Spinner::new().xsmall().color(theme.info))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_medium()
-                                        .text_color(theme.info)
-                                        .child("Working"),
-                                )
                                 .into_any_element()
                         } else if active_attention == Some(SessionAttention::NeedsYou) {
                             div()
