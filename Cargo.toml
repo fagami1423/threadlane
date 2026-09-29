@@ -88,7 +88,7 @@ wasmi = "2.0"
 
 [profile.dev]
 opt-level = 0
-debug = true
+debug = 0
 strip = "none"
 debug-assertions = true
 overflow-checks = true
