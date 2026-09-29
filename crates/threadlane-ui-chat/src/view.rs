@@ -888,8 +888,22 @@ impl ChatListView {
         cx.notify();
     }
 
+    /// Session titles generated from a linked issue start with "#N"; the
+    /// sidebar card and environment panel already surface that number, so the
+    /// header drops the duplicated prefix.
+    fn header_title_without_issue_prefix(title: &str, issue_number: Option<u64>) -> String {
+        issue_number
+            .and_then(|number| {
+                title
+                    .strip_prefix(&format!("#{number}"))
+                    .map(|rest| rest.trim_start_matches([' ', '·', '-', '–', ':']).to_string())
+            })
+            .filter(|rest| !rest.is_empty())
+            .unwrap_or_else(|| title.to_string())
+    }
+
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (active_title, active_attention, linked_issue, active_work_dir) = {
+        let (active_title, active_attention, linked_issue) = {
             let state = self.model.read(cx);
             let active_session = state
                 .projects
@@ -903,9 +917,12 @@ impl ChatListView {
                 .map(|session| state.session_attention(session))
                 .unwrap_or(SessionAttention::Idle);
             let linked_issue = active_session.and_then(|session| session.github_issue.clone());
-            let work_dir = active_session.map(|session| session.work_dir.clone());
-            (title, attention, linked_issue, work_dir)
+            (title, attention, linked_issue)
         };
+        let display_title = Self::header_title_without_issue_prefix(
+            &active_title,
+            linked_issue.as_ref().map(|issue| issue.number),
+        );
         let theme = cx.theme().colors;
         let editor_tab_count = self.editor.read(cx).tab_count();
         let editor_label = if editor_tab_count > 0 {
@@ -1002,41 +1019,9 @@ impl ChatListView {
                                         .build(window, cx)
                                 }
                             })
-                            .child(active_title),
+                            .child(display_title),
                     )
-                    .children(status_badge)
-                    .children(linked_issue.clone().map(|issue| {
-                        let model = self.model.clone();
-                        Button::new("chat-open-task-context")
-                            .debug_selector(|| "chat-header-issue-link".into())
-                            .label(format!("#{}", issue.number))
-                            .icon(IconName::Github)
-                            .accessibility_label(format!(
-                                "Open task context: {}/{} #{}",
-                                issue.owner, issue.repo, issue.number
-                            ))
-                            .tooltip(format!(
-                                "{} / {} · Open task context",
-                                issue.owner, issue.repo
-                            ))
-                            .ghost()
-                            .xsmall()
-                            .rounded_md()
-                            .on_click(move |_, _, cx| {
-                                if let Some(work_dir) = active_work_dir.clone() {
-                                    model.update(cx, |state, cx| {
-                                        controller::dispatch(
-                                            state,
-                                            AppAction::OpenGitHubIssue {
-                                                work_dir,
-                                                number: issue.number,
-                                            },
-                                        );
-                                        cx.notify();
-                                    });
-                                }
-                            })
-                    })),
+                    .children(status_badge),
             )
             .when(self.current_tab == CentralTab::Chat, |el| {
                 el.child(
@@ -1225,18 +1210,27 @@ impl ChatListView {
             .flex_none()
             .pt_5()
             .pl_3()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .text_sm()
             .child(
                 div()
-                    .px_2()
-                    .py_1()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("Environment"),
-            )
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .text_sm()
+                    .p_1()
+                    .pb_2()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(theme.border.opacity(0.4))
+                    .bg(theme.muted.opacity(0.14))
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("Environment"),
+                    )
             .child(
                 div()
                     .px_2()
@@ -1298,26 +1292,6 @@ impl ChatListView {
                             .text_color(theme.muted_foreground)
                             .child(format!("{} ahead · {} behind", status.ahead, status.behind))
                     }))
-                    .child(
-                        Button::new("environment-commit-and-push")
-                            .debug_selector(|| "environment-commit-and-push".into())
-                            .outline()
-                            .small()
-                            .w_full()
-                            .justify_start()
-                            .accessibility_label("Review changes to commit and push")
-                            .tooltip(
-                                "Select files and enter a message before committing and pushing",
-                            )
-                            .disabled(status.files.is_empty())
-                            .child(action_content(
-                                Icon::default().path("icons/git/commit.svg"),
-                                "Commit and push…".into(),
-                            ))
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(crate::OpenWorkspaceCommit), cx)
-                            }),
-                    )
                     .child(
                         Button::new("environment-git-actions")
                             .debug_selector(|| "environment-git-actions".into())
@@ -1490,8 +1464,9 @@ impl ChatListView {
                             });
                         }
                     }),
-            )
-            .into_any_element()
+            ),
+        )
+        .into_any_element()
     }
 
     fn render_workspace_changes(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -3477,8 +3452,7 @@ impl ChatListView {
             .ghost()
             .small()
             .w_full()
-            .px_3()
-            .rounded_none()
+            .when(is_expanded, |button| button.px_3().rounded_none())
             .flex()
             .items_center()
             .justify_between()
@@ -3551,19 +3525,20 @@ impl ChatListView {
             }
         });
 
-        Some(
-            div()
-                .w_full()
-                .min_w_0()
-                .rounded_xl()
-                .border_1()
-                .border_color(theme.border.opacity(0.3))
-                .bg(theme.muted.opacity(0.14))
-                .overflow_hidden()
-                .child(header)
-                .children(detail)
-                .into_any_element(),
-        )
+        // Collapsed reasoning reads as a quiet transcript row, like tool
+        // activity; the bordered card only appears around expanded content.
+        let container = div()
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .when(is_expanded, |el| {
+                el.rounded_xl()
+                    .border_1()
+                    .border_color(theme.border.opacity(0.3))
+                    .bg(theme.muted.opacity(0.14))
+            });
+
+        Some(container.child(header).children(detail).into_any_element())
     }
 
     fn render_tool_activities_block(
