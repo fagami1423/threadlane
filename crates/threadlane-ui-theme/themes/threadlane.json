@@ -145,7 +145,7 @@
         "muted.foreground": "#9c9ca5",
         "primary.background": "#177a42",
         "primary.foreground": "#ffffff",
-        "primary.hover.background": "#1e8f4c",
+        "primary.hover.background": "#1a8446",
         "primary.active.background": "#125e33",
         "secondary.background": "#1e1e22",
         "secondary.foreground": "#e9e9eb",
@@ -231,7 +231,7 @@
         "editor.background": "#131316",
         "editor.foreground": "#e9e9eb",
         "editor.active_line.background": "#1a1a1e",
-        "editor.line_number": "#56565c",
+        "editor.line_number": "#9c9ca5",
         "editor.active_line_number": "#c9c9cf",
         "editor.invisible": "#2d2d33",
         "syntax": {

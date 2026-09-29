@@ -641,10 +641,10 @@ impl TrajectoryView {
                 _ => (theme.muted.opacity(0.5), theme.muted_foreground, entry.category.clone().into()),
             };
             div()
-                .w(rems(25.625))
-                .min_w(rems(20.0))
+                .w(relative(0.55))
+                .min_w(rems(12.0))
                 .h_full()
-                .flex_none()
+                .flex_shrink_0()
                 .flex()
                 .flex_col()
                 .border_l_1()
@@ -1089,7 +1089,9 @@ impl TrajectoryView {
             .child(div().flex_1())
             .child(
                 div()
-                    .w(rems(17.5))
+                    .flex_1()
+                    .min_w(rems(6.0))
+                    .max_w(rems(17.5))
                     .h_8()
                     .px_2()
                     .rounded_md()
