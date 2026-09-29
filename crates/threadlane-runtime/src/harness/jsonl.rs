@@ -379,7 +379,7 @@ fn parse_transcript_line(
     let payload = atomic_frame_payload(bytes).unwrap_or(bytes);
     match serde_json::from_slice(payload) {
         Ok(line) => Ok(Some(line)),
-        Err(_) if is_recoverable_atomic_fragment(bytes, is_physical_eof) => Ok(None),
+        Err(_) if is_recoverable_journal_fragment(bytes, is_physical_eof) => Ok(None),
         Err(error) => Err(invalid_line(path, offset as usize, error)),
     }
 }
@@ -970,6 +970,9 @@ fn append_session_json_line_with_policy<T: serde::Serialize>(
     value: &T,
     sync_policy: SyncPolicy,
 ) -> io::Result<()> {
+    // Serialization failures must not leave a partial durable record.
+    let mut encoded = serde_json::to_vec(value).map_err(io::Error::other)?;
+    encoded.push(b'\n');
     // Process-wide append lock shared with atomic batches; the session
     // writer lease handles cross-process writers.
     let _guard = session_append_lock()
@@ -983,8 +986,7 @@ fn append_session_json_line_with_policy<T: serde::Serialize>(
     // The separator also quarantines a crash-torn atomic batch if ordinary
     // session traffic is the first append after recovery.
     prepare_append_boundary(&mut file)?;
-    serde_json::to_writer(&mut file, value).map_err(io::Error::other)?;
-    file.write_all(b"\n")?;
+    file.write_all(&encoded)?;
     match sync_policy {
         SyncPolicy::All => file.sync_all(),
         SyncPolicy::Data => file.sync_data(),
@@ -1251,9 +1253,15 @@ fn is_atomic_frame_fragment(bytes: &[u8]) -> bool {
             || bytes.starts_with(LEGACY_ATOMIC_FRAME_PREFIX.as_bytes()))
 }
 
-fn is_recoverable_atomic_fragment(bytes: &[u8], is_physical_eof: bool) -> bool {
-    if is_physical_eof && is_atomic_frame_fragment(bytes) {
-        return true;
+fn is_recoverable_journal_fragment(bytes: &[u8], is_physical_eof: bool) -> bool {
+    if is_physical_eof {
+        let payload = atomic_frame_payload(bytes).unwrap_or(bytes);
+        if is_atomic_frame_fragment(bytes)
+            || serde_json::from_slice::<serde_json::Value>(payload)
+                .is_err_and(|error| error.is_eof())
+        {
+            return true;
+        }
     }
     let Some(stripped) = bytes.strip_suffix(TORN_EOF_SENTINEL.as_bytes()) else {
         return false;
@@ -1271,18 +1279,19 @@ fn read_strict<T: DeserializeOwned>(path: &Path) -> io::Result<Vec<T>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let data = fs::read_to_string(path)?;
-    let count = data.split('\n').count();
+    // A torn write can end inside UTF-8; decode records independently.
+    let data = fs::read(path)?;
+    let count = data.split(|byte| *byte == b'\n').count();
     let mut values = Vec::new();
-    for (index, line) in data.split('\n').enumerate() {
-        if line.trim().is_empty() {
+    for (index, line) in data.split(|byte| *byte == b'\n').enumerate() {
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let is_physical_eof = index == count - 1 && !data.ends_with('\n');
-        let payload = line.strip_prefix(ATOMIC_FRAME_SENTINEL).unwrap_or(line);
-        match serde_json::from_str(payload) {
+        let is_physical_eof = index == count - 1 && !data.ends_with(b"\n");
+        let payload = atomic_frame_payload(line).unwrap_or(line);
+        match serde_json::from_slice(payload) {
             Ok(value) => values.push(value),
-            Err(_error) if is_recoverable_atomic_fragment(line.as_bytes(), is_physical_eof) => {
+            Err(_error) if is_recoverable_journal_fragment(line, is_physical_eof) => {
                 tracing::warn!(session_file = %path.display(), line = index + 1,
                     "skipping incomplete session journal frame; interruption cause unknown");
                 continue
@@ -2356,6 +2365,56 @@ mod tests {
         assert!(!page.items.iter().any(|item| matches!(item,
             TranscriptItem::Message(AgentMessage::Custom { custom_type, .. }) if custom_type == "compaction_summary"
         )));
+    }
+
+    #[test]
+    fn ordinary_tail_recovery_rejects_completed_corruption_and_schema_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid.jsonl");
+        for bytes in [b"{\n".as_slice(), b"{}", b"junk", b"{\n{}\n"] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(JsonlStore::open_read_only(&path).is_err(), "{bytes:?}");
+            assert!(read_transcript_page(&path, None, 10).is_err(), "{bytes:?}");
+        }
+        let entry = serde_json::to_vec(&transcript_entry(1, assistant("complete"))).unwrap();
+        std::fs::write(&path, entry).unwrap();
+        assert_eq!(JsonlStore::open_read_only(&path).unwrap().entries().len(), 1);
+        assert_eq!(read_transcript_page(&path, None, 1).unwrap().messages().len(), 1);
+    }
+
+    #[test]
+    fn every_ordinary_entry_cut_recovers_without_rewriting_history() {
+        let encoded = serde_json::to_vec(&transcript_entry(2, assistant("result 🦀"))).unwrap();
+        for cut in 1..encoded.len() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("entry-cut.jsonl");
+            let mut store = JsonlStore::open(&path).unwrap();
+            store.append_entry(user_entry("root", "main")).unwrap();
+            drop(store);
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes.extend_from_slice(&encoded[..cut]);
+            std::fs::write(&path, &bytes).unwrap();
+
+            assert_eq!(
+                JsonlStore::open_read_only(&path).unwrap().entries().len(),
+                1,
+                "cut {cut}"
+            );
+            assert_eq!(
+                read_transcript_page(&path, None, 1).unwrap().messages().len(),
+                1
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            let mut recovered = JsonlStore::open(&path).unwrap();
+            recovered.append_entry(user_entry("after", "main")).unwrap();
+            drop(recovered);
+            assert!(std::fs::read(&path).unwrap().starts_with(&bytes));
+            assert_eq!(JsonlStore::open(&path).unwrap().entries().len(), 2);
+            assert_eq!(
+                read_transcript_page(&path, None, 2).unwrap().messages().len(),
+                2
+            );
+        }
     }
 
     #[test]
