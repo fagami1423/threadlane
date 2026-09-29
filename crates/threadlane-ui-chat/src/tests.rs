@@ -3798,45 +3798,6 @@ fn conversation_find_loading_failure_and_empty_are_distinct(cx: &mut gpui::TestA
 }
 
 #[gpui::test]
-fn title_error_clears_on_session_switch_and_new_task(cx: &mut gpui::TestAppContext) {
-    use gpui::AppContext as _;
-    cx.update(gpui_component::init);
-    let model = cx.new(|_| {
-        let mut state = threadlane_ui_state::AppState::default();
-        state.active_work_dir = Some("/tmp/title-error-test".into());
-        state.active_session_id = Some("first".into());
-        state.pending_hydrations.clear();
-        state
-    });
-    let retained = model.clone();
-    let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let capture = holder.clone();
-    let (_, cx) = cx.add_window_view(move |window, cx| {
-        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
-        capture.replace(Some(chat.clone()));
-        gpui_component::Root::new(chat, window, cx)
-    });
-    let chat = holder.borrow().as_ref().unwrap().clone();
-    cx.run_until_parked();
-    for next in [Some("second"), None] {
-        chat.update(cx, |chat, cx| {
-            chat.title_error = Some("Old session failure".into());
-            cx.notify();
-        });
-        cx.run_until_parked();
-        assert!(chat.read_with(cx, |chat, _| chat.title_error.is_some()));
-        retained.update(cx, |state, cx| {
-            state.active_session_id = next.map(str::to_owned);
-            state.is_new_task = next.is_none();
-            cx.notify();
-        });
-        cx.run_until_parked();
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert!(chat.read_with(cx, |chat, _| chat.title_error.is_none()));
-    }
-}
-
-#[gpui::test]
 fn worktree_base_picker_is_scoped_to_new_worktree_tasks(cx: &mut gpui::TestAppContext) {
     use gpui::AppContext as _;
     cx.update(gpui_component::init);

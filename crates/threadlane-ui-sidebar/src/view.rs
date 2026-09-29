@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -513,6 +514,7 @@ pub struct SidebarView {
     /// Hash of the model state the sidebar renders; lets the observer skip
     /// notifications for streaming updates that cannot change any row.
     history_fingerprint: u64,
+    title_generating: HashSet<PathBuf>,
     update_label: Option<String>,
     /// Flattened, sorted rows cached per fingerprint for the virtual list.
     history_cache: Option<(u64, Vec<HistoryRow>)>,
@@ -709,9 +711,95 @@ impl SidebarView {
             update_label,
             history_fingerprint,
             history_cache: None,
+            title_generating: HashSet::new(),
             history_list_state: ListState::new(0, ListAlignment::Top, window.rem_size() * 4.5),
             _subscriptions: vec![sub1],
         }
+    }
+
+    fn regenerate_title(
+        &mut self,
+        session: SessionInfo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.title_generating.contains(&session.session_file) {
+            return;
+        }
+        let state = self.model.read(cx);
+        let active = state.active_session_matches(&session.id, &session.session_file);
+        if active && state.active_session_is_loading() {
+            return;
+        }
+        let messages = active.then(|| state.messages.clone());
+        let model = state.selected_model.clone();
+        let runtime = match threadlane_ui_state::chat::executor() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                window.push_notification(error, cx);
+                return;
+            }
+        };
+        self.title_generating.insert(session.session_file.clone());
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let source = session.session_file.clone();
+            let prompt = cx.background_executor().spawn(async move {
+                let messages = match messages {
+                    Some(messages) => messages,
+                    None => std::sync::Arc::new(
+                        threadlane_ui_state::projection::compute_session_messages(&source)?,
+                    ),
+                };
+                let prompt = threadlane_ui_state::chat::conversation_title_prompt(&messages);
+                if prompt.trim().is_empty() {
+                    return Err("The session has no conversation to generate a title from.".to_owned());
+                }
+                Ok(prompt)
+            }).await;
+            let result = match prompt {
+                Ok(prompt) => {
+                    let work_dir = session.runtime_work_dir.clone();
+                    runtime.spawn(async move {
+                        threadlane_ui_state::chat::generate_text(
+                            model,
+                            work_dir,
+                            "Return only a concise session title, maximum 42 Unicode characters. No Markdown, explanations or tools.".into(),
+                            prompt,
+                        ).await
+                    }).await.unwrap_or_else(|error| Err(error.to_string()))
+                }
+                Err(error) => Err(error),
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.title_generating.remove(&session.session_file);
+                let unchanged = this.model.read(cx).projects.iter()
+                    .flat_map(|project| &project.sessions)
+                    .any(|current| current.session_file == session.session_file
+                        && current.id == session.id && current.title == session.title);
+                let result = if unchanged {
+                    result.and_then(|raw| threadlane_ui_state::chat::persist_regenerated_title(
+                        &session.session_file, &raw,
+                    ))
+                } else {
+                    Err("The session was removed or its title changed; generated text was not applied.".into())
+                };
+                match result {
+                    Ok(title) => this.model.update(cx, |state, cx| {
+                        for current in state.projects.iter_mut().flat_map(|project| &mut project.sessions) {
+                            if current.session_file == session.session_file {
+                                current.title = title.clone();
+                            }
+                        }
+                        cx.notify();
+                    }),
+                    Err(error) => window.push_notification(
+                        format!("Couldn’t regenerate title for “{}”: {error}", session.title), cx,
+                    ),
+                }
+                cx.notify();
+            });
+        }).detach();
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1190,6 +1278,8 @@ impl SidebarView {
         let context_work_dir = session.work_dir.clone();
         let context_session_id = session.id.clone();
         let context_model = self.model.clone();
+        let title_view = cx.entity().downgrade();
+        let title_session = session.clone();
         let terminal_model = self.model.clone();
         let terminal_work_dir = session.runtime_work_dir.clone();
         let terminal_unavailable = session.is_worktree && !session.worktree_available;
@@ -1762,8 +1852,33 @@ impl SidebarView {
                 let pin_work_dir = context_work_dir.clone();
                 let pin_session_id = context_session_id.clone();
 
-                menu.item(PopupMenuItem::new("Open Session").on_click(
-                    move |_event, _window, cx| {
+                let title_generating = title_view.upgrade().is_some_and(|view| {
+                    view.read(_cx)
+                        .title_generating
+                        .contains(&title_session.session_file)
+                });
+                let title_loading = context_model
+                    .read(_cx)
+                    .active_session_matches(&title_session.id, &title_session.session_file)
+                    && context_model.read(_cx).active_session_is_loading();
+                let title_view = title_view.clone();
+                let title_session = title_session.clone();
+
+                menu.item(
+                    PopupMenuItem::new(if title_generating {
+                        "Generating title…"
+                    } else {
+                        "Regenerate title"
+                    })
+                    .disabled(title_generating || title_loading)
+                    .on_click(move |_, window, cx| {
+                        let _ = title_view.update(cx, |this, cx| {
+                            this.regenerate_title(title_session.clone(), window, cx);
+                        });
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new("Open Session").on_click(move |_event, _window, cx| {
                         open_model.update(cx, |state, cx| {
                             controller::dispatch(
                                 state,
@@ -1774,8 +1889,8 @@ impl SidebarView {
                             );
                             cx.notify();
                         });
-                    },
-                ))
+                    }),
+                )
                 .item(
                     PopupMenuItem::new(if is_pinned {
                         "Unpin Session"

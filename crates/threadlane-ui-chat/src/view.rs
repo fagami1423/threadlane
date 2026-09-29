@@ -397,8 +397,6 @@ pub struct ChatListView {
     pub input_state: Entity<TextareaState>,
     pub header_left_padding: Pixels,
     environment_available: bool,
-    title_generating: bool,
-    title_error: Option<String>,
     transcript_list_state: ListState,
     transcript_messages: Arc<Vec<ChatMessageInfo>>,
     transcript_rows: Vec<TranscriptRow>,
@@ -747,8 +745,6 @@ impl ChatListView {
             input_state,
             header_left_padding: px(14.0),
             environment_available: false,
-            title_generating: false,
-            title_error: None,
             transcript_list_state,
             transcript_messages: Arc::new(Vec::new()),
             transcript_rows: Vec::new(),
@@ -892,79 +888,6 @@ impl ChatListView {
         cx.notify();
     }
 
-    fn regenerate_title(&mut self, cx: &mut Context<Self>) {
-        if self.title_generating {
-            return;
-        }
-        let state = self.model.read(cx);
-        if state.active_session_is_loading() {
-            return;
-        }
-        let Some(session) = state.active_session_info().cloned() else {
-            return;
-        };
-        let prompt = threadlane_ui_state::chat::conversation_title_prompt(&state.messages);
-        if prompt.trim().is_empty() {
-            return;
-        }
-        let model = state.selected_model.clone();
-        let work_dir = session.runtime_work_dir.clone();
-        let runtime = match threadlane_ui_state::chat::executor() {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                self.title_error = Some(error);
-                cx.notify();
-                return;
-            }
-        };
-        let task = runtime.spawn(async move {
-            threadlane_ui_state::chat::generate_text(model, work_dir,
-                "Return only a concise session title, maximum 42 Unicode characters. No Markdown, explanations or tools.".into(), prompt).await
-        });
-        self.title_generating = true;
-        self.title_error = None;
-        cx.spawn(async move |this, cx| {
-            let result = task.await.unwrap_or_else(|e| Err(e.to_string()));
-            let _ = this.update(cx, |this, cx| {
-                this.title_generating = false;
-                let state = this.model.read(cx);
-                if !state.active_session_matches(&session.id, &session.session_file) {
-                    cx.notify();
-                    return;
-                }
-                let unchanged = state
-                    .active_session_info()
-                    .is_some_and(|s| s.title == session.title);
-                let result = if unchanged {
-                    result.and_then(|raw| {
-                        threadlane_ui_state::chat::persist_regenerated_title(
-                            &session.session_file,
-                            &raw,
-                        )
-                    })
-                } else {
-                    Err("The title changed; generated text was not applied.".into())
-                };
-                match result {
-                    Ok(title) => this.model.update(cx, |state, cx| {
-                        for project in &mut state.projects {
-                            for current in &mut project.sessions {
-                                if current.session_file == session.session_file {
-                                    current.title = title.clone();
-                                }
-                            }
-                        }
-                        cx.notify();
-                    }),
-                    Err(error) => this.title_error = Some(error),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
-    }
-
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (active_title, active_attention, linked_issue, active_work_dir) = {
             let state = self.model.read(cx);
@@ -1081,16 +1004,6 @@ impl ChatListView {
                             })
                             .child(active_title),
                     )
-                    .children(self.model.read(cx).active_session_info().map(|_| {
-                        Button::new("regenerate-session-title")
-                            .icon(Icon::default().path("icons/refresh-cw.svg"))
-                            .ghost().xsmall()
-                            .accessibility_label("Regenerate task title")
-                            .tooltip(if self.title_generating { "Generating task title…" } else { "Regenerate task title" })
-                            .disabled(self.title_generating || self.model.read(cx).active_session_is_loading())
-                            .on_click(cx.listener(|this, _, _, cx| this.regenerate_title(cx)))
-                    }))
-                    .children(self.title_error.clone().map(|error| div().text_xs().text_color(theme.danger).child(error)))
                     .children(status_badge)
                     .children(linked_issue.clone().map(|issue| {
                         let model = self.model.clone();
@@ -7294,7 +7207,6 @@ impl Render for ChatListView {
         };
         let session_changed = session_key != self.last_session_key;
         if session_changed {
-            self.title_error = None;
             self.clear_conversation_find();
             self.markdown_cache_namespace = session_key
                 .as_ref()
