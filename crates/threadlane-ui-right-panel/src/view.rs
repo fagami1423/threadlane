@@ -638,6 +638,43 @@ impl RightPanelView {
         cx.notify();
     }
 
+    /// Open one combined diff of every pending change (staged, unstaged, and
+    /// untracked), like t3code's aggregate "View Diff" row.
+    fn open_combined_diff(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        self.review_diff_revision = self.review_diff_revision.wrapping_add(1);
+        let revision = self.review_diff_revision;
+        let title = "Review · All changes".to_string();
+        self.document_title = Some(title.clone());
+        self.editor_state = None;
+        self.editor_subscription = None;
+        self.document_state
+            .update(cx, |state, cx| state.set_text("Loading diff…", cx));
+        cx.spawn(async move |this, cx| {
+            let work_dir = project.clone();
+            let content = cx
+                .background_executor()
+                .spawn(async move {
+                    threadlane_git::worktree_diff(&work_dir)
+                        .unwrap_or_else(|error| format!("Could not load diff: {error}"))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.project.as_ref() == Some(&project)
+                    && this.review_diff_revision == revision
+                    && this.document_title.as_ref() == Some(&title)
+                {
+                    this.pending_document = Some((title, content));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn close_document(&mut self, cx: &mut Context<Self>) {
         self.review_diff_revision = self.review_diff_revision.wrapping_add(1);
         self.document_title = None;
@@ -2057,9 +2094,7 @@ impl RightPanelView {
             .document_title
             .as_deref()
             .is_some_and(|title| title == format!("Review · {path}").as_str());
-        // Row actions reveal on hover/focus (same trailing-slot pattern as the
-        // sidebar's hover actions); keep them visible when the row is engaged.
-        let actions_reveal = is_selected || is_open;
+        let (file_icon, file_icon_color) = file_type_icon(&path, &theme);
 
         let (status_color, status_bg) = match file.status_char() {
             'A' | '?' => (theme.success, theme.success.opacity(0.15)),
@@ -2070,71 +2105,24 @@ impl RightPanelView {
 
         let row_id = SharedString::from(format!("review-file-{path}"));
         let stage_path = path.clone();
-        let stage_btn = if is_staged {
-            Button::new(SharedString::from(format!("unstage-btn-{path}")))
-                .icon(IconName::Minus)
-                .accessibility_label("Unstage file")
-                .ghost()
-                .xsmall()
-                .opacity(if actions_reveal { 1.0 } else { 0.0 })
-                .group_hover("review-file-row", |style| style.opacity(1.0))
-                .focus_visible(|style| style.opacity(1.0))
-                .tooltip("Unstage file")
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.run_git_action(GitAction::UnstageFile(stage_path.clone()), window, cx);
-                }))
-        } else {
-            Button::new(SharedString::from(format!("stage-btn-{path}")))
-                .icon(IconName::Plus)
-                .accessibility_label("Stage file")
-                .ghost()
-                .xsmall()
-                .opacity(if actions_reveal { 1.0 } else { 0.0 })
-                .group_hover("review-file-row", |style| style.opacity(1.0))
-                .focus_visible(|style| style.opacity(1.0))
-                .tooltip("Stage file")
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.run_git_action(GitAction::StageFile(stage_path.clone()), window, cx);
-                }))
-        };
-
-        let discard_panel = panel_entity.clone();
-        let discard_path_btn = path.clone();
-        let discard_btn = Button::new(SharedString::from(format!("discard-btn-{path}")))
-            .icon(IconName::Close)
-            .accessibility_label("Discard changes")
-            .ghost()
-            .xsmall()
-            .opacity(if actions_reveal { 1.0 } else { 0.0 })
-            .group_hover("review-file-row", |style| style.opacity(1.0))
-            .focus_visible(|style| style.opacity(1.0))
-            .tooltip("Discard changes")
-            .on_click(cx.listener(move |_this, _, window, cx| {
-                Self::handle_discard_option(
-                    discard_panel.clone(),
-                    DiscardOption::Single(discard_path_btn.clone()),
-                    window,
-                    cx,
-                );
-            }));
-
-        let diff_path_btn = path.clone();
-        let diff_btn = Button::new(SharedString::from(format!("open-diff-btn-{path}")))
-            .icon(IconName::ExternalLink)
-            .accessibility_label("Open diff")
-            .ghost()
-            .xsmall()
-            .opacity(if actions_reveal { 1.0 } else { 0.0 })
-            .group_hover("review-file-row", |style| style.opacity(1.0))
-            .focus_visible(|style| style.opacity(1.0))
-            .tooltip("Open diff")
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_file_diff(diff_path_btn.clone(), cx);
+        // Trailing stage toggle (t3code ChangesView right-edge checkbox): a
+        // checked box means the file is staged.
+        let stage_chk = Checkbox::new(SharedString::from(format!("stage-chk-{path}")))
+            .accessibility_label(if is_staged { "Unstage file" } else { "Stage file" })
+            .checked(is_staged)
+            .small()
+            .tooltip(if is_staged { "Unstage file" } else { "Stage file" })
+            .on_click(cx.listener(move |this, checked, window, cx| {
+                let action = if *checked {
+                    GitAction::StageFile(stage_path.clone())
+                } else {
+                    GitAction::UnstageFile(stage_path.clone())
+                };
+                this.run_git_action(action, window, cx);
             }));
 
         div()
             .id(row_id)
-            .group("review-file-row")
             .h_8()
             .mx_2()
             .px_2()
@@ -2155,6 +2143,18 @@ impl RightPanelView {
                 })
             })
             .focus(|row| row.border_color(theme.ring))
+            .child(
+                div()
+                    .flex_none()
+                    .size_5()
+                    .rounded_sm()
+                    .bg(file_icon_color.opacity(0.12))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(file_icon_color)
+                    .child(Icon::new(file_icon).size_3p5()),
+            )
             .child(
                 Checkbox::new(SharedString::from(format!("chk-{path}")))
                     .accessibility_label(format!("Select {path} for Git actions"))
@@ -2197,7 +2197,6 @@ impl RightPanelView {
                                 )
                             }),
                     )
-                    .icon(IconName::File)
                     .accessibility_label(format!(
                         "Review {path}, status {status}, {} additions, {} deletions",
                         file.additions, file.deletions
@@ -2257,9 +2256,7 @@ impl RightPanelView {
                             .child(format!("\u{2212}{}", file.deletions))
                     }))
             }))
-            .child(stage_btn)
-            .child(diff_btn)
-            .child(discard_btn)
+            .child(stage_chk)
             .context_menu({
                 let path = context_path.clone();
                 let absolute_path = absolute_path.clone();
@@ -3163,7 +3160,22 @@ impl RightPanelView {
                                                 .text_color(theme.danger)
                                                 .child(format!("\u{2212}{selected_deletions}")),
                                         )
-                                }),
+                                })
+                                .child(
+                                    Button::new("view-combined-diff-btn")
+                                        .label(format!(
+                                            "View Diff +{total_additions_all} \u{2212}{total_deletions_all}"
+                                        ))
+                                        .accessibility_label(
+                                            "Open combined diff of all changes",
+                                        )
+                                        .ghost()
+                                        .xsmall()
+                                        .tooltip("Open combined diff of all changes")
+                                        .on_click(cx.listener(|this, _event, _window, cx| {
+                                            this.open_combined_diff(cx);
+                                        })),
+                                ),
                         )
                         .child(
                             div()
@@ -5560,6 +5572,29 @@ enum BrowserReply {
 const MAX_BROWSER_EVAL_CHARS: usize = 8_000;
 
 // Keep this aligned with the surface switches in the browser command handlers.
+/// Pick an icon and tint by file type (t3code ChangesView row style).
+fn file_type_icon(path: &str, theme: &gpui_component::theme::ThemeColor) -> (IconName, Hsla) {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "md" | "markdown" | "rst" | "adoc" | "txt" => (IconName::BookOpen, theme.warning),
+        "json" | "jsonc" | "toml" | "yaml" | "yml" | "ini" | "cfg" | "conf" | "xml"
+        | "lock" | "env" => (IconName::Settings, theme.muted_foreground),
+        "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd" => {
+            (IconName::SquareTerminal, theme.success)
+        }
+        "html" | "htm" | "css" | "scss" | "sass" | "less" => (IconName::Globe, theme.info),
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "ico" | "webp" | "bmp" | "avif" => {
+            (IconName::Frame, theme.info)
+        }
+        _ if ext.is_empty() => (IconName::File, theme.muted_foreground),
+        _ => (IconName::FileText, theme.link),
+    }
+}
+
 fn browser_command_reveals_surface(command: &threadlane_protocol::browser::BrowserCommand) -> bool {
     use threadlane_protocol::browser::{BrowserCommand, BrowserTabAction};
     matches!(command,

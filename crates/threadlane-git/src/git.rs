@@ -1264,6 +1264,69 @@ pub fn diff_file(work_dir: &Path, path: &str) -> Result<String, GitError> {
     Ok("No textual diff available for this file.\n".to_owned())
 }
 
+/// Combined working-tree diff for an aggregate "View Diff" view: every
+/// tracked change (staged and unstaged) plus synthetic new-file diffs for
+/// untracked files, which `git diff` ignores entirely.
+pub fn worktree_diff(work_dir: &Path) -> Result<String, GitError> {
+    // 1. Prefer diff against HEAD (staged and unstaged combined).
+    if let Ok(head_diff) = command(work_dir, &["diff", "--no-ext-diff", "HEAD", "--"]) {
+        if !head_diff.trim().is_empty() {
+            return Ok(head_diff);
+        }
+    }
+
+    // 2. HEAD may be unborn or detached: combine staged and unstaged
+    // explicitly, mirroring `diff_file`.
+    let mut diff = String::new();
+    let staged_result = command(work_dir, &["diff", "--no-ext-diff", "--cached", "--"]);
+    let staged = staged_result.as_deref().unwrap_or_default();
+    if !staged.trim().is_empty() {
+        diff.push_str("# Staged changes\n");
+        diff.push_str(&staged);
+    }
+    let unstaged_result = command(work_dir, &["diff", "--no-ext-diff", "--"]);
+    let unstaged = unstaged_result.as_deref().unwrap_or_default();
+    if !unstaged.trim().is_empty() {
+        if !diff.is_empty() {
+            diff.push('\n');
+        }
+        diff.push_str("# Unstaged changes\n");
+        diff.push_str(&unstaged);
+    }
+
+    // 3. Untracked files: synthesize new-file diffs like `diff_file` does.
+    let untracked = command(
+        work_dir,
+        &["ls-files", "--others", "--exclude-standard"],
+    )
+    .unwrap_or_default();
+    for path in untracked.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let full_path = work_dir.join(path);
+        if !full_path.is_file() {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&full_path) {
+            if !diff.is_empty() && !diff.ends_with('\n') {
+                diff.push('\n');
+            }
+            diff.push_str(&format!("diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{} @@\n", content.lines().count()));
+            for line in content.lines() {
+                diff.push('+');
+                diff.push_str(line);
+                diff.push('\n');
+            }
+        }
+    }
+
+    if diff.trim().is_empty() {
+        if let (Err(staged_error), Err(_)) = (&staged_result, &unstaged_result) {
+            return Err(staged_error.clone());
+        }
+        return Ok("No changes in the working tree.\n".to_owned());
+    }
+    Ok(diff)
+}
+
 /// Return the changes most likely to be included in the next commit.
 ///
 /// When anything is staged, only the staged diff is returned. Otherwise the
