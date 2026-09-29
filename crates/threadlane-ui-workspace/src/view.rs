@@ -1607,17 +1607,6 @@ impl WorkspaceView {
         });
         let dirty_count = git_status.map_or(0, |s| s.files.len());
 
-        // An external ACP agent chooses its own model, so the selection alone
-        // does not say what actually ran; show what the agent reports.
-        let model_name = match (
-            state.selected_model.is_empty(),
-            state.active_acp_model_label(),
-        ) {
-            (true, _) => "default".to_string(),
-            (false, Some(agent_model)) => format!("{} · {agent_model}", state.selected_model),
-            (false, None) => state.selected_model.clone(),
-        };
-
         let active_project = state
             .active_work_dir
             .as_ref()
@@ -1719,18 +1708,6 @@ impl WorkspaceView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(
-                        Button::new("status-model-badge")
-                            .icon(IconName::Cpu)
-                            .label("Model")
-                            .ghost()
-                            .xsmall()
-                            .accessibility_label(format!("Switch model · {model_name}"))
-                            .tooltip(format!("Switch model · {model_name}"))
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.execute_palette_action("model", window, cx);
-                            })),
-                    )
                     .child(
                         Button::new("status-terminal-toggle")
                             .icon(if self.bottom_panel_visible {
