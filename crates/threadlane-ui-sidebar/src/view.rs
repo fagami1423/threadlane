@@ -926,62 +926,59 @@ impl SidebarView {
                     }),
             )
             .child(
-                Button::new("new-task-btn")
-                    .accessibility_label("Start a new task (⌘N)")
-                    .ghost()
+                div()
                     .w_full()
-                    .justify_start()
-                    .tooltip("Start a new task (⌘N)")
+                    .p_1()
+                    .rounded_xl()
+                    .bg(theme.muted.opacity(0.28))
+                    .flex()
+                    .items_center()
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
+                        Button::new("new-task-btn")
+                            .accessibility_label("Start a new task (⌘N)")
+                            .ghost()
+                            .xsmall()
+                            .compact()
                             .w_full()
-                            .px_2()
-                            .py_1p5()
-                            .rounded_xl()
-                            .bg(theme.primary.opacity(0.1))
-                            .border_1()
-                            .border_color(theme.primary.opacity(0.18))
-                            .hover(|style| style.bg(theme.primary.opacity(0.14)))
+                            .justify_start()
+                            .tooltip("Start a new task (⌘N)")
                             .child(
                                 div()
-                                    .size_5()
-                                    .rounded_lg()
-                                    .bg(theme.primary.opacity(0.16))
                                     .flex()
                                     .items_center()
-                                    .justify_center()
+                                    .justify_start()
+                                    .gap_2()
+                                    .w_full()
+                                    .px_1()
                                     .child(
                                         Icon::new(IconName::Plus)
                                             .size_3p5()
                                             .text_color(theme.primary),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme.foreground)
+                                            .child("New task"),
+                                    )
+                                    .child(div().flex_1())
+                                    .child(
+                                        div()
+                                            .px_1p5()
+                                            .py(rems(0.125))
+                                            .rounded_md()
+                                            .bg(theme.muted.opacity(0.5))
+                                            .text_xs()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme.muted_foreground.opacity(0.85))
+                                            .child("⌘N"),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_sm()
-                                    .text_color(theme.foreground)
-                                    .child("New task"),
-                            )
-                            .child(
-                                div()
-                                    .px_1p5()
-                                    .py(rems(0.125))
-                                    .rounded_md()
-                                    .bg(theme.muted.opacity(0.5))
-                                    .text_xs()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.muted_foreground.opacity(0.85))
-                                    .child("⌘N"),
-                            ),
-                    )
-                    .on_click(move |_event, window, cx| {
-                        window.dispatch_action(Box::new(crate::BeginNewTask), cx);
-                    }),
+                            .on_click(move |_event, window, cx| {
+                                window.dispatch_action(Box::new(crate::BeginNewTask), cx);
+                            }),
+                    ),
             )
             .child(self.render_github_nav(cx))
     }

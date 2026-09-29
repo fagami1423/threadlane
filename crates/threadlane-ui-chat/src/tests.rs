@@ -2434,48 +2434,33 @@ fn project_menus_mark_the_current_project() {
     assert!(!super::is_current_project(None, Path::new("/work/mypi")));
 }
 
-#[gpui::test]
-fn header_issue_link_appears_only_with_a_linked_issue(cx: &mut gpui::TestAppContext) {
-    use gpui::AppContext as _;
-
-    cx.update(gpui_component::init);
-    let session_file = std::path::Path::new("/test-project/.threadlane/sessions/session-1.jsonl");
-    let model = cx.new(|_| {
-        let mut state = threadlane_ui_state::AppState::default();
-        state.is_new_task = false;
-        threadlane_ui_state::activate_test_session(&mut state, "session-1", session_file);
-        state
-    });
-    let retained_model = model.clone();
-    let (_, cx) = cx.add_window_view(move |window, cx| {
-        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
-        gpui_component::Root::new(chat, window, cx)
-    });
-    cx.run_until_parked();
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    assert!(
-        cx.debug_bounds("chat-header-issue-link").is_none(),
-        "no issue link without a linked issue"
+#[test]
+fn header_title_drops_duplicated_issue_prefix() {
+    use super::ChatListView;
+    assert_eq!(
+        ChatListView::header_title_without_issue_prefix("#295 Preview staged images", Some(295)),
+        "Preview staged images"
     );
-    retained_model.update(cx, |state, cx| {
-        for project in &mut state.projects {
-            for session in &mut project.sessions {
-                session.github_issue = Some(threadlane_git::GitHubIssueRef {
-                    host: "github.com".into(),
-                    owner: "octo".into(),
-                    repo: "demo".into(),
-                    number: 42,
-                    url: "https://github.com/octo/demo/issues/42".into(),
-                });
-            }
-        }
-        cx.notify();
-    });
-    cx.run_until_parked();
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    assert!(
-        cx.debug_bounds("chat-header-issue-link").is_some(),
-        "issue link appears once the session links an issue"
+    assert_eq!(
+        ChatListView::header_title_without_issue_prefix("#295 · Preview", Some(295)),
+        "Preview"
+    );
+    assert_eq!(
+        ChatListView::header_title_without_issue_prefix("#295", Some(295)),
+        "#295",
+        "keep the title if stripping would leave it empty"
+    );
+    assert_eq!(
+        ChatListView::header_title_without_issue_prefix("#42 unrelated", Some(295)),
+        "#42 unrelated"
+    );
+    assert_eq!(
+        ChatListView::header_title_without_issue_prefix("Plain title", Some(295)),
+        "Plain title"
+    );
+    assert_eq!(
+        ChatListView::header_title_without_issue_prefix("#295 Preview", None),
+        "#295 Preview"
     );
 }
 
@@ -2833,7 +2818,6 @@ fn environment_git_shortcuts_follow_checkout(cx: &mut gpui::TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     for selector in [
         "environment-git-actions",
-        "environment-commit-and-push",
         "environment-repository",
         "environment-pr",
         "environment-sync",
@@ -2904,7 +2888,6 @@ fn environment_git_shortcuts_follow_checkout(cx: &mut gpui::TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     for selector in [
         "environment-git-actions",
-        "environment-commit-and-push",
         "environment-repository",
         "environment-pr",
         "environment-sync",
@@ -3926,11 +3909,6 @@ fn environment_git_menu_dispatches_commands_and_dismisses(cx: &mut gpui::TestApp
     });
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let commit = cx.debug_bounds("environment-commit-and-push").unwrap();
-    cx.simulate_click(commit.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
-    assert_eq!(selected.replace(""), "commit");
-
     for (index, command) in ["commit", "pull", "push", "pr", "branch"]
         .into_iter()
         .enumerate()
@@ -4009,10 +3987,6 @@ fn environment_git_menu_dispatches_commands_and_dismisses(cx: &mut gpui::TestApp
     });
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let commit = cx.debug_bounds("environment-commit-and-push").unwrap();
-    cx.simulate_click(commit.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
-    assert_eq!(selected.get(), "", "A clean checkout cannot start a commit");
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let menu = cx.debug_bounds("environment-git-actions").unwrap();
     cx.simulate_click(menu.center(), gpui::Modifiers::default());

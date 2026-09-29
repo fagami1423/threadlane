@@ -1453,13 +1453,32 @@ impl RightPanelView {
 
     fn render_workspace_context(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().colors;
-        let repository = self
-            .project
-            .as_ref()
-            .and_then(|path| path.file_name())
-            .and_then(|name| name.to_str())
-            .unwrap_or("No repository")
-            .to_owned();
+        // `self.project` is the session's git checkout: for worktree sessions
+        // that is a `session_<id>` directory, which is meaningless to show.
+        // Name the attached project and flag the worktree instead.
+        let (repository, is_worktree_session) = {
+            let state = self.model.read(cx);
+            let project_name = state
+                .active_work_dir
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .map(str::to_owned);
+            let is_worktree_session = match (&state.active_work_dir, &self.project) {
+                (Some(root), Some(git_dir)) => root != git_dir,
+                _ => false,
+            };
+            (project_name, is_worktree_session)
+        };
+        let repository = repository
+            .or_else(|| {
+                self.project
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "No repository".to_owned());
         let branch = self
             .git_status
             .as_ref()
@@ -1493,8 +1512,13 @@ impl RightPanelView {
                     .flex_wrap()
                     .gap_2()
                     .child(div().font_weight(FontWeight::MEDIUM).child(repository))
+                    .children(is_worktree_session.then(|| {
+                        Tag::secondary().child("worktree").xsmall()
+                    }))
                     .child(
                         div()
+                            .min_w_0()
+                            .truncate()
                             .text_color(theme.muted_foreground)
                             .child(format!("· {branch}")),
                     )
