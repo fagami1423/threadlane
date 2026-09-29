@@ -440,7 +440,7 @@ pub struct ChatListView {
     progress_summary_expanded: bool,
     markdown_states: HashMap<(SharedString, String), MarkdownRenderState>,
     markdown_cache_namespace: SharedString,
-pasted_images: Vec<ImageAttachment>,
+    pasted_images: Vec<ImageAttachment>,
     image_preview: Option<ImagePreviewState>,
     image_preview_generation: u64,
     composer_key: ComposerKey,
@@ -792,7 +792,7 @@ impl ChatListView {
             progress_summary_expanded: false,
             markdown_states: HashMap::new(),
             markdown_cache_namespace: SharedString::from(""),
-pasted_images: Vec::new(),
+            pasted_images: Vec::new(),
             image_preview: None,
             image_preview_generation: 0,
             composer_key,
@@ -979,23 +979,6 @@ pasted_images: Vec::new(),
         let initiating_focus = preview.initiating_focus.clone();
         self.image_preview = None;
         self.image_preview_generation = self.image_preview_generation.wrapping_add(1);
-        if attachment_is_current {
-            window.focus(&initiating_focus, cx);
-        } else if self.current_tab == CentralTab::Chat {
-            self.input_state.update(cx, |input, cx| input.focus(window, cx));
-        }
-        cx.notify();
-    }
-
-    fn dismiss_image_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(preview) = self.image_preview.as_ref() else {
-            return;
-        };
-        let attachment_is_current = self.preview_attachment_is_current(preview);
-        let initiating_focus = preview.initiating_focus.clone();
-        self.image_preview = None;
-        self.image_preview_generation = self.image_preview_generation.wrapping_add(1);
-        window.close_dialog(cx);
         if attachment_is_current {
             window.focus(&initiating_focus, cx);
         } else if self.current_tab == CentralTab::Chat {

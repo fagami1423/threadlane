@@ -40,8 +40,9 @@ pub(crate) fn decode_staged_image(
         return Err("This image is empty and cannot be previewed.".into());
     }
 
-    let dimensions = ImageReader::with_format(Cursor::new(bytes.as_slice()), format)
-        .limits(image_limits())
+    let mut dimensions_reader = ImageReader::with_format(Cursor::new(bytes.as_slice()), format);
+    dimensions_reader.limits(image_limits());
+    let dimensions = dimensions_reader
         .into_dimensions()
         .map_err(preview_decode_error)?;
     let (width, height) = dimensions;
@@ -52,10 +53,9 @@ pub(crate) fn decode_staged_image(
         return Err("This image is too large to preview (maximum 16 megapixels).".into());
     }
 
-    let decoded = ImageReader::with_format(Cursor::new(bytes), format)
-        .limits(image_limits())
-        .decode()
-        .map_err(preview_decode_error)?;
+    let mut decode_reader = ImageReader::with_format(Cursor::new(bytes), format);
+    decode_reader.limits(image_limits());
+    let decoded = decode_reader.decode().map_err(preview_decode_error)?;
     let mut pixels = decoded.into_rgba8();
     for pixel in pixels.chunks_exact_mut(4) {
         pixel.swap(0, 2);
@@ -65,11 +65,11 @@ pub(crate) fn decode_staged_image(
 }
 
 fn image_limits() -> Limits {
-    Limits {
-        max_image_width: Some(MAX_IMAGE_DIMENSION),
-        max_image_height: Some(MAX_IMAGE_DIMENSION),
-        max_alloc: Some(MAX_DECODE_ALLOCATION),
-    }
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODE_ALLOCATION);
+    limits
 }
 
 fn preview_decode_error(error: image::ImageError) -> String {
