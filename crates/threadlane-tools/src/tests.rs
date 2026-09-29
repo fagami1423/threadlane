@@ -28,6 +28,20 @@ fn cargo_targets_are_partitioned_by_worktree_lane() {
 }
 
 #[test]
+fn cargo_target_cache_lane_is_removed_without_harm_outside_worktrees() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("project");
+    let worktree = root.join(".threadlane").join("worktrees").join("session_1");
+    let cache = root.join(".threadlane").join("cache").join("target").join("session_1");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("artifact"), b"x").unwrap();
+    remove_worktree_cargo_target_dir(&worktree);
+    assert!(!cache.exists());
+    // Calling again on a non-worktree path is a no-op.
+    remove_worktree_cargo_target_dir(dir.path());
+}
+
+#[test]
 fn validate_path_allows_a_new_absolute_destination_under_a_symlinked_root() {
     // `tempdir()` lives under a symlinked prefix on macOS (`/var` ->
     // `/private/var`), which is exactly the shape a caller sends back after

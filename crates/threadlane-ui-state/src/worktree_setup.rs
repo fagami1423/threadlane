@@ -290,6 +290,7 @@ pub(crate) fn cleanup_cancelled(setup: &WorktreeSetup) -> Result<(), String> {
         }
         threadlane_git::remove_worktree(&setup.project, &setup.worktree, true)
             .map_err(|e| e.to_string())?;
+        threadlane_tools::remove_worktree_cargo_target_dir(&setup.worktree);
         // The branch still points at the original setup commit, verified above.
         threadlane_git::delete_branch(&setup.project, branch.unwrap(), true)
             .map_err(|e| e.to_string())?;

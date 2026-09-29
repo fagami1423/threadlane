@@ -8646,6 +8646,7 @@ dependencies = [
  "tempfile",
  "threadlane-hashline",
  "threadlane-project",
+ "tracing",
 ]
 
 [[package]]
@@ -8771,6 +8772,7 @@ dependencies = [
  "threadlane-project",
  "threadlane-protocol",
  "threadlane-provider",
+ "threadlane-tools",
  "threadlane-ui-state",
  "threadlane-ui-theme",
  "tokio",

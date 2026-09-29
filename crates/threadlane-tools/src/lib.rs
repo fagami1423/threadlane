@@ -12,8 +12,8 @@ mod tests;
 
 pub use definitions::{get_available_tools, get_codex_tools};
 pub use dispatch::{
-    read_file_snapshot_digest, read_file_snapshot_path, try_execute_tool,
-    try_execute_tool_in_workspace, try_execute_tool_in_workspace_with,
+    read_file_snapshot_digest, read_file_snapshot_path, remove_worktree_cargo_target_dir,
+    try_execute_tool, try_execute_tool_in_workspace, try_execute_tool_in_workspace_with,
 };
 pub use virtual_read::{
     remote_ref_path, try_remote_ref_path, try_remote_ref_path_with, RemoteCredentials,

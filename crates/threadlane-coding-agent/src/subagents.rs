@@ -29,6 +29,7 @@ use threadlane_runtime::harness::{HookKind, SessionStore};
 use threadlane_runtime::ToolPolicy;
 use threadlane_runtime::{AgentRuntime, TurnState};
 use threadlane_skills::agents::{discover_agents, AgentDefinition, AgentScope};
+use threadlane_tools::remove_worktree_cargo_target_dir;
 use threadlane_wasi::WasiExtensionManager;
 use tokio::sync::broadcast;
 use tokio::time::{timeout, Duration};
@@ -640,6 +641,7 @@ pub(crate) async fn run_subagents_with_context(
                                 ) {
                                     Ok(()) => {
                                         let _ = threadlane_git::prune_worktrees(&parent_work_dir);
+                                        remove_worktree_cargo_target_dir(&work_dir);
                                         format!("Branch: {branch}")
                                     }
                                     Err(_) => format!(

@@ -652,6 +652,7 @@ impl AgentsPanel {
                                         if worktree.is_dir() {
                                             threadlane_git::remove_worktree(&root, &worktree, false)
                                                 .map_err(|error| error.to_string())?;
+                                            threadlane_tools::remove_worktree_cargo_target_dir(&worktree);
                                         }
                                         threadlane_git::delete_branch(&root, &branch, false)
                                             .map_err(|error| error.to_string())?;
@@ -699,6 +700,7 @@ impl AgentsPanel {
                                             if worktree.is_dir() {
                                                 threadlane_git::remove_worktree(&root, &worktree, true)
                                                     .map_err(|error| error.to_string())?;
+                                                threadlane_tools::remove_worktree_cargo_target_dir(&worktree);
                                             }
                                             threadlane_git::delete_branch(&root, &branch, true)
                                                 .map_err(|error| error.to_string())?;

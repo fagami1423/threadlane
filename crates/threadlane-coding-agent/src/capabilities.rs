@@ -25,6 +25,7 @@ use threadlane_runtime::ToolPolicy;
 use threadlane_runtime::harness::{HookContext, HookEffect, HookHandler, HookKind};
 use threadlane_skills::agents::{AgentScope, discover_agents};
 use threadlane_skills::{LoadSkillToolExecutor as SkillLoader, SkillRegistry};
+use threadlane_tools::remove_worktree_cargo_target_dir;
 use threadlane_wasi::WasiExtensionManager;
 use threadlane_wasi::broker::{
     BROKER_API_VERSION, BrokerError, CapabilityDispatcher, HostBrokerRequest,
@@ -251,6 +252,7 @@ impl WorktreeToolExecutor {
                 if let Some(worktree) = worktree {
                     threadlane_git::remove_worktree(&self.work_dir, &worktree.path, false)
                         .map_err(|_| "subagent worktree has uncommitted changes".to_string())?;
+                    remove_worktree_cargo_target_dir(&worktree.path);
                 }
                 let output = threadlane_git::merge(&self.work_dir, branch)
                     .map_err(|error| error.to_string())?;
@@ -263,6 +265,7 @@ impl WorktreeToolExecutor {
                 if let Some(worktree) = worktree {
                     threadlane_git::remove_worktree(&self.work_dir, &worktree.path, true)
                         .map_err(|error| error.to_string())?;
+                    remove_worktree_cargo_target_dir(&worktree.path);
                 }
                 threadlane_git::delete_branch(&self.work_dir, branch, true)
                     .map_err(|error| error.to_string())?;

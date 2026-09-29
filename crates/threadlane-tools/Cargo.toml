@@ -10,6 +10,7 @@ threadlane-hashline.workspace = true
 threadlane-project.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

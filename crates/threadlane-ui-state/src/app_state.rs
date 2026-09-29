@@ -1381,6 +1381,7 @@ impl AppState {
                     }
                     return Err(error.to_string());
                 }
+                threadlane_tools::remove_worktree_cargo_target_dir(&worktree_dir);
                 let stub = canonical_session_file(&work_dir, &session_id);
                 Self::remove_file_if_present(&stub)?;
                 if let Err(error) = threadlane_git::prune_worktrees(&work_dir) {
@@ -1456,6 +1457,7 @@ impl AppState {
                 }
                 threadlane_git::remove_worktree(&work_dir, &worktree_dir, true)
                     .map_err(|error| error.to_string())?;
+                threadlane_tools::remove_worktree_cargo_target_dir(&worktree_dir);
                 if let Err(error) = threadlane_git::prune_worktrees(&work_dir) {
                     tracing::warn!("worktree prune failed: {error}");
                 }
@@ -2517,6 +2519,7 @@ impl AppState {
             if let Err(error) = std::fs::remove_dir_all(worktree_dir) {
                 tracing::warn!("issue setup rollback: worktree dir remove failed: {error}");
             }
+            threadlane_tools::remove_worktree_cargo_target_dir(worktree_dir);
             if let Err(error) = Self::remove_file_if_present(session_file) {
                 tracing::warn!("issue setup rollback: session file remove failed: {error}");
             }

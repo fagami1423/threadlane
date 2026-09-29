@@ -506,7 +506,7 @@ pub fn try_execute_tool_in_workspace_with(
     }
 }
 
-pub(crate) fn worktree_cargo_target_dir(workspace_root: &Path) -> Option<PathBuf> {
+pub fn worktree_cargo_target_dir(workspace_root: &Path) -> Option<PathBuf> {
     let worktrees = workspace_root
         .ancestors()
         .find(|path| path.file_name().is_some_and(|name| name == "worktrees"))?;
@@ -521,6 +521,21 @@ pub(crate) fn worktree_cargo_target_dir(workspace_root: &Path) -> Option<PathBuf
         .collect::<Vec<_>>()
         .join("-");
     (!lane.is_empty()).then(|| threadlane.join("cache/target").join(lane))
+}
+
+/// Removes the Cargo target cache lane that `run_command` creates for a
+/// Threadlane worktree. Safe to call when the lane does not exist.
+pub fn remove_worktree_cargo_target_dir(workspace_root: &Path) {
+    if let Some(target_dir) = worktree_cargo_target_dir(workspace_root) {
+        if target_dir.exists() {
+            if let Err(error) = std::fs::remove_dir_all(&target_dir) {
+                tracing::warn!(
+                    "could not remove worktree cargo target cache {}: {error}",
+                    target_dir.display()
+                );
+            }
+        }
+    }
 }
 
 /// Strips one layer of matching outer shell quotes (`'...'` or `"..."`) so
