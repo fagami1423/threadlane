@@ -1315,6 +1315,15 @@ impl SettingsView {
                     ("⌘ F", "Find in active editor buffer"),
                 ],
             ),
+            (
+                "Terminal",
+                vec![
+                    ("⌘ F / Ctrl ⇧ F", "Find in terminal output (terminal focused)"),
+                    ("Enter / ⇧ Enter", "Next / previous matching line (find focused)"),
+                    ("Escape", "Close terminal find"),
+                    ("⇧ Page Up / Page Down", "Scroll retained output"),
+                ],
+            ),
         ];
 
         let mut list = div().mt_5().flex().flex_col().gap_6();

@@ -38,7 +38,7 @@ use gpui_component::WindowExt;
 use threadlane_ui_right_panel::RightPanelView;
 use threadlane_ui_settings::SettingsView;
 use threadlane_ui_sidebar::SidebarView;
-use threadlane_ui_terminal::TerminalView;
+use threadlane_ui_terminal::{FindInTerminalOutput, TerminalView};
 use threadlane_coding_agent::controller::spawn_session_runtime_construction;
 use threadlane_ui_state::updater::{self, UpdaterEvent};
 use threadlane_coding_agent::controller::runtime_status_text;
@@ -103,6 +103,7 @@ fn open_github_from_palette(state: &mut AppState, notify: impl FnOnce()) {
 pub fn init(cx: &mut App) {
     threadlane_ui_automation::init(cx);
     threadlane_ui_github::view::init(cx);
+    threadlane_ui_terminal::init(cx);
     cx.bind_keys([
         KeyBinding::new("cmd-k", ToggleCommandPalette, None),
         KeyBinding::new("ctrl-k", ToggleCommandPalette, None),
@@ -2299,6 +2300,7 @@ impl Render for WorkspaceView {
                 let active_terminal = active_terminal.expect("available terminal");
                 let active_terminal_clear = active_terminal.clone();
                 let active_terminal_restart = active_terminal.clone();
+                let active_terminal_find = active_terminal.clone();
                 let new_project = terminal_project.clone();
                 let new_cwd = new_tab_cwd.clone();
                 let new_view = cx.entity().clone();
@@ -2370,6 +2372,24 @@ impl Render for WorkspaceView {
                             .small()
                             .on_click(move |_event, _window, cx| {
                                 active_terminal_restart.update(cx, |t, cx| t.restart(cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("terminal-find-btn")
+                            .icon(IconName::Search)
+                            .label("Find")
+                            .accessibility_label("Find in terminal output")
+                            .tooltip(if cfg!(target_os = "macos") {
+                                "Find in terminal output (Cmd+F)"
+                            } else {
+                                "Find in terminal output (Ctrl+Shift+F)"
+                            })
+                            .ghost()
+                            .small()
+                            .on_click(move |_event, window, cx| {
+                                active_terminal_find.update(cx, |t, cx| {
+                                    t.open_find(&FindInTerminalOutput, window, cx)
+                                });
                             }),
                     )
                     .child(
