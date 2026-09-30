@@ -1194,141 +1194,162 @@ fn validate_diff_path(work_dir: &Path, path: &str) -> Result<(), GitError> {
 }
 
 pub fn diff_file(work_dir: &Path, path: &str) -> Result<String, GitError> {
-    validate_diff_path(work_dir, path)?;
-    // 1. Try diff against HEAD (both staged and unstaged combined)
-    if let Ok(head_diff) = command(work_dir, &["diff", "--no-ext-diff", "HEAD", "--", path]) {
-        if !head_diff.trim().is_empty() {
-            return Ok(head_diff);
-        }
-    }
-
-    // 2. Try unstaged + staged separately (e.g. if HEAD is unborn or detached)
-    let mut diff = String::new();
-    let staged_result = command(work_dir, &["diff", "--no-ext-diff", "--cached", "--", path]);
-    let staged = staged_result.as_deref().unwrap_or_default();
-    if !staged.trim().is_empty() {
-        diff.push_str("# Staged changes\n");
-        diff.push_str(&staged);
-    }
-    let unstaged_result = command(work_dir, &["diff", "--no-ext-diff", "--", path]);
-    let unstaged = unstaged_result.as_deref().unwrap_or_default();
-    if !unstaged.trim().is_empty() {
-        if !diff.is_empty() {
-            diff.push('\n');
-        }
-        diff.push_str("# Unstaged changes\n");
-        diff.push_str(&unstaged);
-    }
-    if !diff.trim().is_empty() {
-        return Ok(diff);
-    }
-    if let (Err(staged_error), Err(_unstaged_error)) = (&staged_result, &unstaged_result) {
-        return Err(staged_error.clone());
-    }
-
-    // 3. If untracked or new file, show whole file as additions via git diff --no-index
-    let is_untracked = command(work_dir, &["ls-files", "--error-unmatch", "--", path]).is_err();
-    if is_untracked {
-        let null_source = if cfg!(windows) { "NUL" } else { "/dev/null" };
-        if let Ok(output) = Command::new("git")
-            .args([
-                "diff",
-                "--no-ext-diff",
-                "--no-index",
-                "--",
-                null_source,
-                path,
-            ])
-            .current_dir(work_dir)
-            .output()
-        {
-            let new_file_diff = String::from_utf8_lossy(&output.stdout);
-            if !new_file_diff.trim().is_empty() {
-                return Ok(new_file_diff.into_owned());
-            }
-        }
-    }
-
-    // 4. Fallback: if file exists on disk and is untracked, synthesize additions
-    if is_untracked {
-        let full_path = work_dir.join(path);
-        if full_path.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&full_path) {
-                let mut synth = format!("diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{} @@\n", content.lines().count());
-                for line in content.lines() {
-                    synth.push('+');
-                    synth.push_str(line);
-                    synth.push('\n');
-                }
-                return Ok(synth);
-            }
-        }
-    }
-
-    Ok("No textual diff available for this file.\n".to_owned())
+    let diff = diff_file_with_options(work_dir, path, DiffOptions::default())?;
+    Ok(if diff.is_empty() {
+        "No textual diff available for this file.\n".to_owned()
+    } else {
+        diff
+    })
 }
 
-/// Combined working-tree diff for an aggregate "View Diff" view: every
-/// tracked change (staged and unstaged) plus synthetic new-file diffs for
-/// untracked files, which `git diff` ignores entirely.
-pub fn worktree_diff(work_dir: &Path) -> Result<String, GitError> {
-    // 1. Prefer diff against HEAD (staged and unstaged combined).
-    if let Ok(head_diff) = command(work_dir, &["diff", "--no-ext-diff", "HEAD", "--"]) {
-        if !head_diff.trim().is_empty() {
-            return Ok(head_diff);
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiffOptions {
+    pub ignore_whitespace: bool,
+}
+
+fn tracked_diff(
+    work_dir: &Path,
+    path: Option<&str>,
+    options: DiffOptions,
+) -> Result<String, GitError> {
+    let mut args = vec!["diff", "--no-ext-diff", "--no-textconv"];
+    if options.ignore_whitespace {
+        args.push("--ignore-all-space");
+    }
+    let compare = |base: Option<&str>| {
+        let mut args = args.clone();
+        args.extend(base);
+        args.push("--");
+        args.extend(path);
+        command(work_dir, &args)
+    };
+    match compare(Some("HEAD")) {
+        Ok(diff) => Ok(diff),
+        Err(error) => {
+            if command(work_dir, &["rev-parse", "--verify", "HEAD"]).is_ok() {
+                return Err(error);
+            }
+            let staged = compare(Some("--cached"))?;
+            let unstaged = compare(None)?;
+            let mut diff = String::new();
+            if !staged.is_empty() {
+                diff.push_str("# Staged changes\n");
+                diff.push_str(&staged);
+            }
+            if !unstaged.is_empty() {
+                diff.push_str("# Unstaged changes\n");
+                diff.push_str(&unstaged);
+            }
+            Ok(diff)
         }
     }
+}
 
-    // 2. HEAD may be unborn or detached: combine staged and unstaged
-    // explicitly, mirroring `diff_file`.
-    let mut diff = String::new();
-    let staged_result = command(work_dir, &["diff", "--no-ext-diff", "--cached", "--"]);
-    let staged = staged_result.as_deref().unwrap_or_default();
-    if !staged.trim().is_empty() {
-        diff.push_str("# Staged changes\n");
-        diff.push_str(&staged);
+fn untracked_diff(work_dir: &Path, paths: &str, options: DiffOptions) -> Result<String, GitError> {
+    if paths.is_empty() {
+        return Ok(String::new());
     }
-    let unstaged_result = command(work_dir, &["diff", "--no-ext-diff", "--"]);
-    let unstaged = unstaged_result.as_deref().unwrap_or_default();
-    if !unstaged.trim().is_empty() {
-        if !diff.is_empty() {
-            diff.push('\n');
+    for path in paths.split('\0').filter(|path| !path.is_empty()) {
+        validate_diff_path(work_dir, path)?;
+    }
+    let io_error =
+        |error| GitError::new(work_dir, format!("could not prepare untracked diff: {error}"));
+    let scratch = tempfile::tempdir().map_err(io_error)?;
+    let objects = scratch.path().join("objects");
+    let pathspec = scratch.path().join("paths");
+    std::fs::create_dir(&objects).map_err(io_error)?;
+    std::fs::write(&pathspec, paths).map_err(io_error)?;
+    let git = || {
+        let mut command = Command::new("git");
+        command
+            .current_dir(work_dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_INDEX_FILE", scratch.path().join("index"))
+            .env("GIT_OBJECT_DIRECTORY", &objects)
+            .args(["-c", "core.splitIndex=false", "-c", "core.fsmonitor=false"]);
+        command
+    };
+    let run = |command: &mut Command| {
+        #[cfg(test)]
+        COMMAND_SPAWNS.set(COMMAND_SPAWNS.get() + 1);
+        let output = command
+            .output()
+            .map_err(|error| GitError::new(work_dir, format!("could not start git: {error}")))?;
+        if !output.status.success() {
+            return Err(GitError::new(
+                work_dir,
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ));
         }
-        diff.push_str("# Unstaged changes\n");
-        diff.push_str(&unstaged);
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    run(git()
+        .args([
+            "--literal-pathspecs",
+            "add",
+            "--intent-to-add",
+            "--pathspec-from-file",
+        ])
+        .arg(&pathspec)
+        .arg("--pathspec-file-nul"))?;
+    let mut diff = git();
+    diff.args([
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--ita-invisible-in-index",
+        "--relative",
+    ]);
+    if options.ignore_whitespace {
+        diff.arg("--ignore-all-space");
     }
+    run(diff.arg("--"))
+}
 
-    // 3. Untracked files: synthesize new-file diffs like `diff_file` does.
-    let untracked = command(
+fn untracked_paths(work_dir: &Path, path: Option<&str>) -> Result<String, GitError> {
+    let mut args = vec!["ls-files", "-z", "--others", "--exclude-standard", "--"];
+    args.extend(path);
+    command(work_dir, &args)
+}
+
+/// Local patch with presentation options; a successful empty comparison is empty.
+pub fn diff_file_with_options(
+    work_dir: &Path,
+    path: &str,
+    options: DiffOptions,
+) -> Result<String, GitError> {
+    validate_diff_path(work_dir, path)?;
+    let mut diff = tracked_diff(work_dir, Some(path), options)?;
+    diff.push_str(&untracked_diff(
         work_dir,
-        &["ls-files", "--others", "--exclude-standard"],
-    )
-    .unwrap_or_default();
-    for path in untracked.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let full_path = work_dir.join(path);
-        if !full_path.is_file() {
-            continue;
-        }
-        if let Ok(content) = std::fs::read_to_string(&full_path) {
-            if !diff.is_empty() && !diff.ends_with('\n') {
-                diff.push('\n');
-            }
-            diff.push_str(&format!("diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{} @@\n", content.lines().count()));
-            for line in content.lines() {
-                diff.push('+');
-                diff.push_str(line);
-                diff.push('\n');
-            }
-        }
-    }
-
-    if diff.trim().is_empty() {
-        if let (Err(staged_error), Err(_)) = (&staged_result, &unstaged_result) {
-            return Err(staged_error.clone());
-        }
-        return Ok("No changes in the working tree.\n".to_owned());
-    }
+        &untracked_paths(work_dir, Some(path))?,
+        options,
+    )?);
     Ok(diff)
+}
+
+/// Combined tracked and untracked changes with presentation options.
+pub fn worktree_diff_with_options(
+    work_dir: &Path,
+    options: DiffOptions,
+) -> Result<String, GitError> {
+    let mut diff = tracked_diff(work_dir, None, options)?;
+    diff.push_str(&untracked_diff(
+        work_dir,
+        &untracked_paths(work_dir, None)?,
+        options,
+    )?);
+    Ok(diff)
+}
+
+/// Combined working-tree diff, including untracked additions.
+pub fn worktree_diff(work_dir: &Path) -> Result<String, GitError> {
+    let diff = worktree_diff_with_options(work_dir, DiffOptions::default())?;
+    Ok(if diff.is_empty() {
+        "No changes in the working tree.\n".to_owned()
+    } else {
+        diff
+    })
 }
 
 /// Return the changes most likely to be included in the next commit.

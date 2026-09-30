@@ -10,12 +10,45 @@ use super::draft_pr::{
 use super::pr_generation::{generation_prompt, PrField};
 use super::types::{
     can_publish_branch, discard_options, message_generated_matches_active_project,
-    selection_bar_discard_options, DiscardOption, GitAction,
+    selection_bar_discard_options, DiscardOption, GitAction, ReviewDiffRequest, ReviewDiffTarget,
 };
 use super::view::{retain_review_selection, scan_project_tree, RightPanelView};
 
 fn paths(values: &[&str]) -> HashSet<String> {
     values.iter().map(|value| (*value).to_string()).collect()
+}
+
+#[test]
+fn review_request_identity_distinguishes_target_options_and_revision() {
+    let request = ReviewDiffRequest {
+        project: PathBuf::from("/workspace"),
+        target: ReviewDiffTarget::AllChanges,
+        options: threadlane_git::DiffOptions::default(),
+        revision: 1,
+    };
+    let file_request = ReviewDiffRequest {
+        target: ReviewDiffTarget::File("All changes".into()),
+        ..request.clone()
+    };
+    assert_eq!(request.target.title(), file_request.target.title());
+    assert_ne!(request, file_request);
+    assert!(!request.options.ignore_whitespace);
+    assert_ne!(
+        request,
+        ReviewDiffRequest {
+            options: threadlane_git::DiffOptions {
+                ignore_whitespace: true,
+            },
+            ..request.clone()
+        }
+    );
+    assert_ne!(
+        request,
+        ReviewDiffRequest {
+            revision: 2,
+            ..request.clone()
+        }
+    );
 }
 
 #[test]

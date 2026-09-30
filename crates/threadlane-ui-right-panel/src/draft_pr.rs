@@ -454,7 +454,7 @@ impl DraftPrDialogView {
             };
             panel.update(cx, |panel, cx| {
                 panel.git_feedback = Some(message);
-                panel.refresh_surface(Surface::Review);
+                panel.refresh_surface(Surface::Review, cx);
                 cx.notify();
             });
         }
