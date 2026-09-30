@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.35](https://github.com/wheregmis/threadlane/compare/v0.1.34...v0.1.35) (2026-09-30)
+
+
+### Features
+
+* add project findings and memory recall to manage_memory tool ([8226a2e](https://github.com/wheregmis/threadlane/commit/8226a2e670c90ef578b264fa21a2a9b95213741a))
+* add project findings and memory recall to manage_memory tool ([83cd655](https://github.com/wheregmis/threadlane/commit/83cd655e6580de2d87a7677460a058e92c5f134a))
+* **memory:** bound evidence scan budgets during recall ([acbec19](https://github.com/wheregmis/threadlane/commit/acbec19d797cc7a2fa6a0bdb96b71e37e91571a6))
+
+
+### Bug Fixes
+
+* address local Review lifecycle and diff feedback ([e7d0ad6](https://github.com/wheregmis/threadlane/commit/e7d0ad6bf808ede1aa635eef079b433360129d9d))
+
 ## [0.1.34](https://github.com/wheregmis/threadlane/compare/v0.1.33...v0.1.34) (2026-09-30)
 
 
