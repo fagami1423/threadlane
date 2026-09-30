@@ -4,11 +4,20 @@ use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod search;
+
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::ThemeMode;
-use gpui_component::{ActiveTheme, ElementExt, Icon, IconName, Sizable};
+use gpui_component::{ActiveTheme, Disableable, ElementExt, Icon, IconName, Sizable, WindowExt};
+
+use search::{
+    cue_row, next_find_match, reveal_offset, scan_retained_output, TerminalSearchHit,
+    TerminalSearchOutcome,
+};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 const DEFAULT_ROWS: u16 = 30;
@@ -20,6 +29,43 @@ const TERMINAL_FLOOD_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const TERMINAL_READ_CHUNK_BYTES: usize = 8192;
 const TERMINAL_OUTPUT_BUFFERED_CHUNKS: usize = 8;
 const TERMINAL_PARSE_BUDGET_PER_FRAME: usize = TERMINAL_READ_CHUNK_BYTES * 2;
+/// Debounce between the last query keystroke and a worker scan.
+const TERMINAL_FIND_DEBOUNCE: Duration = Duration::from_millis(120);
+/// Minimum interval between background rescans while find is open and output
+/// keeps arriving; scans never run when find is closed.
+const TERMINAL_FIND_RESCAN_INTERVAL: Duration = Duration::from_millis(250);
+
+actions!(
+    threadlane_terminal,
+    [
+        FindInTerminalOutput,
+        CloseTerminalFind,
+        NextTerminalMatch,
+        PreviousTerminalMatch
+    ]
+);
+
+/// Registers the terminal's focus-scoped keybindings: Cmd+F (macOS) or
+/// Ctrl+Shift+F opens find from the focused terminal, Escape closes it, and
+/// Enter/Shift+Enter navigate while the find input is focused.
+pub fn init(cx: &mut App) {
+    let find_shortcut = if cfg!(target_os = "macos") {
+        "cmd-f"
+    } else {
+        // Ctrl+F stays with the shell: readline and TUI programs own it.
+        "ctrl-shift-f"
+    };
+    cx.bind_keys([
+        KeyBinding::new(find_shortcut, FindInTerminalOutput, Some("Terminal")),
+        KeyBinding::new("escape", CloseTerminalFind, Some("TerminalFind")),
+        KeyBinding::new("enter", NextTerminalMatch, Some("TerminalFind > Input")),
+        KeyBinding::new(
+            "shift-enter",
+            PreviousTerminalMatch,
+            Some("TerminalFind > Input"),
+        ),
+    ]);
+}
 
 /// Terminal text metrics. The painted glyph size, row height, hit-testing,
 /// and resize math must all agree; they share these constants so a font
@@ -85,6 +131,18 @@ enum PtyEvent {
     Frame(TerminalFrame),
     Closed,
     Error(String),
+    /// Bounded result descriptors for one find generation. `revealed` is set
+    /// only when this reply also moved the viewport (settled query or
+    /// navigation), so the view can trust it as the selected match.
+    SearchResults {
+        generation: u64,
+        hits: Vec<TerminalSearchHit>,
+        total: usize,
+        truncated: bool,
+        scrollback_len: usize,
+        alt_screen: bool,
+        revealed: Option<usize>,
+    },
 }
 
 enum TerminalWake {
@@ -131,19 +189,94 @@ enum ParserCommand {
     Clear,
     Resize(u16, u16),
     SetScrollback(usize),
+    /// `Some(query)` opens/updates the search for `generation`; `None` closes
+    /// it so the worker stops scanning entirely.
+    Find {
+        generation: u64,
+        query: Option<String>,
+    },
+    /// Worker-validated navigation: the worker rescans the buffer and
+    /// resolves the hit by identity (`row` + `excerpt`) in the fresh result
+    /// set — never trusting the index the view navigated from — then scrolls
+    /// the viewport to it. When the identity no longer exists the viewport
+    /// stays put and `revealed` comes back `None`, so a stale location can
+    /// never reveal unrelated output.
+    RevealMatch {
+        generation: u64,
+        row: usize,
+        excerpt: String,
+    },
+}
+
+/// Worker-side find state: the query the retained buffer is searched with.
+struct WorkerFind {
+    generation: u64,
+    query: String,
+}
+
+/// Scans the retained buffer unless the terminal is on the alternate screen
+/// (full-screen TUIs) or the query is empty. Returns the outcome plus the
+/// alternate-screen flag so replies can carry it.
+fn worker_find_scan(
+    parser: &mut vt100::Parser,
+    rows: u16,
+    cols: u16,
+    query: &str,
+) -> (TerminalSearchOutcome, bool) {
+    let alt_screen = parser.screen().alternate_screen();
+    let outcome = if alt_screen || query.is_empty() {
+        TerminalSearchOutcome::default()
+    } else {
+        scan_retained_output(parser.screen_mut(), rows, cols, query)
+    };
+    (outcome, alt_screen)
+}
+
+fn emit_find_results(
+    parser: &mut vt100::Parser,
+    rows: u16,
+    cols: u16,
+    find: &WorkerFind,
+    revealed: Option<usize>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<PtyEvent>,
+) -> Result<(), tokio::sync::mpsc::error::SendError<PtyEvent>> {
+    let (outcome, alt_screen) = worker_find_scan(parser, rows, cols, &find.query);
+    event_tx.send(PtyEvent::SearchResults {
+        generation: find.generation,
+        hits: outcome.hits,
+        total: outcome.total,
+        truncated: outcome.truncated,
+        scrollback_len: outcome.scrollback_len,
+        alt_screen,
+        revealed,
+    })
 }
 
 struct TerminalFrame {
     screen: vt100::Screen,
     scrollback: usize,
+    /// Total retained scrollback rows; `scrollback` (the view offset) can
+    /// range over all of it, so the view needs both numbers.
+    scrollback_len: usize,
+    /// Alternate-screen state travels with the frame because
+    /// `state_formatted` does not reproduce it on the reconstructed screen.
+    alt_screen: bool,
 }
 
-fn visible_terminal_frame(parser: &vt100::Parser, rows: u16, cols: u16) -> TerminalFrame {
+fn visible_terminal_frame(parser: &mut vt100::Parser, rows: u16, cols: u16) -> TerminalFrame {
+    // vt100 clamps deep offsets to the scrollback length, so a MAX probe is
+    // the cheap way to read that length without exposing it directly.
+    let saved_offset = parser.screen().scrollback();
+    parser.screen_mut().set_scrollback(usize::MAX);
+    let scrollback_len = parser.screen().scrollback();
+    parser.screen_mut().set_scrollback(saved_offset);
     let mut visible = vt100::Parser::new(rows, cols, 0);
     visible.process(&parser.screen().state_formatted());
     TerminalFrame {
         screen: visible.screen().clone(),
         scrollback: parser.screen().scrollback(),
+        scrollback_len,
+        alt_screen: parser.screen().alternate_screen(),
     }
 }
 
@@ -165,39 +298,159 @@ fn start_parser_worker(
             let (mut frame_interval, mut parse_budget) = terminal_frame_policy(false);
             let mut saturated = false;
             let mut next_frame = Instant::now() + frame_interval;
+            // Find state lives here: the worker owns the retained buffer, so
+            // scans and navigation always run against the real history.
+            let mut find: Option<WorkerFind> = None;
+            // Deferred rescan while output keeps arriving; scanning on every
+            // chunk would stall PTY parsing during output floods.
+            let mut find_rescan_at: Option<Instant> = None;
+            // After the PTY reader ends the buffer is still searchable, so
+            // the worker keeps servicing commands until the view drops the
+            // channel instead of exiting with the shell.
+            let mut output_disconnected = false;
 
             loop {
-                while let Ok(command) = command_rx.try_recv() {
+                let mut commands_open = true;
+                'drain: while commands_open {
+                    let command = match command_rx.try_recv() {
+                        Ok(command) => command,
+                        Err(mpsc::TryRecvError::Empty) => break 'drain,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            commands_open = false;
+                            break 'drain;
+                        }
+                    };
                     match command {
                         ParserCommand::Clear => {
                             parser = vt100::Parser::new(rows, cols, SCROLLBACK_ROWS);
+                            if find.is_some() {
+                                find_rescan_at = Some(Instant::now());
+                            }
                         }
                         ParserCommand::Resize(new_rows, new_cols) => {
                             rows = new_rows.max(1);
                             cols = new_cols.max(1);
                             parser.screen_mut().set_size(rows, cols);
-                            let offset = parser.screen().scrollback().min(rows as usize);
+                            let offset = parser.screen().scrollback();
                             parser.screen_mut().set_scrollback(offset);
+                            if find.is_some() {
+                                find_rescan_at = Some(Instant::now());
+                            }
                         }
                         ParserCommand::SetScrollback(offset) => {
-                            parser
-                                .screen_mut()
-                                .set_scrollback(offset.min(rows as usize));
+                            parser.screen_mut().set_scrollback(offset);
+                        }
+                        ParserCommand::Find { generation, query } => match query {
+                            Some(query) => {
+                                find = Some(WorkerFind { generation, query });
+                                find_rescan_at = None;
+                                let find_state = find.as_ref().unwrap();
+                                // A settled query reveals its newest match.
+                                let (outcome, _) =
+                                    worker_find_scan(&mut parser, rows, cols, &find_state.query);
+                                let revealed = outcome.hits.len().checked_sub(1);
+                                if let Some(index) = revealed {
+                                    parser.screen_mut().set_scrollback(reveal_offset(
+                                        &outcome.hits[index],
+                                        outcome.scrollback_len,
+                                    ));
+                                }
+                                if event_tx
+                                    .send(PtyEvent::SearchResults {
+                                        generation,
+                                        hits: outcome.hits,
+                                        total: outcome.total,
+                                        truncated: outcome.truncated,
+                                        scrollback_len: outcome.scrollback_len,
+                                        alt_screen: parser.screen().alternate_screen(),
+                                        revealed,
+                                    })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            None => {
+                                find = None;
+                                find_rescan_at = None;
+                            }
+                        },
+                        ParserCommand::RevealMatch {
+                            generation,
+                            row,
+                            excerpt,
+                        } => {
+                            if find
+                                .as_ref()
+                                .is_some_and(|state| state.generation == generation)
+                            {
+                                let find_state = find.as_ref().unwrap();
+                                let (outcome, alt_screen) =
+                                    worker_find_scan(&mut parser, rows, cols, &find_state.query);
+                                // Resolve the target by identity: a rescan
+                                // can renumber matches, and only the same
+                                // row + text is the same line.
+                                let revealed = outcome.hits.iter().position(|hit| {
+                                    hit.absolute_row == row && hit.excerpt == excerpt
+                                });
+                                if let Some(index) = revealed {
+                                    parser.screen_mut().set_scrollback(reveal_offset(
+                                        &outcome.hits[index],
+                                        outcome.scrollback_len,
+                                    ));
+                                }
+                                if event_tx
+                                    .send(PtyEvent::SearchResults {
+                                        generation,
+                                        hits: outcome.hits,
+                                        total: outcome.total,
+                                        truncated: outcome.truncated,
+                                        scrollback_len: outcome.scrollback_len,
+                                        alt_screen,
+                                        revealed,
+                                    })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
                         }
                     }
                     dirty = true;
+                }
+                if !commands_open && output_disconnected {
+                    break;
                 }
 
                 let now = Instant::now();
                 if now >= next_frame {
                     if dirty {
                         if event_tx
-                            .send(PtyEvent::Frame(visible_terminal_frame(&parser, rows, cols)))
+                            .send(PtyEvent::Frame(visible_terminal_frame(&mut parser, rows, cols)))
                             .is_err()
                         {
                             break;
                         }
                         dirty = false;
+                    }
+                    // Coalesced rescan: new output refreshes results without
+                    // ever moving the reading position on its own.
+                    if let (Some(due), Some(find_state)) = (find_rescan_at, find.as_mut()) {
+                        if now >= due {
+                            find_rescan_at = None;
+                            if emit_find_results(
+                                &mut parser,
+                                rows,
+                                cols,
+                                find_state,
+                                None,
+                                &event_tx,
+                            )
+                            .is_err()
+                            {
+                                break;
+                            }
+                        }
                     }
                     (frame_interval, parse_budget) = terminal_frame_policy(saturated);
                     parsed_bytes = 0;
@@ -210,22 +463,44 @@ fn start_parser_worker(
                     continue;
                 }
 
+                if output_disconnected {
+                    // Sleep to the next frame instead of recv_timeout on the
+                    // command channel: a recv here would consume a command
+                    // without running its match arm, and after shell exit the
+                    // buffer still answers Find/Resize commands.
+                    std::thread::sleep(next_frame.saturating_duration_since(Instant::now()));
+                    continue;
+                }
+
                 match output_rx.recv_timeout(next_frame.saturating_duration_since(Instant::now())) {
                     Ok(bytes) => {
                         parsed_bytes = parsed_bytes.saturating_add(bytes.len());
                         saturated = terminal_parse_budget_exhausted(parsed_bytes, parse_budget);
                         parser.process(&bytes);
-                        let offset = parser.screen().scrollback().min(rows as usize);
-                        parser.screen_mut().set_scrollback(offset);
+                        // vt100 bumps the view offset as rows scroll into
+                        // history, so the visible content stays put.
+                        if find.is_some() && find_rescan_at.is_none() {
+                            find_rescan_at =
+                                Some(Instant::now() + TERMINAL_FIND_RESCAN_INTERVAL);
+                        }
                         dirty = true;
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         if dirty {
-                            let _ = event_tx
-                                .send(PtyEvent::Frame(visible_terminal_frame(&parser, rows, cols)));
+                            if event_tx
+                                .send(PtyEvent::Frame(visible_terminal_frame(
+                                    &mut parser,
+                                    rows,
+                                    cols,
+                                )))
+                                .is_err()
+                            {
+                                break;
+                            }
+                            dirty = false;
                         }
-                        break;
+                        output_disconnected = true;
                     }
                 }
             }
@@ -258,6 +533,29 @@ fn should_paint_cursor(is_focused: bool, terminal_hides_cursor: bool, blink_visi
     is_focused && !terminal_hides_cursor && blink_visible
 }
 
+/// Live state of the inline Find strip: the query input plus the worker's
+/// latest bounded results for the current generation. Match locations are
+/// worker-owned — the view keeps descriptors (absolute row + excerpt), never
+/// terminal text it could navigate to stalely.
+struct TerminalFind {
+    input: Entity<InputState>,
+    previous_focus: Option<FocusHandle>,
+    query: String,
+    generation: u64,
+    pending: bool,
+    failed: bool,
+    hits: Vec<TerminalSearchHit>,
+    total: usize,
+    truncated: bool,
+    /// Scrollback length the current `hits` were computed against.
+    scrollback_len: usize,
+    selected: Option<usize>,
+    /// Identity of the selected hit (absolute row + excerpt) so a refreshed
+    /// result set keeps the selection only while the same line is present.
+    selected_hit: Option<TerminalSearchHit>,
+    _subscription: Subscription,
+}
+
 /// A persistent, focusable project shell backed by a real pseudo-terminal.
 ///
 /// Construct it with `cx.new(|cx| TerminalView::new(project, cx))` and
@@ -282,6 +580,13 @@ pub struct TerminalView {
     cursor_visible: bool,
     scrollback_offset: usize,
     scroll_accumulator: f32,
+    scrollback_len: usize,
+    alt_screen: bool,
+    find: Option<TerminalFind>,
+    /// Monotonic seed for find generations so a generation is never reused
+    /// across find instances or shell restarts in this view: a delayed reply
+    /// from an older find can then never land under a newer one.
+    find_generation_seed: u64,
 }
 
 impl TerminalView {
@@ -339,6 +644,10 @@ impl TerminalView {
             cursor_visible: true,
             scrollback_offset: 0,
             scroll_accumulator: 0.0,
+            scrollback_len: 0,
+            alt_screen: false,
+            find: None,
+            find_generation_seed: 0,
         };
         terminal.start();
         terminal
@@ -366,6 +675,9 @@ impl TerminalView {
         self.screen = vt100::Parser::new(self.rows, self.cols, 0).screen().clone();
         self.scrollback_offset = 0;
         self.scroll_accumulator = 0.0;
+        self.scrollback_len = 0;
+        self.alt_screen = false;
+        self.find = None;
         self.status = None;
         self.start();
         cx.notify();
@@ -415,7 +727,7 @@ impl TerminalView {
     fn scroll_to_top(&mut self, cx: &mut Context<Self>) {
         let previous_offset = self.scrollback_offset;
         self.scroll_accumulator = 0.0;
-        self.set_scrollback(SCROLLBACK_ROWS);
+        self.set_scrollback(self.scrollback_len);
         if self.scrollback_offset != previous_offset {
             self.clear_selection();
         }
@@ -484,6 +796,48 @@ impl TerminalView {
             PtyEvent::Frame(frame) => {
                 self.screen = frame.screen;
                 self.scrollback_offset = frame.scrollback;
+                self.scrollback_len = frame.scrollback_len;
+                self.alt_screen = frame.alt_screen;
+            }
+            PtyEvent::SearchResults {
+                generation,
+                hits,
+                total,
+                truncated,
+                scrollback_len,
+                alt_screen,
+                revealed,
+            } => {
+                // Replies for an older query generation never land; the
+                // generation moves on every query edit and on close.
+                let Some(find) = &mut self.find else {
+                    return;
+                };
+                if find.generation != generation {
+                    return;
+                }
+                self.alt_screen = alt_screen;
+                find.pending = false;
+                find.failed = false;
+                find.hits = hits;
+                find.total = total;
+                find.truncated = truncated;
+                find.scrollback_len = scrollback_len;
+                if let Some(index) = revealed {
+                    find.selected = Some(index);
+                    find.selected_hit = find.hits.get(index).cloned();
+                } else if let Some(identity) = &find.selected_hit {
+                    // Keep the selection glued to the same line; a hit whose
+                    // row moved out of view is simply deselected, never
+                    // repointed at different output.
+                    find.selected = find.hits.iter().position(|hit| {
+                        hit.absolute_row == identity.absolute_row
+                            && hit.excerpt == identity.excerpt
+                    });
+                    if find.selected.is_none() {
+                        find.selected_hit = None;
+                    }
+                }
             }
             PtyEvent::Closed => {
                 if self.session.is_some() {
@@ -494,10 +848,11 @@ impl TerminalView {
         }
     }
 
-    // vt100's visible_rows subtracts the offset from the live row count, so
-    // keep it within one screen even when scrollback history is much larger.
+    // The worker holds the real emulator and clamps deep offsets to the
+    // retained length itself; the view clamps against its last-known length
+    // so wheel scrolling can reach any retained row.
     fn set_scrollback(&mut self, offset: usize) {
-        self.scrollback_offset = offset.min(self.rows as usize);
+        self.scrollback_offset = offset.min(self.scrollback_len);
         if let Some(parser) = &self.parser_command_tx {
             let _ = parser.send(ParserCommand::SetScrollback(self.scrollback_offset));
         }
@@ -519,7 +874,14 @@ impl TerminalView {
         }
     }
 
-    fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(find) = &self.find {
+            if find.input.read(cx).focus_handle(cx).is_focused(window) {
+                // Keystrokes inside the find input belong to the input: they
+                // must not reach the shell as raw PTY bytes.
+                return;
+            }
+        }
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
 
@@ -767,6 +1129,365 @@ impl TerminalView {
             self.paste(text);
         }
     }
+
+    /// Opens the inline find strip (or re-selects the query when it is
+    /// already open). Called by the FindInTerminalOutput action, the toolbar
+    /// button, and the context-menu item — one command, one path.
+    pub fn open_find(
+        &mut self,
+        _: &FindInTerminalOutput,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            cx.propagate();
+            return;
+        }
+        if self.find.is_none() {
+            let generation = self.next_find_generation();
+            let input = cx.new(|cx| {
+                InputState::new(window, cx).placeholder("Find in retained output…")
+            });
+            let subscription = cx.subscribe_in(
+                &input,
+                window,
+                |this, input, event: &InputEvent, _, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        let query = input.read(cx).value().to_string();
+                        this.update_find_query(query, cx);
+                    }
+                },
+            );
+            self.find = Some(TerminalFind {
+                input,
+                previous_focus: window.focused(cx),
+                query: String::new(),
+                generation,
+                pending: false,
+                failed: false,
+                hits: Vec::new(),
+                total: 0,
+                truncated: false,
+                scrollback_len: self.scrollback_len,
+                selected: None,
+                selected_hit: None,
+                _subscription: subscription,
+            });
+            self.send_find_query();
+        }
+        let Some(find) = &self.find else {
+            return;
+        };
+        find.input.update(cx, |input, cx| {
+            input.focus(window, cx);
+            input.select_all(window, cx);
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn close_find(
+        &mut self,
+        _: &CloseTerminalFind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(find) = self.find.take() else {
+            cx.propagate();
+            return;
+        };
+        if window.has_active_dialog(cx) {
+            self.find = Some(find);
+            cx.propagate();
+            return;
+        }
+        // Stop worker-side scanning: no background work while find is closed.
+        if let Some(parser) = &self.parser_command_tx {
+            let _ = parser.send(ParserCommand::Find {
+                generation: find.generation,
+                query: None,
+            });
+        }
+        let focus = find
+            .previous_focus
+            .unwrap_or_else(|| self.focus_handle.clone());
+        window.focus(&focus, cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn next_find_generation(&mut self) -> u64 {
+        self.find_generation_seed += 1;
+        self.find_generation_seed
+    }
+
+    fn update_find_query(&mut self, query: String, cx: &mut Context<Self>) {
+        if self
+            .find
+            .as_ref()
+            .is_none_or(|find| find.query == query)
+        {
+            return;
+        }
+        let generation = self.next_find_generation();
+        let find = self.find.as_mut().unwrap();
+        find.query = query;
+        find.generation = generation;
+        find.failed = false;
+        find.hits.clear();
+        find.total = 0;
+        find.selected = None;
+        find.selected_hit = None;
+        find.pending = !find.query.is_empty();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(TERMINAL_FIND_DEBOUNCE).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(find) = &mut this.find else {
+                    return;
+                };
+                if find.generation != generation {
+                    return;
+                }
+                this.send_find_query();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Sends the current query to the parser worker, or marks the strip
+    /// failed when the worker is gone (dead session, closed channel).
+    fn send_find_query(&mut self) {
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        let sent = self.parser_command_tx.as_ref().is_some_and(|parser| {
+            parser
+                .send(ParserCommand::Find {
+                    generation: find.generation,
+                    query: Some(find.query.clone()),
+                })
+                .is_ok()
+        });
+        if !sent {
+            find.failed = true;
+            find.pending = false;
+        }
+    }
+
+    fn retry_find(&mut self, cx: &mut Context<Self>) {
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        find.failed = false;
+        find.pending = !find.query.is_empty();
+        self.send_find_query();
+        cx.notify();
+    }
+
+    fn navigate_find(&mut self, previous: bool, cx: &mut Context<Self>) {
+        let alt_screen = self.alt_screen;
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        if find.pending || find.failed || find.hits.is_empty() || alt_screen {
+            return;
+        }
+        let Some(index) = next_find_match(find.selected, find.hits.len(), previous) else {
+            return;
+        };
+        find.selected = Some(index);
+        find.selected_hit = find.hits.get(index).cloned();
+        let generation = find.generation;
+        // Navigation asks the worker to reveal by hit identity; the worker
+        // resolves it in a fresh scan so output churn cannot reveal a
+        // different line.
+        if let (Some(hit), Some(parser)) = (&find.selected_hit, &self.parser_command_tx) {
+            let _ = parser.send(ParserCommand::RevealMatch {
+                generation,
+                row: hit.absolute_row,
+                excerpt: hit.excerpt.clone(),
+            });
+        }
+        cx.notify();
+    }
+
+    fn next_terminal_match(
+        &mut self,
+        _: &NextTerminalMatch,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_find(false, cx);
+        cx.stop_propagation();
+    }
+
+    fn previous_terminal_match(
+        &mut self,
+        _: &PreviousTerminalMatch,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_find(true, cx);
+        cx.stop_propagation();
+    }
+
+    fn find_status_text(&self) -> String {
+        let Some(find) = &self.find else {
+            return String::new();
+        };
+        if self.alt_screen {
+            "Find unavailable in full-screen terminal applications".to_owned()
+        } else if find.failed {
+            "Couldn't search terminal output".to_owned()
+        } else if find.query.is_empty() {
+            "Type to find output".to_owned()
+        } else if find.pending {
+            "Searching…".to_owned()
+        } else if find.hits.is_empty() {
+            "No matching lines in retained output".to_owned()
+        } else if let Some(index) = find.selected {
+            // `hits` holds the newest descriptors when truncated, so a
+            // visible index maps to a global match position.
+            let position = find.total - find.hits.len() + index + 1;
+            format!("{position} of {} matching lines", find.total)
+        } else {
+            format!("{} matching lines · Choose Previous or Next", find.total)
+        }
+    }
+
+    fn render_find_strip(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(find) = &self.find else {
+            return div().into_any_element();
+        };
+        let theme = cx.theme();
+        let status = self.find_status_text();
+        let nav_disabled =
+            find.pending || find.failed || find.hits.is_empty() || self.alt_screen;
+        div()
+            .key_context("TerminalFind")
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div().flex_1().min_w(rems(10.)).child(
+                            Input::new(&find.input)
+                                .small()
+                                .aria_label("Find in terminal output"),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(theme.border)
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("Match case"),
+                    )
+                    .child(
+                        Button::new("terminal-find-previous")
+                            .debug_selector(|| "terminal-find-previous".into())
+                            .label("Previous")
+                            .small()
+                            .ghost()
+                            .accessibility_label("Previous matching line (Shift+Enter)")
+                            .tooltip("Previous matching line (Shift+Enter)")
+                            .disabled(nav_disabled)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.navigate_find(true, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("terminal-find-next")
+                            .debug_selector(|| "terminal-find-next".into())
+                            .label("Next")
+                            .small()
+                            .ghost()
+                            .accessibility_label("Next matching line (Enter)")
+                            .tooltip("Next matching line (Enter)")
+                            .disabled(nav_disabled)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.navigate_find(false, cx)
+                            })),
+                    )
+                    .children(find.failed.then(|| {
+                        Button::new("terminal-find-retry")
+                            .label("Retry")
+                            .small()
+                            .ghost()
+                            .accessibility_label("Retry terminal output search")
+                            .tooltip("Retry terminal output search")
+                            .on_click(cx.listener(|this, _, _, cx| this.retry_find(cx)))
+                    }))
+                    .children((self.scrollback_offset > 0).then(|| {
+                        Button::new("terminal-find-jump-to-live")
+                            .label("Jump to live output")
+                            .small()
+                            .ghost()
+                            .accessibility_label("Jump to live output")
+                            .tooltip("Jump to live output")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.scroll_to_bottom(cx)
+                            }))
+                    }))
+                    .child(
+                        Button::new("terminal-find-close")
+                            .debug_selector(|| "terminal-find-close".into())
+                            .label("Close")
+                            .small()
+                            .ghost()
+                            .accessibility_label("Close find in terminal output (Escape)")
+                            .tooltip("Close find (Escape)")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_find(&CloseTerminalFind, window, cx)
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("terminal-find-status")
+                            .role(Role::Status)
+                            .aria_label(status.clone())
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(status),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("Retained output · current terminal"),
+                    ),
+            )
+            .children(find.selected.and_then(|index| {
+                find.hits.get(index).map(|hit| {
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(format!("Match: {}", hit.excerpt))
+                })
+            }))
+            .into_any_element()
+    }
 }
 
 fn rgb_to_hsla(r: u8, g: u8, b: u8) -> Hsla {
@@ -879,6 +1600,14 @@ impl Render for TerminalView {
         let (cursor_row, cursor_col) = screen.cursor_position();
         let hide_cursor = screen.hide_cursor();
 
+        // The selected find hit paints as a row-level background cue: it
+        // sits behind the per-cell ANSI colors and is never part of copied
+        // text, so a selection cannot change what Copy produces.
+        let find_cue_row = self.find.as_ref().and_then(|find| {
+            let hit = find.selected.and_then(|index| find.hits.get(index))?;
+            cue_row(hit, self.scrollback_len, self.scrollback_offset, self.rows)
+        });
+
         let mut screen_lines = Vec::with_capacity(self.rows as usize);
         for row in 0..self.rows {
             let mut row_spans = Vec::new();
@@ -982,12 +1711,14 @@ impl Render for TerminalView {
                 row_spans.push(div().child(" "));
             }
 
+            let find_cue = find_cue_row == Some(row);
             screen_lines.push(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .h(px(row_height))
+                    .when(find_cue, |row| row.bg(theme.accent.opacity(0.18)))
                     .children(row_spans),
             );
         }
@@ -1079,12 +1810,19 @@ impl Render for TerminalView {
             None
         };
 
+        let find_strip = self.find.as_ref().map(|_| self.render_find_strip(cx));
+
         div()
             .id("pty-terminal-root")
+            .key_context("Terminal")
             .size_full()
             .min_h_0()
             .flex()
             .flex_col()
+            .on_action(cx.listener(Self::open_find))
+            .on_action(cx.listener(Self::close_find))
+            .on_action(cx.listener(Self::next_terminal_match))
+            .on_action(cx.listener(Self::previous_terminal_match))
             .bg(theme.background.opacity(if self.translucent_background {
                 0.92
             } else {
@@ -1097,6 +1835,7 @@ impl Render for TerminalView {
             .track_focus(&self.focus_handle)
             .role(Role::Terminal)
             .on_key_down(cx.listener(Self::key_down))
+            .children(find_strip)
             .child(
                 div()
                     .id("pty-terminal-screen")
@@ -1203,6 +1942,16 @@ impl Render for TerminalView {
                                         });
                                     }),
                             );
+                            let t_find = terminal.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new("Find in Terminal Output…").on_click(
+                                    move |_event, window, cx| {
+                                        t_find.update(cx, |terminal, cx| {
+                                            terminal.open_find(&FindInTerminalOutput, window, cx)
+                                        });
+                                    },
+                                ),
+                            );
                             menu.item(PopupMenuItem::new("Copy Terminal Output").on_click(
                                 move |_event, _window, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(
@@ -1302,8 +2051,41 @@ mod tests {
     use super::{
         ansi_index_to_hsla, next_terminal_wake, rgb_to_hsla, selection_bounds, should_paint_cursor,
         start_parser_worker, terminal_frame_policy, terminal_parse_budget_exhausted, ParserCommand,
-        PtyEvent, TerminalWake, TERMINAL_PARSE_BUDGET_PER_FRAME,
+        PtyEvent, TerminalWake, TERMINAL_FIND_RESCAN_INTERVAL, TERMINAL_PARSE_BUDGET_PER_FRAME,
     };
+
+    /// Receives worker events until a `SearchResults` event arrives.
+    async fn next_search_results(
+        event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<PtyEvent>,
+    ) -> PtyEvent {
+        for _ in 0..200 {
+            let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+                .await
+                .expect("timed out waiting for terminal search results")
+                .expect("terminal worker channel closed");
+            if matches!(event, PtyEvent::SearchResults { .. }) {
+                return event;
+            }
+        }
+        panic!("expected terminal search results");
+    }
+
+    /// Waits for the next painted frame; used to know previously sent output
+    /// bytes were parsed before issuing a command that scans the buffer.
+    async fn next_frame(
+        event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<PtyEvent>,
+    ) {
+        for _ in 0..200 {
+            let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+                .await
+                .expect("timed out waiting for a terminal frame")
+                .expect("terminal worker channel closed");
+            if matches!(event, PtyEvent::Frame(_)) {
+                return;
+            }
+        }
+        panic!("expected a terminal frame");
+    }
 
     #[test]
     fn terminal_parser_yields_at_its_frame_budget() {
@@ -1336,6 +2118,8 @@ mod tests {
             .send(PtyEvent::Frame(super::TerminalFrame {
                 screen: parser.screen().clone(),
                 scrollback: 0,
+                scrollback_len: 0,
+                alt_screen: false,
             }))
             .unwrap();
         parser.process(b"\rnew");
@@ -1343,6 +2127,8 @@ mod tests {
             .send(PtyEvent::Frame(super::TerminalFrame {
                 screen: parser.screen().clone(),
                 scrollback: 0,
+                scrollback_len: 0,
+                alt_screen: false,
             }))
             .unwrap();
         event_tx.send(PtyEvent::Error("closed".into())).unwrap();
@@ -1393,6 +2179,302 @@ mod tests {
             panic!("expected cleared terminal frame");
         };
         assert_eq!(frame.screen.contents(), "");
+    }
+
+    #[tokio::test]
+    async fn parser_worker_find_covers_retained_scrollback_and_reveals_newest() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (output_tx, command_tx) = start_parser_worker(4, 16, event_tx).unwrap();
+
+        let mut input = String::from("needle deep\r\n");
+        for line in 0..40 {
+            input.push_str(&format!("line {line}\r\n"));
+        }
+        input.push_str("needle live");
+        output_tx.send(input.into_bytes()).unwrap();
+        next_frame(&mut event_rx).await;
+
+        command_tx
+            .send(ParserCommand::Find { generation: 7, query: Some("needle".to_string()) })
+            .unwrap();
+        let PtyEvent::SearchResults {
+            generation, hits, total, scrollback_len, alt_screen, revealed, ..
+        } = next_search_results(&mut event_rx).await
+        else {
+            panic!("expected search results");
+        };
+        assert_eq!(generation, 7);
+        assert_eq!(total, 2);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].absolute_row, 0);
+        assert!(hits[0].excerpt.contains("needle deep"));
+        assert_eq!(scrollback_len, 38);
+        assert!(!alt_screen);
+        // A settled query reveals the newest match — here the live row.
+        assert_eq!(revealed, Some(1));
+    }
+
+    #[tokio::test]
+    async fn parser_worker_reveal_moves_the_view_to_a_scrollback_match() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (output_tx, command_tx) = start_parser_worker(4, 16, event_tx).unwrap();
+
+        let mut input = String::from("needle deep\r\n");
+        for line in 0..40 {
+            input.push_str(&format!("line {line}\r\n"));
+        }
+        output_tx.send(input.into_bytes()).unwrap();
+        next_frame(&mut event_rx).await;
+
+        command_tx
+            .send(ParserCommand::Find { generation: 1, query: Some("needle".to_string()) })
+            .unwrap();
+        let _ = next_search_results(&mut event_rx).await;
+
+        // The worker resolves the hit by identity in a fresh scan.
+        command_tx
+            .send(ParserCommand::RevealMatch {
+                generation: 1,
+                row: 0,
+                excerpt: "needle deep".to_string(),
+            })
+            .unwrap();
+        let PtyEvent::SearchResults { revealed, .. } = next_search_results(&mut event_rx).await
+        else {
+            panic!("expected search results");
+        };
+        assert_eq!(revealed, Some(0));
+
+        // The reveal moved the parser's view into deep scrollback; the next
+        // painted frame carries that offset to the view.
+        let mut saw_deep_frame = false;
+        for _ in 0..200 {
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("timed out waiting for a terminal frame")
+                .expect("terminal worker channel closed");
+            if let PtyEvent::Frame(frame) = event {
+                if frame.scrollback > 0 {
+                    saw_deep_frame = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_deep_frame, "expected a frame scrolled into scrollback");
+    }
+
+    #[tokio::test]
+    async fn parser_worker_stale_reveal_generation_is_ignored() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (output_tx, command_tx) = start_parser_worker(4, 16, event_tx).unwrap();
+
+        output_tx.send(b"needle\r\n".to_vec()).unwrap();
+        next_frame(&mut event_rx).await;
+        command_tx
+            .send(ParserCommand::Find { generation: 4, query: Some("needle".to_string()) })
+            .unwrap();
+        let _ = next_search_results(&mut event_rx).await;
+
+        command_tx
+            .send(ParserCommand::RevealMatch {
+                generation: 999,
+                row: 0,
+                excerpt: "needle".to_string(),
+            })
+            .unwrap();
+        // No rescan is scheduled for a mismatched generation: draining the
+        // channel for a while must not surface another SearchResults.
+        let saw_results = tokio::time::timeout(Duration::from_millis(400), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(PtyEvent::SearchResults { .. }) => break true,
+                    Some(_) | None => {}
+                }
+            }
+        })
+        .await;
+        assert!(saw_results.is_err(), "stale generation produced results");
+    }
+
+    #[tokio::test]
+    async fn parser_worker_reveal_refuses_a_stale_hit_identity() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (output_tx, command_tx) = start_parser_worker(4, 16, event_tx).unwrap();
+
+        output_tx.send(b"needle one\r\n".to_vec()).unwrap();
+        next_frame(&mut event_rx).await;
+        command_tx
+            .send(ParserCommand::Find { generation: 8, query: Some("needle".to_string()) })
+            .unwrap();
+        let _ = next_search_results(&mut event_rx).await;
+
+        // A clear + rewrite removes the hit the view navigated to. The
+        // identity can no longer be confirmed, so the worker must NOT reveal
+        // a different line in its place.
+        command_tx.send(ParserCommand::Clear).unwrap();
+        let _ = next_search_results(&mut event_rx).await;
+        output_tx.send(b"needle other\r\n".to_vec()).unwrap();
+        let _ = next_search_results(&mut event_rx).await;
+
+        command_tx
+            .send(ParserCommand::RevealMatch {
+                generation: 8,
+                row: 0,
+                excerpt: "needle one".to_string(),
+            })
+            .unwrap();
+        let PtyEvent::SearchResults { revealed, .. } = next_search_results(&mut event_rx).await
+        else {
+            panic!("expected search results");
+        };
+        assert_eq!(revealed, None);
+    }
+
+    #[tokio::test]
+    async fn parser_worker_suspends_and_resumes_find_on_alternate_screen() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (output_tx, command_tx) = start_parser_worker(4, 16, event_tx).unwrap();
+
+        output_tx.send(b"needle top\r\nmore\r\n".to_vec()).unwrap();
+        next_frame(&mut event_rx).await;
+        output_tx.send(b"\x1b[?1049hfull screen app".to_vec()).unwrap();
+        next_frame(&mut event_rx).await;
+
+        command_tx
+            .send(ParserCommand::Find { generation: 2, query: Some("needle".to_string()) })
+            .unwrap();
+        let PtyEvent::SearchResults { alt_screen, hits, total, .. } =
+            next_search_results(&mut event_rx).await
+        else {
+            panic!("expected search results");
+        };
+        assert!(alt_screen);
+        assert!(hits.is_empty());
+        assert_eq!(total, 0);
+
+        // Leaving the alternate screen rescans and reports the restored
+        // primary buffer on the next coalesced rescan tick.
+        output_tx.send(b"\x1b[?1049l".to_vec()).unwrap();
+        let PtyEvent::SearchResults { alt_screen, total, .. } =
+            next_search_results(&mut event_rx).await
+        else {
+            panic!("expected search results");
+        };
+        assert!(!alt_screen);
+        assert_eq!(total, 1);
+    }
+
+    #[tokio::test]
+    async fn parser_worker_refreshes_results_as_output_arrives() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (output_tx, command_tx) = start_parser_worker(4, 16, event_tx).unwrap();
+
+        output_tx.send(b"needle one\r\n".to_vec()).unwrap();
+        next_frame(&mut event_rx).await;
+        command_tx
+            .send(ParserCommand::Find { generation: 3, query: Some("needle".to_string()) })
+            .unwrap();
+        let PtyEvent::SearchResults { total, revealed, .. } =
+            next_search_results(&mut event_rx).await
+        else {
+            panic!("expected search results");
+        };
+        assert_eq!(total, 1);
+        assert_eq!(revealed, Some(0));
+
+        // New output updates the result list via a coalesced rescan without
+        // moving the reading position (revealed is None on refreshes).
+        output_tx.send(b"needle two\r\n".to_vec()).unwrap();
+        let PtyEvent::SearchResults { total, revealed, .. } =
+            next_search_results(&mut event_rx).await
+        else {
+            panic!("expected search results");
+        };
+        assert_eq!(total, 2);
+        assert_eq!(revealed, None);
+    }
+
+    #[tokio::test]
+    async fn parser_worker_invalidates_results_on_clear_and_resize() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (output_tx, command_tx) = start_parser_worker(4, 16, event_tx).unwrap();
+
+        output_tx.send(b"needle\r\n".to_vec()).unwrap();
+        next_frame(&mut event_rx).await;
+        command_tx
+            .send(ParserCommand::Find { generation: 5, query: Some("needle".to_string()) })
+            .unwrap();
+        let _ = next_search_results(&mut event_rx).await;
+
+        command_tx.send(ParserCommand::Clear).unwrap();
+        let PtyEvent::SearchResults { total, .. } = next_search_results(&mut event_rx).await else {
+            panic!("expected search results");
+        };
+        assert_eq!(total, 0);
+
+        output_tx.send(b"needle again\r\n".to_vec()).unwrap();
+        let _ = next_search_results(&mut event_rx).await;
+        command_tx.send(ParserCommand::Resize(2, 8)).unwrap();
+        let PtyEvent::SearchResults { total, .. } = next_search_results(&mut event_rx).await else {
+            panic!("expected search results");
+        };
+        assert_eq!(total, 1);
+    }
+
+    #[tokio::test]
+    async fn parser_worker_keeps_retained_output_searchable_after_output_ends() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (output_tx, command_tx) = start_parser_worker(4, 16, event_tx).unwrap();
+
+        output_tx.send(b"needle retained\r\n".to_vec()).unwrap();
+        next_frame(&mut event_rx).await;
+        drop(output_tx);
+        // Let the worker observe the output channel closing.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        command_tx
+            .send(ParserCommand::Find { generation: 6, query: Some("needle".to_string()) })
+            .unwrap();
+        let PtyEvent::SearchResults { total, .. } = next_search_results(&mut event_rx).await else {
+            panic!("expected search results");
+        };
+        assert_eq!(total, 1);
+    }
+
+    #[tokio::test]
+    async fn parser_worker_does_not_scan_while_find_is_closed() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (output_tx, command_tx) = start_parser_worker(4, 16, event_tx).unwrap();
+
+        output_tx.send(b"needle\r\n".to_vec()).unwrap();
+        next_frame(&mut event_rx).await;
+        command_tx
+            .send(ParserCommand::Find { generation: 1, query: Some("needle".to_string()) })
+            .unwrap();
+        let _ = next_search_results(&mut event_rx).await;
+
+        command_tx
+            .send(ParserCommand::Find { generation: 1, query: None })
+            .unwrap();
+        // Keep output flowing well past the rescan interval: no search may
+        // run after the strip closed.
+        let window = TERMINAL_FIND_RESCAN_INTERVAL + Duration::from_millis(400);
+        let mut produced_results = false;
+        let _ = tokio::time::timeout(window, async {
+            for _ in 0..8 {
+                output_tx.send(b"needle more\r\n".to_vec()).unwrap();
+                tokio::time::sleep(Duration::from_millis(80)).await;
+            }
+            loop {
+                match event_rx.recv().await {
+                    Some(PtyEvent::SearchResults { .. }) => produced_results = true,
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        })
+        .await;
+        assert!(!produced_results);
     }
 
     #[test]
