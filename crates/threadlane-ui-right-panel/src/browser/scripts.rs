@@ -524,11 +524,11 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
   style.textContent = [
     ".box{position:fixed;pointer-events:none;border:2px solid;border-radius:3px;box-sizing:border-box;display:none}",
     ".tag{position:fixed;pointer-events:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:280px;background:#111827;color:#f9fafb;font:11px/1.4 ui-monospace,monospace;padding:1px 6px;border-radius:4px;display:none}",
-    ".card{position:fixed;pointer-events:auto;display:none;align-items:center;gap:6px;background:#15181f;border:1px solid rgba(255,255,255,0.15);border-radius:999px;padding:5px 6px 5px 12px;box-shadow:0 8px 24px rgba(0,0,0,0.45);color:#f9fafb;font:12px/1.4 -apple-system,system-ui,sans-serif;white-space:nowrap}",
-    ".card input{width:190px;max-width:45vw;background:transparent;border:0;outline:none;color:#f9fafb;font:12px/1.4 -apple-system,system-ui,sans-serif;padding:0}",
+    ".card{position:fixed;pointer-events:auto;display:none;align-items:center;gap:6px;max-width:calc(100vw - 12px);box-sizing:border-box;background:#15181f;border:1px solid rgba(255,255,255,0.15);border-radius:999px;padding:5px 6px 5px 12px;box-shadow:0 8px 24px rgba(0,0,0,0.45);color:#f9fafb;font:12px/1.4 -apple-system,system-ui,sans-serif;white-space:nowrap}",
+    ".card input{flex:1 1 auto;min-width:40px;width:170px;background:transparent;border:0;outline:none;color:#f9fafb;font:12px/1.4 -apple-system,system-ui,sans-serif;padding:0}",
     ".card input::placeholder{color:rgba(249,250,251,0.45)}",
     ".attach{flex:none;width:22px;height:22px;border-radius:50%;border:0;background:" + PICK_BORDER + ";color:#fff;font:600 12px/1 -apple-system,system-ui,sans-serif;cursor:pointer;padding:0}",
-    ".count{font-size:11px;opacity:0.65;flex:none;max-width:160px;overflow:hidden;text-overflow:ellipsis}",
+    ".count{font-size:11px;opacity:0.65;flex:0 1 auto;min-width:0;max-width:120px;overflow:hidden;text-overflow:ellipsis}",
   ].join("\n");
   shadow.appendChild(style);
   const root = document.createElement("div");
