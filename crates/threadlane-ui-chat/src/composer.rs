@@ -4,6 +4,12 @@ use threadlane_protocol::ImageAttachment;
 pub const INPUT_KEY_CONTEXT: &str = "Input";
 pub const SLASH_COMMAND_KEY_CONTEXT: &str = "SlashCommandMenu";
 pub const SLASH_COMMAND_BINDING_CONTEXT: &str = "SlashCommandMenu > Input";
+/// Keymap context armed while the composer can browse earlier prompts.
+pub const PROMPT_RECALL_KEY_CONTEXT: &str = "ComposerPromptRecall";
+/// Up/Down bindings win over the Textarea's MoveUp/MoveDown only while the
+/// composer is empty or already browsing; every other press falls through
+/// to native caret movement via an explicit MoveUp/MoveDown dispatch.
+pub const PROMPT_RECALL_BINDING_CONTEXT: &str = "ComposerPromptRecall > Input";
 
 // Content widths are rem-based so the reading column follows interface zoom.
 pub const CHAT_CONTENT_MAX_WIDTH: f32 = 48.0;

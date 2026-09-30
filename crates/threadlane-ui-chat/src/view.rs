@@ -10,7 +10,9 @@ use gpui::*;
 use gpui_component::button::{
     Button, ButtonCustomVariant, ButtonVariants, Toggle, ToggleVariants,
 };
-use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_component::input::{
+    Input, InputEvent, InputState, MoveDown, MoveUp, Textarea, TextareaState,
+};
 use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_component::notification::Notification;
 use gpui_component::popover::Popover;
@@ -339,11 +341,15 @@ actions!(
         SelectPreviousSlashCommand,
         SelectNextSlashCommand,
         DismissSlashCommand,
+        RecallOlderPrompt,
+        RecallNewerPrompt,
     ]
 );
 
 #[path = "conversation_find.rs"]
 mod conversation_find;
+#[path = "prompt_navigation.rs"]
+mod prompt_navigation;
 use conversation_find::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -380,6 +386,16 @@ pub fn init(cx: &mut App) {
             DismissSlashCommand,
             Some(SLASH_COMMAND_BINDING_CONTEXT),
         ),
+        KeyBinding::new(
+            "up",
+            RecallOlderPrompt,
+            Some(PROMPT_RECALL_BINDING_CONTEXT),
+        ),
+        KeyBinding::new(
+            "down",
+            RecallNewerPrompt,
+            Some(PROMPT_RECALL_BINDING_CONTEXT),
+        ),
     ]);
     init_conversation_find(cx);
 }
@@ -401,6 +417,14 @@ struct ImagePreviewState {
     decoded: Option<Result<Arc<RenderImage>, String>>,
     mode: ImagePreviewMode,
     initiating_focus: FocusHandle,
+}
+
+#[derive(Clone)]
+struct PromptRecallState {
+    /// Transcript message whose text is currently loaded in the composer.
+    landmark_id: String,
+    /// The loaded text; any edit to the composer ends browsing.
+    applied_text: String,
 }
 
 pub struct ChatListView {
@@ -426,6 +450,18 @@ pub struct ChatListView {
     find_source: Option<(Arc<Vec<ChatMessageInfo>>, bool, bool)>,
     find_session: (Option<PathBuf>, Option<String>),
     find_task: Option<Task<()>>,
+
+    prompt_recall: Option<PromptRecallState>,
+    outline_open: bool,
+    outline_focus: FocusHandle,
+    outline_list_state: ListState,
+    outline_landmarks: Vec<PromptLandmark>,
+    /// Prompt landmarks memoized against the messages `Arc` + generation
+    /// flag; holding the `Arc` itself makes pointer-equality invalidation
+    /// sound (any `Arc::make_mut` on the model reallocates).
+    prompt_landmarks_cache: Option<(Arc<Vec<ChatMessageInfo>>, bool, Arc<Vec<PromptLandmark>>)>,
+    outline_focus_id: Option<String>,
+    outline_selected_id: Option<String>,
 
     expanded_activity_groups: HashSet<String>,
     progress_summary_expanded: bool,
@@ -533,6 +569,9 @@ impl ChatListView {
                 std::mem::take(&mut state.requested_composer_inserts)
             });
             for insert in inserts {
+                if !insert.text.is_empty() || !insert.images.is_empty() {
+                    this.prompt_recall = None;
+                }
                 if !insert.text.is_empty() {
                     this.input_state.update(cx, |input, cx| {
                         let existing = input.value().to_string();
@@ -550,6 +589,7 @@ impl ChatListView {
                 }
                 this.pasted_images.extend(insert.images);
             }
+            this.retain_prompt_recall(cx);
             if let Some(target) =
                 model.update(cx, |state, _cx| state.requested_editor_target.take())
             {
@@ -607,6 +647,7 @@ impl ChatListView {
                 cx.notify();
                 match event {
                     InputEvent::Change => {
+                        this.prompt_recall = None;
                         this.dismiss_slash_menu = false;
                         this.selected_slash_index = 0;
                         this.slash_scroll_handle.scroll_to_item(0);
@@ -671,6 +712,7 @@ impl ChatListView {
                                 }
                                 cx.notify();
                             });
+                            this.prompt_recall = None;
                             input_state.update(cx, |state, cx| {
                                 state.set_value("", window, cx);
                             });
@@ -760,6 +802,14 @@ impl ChatListView {
             find_source: None,
             find_session: (None, None),
             find_task: None,
+            prompt_recall: None,
+            outline_open: false,
+            outline_focus: cx.focus_handle(),
+            outline_list_state: ListState::new(0, ListAlignment::Top, window.rem_size() * 20.0),
+            outline_landmarks: Vec::new(),
+            prompt_landmarks_cache: None,
+            outline_focus_id: None,
+            outline_selected_id: None,
             expanded_activity_groups: HashSet::new(),
             progress_summary_expanded: false,
             markdown_states: HashMap::new(),
@@ -801,6 +851,7 @@ impl ChatListView {
         if key == self.composer_key {
             return;
         }
+        self.prompt_recall = None;
         self.invalidate_image_preview(window, cx);
 
         // An explicit stash is separate from the unsent text and attachments in each task.
@@ -1158,6 +1209,9 @@ impl ChatListView {
         }
         if tab != CentralTab::Chat {
             self.clear_conversation_find();
+            self.prompt_recall = None;
+            self.outline_open = false;
+            self.outline_selected_id = None;
         }
         self.current_tab = tab;
         cx.notify();
@@ -1311,7 +1365,8 @@ impl ChatListView {
                     .children(status_badge),
             )
             .when(self.current_tab == CentralTab::Chat, |el| {
-                el.child(
+                el.child(self.render_outline_popover(cx))
+                    .child(
                     Button::new("conversation-find-open")
                         .debug_selector(|| "conversation-find-open".into())
                         .icon(IconName::Search)
@@ -2241,7 +2296,7 @@ impl ChatListView {
         } else {
             // Reconciliation can replace every optimistic ID. Keep a find
             // reader's viewport, without guessing a new selected message.
-            let reading_position = (self.find_open
+            let reading_position = ((self.find_open || self.outline_selected_id.is_some())
                 && !session_changed
                 && !self.transcript_list_state.is_following_tail())
                 .then(|| self.transcript_list_state.logical_scroll_top());
@@ -2263,9 +2318,19 @@ impl ChatListView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let messages = Arc::clone(&self.transcript_messages);
-        let selected = self.find_open
+        let selected_match = self.find_open
             && matches!(self.transcript_rows.get(index),
             Some(TranscriptRow::Message(i)) if self.find_selected.as_ref() == Some(&messages[*i].id));
+        let selected_prompt = self.outline_selected_id.as_ref().is_some_and(|id| {
+            matches!(self.transcript_rows.get(index),
+                Some(TranscriptRow::Message(i)) if messages[*i].id == *id)
+        });
+        let selected = selected_match || selected_prompt;
+        let selected_label = if selected_prompt {
+            "Selected prompt"
+        } else {
+            "Selected matching message"
+        };
         let content = match self.transcript_rows.get(index).cloned() {
             Some(TranscriptRow::Message(message_index)) => messages
                 .get(message_index)
@@ -2282,7 +2347,7 @@ impl ChatListView {
             .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
             .mx_auto()
             .when(selected, |el| el.border_1().border_color(cx.theme().primary)
-                .child(div().text_sm().child("Selected matching message")))
+                .child(div().text_sm().child(selected_label)))
             .children(content)
             .into_any_element()
     }
@@ -3048,6 +3113,7 @@ impl ChatListView {
                                             this.focus_composer(window, cx);
                                             return;
                                         }
+                                        this.prompt_recall = None;
                                         this.input_state.update(cx, |input, cx| {
                                             input.set_value(content.clone(), window, cx);
                                         });
@@ -3602,6 +3668,10 @@ impl ChatListView {
         cx: &mut Context<Self>,
     ) {
         if self.find_open {
+            return;
+        }
+        if self.outline_open {
+            self.handle_outline_key_down(event, window, cx);
             return;
         }
         let key = event.keystroke.key.as_str();
@@ -4902,7 +4972,7 @@ impl ChatListView {
                         .xsmall()
                         .ghost()
                         .tooltip("Edit message in the composer")
-                        .on_click(move |_event, window, cx| {
+                        .on_click(cx.listener(move |this, _event, window, cx| {
                             let restored = dismiss_model.update(cx, |state, cx| {
                                 let restored =
                                     state.active_pending_composer_message().map(str::to_owned);
@@ -4911,11 +4981,12 @@ impl ChatListView {
                                 restored
                             });
                             if let Some(restored) = restored {
+                                this.prompt_recall = None;
                                 dismiss_input.update(cx, |input, cx| {
                                     input.set_value(restored, window, cx);
                                 });
                             }
-                        }),
+                        })),
                 )
         });
 
@@ -5182,6 +5253,10 @@ impl ChatListView {
             });
 
         let input_value = self.input_state.read(cx).value().to_string();
+        // Arm Up/Down recall interception while browsing or while an empty
+        // composer could enter browsing; everything else keeps native arrows.
+        let prompt_recall_keys_active =
+            self.prompt_recall.is_some() || (input_value.is_empty() && self.pasted_images.is_empty());
         let mut slash_completion_active = false;
         let command_menu = if let Some(query) = active_slash_command_query(&input_value) {
             if self.dismiss_slash_menu {
@@ -5587,6 +5662,7 @@ impl ChatListView {
                                             cx.notify();
                                             popped
                                         }) {
+                                            this.prompt_recall = None;
                                             restore_input.update(cx, |input, cx| {
                                                 input.set_value(text, window, cx);
                                             });
@@ -5694,6 +5770,29 @@ impl ChatListView {
                         }
                     }
                 })
+        };
+
+        // The composer-level "Recall previous prompt" command: same gates as
+        // the Up-arrow path, disabled with a reason when ineligible.
+        let prompt_recall_button = {
+            let recall_unavailable_reason = if self.prompt_recall.is_some() {
+                None
+            } else {
+                self.prompt_recall_block_reason(has_composer_text, cx)
+            };
+            Button::new("prompt-recall-btn")
+                .debug_selector(|| "prompt-recall-btn".into())
+                .icon(IconName::Undo2)
+                .accessibility_label("Recall previous prompt")
+                .tooltip(recall_unavailable_reason.unwrap_or("Recall previous prompt (Up)"))
+                .ghost()
+                .small()
+                .rounded_lg()
+                .disabled(recall_unavailable_reason.is_some())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.step_prompt_recall(true, window, cx);
+                    this.focus_composer(window, cx);
+                }))
         };
 
         let setup_card = self
@@ -5885,15 +5984,34 @@ impl ChatListView {
                     .shadow_lg()
                     .hover(|style| style.border_color(theme.primary.opacity(0.28)))
                     .on_action(cx.listener(Self::paste_composer_clipboard))
-                    .when(slash_completion_active, |composer| {
-                        composer
-                            .key_context(SLASH_COMMAND_KEY_CONTEXT)
-                            .on_action(cx.listener(Self::complete_slash_command_action))
-                            .on_action(cx.listener(Self::select_previous_slash_command_action))
-                            .on_action(cx.listener(Self::select_next_slash_command_action))
-                            .on_action(cx.listener(Self::dismiss_slash_command_action))
+                    .map(|composer| {
+                        let mut contexts = String::new();
+                        if slash_completion_active {
+                            contexts.push_str(SLASH_COMMAND_KEY_CONTEXT);
+                        }
+                        if prompt_recall_keys_active {
+                            if !contexts.is_empty() {
+                                contexts.push(' ');
+                            }
+                            contexts.push_str(PROMPT_RECALL_KEY_CONTEXT);
+                        }
+                        if contexts.is_empty() {
+                            composer
+                        } else {
+                            composer
+                                .key_context(contexts.as_str())
+                                .on_action(cx.listener(Self::complete_slash_command_action))
+                                .on_action(cx.listener(Self::select_previous_slash_command_action))
+                                .on_action(cx.listener(Self::select_next_slash_command_action))
+                                .on_action(cx.listener(Self::dismiss_slash_command_action))
+                                .on_action(cx.listener(Self::recall_older_prompt_action))
+                                .on_action(cx.listener(Self::recall_newer_prompt_action))
+                        }
                     })
                     .children(stash_banner)
+                    .children(self.prompt_recall.is_some().then(|| {
+                        self.render_prompt_recall_strip(cx)
+                    }))
                     .children(
                         (!image_chips.is_empty())
                             .then(|| div().flex().flex_wrap().gap_2().children(image_chips)),
@@ -5940,6 +6058,7 @@ impl ChatListView {
                                     .gap_1()
                                     .flex_wrap()
                                     .child(stash_button)
+                                    .child(prompt_recall_button)
                                     .children(subagent_popover)
                                     .children(context_percent_label.map(|label| {
                                         div()
@@ -5962,6 +6081,7 @@ impl ChatListView {
                                             .on_click(cx.listener(move |this, _event, window, cx| {
                                                 let text = queue_prompt_input.read(cx).value().to_string();
                                                 if has_sendable_prompt(&text, this.pasted_images.len()) {
+                                                    this.prompt_recall = None;
                                                     queue_prompt_model.update(cx, |state, cx| {
                                                         let images = std::mem::take(&mut this.pasted_images);
                                                         controller::dispatch(state, AppAction::StageBusyMessage { text, images });
@@ -5988,6 +6108,7 @@ impl ChatListView {
                                             .on_click(cx.listener(move |this, _event, window, cx| {
                                                 let text = steer_prompt_input.read(cx).value().to_string();
                                                 if has_sendable_prompt(&text, this.pasted_images.len()) {
+                                                    this.prompt_recall = None;
                                                     steer_prompt_model.update(cx, |state, cx| {
                                                         let images = std::mem::take(&mut this.pasted_images);
                                                         controller::dispatch(state, AppAction::StageBusyMessage { text, images });
@@ -6045,6 +6166,7 @@ impl ChatListView {
                                         .on_click(cx.listener(move |this, _event, window, cx| {
                                             let text = send_input.read(cx).value().to_string();
                                             if !text.trim().is_empty() || !this.pasted_images.is_empty() {
+                                                this.prompt_recall = None;
                                                 let images = std::mem::take(&mut this.pasted_images);
                                                 send_model.update(cx, |state, cx| {
                                                     controller::dispatch(
@@ -6382,6 +6504,12 @@ impl Render for ChatListView {
         let session_changed = session_key != self.last_session_key;
         if session_changed {
             self.clear_conversation_find();
+            self.prompt_recall = None;
+            self.outline_open = false;
+            self.outline_landmarks.clear();
+            self.prompt_landmarks_cache = None;
+            self.outline_focus_id = None;
+            self.outline_selected_id = None;
             self.markdown_cache_namespace = session_key
                 .as_ref()
                 .map(|(work_dir, session_id)| {
@@ -6406,11 +6534,14 @@ impl Render for ChatListView {
             window.defer(cx, |window, cx| window.close_dialog(cx));
         }
         self.sync_transcript_rows(messages.clone(), is_generating, session_changed);
+        self.refresh_conversation_outline(cx);
+        self.retain_prompt_recall(cx);
         if let Some(prompt) = self
             .model
             .update(cx, |state, _cx| state.requested_composer_prompt.take())
         {
             self.current_tab = CentralTab::Chat;
+            self.prompt_recall = None;
             self.input_state.update(cx, |input, cx| {
                 input.set_value(&prompt, window, cx);
             });
@@ -6553,6 +6684,7 @@ impl Render for ChatListView {
                                                                 )
                                                                 .on_click(cx.listener(
                                                                     |this, _, _, cx| {
+                                                                        this.outline_selected_id = None;
                                                                         this.transcript_list_state
                                                                             .scroll_to_end();
                                                                         cx.notify();

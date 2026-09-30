@@ -47,6 +47,9 @@ impl ChatListView {
             cx.propagate();
             return;
         }
+        // Find supersedes the outline: clear any outline jump marker.
+        self.outline_open = false;
+        self.outline_selected_id = None;
         if !self.find_open {
             self.find_previous_focus = window.focused(cx);
             let state = self.model.read(cx);
