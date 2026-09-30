@@ -18,8 +18,8 @@ mod test_support;
 
 pub use app_state::{close_work_needs_refresh, ActiveCloseWork, AppState};
 pub use threadlane_daemon::{
-    agent_events, automation, chat, discovery, projection, provider_auth, settings, updater,
-    worktree_setup,
+    agent_events, automation, chat, discovery, events, projection, provider_auth, settings,
+    updater, worktree_setup,
 };
 pub use threadlane_daemon::{
     derive_session_attention, hash_session_identity, next_event_batch, next_event_batch_capped,
