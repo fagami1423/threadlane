@@ -11,6 +11,10 @@ pub enum AppAction {
         work_dir: PathBuf,
         session_id: String,
     },
+    ForkSession {
+        work_dir: PathBuf,
+        session_id: String,
+    },
     SettleSession {
         work_dir: PathBuf,
         session_id: String,

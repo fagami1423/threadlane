@@ -26,6 +26,11 @@ pub fn dispatch(state: &mut AppState, action: AppAction) {
         } => {
             state.select_session(work_dir, session_id);
         }
+        AppAction::ForkSession { work_dir, session_id } => {
+            if let Err(error) = state.fork_session(work_dir, session_id) {
+                state.session_status = Some(error);
+            }
+        }
         AppAction::SettleSession {
             work_dir,
             session_id,

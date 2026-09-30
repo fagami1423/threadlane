@@ -1573,6 +1573,148 @@ fn issue_work_state(work_dir: &Path) -> AppState {
 }
 
 #[test]
+fn fork_session_targets_context_session_and_preserves_shared_checkout_after_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().canonicalize().unwrap();
+    let source_id = "source";
+    let checkout = project.join(".threadlane/worktrees/source");
+    std::fs::create_dir_all(&checkout).unwrap();
+    std::fs::write(checkout.join("uncommitted.txt"), "user work").unwrap();
+    let source = canonical_session_file(&project, source_id);
+    for (key, value) in [
+        ("is_worktree", "true"),
+        ("worktree_path", checkout.to_str().unwrap()),
+        ("model", "openai/test"),
+    ] {
+        CodingSessionHarness::append_fact_to_path(&source, "main", key, value, None).unwrap();
+    }
+    // Discovery must fork the full local transcript, not the metadata stub.
+    let local_source = canonical_session_file(&checkout, source_id);
+    CodingSessionHarness::append_fact_to_path(&local_source, "main", "name", "Local history", None)
+        .unwrap();
+    let before = std::fs::read(&source).unwrap();
+    let mut state = issue_work_state(&project);
+    state.projects[0].sessions = discover_sessions_in_project(&project);
+    state.active_session_id = Some("different-session".into());
+    let fork_id = state
+        .fork_session(project.clone(), source_id.into())
+        .unwrap();
+    assert_eq!(state.active_session_id.as_deref(), Some(fork_id.as_str()));
+    assert_eq!(std::fs::read(&source).unwrap(), before);
+    let sessions = discover_sessions_in_project(&project);
+    let fork = sessions
+        .iter()
+        .find(|session| session.id == fork_id)
+        .unwrap();
+    assert_eq!(fork.runtime_work_dir, checkout);
+    assert!(fork.is_worktree && fork.worktree_available);
+    assert_eq!(fork.title, "Local history (fork)");
+    assert_eq!(
+        discover_session_stubs_in_project(&project)
+            .iter()
+            .find(|session| session.id == fork_id)
+            .unwrap()
+            .runtime_work_dir,
+        checkout
+    );
+    assert!(
+        state
+            .remove_session(project.clone(), source_id.into(), true)
+            .unwrap_err()
+            .contains("another session")
+    );
+    assert!(
+        state
+            .settle_session(project.clone(), fork_id.clone(), true)
+            .unwrap_err()
+            .contains("another session")
+    );
+    state
+        .remove_session(project.clone(), source_id.into(), false)
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(checkout.join("uncommitted.txt")).unwrap(),
+        "user work"
+    );
+    assert_eq!(
+        discover_sessions_in_project(&project)[0].runtime_work_dir,
+        checkout
+    );
+    let second_fork = state.fork_session(project.clone(), fork_id).unwrap();
+    assert_eq!(
+        state.session_runtime_work_dir(&project, &second_fork),
+        checkout
+    );
+}
+
+#[test]
+fn fork_session_rejects_missing_checkout_and_unknown_session_without_switching() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().canonicalize().unwrap();
+    let source = canonical_session_file(&project, "missing");
+    CodingSessionHarness::append_fact_to_path(&source, "main", "is_worktree", "true", None)
+        .unwrap();
+    let mut state = issue_work_state(&project);
+    state.projects[0].sessions = discover_sessions_in_project(&project);
+    assert!(
+        state
+            .fork_session(project.clone(), "missing".into())
+            .is_err()
+    );
+    assert!(
+        state
+            .fork_session(project.clone(), "unknown".into())
+            .is_err()
+    );
+    assert!(state.active_session_id.is_none());
+    assert_eq!(discover_sessions_in_project(&project).len(), 1);
+}
+
+#[test]
+fn fork_session_in_project_root_rejects_running_source_then_dispatches() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().canonicalize().unwrap();
+    let mut state = issue_work_state(&project);
+    let source_id = state.create_new_session().unwrap();
+    let source = canonical_session_file(&project, &source_id);
+    let runtime = state.ensure_session_runtime(project.clone(), source);
+    runtime.begin_generation().unwrap();
+    assert!(
+        state
+            .fork_session(project.clone(), source_id.clone())
+            .unwrap_err()
+            .contains("Stop")
+    );
+    runtime.finish_generation(None);
+    crate::controller::dispatch(
+        &mut state,
+        crate::actions::AppAction::ForkSession {
+            work_dir: project.clone(),
+            session_id: source_id.clone(),
+        },
+    );
+    assert_ne!(state.active_session_id.as_deref(), Some(source_id.as_str()));
+    let fork = state.active_session_info().unwrap();
+    assert!(!fork.is_worktree);
+    assert_eq!(fork.runtime_work_dir, project);
+}
+
+#[test]
+fn fork_session_worktree_owner_cannot_escape_project() {
+    let project = tempfile::tempdir().unwrap();
+    for owner in ["../escape", "/tmp/escape", "a/b", ".."] {
+        let facts = std::collections::BTreeMap::from([
+            ("is_worktree".into(), "true".into()),
+            ("worktree_owner".into(), owner.into()),
+        ]);
+        assert_eq!(
+            crate::discovery::effective_session_work_dir(project.path(), "fork", &facts),
+            project.path().join(".threadlane/worktrees/fork")
+        );
+    }
+}
+
+#[test]
 fn new_session_persists_draft_reasoning_effort() {
     let project = tempfile::tempdir().unwrap();
     let mut state = issue_work_state(project.path());

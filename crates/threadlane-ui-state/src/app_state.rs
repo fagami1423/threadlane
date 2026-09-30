@@ -1021,7 +1021,10 @@ impl AppState {
         if session.worktree_available {
             return Err("The active worktree is already available".into());
         }
-        let expected_path = Self::canonical_worktree_dir(&work_dir, &session_id);
+        let stub = JsonlStore::open_read_only(canonical_session_file(&work_dir, &session_id))
+            .map_err(|error| error.to_string())?;
+        let expected_path =
+            crate::discovery::effective_session_work_dir(&work_dir, &session_id, &stub.facts());
         if session.runtime_work_dir != expected_path {
             return Err("The recorded worktree path is not safe to recreate".into());
         }
@@ -1324,12 +1327,113 @@ impl AppState {
         self.pending_hydrations.push(request);
     }
 
+    pub(crate) fn fork_session(
+        &mut self,
+        work_dir: PathBuf,
+        session_id: String,
+    ) -> Result<String, String> {
+        let source = self
+            .projects
+            .iter()
+            .find(|project| project.work_dir == work_dir)
+            .and_then(|project| {
+                project
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+            })
+            .cloned()
+            .ok_or("Session was not found")?;
+        if self.worktree_setups.contains_key(&session_id) {
+            return Err("Finish or cancel worktree setup before forking this session".into());
+        }
+        if !source.runtime_work_dir.is_dir() {
+            return Err("Recreate the missing worktree before forking this session".into());
+        }
+        if self
+            .session_runtimes
+            .get(&source.session_file)
+            .is_some_and(|runtime| runtime.is_generating())
+        {
+            return Err("Stop the running generation before forking this session".into());
+        }
+        let id = format!(
+            "session_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let destination = canonical_session_file(&work_dir, &id);
+        threadlane_coding_agent::harness::CodingSessionHarness::fork_to_path(
+            &source.session_file,
+            &destination,
+        )?;
+        if source.is_worktree {
+            let result = (|| {
+                use threadlane_coding_agent::harness::CodingSessionHarness;
+                let owner = source
+                    .runtime_work_dir
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or("Worktree has no valid owner")?;
+                for (key, value) in [
+                    ("is_worktree", "true"),
+                    ("worktree_owner", owner),
+                    (
+                        "worktree_path",
+                        source.runtime_work_dir.to_str().ok_or("Worktree path is not UTF-8")?,
+                    ),
+                ] {
+                    CodingSessionHarness::append_fact_to_path(
+                        &destination, "main", key, value, None,
+                    )?;
+                }
+                Ok::<(), String>(())
+            })();
+            if let Err(error) = result {
+                Self::remove_file_if_present(&destination)?;
+                return Err(error);
+            }
+        }
+        if let Some(project) = self
+            .projects
+            .iter_mut()
+            .find(|project| project.work_dir == work_dir)
+        {
+            project.sessions = discover_sessions_in_project(&work_dir);
+        }
+        self.session_refresh_generation = self.session_refresh_generation.wrapping_add(1);
+        self.select_session(work_dir.clone(), id.clone());
+        self.request_session_refresh(&work_dir);
+        Ok(id)
+    }
+
+    fn ensure_worktree_not_shared(&self, work_dir: &Path, session_id: &str) -> Result<(), String> {
+        if let Some(checkout) = self.session_worktree_path(work_dir, session_id) {
+            if discover_session_stubs_in_project(work_dir)
+                .iter()
+                .any(|session| {
+                    session.id != session_id
+                        && session.is_worktree
+                        && session.runtime_work_dir == checkout
+                })
+            {
+                return Err("This worktree is used by another session. Keep the worktree when archiving or deleting this session.".into());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn settle_session(
         &mut self,
         work_dir: PathBuf,
         session_id: String,
         delete_worktree: bool,
     ) -> Result<(), String> {
+        if delete_worktree {
+            self.ensure_worktree_not_shared(&work_dir, &session_id)?;
+        }
         if self.worktree_setups.contains_key(&session_id) {
             return Err("Cancel worktree setup before archiving or deleting this session".into());
         }
@@ -1418,6 +1522,9 @@ impl AppState {
         session_id: String,
         delete_worktree: bool,
     ) -> Result<(), String> {
+        if delete_worktree {
+            self.ensure_worktree_not_shared(&work_dir, &session_id)?;
+        }
         if self.worktree_setups.contains_key(&session_id) {
             return Err("Cancel worktree setup before archiving or deleting this session".into());
         }

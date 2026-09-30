@@ -1823,6 +1823,9 @@ impl SidebarView {
                 let open_work_dir = context_work_dir.clone();
                 let open_session_id = context_session_id.clone();
                 let copy_session_id = context_session_id.clone();
+                let fork_model = context_model.clone();
+                let fork_work_dir = context_work_dir.clone();
+                let fork_session_id = context_session_id.clone();
                 let copy_project_path = context_work_dir.to_string_lossy().into_owned();
                 let copy_session_file = copy_session_file.clone();
                 let export_log_model = context_model.clone();
@@ -1884,6 +1887,31 @@ impl SidebarView {
                                     session_id: open_session_id.clone(),
                                 },
                             );
+                            cx.notify();
+                        });
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new("Fork Session").on_click(move |_event, window, cx| {
+                        fork_model.update(cx, |state, cx| {
+                            let previous_session = state.active_session_id.clone();
+                            controller::dispatch(
+                                state,
+                                AppAction::ForkSession {
+                                    work_dir: fork_work_dir.clone(),
+                                    session_id: fork_session_id.clone(),
+                                },
+                            );
+                            if state.active_session_id == previous_session {
+                                if let Some(error) = state.session_status.clone() {
+                                    window.push_notification(error, cx);
+                                }
+                            } else {
+                                window.push_notification(
+                                    "Session forked with recovered context. Both sessions use the same checkout.",
+                                    cx,
+                                );
+                            }
                             cx.notify();
                         });
                     }),

@@ -6,6 +6,120 @@ fn temp_session() -> (tempfile::TempDir, PathBuf) {
 }
 
 #[test]
+fn fork_session_recovers_transcript_when_source_reduction_fails() {
+    let (dir, source) = temp_session();
+    let mut original = CodingSessionHarness::open(&source).unwrap();
+    original
+        .append_message(AgentMessage::user("Keep this context", vec![]))
+        .unwrap();
+    drop(original);
+    let bytes = fs::read(&source).unwrap();
+    fs::write(&source, [bytes.clone(), bytes].concat()).unwrap();
+    assert!(JsonlStore::open_read_only(&source).is_err());
+    let before = fs::read(&source).unwrap();
+    let destination = dir.path().join("recovered.jsonl");
+    CodingSessionHarness::fork_to_path(&source, &destination).unwrap();
+    let fork = JsonlStore::open_read_only(destination).unwrap();
+    assert!(
+        fork.model_context("main")
+            .unwrap()
+            .messages()
+            .contains(&AgentMessage::user("Keep this context", vec![]))
+    );
+    assert_eq!(fs::read(source).unwrap(), before);
+}
+
+#[test]
+fn fork_session_recovers_context_without_failed_operations_or_tool_protocol() {
+    let (dir, source) = temp_session();
+    let destination = dir.path().join("fork.jsonl");
+    let mut original = CodingSessionHarness::open(&source).unwrap();
+    original
+        .set_fact("main", "model", "openai/test".into())
+        .unwrap();
+    original
+        .set_fact("main", "reasoning_effort", "High".into())
+        .unwrap();
+    original
+        .set_fact("main", "automation_id", "do-not-copy".into())
+        .unwrap();
+    original
+        .begin_run("stuck-run", AgentMessage::user("Fix the checkout", vec![]))
+        .unwrap();
+    original
+        .append_message(AgentMessage::Assistant {
+            content: Some("Investigating".into()),
+            tool_calls: Some(vec![threadlane_protocol::RuntimeToolCall {
+                id: "orphan-call".into(),
+                r#type: "function".into(),
+                function: threadlane_protocol::RuntimeToolCallFunction {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"README.md"}"#.into(),
+                },
+                thought_signature: None,
+            }]),
+            stop_reason: None,
+            deferred_handle: None,
+        })
+        .unwrap();
+    original
+        .append_message(AgentMessage::Tool {
+            tool_call_id: "other-orphan".into(),
+            name: "read_file".into(),
+            content: "important findings".into(),
+            is_error: false,
+            terminate: false,
+            images: vec![],
+        })
+        .unwrap();
+    let before = fs::read(&source).unwrap();
+
+    CodingSessionHarness::fork_to_path(&source, &destination).unwrap();
+
+    assert_eq!(fs::read(&source).unwrap(), before);
+    let fork = JsonlStore::open_read_only(&destination).unwrap();
+    assert_ne!(fork.session_id(), original.store.session_id());
+    assert_eq!(fork.facts()["model"], "openai/test");
+    assert_eq!(fork.facts()["reasoning_effort"], "High");
+    assert!(!fork.facts().contains_key("automation_id"));
+    assert!(
+        !fork
+            .records()
+            .iter()
+            .any(|record| matches!(record, HarnessRecord::OperationStarted { .. }))
+    );
+    let messages = fork.model_context("main").unwrap().messages();
+    assert_eq!(messages[0], AgentMessage::user("Fix the checkout", vec![]));
+    let text = serde_json::to_string(&messages).unwrap();
+    assert!(text.contains("Investigating"));
+    assert!(text.contains("important findings"));
+    assert!(messages.iter().all(|message| matches!(
+        message,
+        AgentMessage::User { .. }
+            | AgentMessage::UserWithImages { .. }
+            | AgentMessage::Assistant {
+                tool_calls: None,
+                deferred_handle: None,
+                ..
+            }
+    )));
+    let mut resumed = CodingSessionHarness::open(&destination).unwrap();
+    resumed
+        .begin_run("new-run", AgentMessage::user("Continue", vec![]))
+        .unwrap();
+}
+
+#[test]
+fn fork_session_never_overwrites_an_existing_destination() {
+    let (dir, source) = temp_session();
+    CodingSessionHarness::append_fact_to_path(&source, "main", "name", "Original", None).unwrap();
+    let destination = dir.path().join("existing.jsonl");
+    fs::write(&destination, "keep me").unwrap();
+    assert!(CodingSessionHarness::fork_to_path(&source, &destination).is_err());
+    assert_eq!(fs::read_to_string(destination).unwrap(), "keep me");
+}
+
+#[test]
 fn automation_facts_create_missing_session_directories() {
     let dir = tempfile::tempdir().unwrap();
     let worktree = dir.path().join("worktree");
