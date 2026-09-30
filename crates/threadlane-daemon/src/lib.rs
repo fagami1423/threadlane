@@ -18,6 +18,7 @@ pub mod discovery;
 pub mod events;
 pub mod projection;
 pub mod provider_auth;
+pub mod runtimes;
 pub mod settings;
 pub mod types;
 pub mod updater;
@@ -26,10 +27,10 @@ pub mod worktree_setup;
 pub use events::{next_event_batch, next_event_batch_capped};
 pub use types::{
     derive_session_attention, hash_session_identity, AttachedProject, ChatMessageInfo,
-    ChatStreamEvent, ContextWindowInfo, MessageRole, PendingComposerMessage, ProjectInfo,
-    RunCompletionToken, RunTiming, SessionAttention, SessionCompletionSummary,
-    SessionDiscoveryCache, SessionDiscoveryCacheEntry, SessionHealth, SessionHydrationRequest,
-    SessionInfo, SessionMetricsInfo, SessionProjectionKey, SessionProjectionResult,
-    SubagentActivityInfo, SubagentActivityStatus, ToolActivityInfo, TrajectoryDiagnostics,
-    TrajectoryEntry, WorkMode,
+    ContextWindowInfo, HydrationRuntimeOptions, MessageRole, PendingComposerMessage,
+    ProjectInfo, RunCompletionToken, RunTiming, SessionAttention, SessionCommand,
+    SessionCompletionSummary, SessionDiscoveryCache, SessionDiscoveryCacheEntry, SessionEvent,
+    SessionHealth, SessionHydrationRequest, SessionInfo, SessionMetricsInfo,
+    SessionProjectionKey, SessionProjectionResult, SessionSnapshot, SubagentActivityInfo,
+    SubagentActivityStatus, ToolActivityInfo, TrajectoryDiagnostics, TrajectoryEntry, WorkMode,
 };

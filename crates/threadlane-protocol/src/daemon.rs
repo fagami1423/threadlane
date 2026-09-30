@@ -1,0 +1,837 @@
+//! Daemon wire contract (issue #79): every type that crosses between the
+//! daemon-owned session core and thin clients.
+//!
+//! Everything in this module is plain data — `Serialize + Deserialize`,
+//! ID- or path-referenced, free of process handles — so a client can speak
+//! the contract over a channel today (the GPUI app embeds `threadlane-daemon`
+//! in-process) or over a socket tomorrow (`threadlane-daemon` the process).
+//!
+//! Surface map:
+//! - [`SessionCommand`]: every request a client can issue. Commands that need
+//!   a live session address it by `session_id`; the daemon resolves the
+//!   owning runtime internally (handles never cross the wire).
+//! - [`SessionEvent`]: the live event stream. `Agent` wraps the shared
+//!   [`AgentEvent`] vocabulary (turn lifecycle, message deltas, tool calls,
+//!   permission/question requests, subagent and fusion updates); the rest are
+//!   daemon-level events for worktree setup, titles, scheduled results, ACP
+//!   config options, and session/project deltas.
+//! - [`SessionSnapshot`] / [`ProjectInfo`]: attach-mid-run semantics — a
+//!   client that connects or selects a session gets one snapshot and then
+//!   tails live `SessionEvent`s.
+//!
+//! Session files stay `PathBuf`s on the wire: the daemon owns the filesystem
+//! and paths are the canonical identity handle. Consumers must not assume
+//! the file is readable from their own process; `session_id` is the key.
+
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use crate::acp::AcpConfigOption;
+use crate::interaction::QuestionAnswer;
+use crate::messages::{ImageAttachment, ReasoningEffort, SessionPlan, TokenUsage};
+use crate::orchestration::{ModelRoles, OrchestratorMode};
+use crate::events::{AgentEvent, SubagentIsolation};
+
+/// A command a client sends to the daemon.
+///
+/// Every variant is accepted in any session state; the daemon is the one
+/// place that knows whether a runtime exists, is generating, or must be
+/// constructed first, so commands never carry runtime handles.
+// No `PartialEq`: `WorktreeSetup::cancelled` is a process-local flag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionCommand {
+    /// Submit a user prompt. `work_dir` is the effective execution directory
+    /// (the worktree for worktree sessions); `acp_config` holds pending ACP
+    /// agent settings to apply before the first turn.
+    SubmitPrompt {
+        session_id: String,
+        work_dir: PathBuf,
+        text: String,
+        #[serde(default)]
+        images: Vec<ImageAttachment>,
+        effort: ReasoningEffort,
+        #[serde(default)]
+        acp_config: Vec<(String, String)>,
+    },
+    /// Cancel the session's in-flight turn.
+    CancelRun { session_id: String },
+    /// Resolve a permission prompt raised by an `AgentEvent::PermissionRequested`.
+    AnswerPermission {
+        session_id: String,
+        request_id: String,
+        decision: PermissionDecision,
+    },
+    /// Resolve (or dismiss) a question raised by `AgentEvent::QuestionRequested`.
+    AnswerQuestion {
+        session_id: String,
+        answer: QuestionAnswer,
+    },
+    /// Switch the session's model. The daemon persists the selection and
+    /// rebuilds the runtime so provider credentials re-resolve.
+    SetModel { session_id: String, model: String },
+    /// Switch reasoning effort; applies to the next turn when a run is live.
+    SetReasoningEffort {
+        session_id: String,
+        effort: ReasoningEffort,
+    },
+    /// Replace the session's model-role routing (fast model, fallback chain).
+    SetModelRoles { session_id: String, roles: ModelRoles },
+    /// Switch the orchestration mode (Agent vs Fusion) for the session's
+    /// project and rebuild the live runtime so the next turn routes anew.
+    SetOrchestratorMode {
+        session_id: String,
+        mode: OrchestratorMode,
+    },
+    /// Ask a session's external ACP agent what settings it offers. Starting
+    /// the agent is the point: it reports settings on `session/new`, so this
+    /// is how the picker learns the option set before the first turn.
+    LoadAcpConfigOptions { session_id: String },
+    /// Apply one of the agent's own settings; the refreshed set arrives as
+    /// `SessionEvent::AcpConfigOptions`.
+    SetAcpConfigOption {
+        session_id: String,
+        config_id: String,
+        value: String,
+    },
+    /// Hydrate a session: project its durable transcript (and optionally
+    /// rebuild a live runtime) so the client can render it.
+    HydrateSession { request: SessionHydrationRequest },
+    /// Prepare a worktree session: name the branch, create the checkout,
+    /// construct the runtime, then submit `setup.text` as the first turn.
+    PrepareWorktree { setup: WorktreeSetup },
+    /// Cancel an in-flight worktree preparation.
+    CancelWorktreeSetup { session_id: String },
+    /// Remove a session (transcript and runtime). `delete_worktree` also
+    /// removes a session-owned checkout that has no unrecorded work.
+    DeleteSession {
+        session_id: String,
+        session_file: PathBuf,
+        #[serde(default)]
+        delete_worktree: bool,
+    },
+    /// Attach a project directory to the workspace.
+    AddProject { work_dir: PathBuf },
+    /// Detach a project directory.
+    RemoveProject { work_dir: PathBuf },
+    /// Refresh the provider/model catalog (live discovery merged into the
+    /// picker). `work_dir` scopes project-level model overrides.
+    RefreshCatalog { work_dir: Option<PathBuf> },
+    /// Forward keyboard input to a daemon-owned PTY.
+    TerminalInput { terminal_id: String, data: String },
+    /// Resize a daemon-owned PTY.
+    TerminalResize {
+        terminal_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    /// Request a project snapshot; answered by `SessionEvent::ProjectChanged`.
+    GetProjectState { work_dir: PathBuf },
+    /// Request a session snapshot; answered by `SessionEvent::SessionSnapshot`.
+    GetSessionSnapshot { session_id: String },
+}
+
+/// An event the daemon broadcasts to clients.
+///
+/// Ordering follows the producing session's journal: events for one
+/// `session_id` arrive in emission order; cross-session ordering is not
+/// guaranteed beyond causality.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionEvent {
+    /// A turn-level event from the session's agent. [`AgentEvent`] carries
+    /// the full vocabulary: start/end, message and reasoning deltas, tool
+    /// calls, permission/question requests, subagent and fusion updates.
+    Agent {
+        session_id: String,
+        event: AgentEvent,
+    },
+    /// The session's generation finished (completed, errored, or cancelled).
+    Finished {
+        session_id: String,
+        session_file: PathBuf,
+    },
+    /// A scheduled (non-interactive) run of the session settled.
+    /// `result` is `None` when the work produced no summary to surface.
+    Scheduled {
+        session_id: String,
+        session_file: PathBuf,
+        result: Option<Result<String, String>>,
+    },
+    /// The session's automatic title was generated and persisted.
+    TitleGenerated {
+        session_id: String,
+        session_file: PathBuf,
+    },
+    /// Available base branches for a new worktree task in `project`.
+    WorktreeBases {
+        project: PathBuf,
+        result: Result<(String, Vec<String>), String>,
+    },
+    /// Progress of an in-flight worktree preparation.
+    WorktreeProgress {
+        session_id: String,
+        stage: SetupStage,
+        branch: Option<String>,
+    },
+    /// Worktree preparation settled. On success the daemon has already
+    /// registered the new runtime; `session` is the discovered metadata.
+    WorktreePrepared {
+        session_id: String,
+        result: Result<SessionInfo, String>,
+    },
+    /// Settings an external ACP agent exposes, as it reports them.
+    ///
+    /// `runtime_instance` identifies the daemon-side runtime generation the
+    /// options came from — a client must apply them only while that instance
+    /// is still the registered runtime for `session_file` (the check that
+    /// used to ride a `Weak<SessionRuntime>` in-process).
+    AcpConfigOptions {
+        session_id: String,
+        session_file: PathBuf,
+        runtime_instance: u64,
+        options: Vec<AcpConfigOption>,
+        error: Option<String>,
+        /// Restores a New-task picker selection when applying it failed.
+        failed_config: Option<(String, String)>,
+    },
+    /// Output or lifecycle event from a daemon-owned PTY.
+    TerminalEvent {
+        session_id: String,
+        event: TerminalEvent,
+    },
+    /// A project snapshot or delta. Sent on attach and whenever the project's
+    /// session list changes (new session, title update, health transition).
+    ProjectChanged { project: ProjectInfo },
+    /// Attach-mid-run snapshot: the session's durable projection as of the
+    /// snapshot point. Live `Agent`/`Finished`/… events continue after it;
+    /// the client renders snapshot + tail.
+    SessionSnapshot {
+        session_id: String,
+        snapshot: Box<SessionSnapshot>,
+    },
+    /// A daemon-level error not attributable to an agent event.
+    DaemonError {
+        session_id: Option<String>,
+        message: String,
+    },
+}
+
+/// A permission decision the client sends back to the daemon.
+///
+/// Mirrors `threadlane_permission::PermissionDecision` (which owns the
+/// in-process enum); kept here so the wire contract does not reach across
+/// crate boundaries for a four-variant vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecision {
+    AllowOnce,
+    /// In-memory grant for the rest of the session (never persisted).
+    AllowSession,
+    AllowAlways,
+    Deny,
+}
+
+/// Terminal output or lifecycle event streamed from a daemon-owned PTY.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TerminalEvent {
+    Output { terminal_id: String, data: String },
+    Resized {
+        terminal_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    Exited {
+        terminal_id: String,
+        exit_code: Option<i32>,
+    },
+}
+
+/// Stages of first-send worktree preparation, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SetupStage {
+    Naming,
+    Creating,
+    Starting,
+}
+
+impl SetupStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Naming => "Naming the worktree",
+            Self::Creating => "Creating the worktree",
+            Self::Starting => "Starting the session",
+        }
+    }
+}
+
+/// A durable first-send worktree preparation. Persisted into the session
+/// metadata stub (`worktree_setup` fact) so an interrupted setup can be
+/// retried or recovered; also the `PrepareWorktree` command payload.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorktreeSetup {
+    pub project: PathBuf,
+    pub session_id: String,
+    pub session_file: PathBuf,
+    pub worktree: PathBuf,
+    pub base: String,
+    pub stage: SetupStage,
+    pub branch: Option<String>,
+    pub error: Option<String>,
+    /// Client-side cancel flag: meaningful only in-process, never serialized.
+    #[serde(skip)]
+    pub cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub text: String,
+    pub images: Vec<ImageAttachment>,
+    pub model: String,
+    pub effort: ReasoningEffort,
+    pub acp_config: Vec<(String, String)>,
+}
+
+/// Runtime construction inputs for [`SessionHydrationRequest`].
+///
+/// Carries identity and configuration only — the daemon resolves ancillary
+/// resources (browser bridge, provider credentials, subagent settings)
+/// internally when it builds the runtime.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HydrationRuntimeOptions {
+    /// Effective worktree directory for agent execution.
+    pub work_dir: PathBuf,
+    pub model: String,
+    pub model_roles: ModelRoles,
+}
+
+/// A session whose durable projections a client wants computed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionHydrationRequest {
+    pub session_id: String,
+    pub session_file: PathBuf,
+    pub reload_messages: bool,
+    /// When present, the daemon also (re)builds the session's runtime.
+    pub runtime_options: Option<HydrationRuntimeOptions>,
+}
+
+/// Point-in-time snapshot of one session, served on attach so a client can
+/// render without waiting for new events.
+///
+/// Session-diagnostics and token-efficiency projections stay daemon-local
+/// for now (they carry engine-owned types a remote client does not need);
+/// extend this struct when a remote diagnostics surface exists.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionSnapshot {
+    pub session: SessionInfo,
+    pub messages: Vec<ChatMessageInfo>,
+    pub trajectory: Vec<TrajectoryEntry>,
+    pub subagents: Vec<SubagentActivityInfo>,
+    pub plan: SessionPlan,
+    pub metrics: SessionMetricsInfo,
+    pub token_usage: TokenUsage,
+    pub context_window: Option<ContextWindowInfo>,
+    pub run_timing: Option<RunTiming>,
+}
+
+/// Reference to a GitHub issue attached to a session or project view.
+///
+/// Moved verbatim from `threadlane-git` (which re-exports it) so the session
+/// list contract stays inside the protocol crate.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubIssueRef {
+    pub host: String,
+    pub owner: String,
+    pub repo: String,
+    pub number: u64,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SessionHealth {
+    #[default]
+    Healthy,
+    Working,
+    Warning,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SessionAttention {
+    NeedsYou,
+    Working,
+    Ready,
+    Idle,
+}
+
+impl SessionAttention {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NeedsYou => "Needs you",
+            Self::Working => "Working",
+            Self::Ready => "Ready",
+            Self::Idle => "Idle",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum WorkMode {
+    #[default]
+    Local,
+    Worktree,
+}
+
+impl WorkMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Local => "Local",
+            Self::Worktree => "Worktree",
+        }
+    }
+}
+
+/// Identity of one successful main-lane Run completion in a session journal:
+/// the `OperationFinished` record id, the run it closed, and its journal seq.
+/// Persisted inside `session_seen.json`, so the shape and field names are a
+/// stable on-disk contract.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RunCompletionToken {
+    pub record_id: String,
+    pub run_id: String,
+    pub seq: u64,
+}
+
+/// What discovery could prove about a session's latest successful main-lane
+/// Run completion. `Unknown` deliberately stays distinct from `None`: an
+/// unreadable stub must never be baselined as acknowledged, while a parsed
+/// transcript with no qualifying completion confirms there is nothing to mark.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionCompletionSummary {
+    #[default]
+    Unknown,
+    None,
+    Latest(RunCompletionToken),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub id: String,
+    pub title: String,
+    /// Canonical attached project that owns this session file.
+    pub work_dir: PathBuf,
+    /// Effective directory used for agent execution.
+    pub runtime_work_dir: PathBuf,
+    pub session_file: PathBuf,
+    pub updated_at: u64,
+    pub health: SessionHealth,
+    pub git_branch: Option<String>,
+    pub github_issue: Option<GitHubIssueRef>,
+    pub is_worktree: bool,
+    pub worktree_available: bool,
+    pub completion_summary: SessionCompletionSummary,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProjectInfo {
+    pub name: String,
+    pub work_dir: PathBuf,
+    pub sessions: Vec<SessionInfo>,
+    pub is_expanded: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MessageRole {
+    User,
+    Assistant,
+    System,
+    Error,
+    ContextMarker,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolActivityInfo {
+    pub id: String,
+    pub category: String,
+    pub title: String,
+    pub display_summary: String,
+    pub detail: String,
+    pub is_expanded: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrajectoryDiagnostics {
+    pub status: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub model_visible: bool,
+    pub source: Option<String>,
+    pub raw: Option<String>,
+    pub parent_id: Option<String>,
+    pub result_id: Option<String>,
+    pub exit_code: Option<i32>,
+    pub output_bytes: Option<u64>,
+    pub files_mutated: Vec<String>,
+    pub commands_executed: Vec<String>,
+    pub error_summary: Option<String>,
+    pub items_count: Option<usize>,
+    pub token_estimate: Option<u32>,
+    pub is_anomaly: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrajectoryEntry {
+    pub seq: Option<u64>,
+    pub run_id: Option<String>,
+    pub turn: Option<u32>,
+    /// The user-facing request this entry belongs to, when it can be inferred
+    /// from the canonical transcript. Runtime records inherit the active request.
+    pub request: Option<u32>,
+    pub category: String,
+    pub summary: String,
+    pub detail: String,
+    pub lane: Option<String>,
+    pub correlation_id: Option<String>,
+    pub diagnostics: TrajectoryDiagnostics,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMetricsInfo {
+    pub turns: usize,
+    pub tool_calls: usize,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+}
+
+impl SessionMetricsInfo {
+    pub fn billed_input_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
+    }
+
+    pub fn cache_hit_percent(&self) -> Option<u64> {
+        let billed_input = self.billed_input_tokens();
+        (billed_input > 0).then(|| {
+            (((self.cache_read_tokens as u128) * 100 + (billed_input as u128) / 2)
+                / billed_input as u128) as u64
+        })
+    }
+
+    pub fn accumulate_usage(&mut self, usage: &TokenUsage) {
+        self.input_tokens = self
+            .input_tokens
+            .saturating_add(u64::from(usage.input_tokens));
+        self.output_tokens = self
+            .output_tokens
+            .saturating_add(u64::from(usage.output_tokens));
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(u64::from(usage.cache_read_tokens));
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(u64::from(usage.cache_write_tokens));
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextWindowInfo {
+    pub current_tokens: u64,
+    pub context_limit: u64,
+    pub context_limit_is_estimate: bool,
+    pub effective_model: String,
+    pub compaction_generation: u64,
+    pub last_compaction_seq: Option<u64>,
+    pub provisional: bool,
+    pub estimating: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SessionProjectionKey {
+    pub session_id: String,
+    pub session_file: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChatMessageInfo {
+    pub id: String,
+    pub role: MessageRole,
+    pub content: String,
+    pub tool_activities: Vec<ToolActivityInfo>,
+    pub streaming: bool,
+    pub reasoning_content: Option<String>,
+    pub reasoning_expanded: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubagentActivityStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SubagentActivityInfo {
+    pub batch_run_id: u64,
+    pub task_index: usize,
+    pub journal_run_id: Option<String>,
+    pub lane: Option<String>,
+    pub agent: String,
+    pub task: String,
+    pub model: Option<String>,
+    pub status: SubagentActivityStatus,
+    pub messages: Vec<ChatMessageInfo>,
+    pub isolation: Option<SubagentIsolation>,
+    pub error: Option<String>,
+}
+
+/// A queued composer message a client wants the session to run next.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PendingComposerMessage {
+    pub text: String,
+    pub images: Vec<ImageAttachment>,
+}
+
+/// Timing of the latest foreground run, projected from the session journal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunTiming {
+    pub start_seq: u64,
+    pub source_seq: u64,
+    pub started_at_ms: Option<u64>,
+    pub finished_at_ms: Option<u64>,
+    pub finished: bool,
+    pub suppressed: bool,
+}
+
+impl RunTiming {
+    pub fn elapsed_seconds(&self, now_ms: u64, generating: bool) -> Option<u64> {
+        if self.suppressed || generating == self.finished {
+            return None;
+        }
+        let end = if self.finished {
+            self.finished_at_ms?
+        } else {
+            now_ms
+        };
+        end.checked_sub(self.started_at_ms?).map(|ms| ms / 1000)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acp::ACP_CONFIG_CATEGORY_MODEL;
+    use crate::interaction::{PermissionRequest, QuestionItemAnswer};
+
+    #[test]
+    fn session_command_round_trips_through_json() {
+        let commands = vec![
+            SessionCommand::SubmitPrompt {
+                session_id: "sess_1".into(),
+                work_dir: PathBuf::from("/repo"),
+                text: "hello".into(),
+                images: vec![ImageAttachment {
+                    display_name: "shot.png".into(),
+                    data_url: "data:image/png;base64,AAAA".into(),
+                }],
+                effort: ReasoningEffort::High,
+                acp_config: vec![("model".into(), "auto".into())],
+            },
+            SessionCommand::CancelRun {
+                session_id: "sess_1".into(),
+            },
+            SessionCommand::AnswerPermission {
+                session_id: "sess_1".into(),
+                request_id: "perm_1".into(),
+                decision: PermissionDecision::AllowSession,
+            },
+            SessionCommand::AnswerQuestion {
+                session_id: "sess_1".into(),
+                answer: QuestionAnswer {
+                    request_id: "q_1".into(),
+                    answers: vec![QuestionItemAnswer {
+                        question_id: "q1".into(),
+                        selected: vec!["a".into()],
+                        custom_text: None,
+                    }],
+                    dismissed: false,
+                },
+            },
+            SessionCommand::SetModel {
+                session_id: "sess_1".into(),
+                model: "gpt-test".into(),
+            },
+            SessionCommand::SetReasoningEffort {
+                session_id: "sess_1".into(),
+                effort: ReasoningEffort::Low,
+            },
+            SessionCommand::SetModelRoles {
+                session_id: "sess_1".into(),
+                roles: ModelRoles {
+                    fast: Some("fast-model".into()),
+                    fallback_chain: vec!["b".into()],
+                    cooldown_models: vec![],
+                },
+            },
+            SessionCommand::SetOrchestratorMode {
+                session_id: "sess_1".into(),
+                mode: OrchestratorMode::Fusion,
+            },
+            SessionCommand::SetAcpConfigOption {
+                session_id: "sess_1".into(),
+                config_id: "cfg".into(),
+                value: "v".into(),
+            },
+            SessionCommand::HydrateSession {
+                request: SessionHydrationRequest {
+                    session_id: "sess_1".into(),
+                    session_file: PathBuf::from("/repo/.threadlane/sessions/sess_1.jsonl"),
+                    reload_messages: true,
+                    runtime_options: Some(HydrationRuntimeOptions {
+                        work_dir: PathBuf::from("/repo"),
+                        model: "gpt-test".into(),
+                        model_roles: ModelRoles::default(),
+                    }),
+                },
+            },
+            SessionCommand::TerminalResize {
+                terminal_id: "pty_1".into(),
+                cols: 80,
+                rows: 24,
+            },
+            SessionCommand::GetProjectState {
+                work_dir: PathBuf::from("/repo"),
+            },
+            SessionCommand::GetSessionSnapshot {
+                session_id: "sess_1".into(),
+            },
+        ];
+        for command in commands {
+            let json = serde_json::to_string(&command).expect("command serializes");
+            let back: SessionCommand =
+                serde_json::from_str(&json).expect("command deserializes");
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        }
+    }
+
+    fn sample_session() -> SessionInfo {
+        SessionInfo {
+            id: "sess_1".into(),
+            title: "work".into(),
+            work_dir: PathBuf::from("/repo"),
+            runtime_work_dir: PathBuf::from("/repo"),
+            session_file: PathBuf::from("/repo/.threadlane/sessions/sess_1.jsonl"),
+            updated_at: 1,
+            health: SessionHealth::Working,
+            git_branch: Some("worktree/fix-1".into()),
+            github_issue: Some(GitHubIssueRef {
+                host: "github.com".into(),
+                owner: "o".into(),
+                repo: "r".into(),
+                number: 79,
+                url: "https://github.com/o/r/issues/79".into(),
+            }),
+            is_worktree: true,
+            worktree_available: true,
+            completion_summary: SessionCompletionSummary::Latest(RunCompletionToken {
+                record_id: "r1".into(),
+                run_id: "run1".into(),
+                seq: 9,
+            }),
+        }
+    }
+
+    #[test]
+    fn session_event_round_trips_through_json() {
+        let events = vec![
+            SessionEvent::Agent {
+                session_id: "sess_1".into(),
+                event: AgentEvent::PermissionRequested {
+                    request: PermissionRequest {
+                        id: "perm_1".into(),
+                        capability: "network".into(),
+                        title: "Allow host".into(),
+                        detail: "example.com".into(),
+                        scopes: vec![crate::interaction::PermissionScope::Session],
+                    },
+                },
+            },
+            SessionEvent::Finished {
+                session_id: "sess_1".into(),
+                session_file: PathBuf::from("/repo/.threadlane/sessions/sess_1.jsonl"),
+            },
+            SessionEvent::Scheduled {
+                session_id: "sess_1".into(),
+                session_file: PathBuf::from("/repo/.threadlane/sessions/sess_1.jsonl"),
+                result: Some(Ok("done".into())),
+            },
+            SessionEvent::TitleGenerated {
+                session_id: "sess_1".into(),
+                session_file: PathBuf::from("/repo/.threadlane/sessions/sess_1.jsonl"),
+            },
+            SessionEvent::WorktreePrepared {
+                session_id: "sess_1".into(),
+                result: Ok(sample_session()),
+            },
+            SessionEvent::AcpConfigOptions {
+                session_id: "sess_1".into(),
+                session_file: PathBuf::from("/repo/.threadlane/sessions/sess_1.jsonl"),
+                runtime_instance: 7,
+                options: vec![AcpConfigOption {
+                    id: "model".into(),
+                    name: "Model".into(),
+                    description: None,
+                    category: Some(ACP_CONFIG_CATEGORY_MODEL.into()),
+                    current_value: serde_json::Value::String("auto".into()),
+                    options: vec![],
+                }],
+                error: None,
+                failed_config: Some(("model".into(), "auto".into())),
+            },
+            SessionEvent::TerminalEvent {
+                session_id: "sess_1".into(),
+                event: TerminalEvent::Output {
+                    terminal_id: "pty_1".into(),
+                    data: "$ ".into(),
+                },
+            },
+            SessionEvent::ProjectChanged {
+                project: ProjectInfo {
+                    name: "repo".into(),
+                    work_dir: PathBuf::from("/repo"),
+                    sessions: vec![sample_session()],
+                    is_expanded: true,
+                },
+            },
+            SessionEvent::SessionSnapshot {
+                session_id: "sess_1".into(),
+                snapshot: Box::new(SessionSnapshot {
+                    session: sample_session(),
+                    ..Default::default()
+                }),
+            },
+            SessionEvent::DaemonError {
+                session_id: None,
+                message: "boom".into(),
+            },
+        ];
+        for event in events {
+            let json = serde_json::to_string(&event).expect("event serializes");
+            let back: SessionEvent = serde_json::from_str(&json).expect("event deserializes");
+            assert_eq!(event, back);
+        }
+    }
+
+    #[test]
+    fn permission_decision_variants_decode() {
+        for (json, expected) in [
+            (r#""allow_once""#, PermissionDecision::AllowOnce),
+            (r#""allow_session""#, PermissionDecision::AllowSession),
+            (r#""allow_always""#, PermissionDecision::AllowAlways),
+            (r#""deny""#, PermissionDecision::Deny),
+        ] {
+            let back: PermissionDecision = serde_json::from_str(json).expect("decodes");
+            assert_eq!(back, expected);
+        }
+    }
+}

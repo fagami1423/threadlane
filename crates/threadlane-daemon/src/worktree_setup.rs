@@ -1,63 +1,15 @@
 //! First-send worktree preparation, off the UI thread.
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::time::Duration;
 
-use threadlane_coding_agent::controller::SessionRuntime;
-use threadlane_protocol::{ImageAttachment, ReasoningEffort};
 use threadlane_runtime::harness::{JsonlStore, SessionStore};
 
-use crate::{ChatStreamEvent, SessionInfo};
+use crate::{SessionEvent, SessionInfo};
 
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
-pub enum SetupStage {
-    Naming,
-    Creating,
-    Starting,
-}
-
-impl SetupStage {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Naming => "Naming the worktree",
-            Self::Creating => "Creating the worktree",
-            Self::Starting => "Starting the session",
-        }
-    }
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct WorktreeSetup {
-    pub project: PathBuf,
-    pub session_id: String,
-    pub session_file: PathBuf,
-    pub worktree: PathBuf,
-    pub base: String,
-    pub stage: SetupStage,
-    pub branch: Option<String>,
-    pub error: Option<String>,
-    #[serde(skip)]
-    pub cancelled: Arc<std::sync::atomic::AtomicBool>,
-    pub text: String,
-    pub images: Vec<ImageAttachment>,
-    pub model: String,
-    pub effort: ReasoningEffort,
-    pub acp_config: Vec<(String, String)>,
-}
-
-#[derive(Clone)]
-pub struct PreparedWorktree {
-    pub session: SessionInfo,
-    pub runtime: Arc<SessionRuntime>,
-}
-
-impl std::fmt::Debug for PreparedWorktree {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PreparedWorktree")
-            .field("session", &self.session)
-            .finish_non_exhaustive()
-    }
-}
+// `SetupStage`/`WorktreeSetup` are daemon wire types, canonical in
+// `threadlane_protocol::daemon` (also the `PrepareWorktree` command payload
+// and the durable `worktree_setup` fact shape); re-exported here so
+// `worktree_setup::SetupStage` paths keep working.
+pub use threadlane_protocol::daemon::{SetupStage, WorktreeSetup};
 
 /// Model output is untrusted: allow only a bounded ASCII slug and add a unique suffix.
 pub fn branch_name(raw: &str, session_id: &str) -> String {
@@ -81,11 +33,11 @@ pub fn branch_name(raw: &str, session_id: &str) -> String {
 pub fn start(
     setup: WorktreeSetup,
     mut options: threadlane_coding_agent::CodingAgentOptions,
-    tx: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
+    tx: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
 ) -> Result<(), String> {
     crate::chat::executor()?.spawn(async move {
         let progress = |stage, branch| {
-            let _ = tx.send(ChatStreamEvent::WorktreeProgress {
+            let _ = tx.send(SessionEvent::WorktreeProgress {
                 session_id: setup.session_id.clone(),
                 stage,
                 branch,
@@ -188,10 +140,13 @@ pub fn start(
             })
             .await
             .map_err(|e| e.to_string())??;
-            Ok(PreparedWorktree { session, runtime })
+            // The event stream stays wire-clean: the runtime handle waits in
+            // the daemon-side mailbox until the consumer claims it.
+            crate::runtimes::park_prepared_runtime(setup.session_id.clone(), runtime);
+            Ok(session)
         }
         .await;
-        let _ = tx.send(ChatStreamEvent::WorktreePrepared {
+        let _ = tx.send(SessionEvent::WorktreePrepared {
             session_id: setup.session_id,
             result,
         });

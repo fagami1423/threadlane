@@ -40,14 +40,10 @@ pub struct GitHubRepository {
     pub repo: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct GitHubIssueRef {
-    pub host: String,
-    pub owner: String,
-    pub repo: String,
-    pub number: u64,
-    pub url: String,
-}
+// Canonical in `threadlane_protocol::daemon` — the session-list contract
+// (`SessionInfo::github_issue`) carries it on the wire; re-exported here so
+// `threadlane_git::GitHubIssueRef` paths keep working.
+pub use threadlane_protocol::daemon::GitHubIssueRef;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GitHubLabel {

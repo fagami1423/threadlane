@@ -8242,6 +8242,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "threadlane-protocol",
  "tokio",
 ]
 
@@ -8421,6 +8422,7 @@ dependencies = [
  "tempfile",
  "threadlane-auth",
  "threadlane-project",
+ "threadlane-protocol",
  "tracing",
 ]
 

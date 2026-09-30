@@ -130,8 +130,8 @@ pub struct AppState {
     pub requested_composer_prompt: Option<String>,
     pub requested_terminal_command: Option<String>,
     pub requested_terminal_work_dir: Option<PathBuf>,
-    stream_tx: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
-    pub stream_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ChatStreamEvent>>,
+    stream_tx: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
+    pub stream_rx: Option<tokio::sync::mpsc::UnboundedReceiver<SessionEvent>>,
     session_refresh_tx: Sender<(u64, PathBuf)>,
     pub session_refresh_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<(u64, PathBuf, Vec<SessionInfo>)>>,
@@ -143,7 +143,7 @@ pub struct AppState {
     scheduler_handles: HashMap<PathBuf, SchedulerSupervisorHandle>,
     scheduler_results:
         HashMap<PathBuf, tokio::sync::mpsc::UnboundedReceiver<SchedulerSupervisorEvent>>,
-    deferred_stream_events: HashMap<String, Vec<ChatStreamEvent>>,
+    deferred_stream_events: HashMap<String, Vec<SessionEvent>>,
     /// Bridge to the embedded browser panel. The channel is created with the
     /// app; the first constructed right panel claims the receiver and pumps
     /// agent browser commands into the live view.
@@ -664,12 +664,11 @@ impl AppState {
                 session_file: session_file.to_path_buf(),
                 reload_messages: true,
                 runtime_options: active_runtime_work_dir.map(|work_dir| {
-                    (
+                    HydrationRuntimeOptions {
                         work_dir,
-                        state.selected_model.clone(),
-                        state.model_roles.clone(),
-                        state.browser_bridge.clone(),
-                    )
+                        model: state.selected_model.clone(),
+                        model_roles: state.model_roles.clone(),
+                    }
                 }),
             });
         }
@@ -1320,7 +1319,7 @@ impl AppState {
                     runtime.spawn_blocking(move || {
                         let result =
                             threadlane_git::worktree_bases(&project).map_err(|e| e.to_string());
-                        let _ = tx.send(ChatStreamEvent::WorktreeBases { project, result });
+                        let _ = tx.send(SessionEvent::WorktreeBases { project, result });
                     });
                 }
                 Err(error) => self.session_status = Some(error),
@@ -1500,12 +1499,11 @@ impl AppState {
             session_id,
             session_file,
             reload_messages: true,
-            runtime_options: Some((
-                runtime_work_dir,
-                self.selected_model.clone(),
-                self.model_roles.clone(),
-                self.browser_bridge.clone(),
-            )),
+            runtime_options: Some(HydrationRuntimeOptions {
+                work_dir: runtime_work_dir,
+                model: self.selected_model.clone(),
+                model_roles: self.model_roles.clone(),
+            }),
         };
         self.drain_chat_stream(Vec::new());
         self.pending_hydrations.retain(|pending| {
@@ -2418,7 +2416,7 @@ impl AppState {
             .is_some_and(|events| {
                 events
                     .iter()
-                    .any(|event| matches!(event, ChatStreamEvent::Scheduled { .. }))
+                    .any(|event| matches!(event, SessionEvent::Scheduled { .. }))
             });
         let ready_work =
             deferred_work || branch_is_actionable || (linked_pr.is_none() && actionable_git_work);
@@ -2429,7 +2427,7 @@ impl AppState {
                 events.iter().any(|event| {
                     matches!(
                         event,
-                        ChatStreamEvent::Scheduled {
+                        SessionEvent::Scheduled {
                             result: Some(Err(_)),
                             ..
                         }
@@ -2669,7 +2667,7 @@ impl AppState {
     fn finish_worktree_setup(
         &mut self,
         id: &str,
-        result: Result<crate::worktree_setup::PreparedWorktree, String>,
+        result: Result<SessionInfo, String>,
     ) {
         let Some(setup) = self.worktree_setups.get(id).cloned() else {
             return;
@@ -2677,6 +2675,8 @@ impl AppState {
         let active = self.active_session_id.as_deref() == Some(id);
         if setup.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             drop(result);
+            // Free the runtime parked by the producer before it was claimed.
+            let _ = crate::runtimes::take_prepared_runtime(id);
             if active {
                 self.is_generating = false;
                 self.session_status = Some("Worktree setup cancelled".into());
@@ -2684,8 +2684,7 @@ impl AppState {
             self.cleanup_cancelled_worktree(&setup);
             return;
         }
-        let result = result.and_then(|prepared| {
-            let session = prepared.session;
+        let result = result.and_then(|session| {
             if let Some(project) = self
                 .projects
                 .iter_mut()
@@ -2694,7 +2693,10 @@ impl AppState {
                 project.sessions.retain(|s| s.id != id);
                 project.sessions.insert(0, session.clone());
             }
-            let runtime = self.register_session_runtime(session.session_file, prepared.runtime);
+            let prepared = crate::runtimes::take_prepared_runtime(id).ok_or_else(|| {
+                "Prepared session runtime was already claimed".to_string()
+            })?;
+            let runtime = self.register_session_runtime(session.session_file, prepared);
             crate::chat::execute_prompt(
                 runtime,
                 setup.worktree.clone(),
@@ -3875,12 +3877,12 @@ impl AppState {
     pub fn apply_durable_event(&mut self, session_id: &str, event: HarnessEvent) -> bool {
         match event.payload() {
             EventPayload::Agent(agent_event) => {
-                self.drain_chat_stream(vec![ChatStreamEvent::Agent {
+                self.drain_chat_stream(vec![SessionEvent::Agent {
                     session_id: session_id.to_owned(),
                     event: agent_event.clone(),
                 }])
             }
-            EventPayload::Fault(error) => self.drain_chat_stream(vec![ChatStreamEvent::Agent {
+            EventPayload::Fault(error) => self.drain_chat_stream(vec![SessionEvent::Agent {
                 session_id: session_id.to_owned(),
                 event: AgentEvent::AgentError {
                     error: error.clone(),
@@ -3952,7 +3954,7 @@ impl AppState {
         changed
     }
 
-    pub fn drain_chat_stream(&mut self, mut events: Vec<ChatStreamEvent>) -> bool {
+    pub fn drain_chat_stream(&mut self, mut events: Vec<SessionEvent>) -> bool {
         let seen_changed = self.drain_session_seen_write_results();
         let scheduler_files: Vec<PathBuf> = self.scheduler_results.keys().cloned().collect();
         for session_file in scheduler_files {
@@ -3973,9 +3975,9 @@ impl AppState {
                         .unwrap_or_else(|| session_file.to_string_lossy().into_owned());
                     events.push(match update {
                         SchedulerSupervisorEvent::Agent(event) => {
-                            ChatStreamEvent::Agent { session_id, event }
+                            SessionEvent::Agent { session_id, event }
                         }
-                        SchedulerSupervisorEvent::Completed(result) => ChatStreamEvent::Scheduled {
+                        SchedulerSupervisorEvent::Completed(result) => SessionEvent::Scheduled {
                             session_id,
                             session_file: session_file.clone(),
                             result,
@@ -3994,7 +3996,7 @@ impl AppState {
 
         for event in deferred.chain(events) {
             match event {
-                ChatStreamEvent::WorktreeBases { project, result } => {
+                SessionEvent::WorktreeBases { project, result } => {
                     if self.is_new_task && self.active_work_dir.as_ref() == Some(&project) {
                         match result {
                             Ok((default, branches)) => {
@@ -4015,7 +4017,7 @@ impl AppState {
                         changed = true;
                     }
                 }
-                ChatStreamEvent::WorktreeProgress {
+                SessionEvent::WorktreeProgress {
                     session_id,
                     stage,
                     branch,
@@ -4028,11 +4030,11 @@ impl AppState {
                         changed = true;
                     }
                 }
-                ChatStreamEvent::WorktreePrepared { session_id, result } => {
+                SessionEvent::WorktreePrepared { session_id, result } => {
                     self.finish_worktree_setup(&session_id, result);
                     changed = true;
                 }
-                ChatStreamEvent::Agent { session_id, event }
+                SessionEvent::Agent { session_id, event }
                     if self.active_session_id.as_deref() == Some(&session_id) =>
                 {
                     if matches!(&event, AgentEvent::AgentStart) {
@@ -4271,7 +4273,7 @@ impl AppState {
                         ChatAgentUpdate::Ignore => {}
                     }
                 }
-                ChatStreamEvent::Scheduled {
+                SessionEvent::Scheduled {
                     session_id,
                     session_file,
                     result,
@@ -4290,7 +4292,7 @@ impl AppState {
                         self.deferred_stream_events
                             .entry(session_id.clone())
                             .or_default()
-                            .push(ChatStreamEvent::Scheduled {
+                            .push(SessionEvent::Scheduled {
                                 session_id,
                                 session_file,
                                 result,
@@ -4336,7 +4338,7 @@ impl AppState {
                         self.request_session_refresh(&work_dir);
                     }
                 }
-                ChatStreamEvent::Finished {
+                SessionEvent::Finished {
                     session_id,
                     session_file,
                 } => {
@@ -4353,7 +4355,7 @@ impl AppState {
                         self.deferred_stream_events
                             .entry(session_id.clone())
                             .or_default()
-                            .push(ChatStreamEvent::Finished {
+                            .push(SessionEvent::Finished {
                                 session_id,
                                 session_file,
                             });
@@ -4400,24 +4402,28 @@ impl AppState {
                         self.request_session_refresh(&work_dir);
                     }
                 }
-                ChatStreamEvent::AcpConfigOptions {
+                SessionEvent::AcpConfigOptions {
                     session_id,
-                    source,
+                    session_file,
+                    runtime_instance,
                     options,
                     error,
                     failed_config,
                 } => {
-                    let Some(runtime) = source.upgrade() else {
+                    // Apply options only while the producing runtime instance
+                    // is still the registered one — the wire-clean stand-in
+                    // for the old `Weak<SessionRuntime>` identity check.
+                    let Some(current_instance) = self
+                        .session_runtimes
+                        .get(&session_file)
+                        .map(|runtime| runtime.instance_id())
+                    else {
                         continue;
                     };
-                    if !self
-                        .session_runtimes
-                        .get(&runtime.session_file)
-                        .is_some_and(|current| Arc::ptr_eq(current, &runtime))
-                    {
+                    if current_instance != runtime_instance {
                         continue;
                     }
-                    let is_active = self.active_session_matches(&session_id, &runtime.session_file);
+                    let is_active = self.active_session_matches(&session_id, &session_file);
                     if let Some(error) = error {
                         if let (Some((config_id, value)), Some(agent_id)) = (
                             failed_config,
@@ -4434,7 +4440,7 @@ impl AppState {
                         }
                         continue;
                     }
-                    let key = Self::projection_key(&session_id, &runtime.session_file);
+                    let key = Self::projection_key(&session_id, &session_file);
                     if options.is_empty() {
                         if self.acp_config_options.remove(&key).is_some() && is_active {
                             changed = true;
@@ -4446,7 +4452,7 @@ impl AppState {
                         }
                     }
                 }
-                ChatStreamEvent::TitleGenerated {
+                SessionEvent::TitleGenerated {
                     session_id,
                     session_file,
                 } => {
@@ -4462,7 +4468,7 @@ impl AppState {
                         self.refresh_active_session();
                     }
                 }
-                ChatStreamEvent::Agent { session_id, event } => {
+                SessionEvent::Agent { session_id, event } => {
                     match &event {
                         AgentEvent::PermissionRequested { request } => {
                             self.pending_permissions
@@ -4475,7 +4481,16 @@ impl AppState {
                     self.deferred_stream_events
                         .entry(session_id.clone())
                         .or_default()
-                        .push(ChatStreamEvent::Agent { session_id, event });
+                        .push(SessionEvent::Agent { session_id, event });
+                }
+                // Wire variants with no in-process producer yet: PTY output
+                // stays desktop-local, snapshots are a remote-daemon attach
+                // affordance, and project deltas arrive via the file watcher.
+                SessionEvent::TerminalEvent { .. }
+                | SessionEvent::ProjectChanged { .. }
+                | SessionEvent::SessionSnapshot { .. } => {}
+                SessionEvent::DaemonError { message, .. } => {
+                    tracing::warn!("daemon error: {message}");
                 }
             }
         }

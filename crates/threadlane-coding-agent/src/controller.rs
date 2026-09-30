@@ -8,7 +8,7 @@
 //! `test_support` provider-injection helper) used by the GPUI crates.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::cancellation::CodingAgentCancellation;
@@ -156,7 +156,14 @@ pub struct SessionController {
     scheduler_supervisor_active: Arc<AtomicBool>,
     scheduled_work_active: Arc<AtomicBool>,
     status: Mutex<SessionStatus>,
+    /// Process-unique id distinguishing this runtime instance from a rebuilt
+    /// one for the same session file. Carried on wire events (e.g. ACP config
+    /// options) so a client can drop results from a stale runtime — the
+    /// serializable stand-in for a `Weak<SessionRuntime>` check.
+    instance_id: u64,
 }
+
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 impl SessionController {
 
     /// Subscribe to replayable durable harness events for this session.
@@ -225,7 +232,12 @@ impl SessionController {
             scheduler_supervisor_active: Arc::new(AtomicBool::new(false)),
             scheduled_work_active: Arc::new(AtomicBool::new(false)),
             status: Mutex::new(status),
+            instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         })
+    }
+
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
     }
 
     pub fn session_file(&self) -> &Path {

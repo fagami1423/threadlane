@@ -43,7 +43,7 @@ use threadlane_coding_agent::controller::spawn_session_runtime_construction;
 use threadlane_ui_state::updater::{self, UpdaterEvent};
 use threadlane_coding_agent::controller::runtime_status_text;
 use threadlane_ui_state::{
-    AppState, SessionHydrationRequest, SessionInfo, WorkspacePage,
+    AppState, HydrationRuntimeOptions, SessionHydrationRequest, SessionInfo, WorkspacePage,
 };
 use threadlane_ui_state::projection::{
     coding_agent_options, compute_full_session_projection, compute_latest_run_completion,
@@ -284,16 +284,24 @@ impl WorkspaceView {
             // Runtime construction loads WASI extensions through wasmi and must
             // not run on GPUI's 512 KiB GCD worker stacks. The blocking-pool
             // task starts now and overlaps the transcript projection below.
-            let runtime_task =
-                request
-                    .runtime_options
-                    .clone()
-                    .map(|(work_dir, model, roles, browser)| {
-                        let session_file = request.session_file.clone();
-                        spawn_session_runtime_construction(
-                            coding_agent_options(work_dir, session_file, model, roles, browser),
-                        )
-                    });
+            let runtime_task = request.runtime_options.clone().map(|options| {
+                let HydrationRuntimeOptions {
+                    work_dir,
+                    model: model_id,
+                    model_roles,
+                } = options;
+                let session_file = request.session_file.clone();
+                // The wire request carries ids and paths only; the app-global
+                // browser bridge is resolved daemon-side at construction.
+                let browser = model.update(cx, |state, _cx| state.browser_bridge.clone());
+                spawn_session_runtime_construction(coding_agent_options(
+                    work_dir,
+                    session_file,
+                    model_id,
+                    model_roles,
+                    browser,
+                ))
+            });
             if request.reload_messages {
                 // The completion token is captured strictly before the
                 // transcript load so an acknowledged result can never claim

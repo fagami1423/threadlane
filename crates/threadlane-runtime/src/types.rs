@@ -13,59 +13,17 @@ pub enum ToolExecutionMode {
     Parallel,
 }
 
-
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ModelRoles {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fast: Option<String>,
-    /// Ordered alternate models attempted after a pre-output quota/rate-limit failure.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) fallback_chain: Vec<String>,
-    /// Persisted cooldown markers for temporarily exhausted provider/model routes.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) cooldown_models: Vec<String>,
-}
-
-impl ModelRoles {
-    pub fn resolve_fast<'a>(&'a self, fallback: &'a str) -> &'a str {
-        self.fast.as_deref().unwrap_or(fallback)
-    }
-
-    pub(crate) fn fallback_after<'a>(&'a self, current: &str) -> Option<&'a str> {
-        self.fallback_chain
-            .iter()
-            .map(String::as_str)
-            .find(|candidate| {
-                *candidate != current
-                    && !self
-                        .cooldown_models
-                        .iter()
-                        .any(|cooldown| cooldown == candidate)
-            })
-    }
-}
+/// Model-routing roles (`fast`, `fallback_chain`, `cooldown_models`).
+/// Canonical in `threadlane_protocol::orchestration` — the daemon hydration
+/// contract carries them — so existing `threadlane_runtime::ModelRoles`
+/// paths keep working via this re-export.
+pub use threadlane_protocol::orchestration::ModelRoles;
 
 /// Orchestration mode: `Normal` direct execution or `Fusion` main +
 /// sidekick routing.
 /// Canonical in `threadlane_protocol::OrchestratorMode`; re-exported via the
 /// `threadlane_protocol::{... OrchestratorMode}` import above so existing
 /// `threadlane_protocol::OrchestratorMode` paths keep working.
-
-#[cfg(test)]
-mod model_role_tests {
-    use super::ModelRoles;
-
-    #[test]
-    fn fallback_skips_current_and_cooldown_routes() {
-        let roles = ModelRoles {
-            fallback_chain: vec!["primary".into(), "cooling".into(), "backup".into()],
-            cooldown_models: vec!["cooling".into()],
-            ..Default::default()
-        };
-        assert_eq!(roles.fallback_after("primary"), Some("backup"));
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct TurnState {
