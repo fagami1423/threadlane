@@ -9,20 +9,52 @@ use super::*;
 impl ChatListView {
     // ---- Composer prompt recall -----------------------------------------
 
+    /// Prompt landmarks derived once per messages `Arc` + generation flag.
+    /// The view's held `Arc` clone forces `Arc::make_mut` on the model to
+    /// reallocate, so `ptr_eq` is a sound invalidation key — streaming
+    /// updates replace the pointer and rebuild the list exactly once.
+    fn prompt_landmark_entries(&mut self, cx: &App) -> Arc<Vec<PromptLandmark>> {
+        let (messages, generating) = {
+            let state = self.model.read(cx);
+            (state.messages.clone(), state.is_generating)
+        };
+        let stale = self
+            .prompt_landmarks_cache
+            .as_ref()
+            .is_none_or(|(cached, gen, _)| {
+                *gen != generating || !Arc::ptr_eq(cached, &messages)
+            });
+        if stale {
+            self.prompt_landmarks_cache = Some((
+                messages.clone(),
+                generating,
+                Arc::new(prompt_landmarks(&messages, generating)),
+            ));
+        }
+        self.prompt_landmarks_cache
+            .as_ref()
+            .map(|(_, _, landmarks)| landmarks.clone())
+            .expect("cache populated above")
+    }
+
     /// User prompts eligible for recall: nonblank text, excluding pending
     /// optimistic queue/steer echoes.
-    fn recallable_prompts(&self, cx: &App) -> Vec<PromptLandmark> {
-        let state = self.model.read(cx);
-        prompt_landmarks(&state.messages, state.is_generating)
-            .into_iter()
+    fn recallable_prompts(&mut self, cx: &App) -> Vec<PromptLandmark> {
+        self.prompt_landmark_entries(cx)
+            .iter()
             .filter(|landmark| !landmark.pending_echo && !landmark.text.trim().is_empty())
+            .cloned()
             .collect()
     }
 
     /// Why recall is unavailable, if it is. While browsing, the composer
     /// necessarily holds the recalled text, so `has_text` only blocks when
     /// the text is a genuine draft.
-    pub(super) fn prompt_recall_block_reason(&self, has_text: bool, cx: &App) -> Option<&'static str> {
+    pub(super) fn prompt_recall_block_reason(
+        &mut self,
+        has_text: bool,
+        cx: &App,
+    ) -> Option<&'static str> {
         if self.current_tab != CentralTab::Chat {
             return Some("Switch to Chat to recall a prompt");
         }
@@ -159,6 +191,8 @@ impl ChatListView {
         true
     }
 
+    /// Loads a landmark's text into the composer as the current recall
+    /// state, placing the caret per the navigation direction.
     fn apply_recall_landmark(
         &mut self,
         landmark: &PromptLandmark,
@@ -252,7 +286,10 @@ impl ChatListView {
 
     /// The compact status strip shown while browsing: `Earlier prompt · text
     /// only`, with named Older/Newer buttons that keep focus in the composer.
-    pub(super) fn render_prompt_recall_strip(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_prompt_recall_strip(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme().colors;
         let entries = self.recallable_prompts(cx);
         let position = self
@@ -341,8 +378,7 @@ impl ChatListView {
         if !self.outline_open || self.current_tab != CentralTab::Chat {
             return;
         }
-        let state = self.model.read(cx);
-        let landmarks = prompt_landmarks(&state.messages, state.is_generating);
+        let landmarks = self.prompt_landmark_entries(cx).as_ref().clone();
         if landmarks.len() != self.outline_landmarks.len() {
             // Rebuilding the list state on every render would fight the
             // user's scroll; only resize when the count actually changed.
@@ -361,6 +397,7 @@ impl ChatListView {
         }
     }
 
+    /// List index of the currently focused landmark id, if still present.
     fn outline_focus_index(&self) -> Option<usize> {
         self.outline_focus_id.as_ref().and_then(|id| {
             self.outline_landmarks
@@ -369,6 +406,9 @@ impl ChatListView {
         })
     }
 
+    /// Opens the outline popover: supersedes Find, focuses the previously
+    /// jumped-to prompt when still listed (else the newest), and hands
+    /// keyboard focus to the list.
     pub(super) fn open_conversation_outline(
         &mut self,
         window: &mut Window,
@@ -429,6 +469,8 @@ impl ChatListView {
         cx.notify();
     }
 
+    /// Key handling while the outline list owns focus: Escape cancels,
+    /// arrows/Home/End move list focus, Enter/Space jump.
     pub(super) fn handle_outline_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -478,11 +520,11 @@ impl ChatListView {
         let Some(focus_id) = self.outline_focus_id.clone() else {
             return;
         };
+        let landmarks = self.prompt_landmark_entries(cx).as_ref().clone();
         let (messages, generating) = {
             let state = self.model.read(cx);
             (state.messages.clone(), state.is_generating)
         };
-        let landmarks = prompt_landmarks(&messages, generating);
         if landmarks.len() != self.outline_landmarks.len() {
             self.outline_list_state.reset(landmarks.len());
         }
@@ -518,6 +560,8 @@ impl ChatListView {
         self.close_conversation_outline(cx);
     }
 
+    /// One outline list row: `Prompt N · excerpt`, with the focused and
+    /// last-jumped-to landmarks highlighted.
     fn render_outline_row(
         &mut self,
         index: usize,
@@ -593,6 +637,8 @@ impl ChatListView {
             .into_any_element()
     }
 
+    /// The header trigger plus the bounded popover hosting the prompt
+    /// landmark list.
     pub(super) fn render_outline_popover(
         &self,
         cx: &mut Context<Self>,
@@ -631,6 +677,8 @@ impl ChatListView {
             })
     }
 
+    /// The popover body: header, status line for loading/error/empty,
+    /// and the virtualized landmark list.
     fn render_outline_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().colors;
         let (loading, load_error) = {

@@ -208,6 +208,8 @@ pub fn prompt_landmarks(messages: &[ChatMessageInfo], generating: bool) -> Vec<P
     landmarks
 }
 
+/// Whitespace-normalized, `PROMPT_EXCERPT_CHARS`-bounded excerpt of a prompt
+/// for compact list display; appends `…` when truncated.
 fn prompt_excerpt(content: &str) -> String {
     let mut normalized = String::with_capacity(content.len());
     let mut last_was_space = true;

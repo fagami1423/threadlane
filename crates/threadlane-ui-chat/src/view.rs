@@ -456,6 +456,10 @@ pub struct ChatListView {
     outline_focus: FocusHandle,
     outline_list_state: ListState,
     outline_landmarks: Vec<PromptLandmark>,
+    /// Prompt landmarks memoized against the messages `Arc` + generation
+    /// flag; holding the `Arc` itself makes pointer-equality invalidation
+    /// sound (any `Arc::make_mut` on the model reallocates).
+    prompt_landmarks_cache: Option<(Arc<Vec<ChatMessageInfo>>, bool, Arc<Vec<PromptLandmark>>)>,
     outline_focus_id: Option<String>,
     outline_selected_id: Option<String>,
 
@@ -803,6 +807,7 @@ impl ChatListView {
             outline_focus: cx.focus_handle(),
             outline_list_state: ListState::new(0, ListAlignment::Top, window.rem_size() * 20.0),
             outline_landmarks: Vec::new(),
+            prompt_landmarks_cache: None,
             outline_focus_id: None,
             outline_selected_id: None,
             expanded_activity_groups: HashSet::new(),
@@ -6502,6 +6507,7 @@ impl Render for ChatListView {
             self.prompt_recall = None;
             self.outline_open = false;
             self.outline_landmarks.clear();
+            self.prompt_landmarks_cache = None;
             self.outline_focus_id = None;
             self.outline_selected_id = None;
             self.markdown_cache_namespace = session_key
