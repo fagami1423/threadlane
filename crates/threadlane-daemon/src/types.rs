@@ -341,6 +341,7 @@ pub struct SessionProjectionResult {
     pub subagents: Vec<SubagentActivityInfo>,
     pub diagnostics: threadlane_runtime::harness::SessionDiagnostics,
     pub metrics: SessionMetricsInfo,
+    pub token_efficiency: threadlane_runtime::harness::TokenEfficiencyReport,
     pub token_usage: TokenUsage,
     pub context_window: Option<ContextWindowInfo>,
 }

@@ -27,6 +27,11 @@ impl EfficiencyUsage {
     fn input_tokens(&self) -> u64 {
         self.uncached_input_tokens + self.cache_read_tokens + self.cache_write_tokens
     }
+
+    /// Processed context and output, including cache reads; not a billed-cost total.
+    pub fn processed_tokens(&self) -> u64 {
+        self.input_tokens() + self.output_tokens
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -210,10 +215,8 @@ pub fn project_token_efficiency<S: SessionStore>(store: &S) -> TokenEfficiencyRe
         }
     }
     if report.completed_foreground_runs > 0 {
-        report.session_tokens_per_completed_foreground_run = Some(
-            (report.usage.input_tokens() + report.usage.output_tokens) as f64
-                / report.completed_foreground_runs as f64,
-        );
+        report.session_tokens_per_completed_foreground_run =
+            Some(report.usage.processed_tokens() as f64 / report.completed_foreground_runs as f64);
     }
     report
 }

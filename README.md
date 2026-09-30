@@ -59,6 +59,8 @@ On macOS, use `./scripts/run-gpui-macos.sh` rather than `cargo run -p threadlane
 
 ### Inspect token efficiency
 
+The chat's Environment panel shows the active session's processed tokens, cache reads and writes, child usage, requests and failures, and context reductions. It loads the durable report in the background when opening a chat and refreshes after each run. While generating, it shows the last journal snapshot. Processed tokens include cache reads and are not a billed-cost estimate.
+
 ```bash
 cargo run -p threadlane-gpui -- --token-efficiency /path/to/session.jsonl
 ```

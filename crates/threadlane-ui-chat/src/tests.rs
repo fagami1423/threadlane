@@ -2773,12 +2773,87 @@ fn environment_section_renders_without_git_data(cx: &mut gpui::TestAppContext) {
         "environment-changes",
         "environment-files",
         "environment-terminal",
+        "environment-token-efficiency",
     ] {
         assert!(
             cx.debug_bounds(selector).is_some(),
             "{selector} renders with no session or git status"
         );
     }
+}
+
+#[gpui::test]
+fn environment_token_efficiency_follows_durable_session_hydration(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    use threadlane_ui_state::activate_test_session;
+
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("session.jsonl");
+    let usage = |lane: &str, seq: u64, input: u64| {
+        serde_json::json!({"Usage": {"id": format!("usage-{seq}"), "seq": seq,
+            "lane": lane, "timestamp": seq, "cause": "Provider",
+            "usage": {"input_tokens": input, "output_tokens": 10,
+                "cache_read_tokens": 20, "cache_write_tokens": 0, "total_tokens": input + 30}}})
+    };
+    std::fs::write(
+        &file,
+        format!("{}\n{}\n", usage("main", 1, 100), usage("child", 2, 40)),
+    )
+    .unwrap();
+    let projection = threadlane_daemon::projection::compute_full_session_projection(&file).unwrap();
+    assert_eq!(projection.token_efficiency.usage.processed_tokens(), 200);
+    cx.update(gpui_component::init);
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::default();
+        activate_test_session(&mut state, "session", &file);
+        state.is_new_task = false;
+        state.apply_session_hydration("session", &file, projection);
+        state
+    });
+    let model_for_view = model.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| {
+            let mut chat = super::ChatListView::new(model_for_view, window, cx);
+            chat.environment_available = true;
+            chat
+        });
+        gpui_component::Root::new(chat, window, cx)
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("environment-token-efficiency").is_some());
+    assert!(cx.debug_bounds("efficiency-Processed tokens").is_some());
+    assert!(cx.debug_bounds("efficiency-Child tokens").is_some());
+    model.read_with(cx, |state, _| {
+        let report = state.active_token_efficiency().unwrap();
+        assert_eq!(report.usage.processed_tokens(), 200);
+        assert_eq!(report.lanes["child"].usage.processed_tokens(), 70);
+    });
+
+    // A completed-run hydration refresh replaces the snapshot without a second accounting path.
+    std::fs::write(&file, format!("{}\n", usage("main", 1, 250))).unwrap();
+    let refreshed = threadlane_daemon::projection::compute_full_session_projection(&file).unwrap();
+    model.update(cx, |state, cx| {
+        state.apply_session_hydration("session", &file, refreshed);
+        assert_eq!(
+            state
+                .active_token_efficiency()
+                .unwrap()
+                .usage
+                .processed_tokens(),
+            280
+        );
+        state.active_session_id = Some("other-session".into());
+        assert!(
+            state.active_token_efficiency().is_none(),
+            "never show another session's totals"
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("environment-token-efficiency").is_some());
+    assert!(cx.debug_bounds("efficiency-Processed tokens").is_none());
 }
 
 #[gpui::test]

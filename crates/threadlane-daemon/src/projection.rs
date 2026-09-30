@@ -91,6 +91,7 @@ pub fn compute_full_session_projection(
         subagents,
         diagnostics,
         metrics,
+        token_efficiency: threadlane_runtime::harness::project_token_efficiency(&store),
         token_usage,
         context_window,
     })

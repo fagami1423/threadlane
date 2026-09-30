@@ -83,6 +83,8 @@ pub struct AppState {
     diagnostics_by_session:
         HashMap<SessionProjectionKey, threadlane_runtime::harness::SessionDiagnostics>,
     session_metrics: HashMap<SessionProjectionKey, SessionMetricsInfo>,
+    token_efficiency_by_session:
+        HashMap<SessionProjectionKey, threadlane_runtime::harness::TokenEfficiencyReport>,
     context_windows: HashMap<SessionProjectionKey, ContextWindowInfo>,
     run_timings: HashMap<SessionProjectionKey, RunTiming>,
     /// Settings each ACP session's agent exposes, keyed by session id.
@@ -450,6 +452,7 @@ impl AppState {
             diagnostics_revision: 0,
             diagnostics_by_session: HashMap::new(),
             session_metrics: HashMap::new(),
+            token_efficiency_by_session: HashMap::new(),
             context_windows: HashMap::new(),
             run_timings: HashMap::new(),
             acp_config_options: HashMap::new(),
@@ -2797,6 +2800,8 @@ impl AppState {
             .insert(key.clone(), result.subagents);
         self.trajectory_revision = self.trajectory_revision.wrapping_add(1);
         self.session_metrics.insert(key.clone(), result.metrics);
+        self.token_efficiency_by_session
+            .insert(key.clone(), result.token_efficiency);
         if let Some(context_window) = result.context_window {
             self.context_windows.insert(key.clone(), context_window);
         } else {
@@ -2956,6 +2961,8 @@ impl AppState {
             .insert(key.clone(), result.diagnostics);
         self.diagnostics_revision = self.diagnostics_revision.wrapping_add(1);
         self.session_metrics.insert(key.clone(), result.metrics);
+        self.token_efficiency_by_session
+            .insert(key.clone(), result.token_efficiency);
         if let Some(context_window) = result.context_window {
             self.context_windows.insert(key.clone(), context_window);
         } else {
@@ -3451,6 +3458,13 @@ impl AppState {
             .and_then(|key| self.session_metrics.get(&key))
             .cloned()
             .unwrap_or_default()
+    }
+
+    pub fn active_token_efficiency(
+        &self,
+    ) -> Option<&threadlane_runtime::harness::TokenEfficiencyReport> {
+        self.active_session_projection_key()
+            .and_then(|key| self.token_efficiency_by_session.get(&key))
     }
 
     /// Asks the selected external agent what settings it offers.

@@ -2306,6 +2306,7 @@ async fn durable_projections_and_hydration_are_scoped_by_session_file() {
     let projection_a = compute_full_session_projection(&file_a).unwrap();
     let projection_b = compute_full_session_projection(&file_b).unwrap();
     let expected_b_billed = projection_b.metrics.billed_input_tokens();
+    let expected_b_processed = projection_b.token_efficiency.usage.processed_tokens();
     let mut state = AppState::load_from_registry(Vec::new());
     activate_test_session(&mut state, "same-session", &file_a);
     state.apply_session_hydration("same-session", &file_a, projection_a);
@@ -2314,6 +2315,11 @@ async fn durable_projections_and_hydration_are_scoped_by_session_file() {
 
     assert_eq!(state.context_windows.len(), 2);
     assert_eq!(state.session_metrics.len(), 2);
+    assert_eq!(state.token_efficiency_by_session.len(), 2);
+    assert_eq!(
+        state.active_token_efficiency().unwrap().usage.processed_tokens(),
+        expected_b_processed
+    );
     assert_eq!(
         state.active_context_window().unwrap().current_tokens,
         222_222
@@ -2325,6 +2331,10 @@ async fn durable_projections_and_hydration_are_scoped_by_session_file() {
 
     let stale = compute_full_session_projection(&file_a).unwrap();
     state.apply_session_hydration("same-session", &file_a, stale);
+    assert_eq!(
+        state.active_token_efficiency().unwrap().usage.processed_tokens(),
+        expected_b_processed
+    );
     assert_eq!(
         state.active_context_window().unwrap().current_tokens,
         222_222
