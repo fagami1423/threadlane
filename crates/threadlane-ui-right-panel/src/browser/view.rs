@@ -46,6 +46,7 @@ pub struct BrowserView {
     next_tab_id: usize,
     annotating: bool,
     annotate_task: Option<Task<()>>,
+    url_watch_task: Option<Task<()>>,
     visible: bool,
     _annotation_escape: Subscription,
 }
@@ -77,6 +78,7 @@ impl BrowserView {
             next_tab_id: 1,
             annotating: false,
             annotate_task: None,
+            url_watch_task: None,
             visible: false,
             _annotation_escape: Self::annotation_escape_subscription(cx),
         };
@@ -470,7 +472,57 @@ impl BrowserView {
 
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.visible = visible;
+        if visible {
+            self.start_url_watch(cx);
+        } else {
+            self.url_watch_task.take();
+        }
         self.sync_active_visibility(cx);
+    }
+
+    /// Adopts live webview URL changes so in-page navigation (link clicks,
+    /// SPA pushes, history moves) refreshes the address bar. wry gives no
+    /// commit callback, so this polls while the panel is visible and renders
+    /// only when the URL actually changed.
+    fn start_url_watch(&mut self, cx: &mut Context<Self>) {
+        if self.url_watch_task.is_some() {
+            return;
+        }
+        self.url_watch_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(700))
+                    .await;
+                let keep_running = this
+                    .update(cx, |this, cx| {
+                        if !this.visible {
+                            return false;
+                        }
+                        let Some(tab) = this.tabs.get_mut(this.active_tab) else {
+                            return true;
+                        };
+                        let live = tab
+                            .webview
+                            .as_ref()
+                            .and_then(|webview| webview.read(cx).raw().url().ok())
+                            .filter(|url| !url.is_empty());
+                        if let Some(live) = live {
+                            if live != tab.url {
+                                // Committed — to the pending request or a
+                                // redirect / in-page move. Adopt it.
+                                tab.url = live;
+                                tab.pending_url = None;
+                                cx.notify();
+                            }
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_running {
+                    break;
+                }
+            }
+        }));
     }
 
     pub fn is_annotating(&self) -> bool {
@@ -1087,6 +1139,7 @@ mod browser_tabs_tests {
                 next_tab_id: 12,
                 annotating: false,
                 annotate_task: None,
+                url_watch_task: None,
                 visible: false,
                 _annotation_escape: BrowserView::annotation_escape_subscription(cx),
             });

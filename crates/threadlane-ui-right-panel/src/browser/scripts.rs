@@ -822,6 +822,21 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
     commit();
   });
 
+  // Events dispatched to shadow controls (comment box, Attach) bubble back up
+  // through `host`, retargeted — page-level document/window listeners would
+  // observe them (single-letter shortcuts, delegated clicks). Capture legs
+  // above must stay untouched or the event never reaches the textarea, so the
+  // bubble is cut at the host: the shadow tree already saw its event, and the
+  // page stays deaf. Listeners die with the host node on uninstall.
+  for (const type of [
+    "keydown", "keypress", "keyup", "input", "beforeinput",
+    "compositionstart", "compositionupdate", "compositionend",
+    "pointerdown", "pointerup", "mousedown", "mouseup",
+    "click", "dblclick", "auxclick", "contextmenu", "focusin", "focusout",
+  ]) {
+    host.addEventListener(type, (event) => event.stopPropagation());
+  }
+
   window.addEventListener("pointermove", onPointerMove, true);
   window.addEventListener("pointerdown", onPointerDown, true);
   window.addEventListener("pointerup", onPointerUp, true);
@@ -839,9 +854,11 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
 /// Returns the picker state as JSON: `{pick, active}`. `pick` is the
 /// recorded `{comment, elements, crop, viewport, url, title}` object (or
 /// null); `active` is false once the session ends, telling the host to stop
-/// polling.
+/// polling. The overlay element must also be present: SPA navigation can
+/// remove the injected DOM while leaving `__tlane_annotating` set, which
+/// would otherwise wedge the panel in the annotating state.
 pub fn annotate_poll_js() -> String {
-    r#"(() => JSON.stringify({ pick: window.__tlane_pick || null, active: !!window.__tlane_annotating }))()"#.to_string()
+    r#"(() => JSON.stringify({ pick: window.__tlane_pick || null, active: !!window.__tlane_annotating && !!document.querySelector("[data-tlane-annotator]") }))()"#.to_string()
 }
 
 /// Tears down the picker overlay and listeners without recording.
