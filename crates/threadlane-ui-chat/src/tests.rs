@@ -1217,6 +1217,18 @@ fn queued_panel_tracks_active_messages_and_generation(cx: &mut gpui::TestAppCont
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(cx.debug_bounds("queued-messages-panel").is_some());
     assert!(cx.debug_bounds("queued-message-row").is_some());
+    for selector in ["queued-steer", "queued-edit", "queued-remove"] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector} is offered on each queued message row"
+        );
+    }
+    for selector in ["send-btn", "composer-stop-btn"] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector} remains in the composer while generating"
+        );
+    }
     retained_model.update(cx, |state, cx| {
         state.is_generating = false;
         cx.notify();

@@ -45,7 +45,7 @@ impl CodingSessionHarness {
             "entry-queue-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis())
+                .map(|d| d.as_nanos())
                 .unwrap_or(0)
         );
         let target = ProvisionedEntry::new(&id, None, AgentMessage::user(content, images));
@@ -81,6 +81,17 @@ impl CodingSessionHarness {
         entry_id: &str,
     ) -> Result<Option<AgentMessage>, String> {
         self.ensure_fresh()?;
+        Ok(self
+            .unbound_queue_entry(entry_id)?
+            .filter(|(entry_queue, _)| *entry_queue == queue)
+            .map(|(_, message)| message))
+    }
+
+    /// Look up an unbound queued entry across every queue kind.
+    pub(crate) fn unbound_queue_entry(
+        &mut self,
+        entry_id: &str,
+    ) -> Result<Option<(QueueKind, AgentMessage)>, String> {
         let state = Reducer::reduce(self.store.store())
             .map_err(|error| format!("reduce failed: {error:?}"))?;
         let lane = state
@@ -89,8 +100,19 @@ impl CodingSessionHarness {
         Ok(lane
             .queued
             .iter()
-            .find(|q| q.run_id.is_none() && q.queue == queue && q.target.id == entry_id)
-            .map(|queued| queued.target.message.clone()))
+            .find(|q| q.run_id.is_none() && q.target.id == entry_id)
+            .map(|queued| (queued.queue.clone(), queued.target.message.clone())))
+    }
+
+    /// Durable-cancel an unbound queued entry.
+    pub(crate) fn cancel_unbound_entry(&mut self, entry_id: &str) -> Result<(), String> {
+        self.store
+            .cancel_unbound(entry_id)
+            .map_err(|error| error.to_string())?;
+        self.store
+            .drive_to_completion()
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     /// Validate an accepted run token against the session journal and reduced state.

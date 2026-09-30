@@ -1516,8 +1516,8 @@ impl CodingAgent {
                     self.run_acp_turn(agent_id, &content, images, Some((queue.clone(), entry_id)))
                         .await
                 }
-                AgentWork::QueueMessage { content, images }
-                | AgentWork::SteerMessage { content, images } => {
+                AgentWork::QueueMessage { content, images, .. }
+                | AgentWork::SteerMessage { content, images, .. } => {
                     // Legacy pending steer inputs are retained as later prompts.
                     self.run_acp_turn(agent_id, content, images.clone(), None)
                         .await
@@ -3115,10 +3115,13 @@ mod compaction_sync_tests {
                 let work = self.work.lock().unwrap();
                 let work = work.as_ref().unwrap();
                 match prompt.as_str() {
-                    "initial" => work
-                        .try_queue_follow_up_with_images("first follow-up", vec![])
-                        .unwrap(),
-                    "first follow-up" => work.queue_steer_with_images("new steer", vec![]).unwrap(),
+                    "initial" => {
+                        work.try_queue_follow_up_with_images("first follow-up", vec![])
+                            .unwrap();
+                    }
+                    "first follow-up" => {
+                        work.queue_steer_with_images("new steer", vec![]).unwrap();
+                    }
                     _ => {}
                 }
             }

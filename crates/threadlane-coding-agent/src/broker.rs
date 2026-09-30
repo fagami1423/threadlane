@@ -247,10 +247,11 @@ impl HostCapabilityHandler {
             .session_file
             .as_deref()
             .ok_or_else(|| internal_error("Agent queue durability is unavailable"))?;
-        enqueue_harness_follow_up(session_file, content.clone(), Vec::new()).map_err(host_error)?;
-        self.agent_work.schedule(AgentWork::QueueMessage {
-            content,
-            images: Vec::new(),
+        let entry_id =
+            enqueue_harness_follow_up(session_file, content, Vec::new()).map_err(host_error)?;
+        self.agent_work.schedule(AgentWork::DurableQueueWake {
+            queue: threadlane_runtime::harness::QueueKind::FollowUp,
+            entry_id,
         });
         Ok(serde_json::json!({"queued": true}))
     }
