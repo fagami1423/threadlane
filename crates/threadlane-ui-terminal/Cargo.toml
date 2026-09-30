@@ -11,3 +11,6 @@ portable-pty.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 vt100.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

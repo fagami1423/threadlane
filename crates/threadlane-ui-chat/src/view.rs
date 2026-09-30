@@ -1259,6 +1259,45 @@ impl ChatListView {
         cx.notify();
     }
 
+    /// Appends `text` to the draft `destination` names, then reveals Chat
+    /// and focuses the composer. `destination` is re-validated against the
+    /// live composer key after draft synchronization, so a session or
+    /// project switch that raced the caller leaves the draft — and the
+    /// payload — untouched and this returns `false`.
+    ///
+    /// The append is ordinary undoable draft text (`select_all` +
+    /// `replace`, not `set_value`, which would silently clear the draft's
+    /// undo history): it preserves staged images and the clipboard,
+    /// clears prompt-recall and file completion like any external edit,
+    /// and never sends, queues, or stages anything.
+    pub fn append_draft_text_for(
+        &mut self,
+        destination: ComposerKey,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.sync_composer_draft(window, cx);
+        if text.is_empty() || self.composer_key != destination {
+            return false;
+        }
+        self.prompt_recall = None;
+        self.clear_file_completion();
+        self.input_state.update(cx, |input, cx| {
+            let existing = input.value().to_string();
+            let separator = if existing.is_empty() || existing.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            input.select_all(window, cx);
+            input.replace(format!("{existing}{separator}{text}"), window, cx);
+        });
+        self.set_tab(CentralTab::Chat, cx);
+        self.focus_composer(window, cx);
+        true
+    }
+
     /// Session titles generated from a linked issue start with "#N"; the
     /// sidebar card and environment panel already surface that number, so the
     /// header drops the duplicated prefix.

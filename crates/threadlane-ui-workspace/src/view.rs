@@ -9,7 +9,7 @@ use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable, ResizableState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::status_bar::StatusBar;
-use gpui_component::{v_flex, ActiveTheme, Icon, IconName, Selectable, Sizable};
+use gpui_component::{v_flex, ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable};
 
 actions!(
     threadlane_workspace,
@@ -38,7 +38,7 @@ use gpui_component::WindowExt;
 use threadlane_ui_right_panel::RightPanelView;
 use threadlane_ui_settings::SettingsView;
 use threadlane_ui_sidebar::SidebarView;
-use threadlane_ui_terminal::{FindInTerminalOutput, TerminalView};
+use threadlane_ui_terminal::{FindInTerminalOutput, TerminalSelection, TerminalView};
 use threadlane_coding_agent::controller::spawn_session_runtime_construction;
 use threadlane_ui_state::updater::{self, UpdaterEvent};
 use threadlane_coding_agent::controller::runtime_status_text;
@@ -170,6 +170,44 @@ struct TerminalGroup {
     active_tab: usize,
 }
 
+/// Largest terminal excerpt the handoff writes into a chat draft, in
+/// UTF-8 bytes. Matches the "Select less terminal output" notice.
+const TERMINAL_EXCERPT_LIMIT: usize = 32 * 1024;
+
+/// `None` when a selection snapshot can be handed to the chat draft;
+/// otherwise the user-facing reason the command is disabled or a stale
+/// activation is rejected. Textual, never color-only.
+fn terminal_excerpt_block_reason(snapshot: Option<&TerminalSelection>) -> Option<&'static str> {
+    match snapshot {
+        None => Some("Select terminal output first"),
+        Some(selection) if selection.text.trim().is_empty() => {
+            Some("The terminal selection is empty — select output text first")
+        }
+        Some(selection) if selection.text.len() > TERMINAL_EXCERPT_LIMIT => {
+            Some("Select less terminal output (maximum 32 KiB)")
+        }
+        Some(_) => None,
+    }
+}
+
+/// The labeled, safely fenced plain-text block appended to the draft.
+/// `launched_in` is the shell's launch directory, not its current cwd.
+/// The fence grows past the excerpt's longest backtick run so the block
+/// parses as one unit; whitespace inside is preserved.
+fn format_terminal_excerpt(shell: usize, launched_in: &Path, text: &str) -> String {
+    let longest_run = text
+        .split(|ch| ch != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat((longest_run + 1).max(3));
+    format!(
+        "Terminal · Shell {shell} · launched in {}\n{fence}\n{}\n{fence}",
+        launched_in.display(),
+        text.trim_end_matches('\n')
+    )
+}
+
 fn git_result_matches_active(requested: &Path, active: &Path) -> bool {
     requested == active
 }
@@ -232,6 +270,7 @@ pub struct WorkspaceView {
     /// A misclick arms instead of destroying build/test scrollback; the
     /// second click confirms.
     pending_terminal_close: Option<(PathBuf, usize)>,
+    terminal_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -545,6 +584,7 @@ impl WorkspaceView {
                 git_event_tx,
                 updater_tx,
                 pending_terminal_close: None,
+                terminal_subscriptions: Vec::new(),
                 _subscriptions: vec![sub, right_panel_sub, command_state_sub],
             }
         });
@@ -722,6 +762,121 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    /// Creates a project terminal and tracks its selection presence so
+    /// the "Add selection to chat" affordance refreshes on selection
+    /// transitions only — the terminal still notifies per PTY frame, but
+    /// the workspace re-renders only when presence actually changes.
+    fn new_terminal_with_tracking(
+        cwd: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> (Entity<TerminalView>, Subscription) {
+        let terminal = cx.new(|cx| TerminalView::new(cwd, cx));
+        let mut had_selection = false;
+        let subscription = cx.observe(&terminal, move |_, terminal, cx| {
+            let has_selection = terminal.read(cx).has_selection();
+            if has_selection != had_selection {
+                had_selection = has_selection;
+                cx.notify();
+            }
+        });
+        (terminal, subscription)
+    }
+
+    /// The terminal shown in the bottom panel at this moment, with the
+    /// project group it belongs to (`None` for the unattached fallback
+    /// shell). `None` while the worktree is unavailable or no shell
+    /// exists yet.
+    fn displayed_terminal(&self, cx: &App) -> Option<(Option<PathBuf>, Entity<TerminalView>)> {
+        let state = self.model.read(cx);
+        if state.active_worktree_unavailable() {
+            return None;
+        }
+        match state.terminal_group_key() {
+            Some(key) => self
+                .terminal_groups
+                .get(&key)
+                .and_then(|group| group.tabs.get(group.active_tab).cloned())
+                .map(|terminal| (Some(key), terminal)),
+            None => self
+                .fallback_terminal
+                .clone()
+                .map(|terminal| (None, terminal)),
+        }
+    }
+
+    /// Appends the displayed terminal's selection to the chat draft.
+    /// Terminal and group bound at activation are re-validated against
+    /// what is displayed now, and the chat view re-validates its draft
+    /// target after draft sync — a session or project switch that raced
+    /// the click leaves draft and selection untouched. Never sends,
+    /// queues, or stages anything.
+    fn add_terminal_selection_to_chat(
+        &mut self,
+        terminal: Entity<TerminalView>,
+        group_key: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (current_group, destination, is_fallback) = {
+            let state = self.model.read(cx);
+            (
+                state.terminal_group_key(),
+                (
+                    state.active_work_dir.clone(),
+                    state.active_session_id.clone(),
+                ),
+                self.fallback_terminal
+                    .as_ref()
+                    .is_some_and(|fallback| fallback.entity_id() == terminal.entity_id()),
+            )
+        };
+        let still_displayed = match &group_key {
+            Some(key) => {
+                current_group.as_ref() == Some(key)
+                    && self
+                        .terminal_groups
+                        .get(key)
+                        .and_then(|group| group.tabs.get(group.active_tab))
+                        .is_some_and(|active| active.entity_id() == terminal.entity_id())
+            }
+            None => current_group.is_none() && is_fallback,
+        };
+        if !still_displayed {
+            window.push_notification(
+                "The terminal changed — the selection was not added",
+                cx,
+            );
+            return;
+        }
+        let snapshot = terminal.read(cx).selection_snapshot();
+        if let Some(reason) = terminal_excerpt_block_reason(snapshot.as_ref()) {
+            window.push_notification(reason, cx);
+            return;
+        }
+        let snapshot = snapshot.expect("block reason proves a snapshot exists");
+        let shell = group_key
+            .as_ref()
+            .and_then(|key| self.terminal_groups.get(key))
+            .and_then(|group| {
+                group
+                    .tabs
+                    .iter()
+                    .position(|tab| tab.entity_id() == terminal.entity_id())
+                    .map(|index| index + 1)
+            })
+            .unwrap_or(1);
+        let excerpt = format_terminal_excerpt(shell, &snapshot.launched_in, &snapshot.text);
+        let added = self.chat_list.update(cx, |chat, cx| {
+            chat.append_draft_text_for(destination, &excerpt, window, cx)
+        });
+        if !added {
+            window.push_notification(
+                "The chat draft changed — the selection was not added",
+                cx,
+            );
+        }
+    }
+
     fn get_or_create_active_terminal(
         &mut self,
         group_key: &PathBuf,
@@ -746,19 +901,27 @@ impl WorkspaceView {
         cwd: &PathBuf,
         cx: &mut Context<Self>,
     ) -> &mut TerminalGroup {
-        let group = self
+        if self
             .terminal_groups
-            .entry(group_key.clone())
-            .or_insert_with(|| TerminalGroup {
-                tabs: vec![cx.new(|cx| TerminalView::new(cwd.clone(), cx))],
-                active_tab: 0,
-            });
-        if group.tabs.is_empty() {
-            group
-                .tabs
-                .push(cx.new(|cx| TerminalView::new(cwd.clone(), cx)));
+            .get(group_key)
+            .is_none_or(|group| group.tabs.is_empty())
+        {
+            let (terminal, subscription) = Self::new_terminal_with_tracking(cwd.clone(), cx);
+            self.terminal_subscriptions.push(subscription);
+            let group = self
+                .terminal_groups
+                .entry(group_key.clone())
+                .or_insert_with(|| TerminalGroup {
+                    tabs: Vec::new(),
+                    active_tab: 0,
+                });
+            group.tabs.push(terminal);
             group.active_tab = 0;
         }
+        let group = self
+            .terminal_groups
+            .get_mut(group_key)
+            .expect("terminal group was just created");
         group.active_tab = group.active_tab.min(group.tabs.len().saturating_sub(1));
         group
     }
@@ -770,7 +933,8 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let terminal = cx.new(|cx| TerminalView::new(cwd, cx));
+        let (terminal, subscription) = Self::new_terminal_with_tracking(cwd, cx);
+        self.terminal_subscriptions.push(subscription);
         terminal.read(cx).focus_handle(cx).focus(window, cx);
         let group = self
             .terminal_groups
@@ -790,7 +954,8 @@ impl WorkspaceView {
         work_dir: PathBuf,
         cx: &mut Context<Self>,
     ) {
-        let terminal = cx.new(|cx| TerminalView::new(work_dir, cx));
+        let (terminal, subscription) = Self::new_terminal_with_tracking(work_dir, cx);
+        self.terminal_subscriptions.push(subscription);
         let group = self.get_or_create_terminal_group(&project, cx);
         group.tabs.push(terminal);
         group.active_tab = group.tabs.len() - 1;
@@ -798,13 +963,16 @@ impl WorkspaceView {
     }
 
     fn fallback_terminal(&mut self, cx: &mut Context<Self>) -> Entity<TerminalView> {
+        if self.fallback_terminal.is_none() {
+            let project =
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let (terminal, subscription) = Self::new_terminal_with_tracking(project, cx);
+            self.terminal_subscriptions.push(subscription);
+            self.fallback_terminal = Some(terminal);
+        }
         self.fallback_terminal
-            .get_or_insert_with(|| {
-                let project =
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                cx.new(|cx| TerminalView::new(project, cx))
-            })
             .clone()
+            .expect("fallback terminal exists")
     }
 
     fn select_terminal_tab(
@@ -859,7 +1027,10 @@ impl WorkspaceView {
                     group.active_tab = group.active_tab.min(group.tabs.len() - 1);
                 }
             } else {
-                group.tabs = vec![cx.new(|cx| TerminalView::new(replacement_cwd.clone(), cx))];
+                let (terminal, subscription) =
+                    Self::new_terminal_with_tracking(replacement_cwd.clone(), cx);
+                self.terminal_subscriptions.push(subscription);
+                group.tabs = vec![terminal];
                 group.active_tab = 0;
                 self.bottom_panel_visible = false;
             }
@@ -985,6 +1156,14 @@ impl WorkspaceView {
             }
             "run_terminal" => {
                 self.toggle_terminal_action(&ToggleTerminal, window, cx);
+            }
+            "add_terminal_selection" => {
+                match self.displayed_terminal(cx) {
+                    Some((group_key, terminal)) => {
+                        self.add_terminal_selection_to_chat(terminal, group_key, window, cx)
+                    }
+                    None => window.push_notification("No terminal is visible", cx),
+                }
             }
             "open_issue" => {
                 model.update(cx, |state, cx| {
@@ -1206,7 +1385,7 @@ impl WorkspaceView {
         let model = self.model.clone();
         let state = model.read(cx);
 
-        let commands: [(&str, &str, &str, Icon, &[&str], &str); 22] = [
+        let commands: [(&str, &str, &str, Icon, &[&str], &str); 23] = [
             (
                 "New Task",
                 "Start a fresh session",
@@ -1238,6 +1417,14 @@ impl WorkspaceView {
                 Icon::from(IconName::SquareTerminal),
                 &["run", "terminal", "command", "shell", "exec"],
                 "⌘J",
+            ),
+            (
+                "Add Selection to Chat",
+                "Append the selected terminal text to the chat draft",
+                "add_terminal_selection",
+                Icon::default().path("icons/square-pen.svg"),
+                &["terminal", "selection", "chat", "draft", "add", "output"],
+                "",
             ),
             (
                 "Open Issue/PR…",
@@ -1385,16 +1572,29 @@ impl WorkspaceView {
             ),
         ];
 
+        let handoff_terminal = self
+            .displayed_terminal(cx)
+            .map(|(_group, terminal)| terminal);
+        let excerpt_block = match &handoff_terminal {
+            Some(terminal) => terminal_excerpt_block_reason(
+                terminal.read(cx).selection_snapshot().as_ref(),
+            ),
+            None => Some("No terminal is visible"),
+        };
+
         let mut commands_group = CommandGroup::new().label("Commands & Actions");
-        for (name, desc, _action_key, icon, keywords, shortcut) in &commands {
+        for (name, desc, action_key, icon, keywords, shortcut) in &commands {
             let name_str = name.to_string();
             let desc_str = desc.to_string();
             let shortcut_str = shortcut.to_string();
-            let item = CommandItem::new()
+            let mut item = CommandItem::new()
                 .label(*name)
                 .icon(icon.clone())
-                .keywords(keywords.iter().copied())
-                .child(move |_window, cx| {
+                .keywords(keywords.iter().copied());
+            if *action_key == "add_terminal_selection" {
+                item = item.disabled(excerpt_block.is_some());
+            }
+            let item = item.child(move |_window, cx| {
                     let colors = cx.theme().colors;
                     div()
                         .w_full()
@@ -1442,12 +1642,14 @@ impl WorkspaceView {
                 .iter()
                 .find(|(_, _, key, _, _, _)| key == action_key)
             {
-                recent_group = recent_group.item(
-                    CommandItem::new()
-                        .label(*name)
-                        .icon(icon.clone())
-                        .keywords(keywords.iter().copied()),
-                );
+                let mut item = CommandItem::new()
+                    .label(*name)
+                    .icon(icon.clone())
+                    .keywords(keywords.iter().copied());
+                if *action_key == "add_terminal_selection" {
+                    item = item.disabled(excerpt_block.is_some());
+                }
+                recent_group = recent_group.item(item);
             }
         }
 
@@ -1960,10 +2162,22 @@ impl Render for WorkspaceView {
                 });
             }
         }
-        let state = self.model.read(cx);
-        let terminal_key = state.terminal_group_key();
-        let terminal_cwd = state.active_git_work_dir();
-        let terminal_unavailable = state.active_worktree_unavailable();
+        let (terminal_key, terminal_cwd, terminal_unavailable, composer_target) = {
+            let state = self.model.read(cx);
+            let composer_target = state
+                .projects
+                .iter()
+                .flat_map(|project| project.sessions.iter())
+                .find(|session| state.active_session_id.as_deref() == Some(&session.id))
+                .map(|session| format!("the \"{}\" draft", session.title))
+                .unwrap_or_else(|| "the new-task draft".to_string());
+            (
+                state.terminal_group_key(),
+                state.active_git_work_dir(),
+                state.active_worktree_unavailable(),
+                composer_target,
+            )
+        };
         let (terminal_tabs, active_terminal_tab, active_terminal) =
             match (&terminal_key, &terminal_cwd) {
                 (Some(key), Some(cwd)) => {
@@ -2314,6 +2528,15 @@ impl Render for WorkspaceView {
                 let active_terminal_clear = active_terminal.clone();
                 let active_terminal_restart = active_terminal.clone();
                 let active_terminal_find = active_terminal.clone();
+                let excerpt_block = terminal_excerpt_block_reason(
+                    active_terminal.read(cx).selection_snapshot().as_ref(),
+                );
+                let handoff_hint = excerpt_block.map(str::to_owned).unwrap_or_else(|| {
+                    format!("Add the selected terminal text to {composer_target} — nothing is sent")
+                });
+                let handoff_terminal = active_terminal.clone();
+                let handoff_group = terminal_project.clone();
+                let handoff_view = cx.entity().clone();
                 let new_project = terminal_project.clone();
                 let new_cwd = new_tab_cwd.clone();
                 let new_view = cx.entity().clone();
@@ -2402,6 +2625,30 @@ impl Render for WorkspaceView {
                             .on_click(move |_event, window, cx| {
                                 active_terminal_find.update(cx, |t, cx| {
                                     t.open_find(&FindInTerminalOutput, window, cx)
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("terminal-add-selection-to-chat")
+                            .icon(Icon::default().path("icons/square-pen.svg"))
+                            .label("Add selection to chat")
+                            .accessibility_label(if excerpt_block.is_some() {
+                                format!("Add selection to chat — {handoff_hint}")
+                            } else {
+                                handoff_hint.clone()
+                            })
+                            .tooltip(handoff_hint.clone())
+                            .ghost()
+                            .small()
+                            .disabled(excerpt_block.is_some())
+                            .on_click(move |_event, window, cx| {
+                                handoff_view.update(cx, |this, cx| {
+                                    this.add_terminal_selection_to_chat(
+                                        handoff_terminal.clone(),
+                                        handoff_group.clone(),
+                                        window,
+                                        cx,
+                                    );
                                 });
                             }),
                     )
@@ -2672,10 +2919,12 @@ impl Render for WorkspaceView {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_project_git_status, git_result_matches_active, next_workspace_event,
-        open_github_from_palette, session_pr_refresh_delay, session_pr_target_is_active, GitEvent,
-        WorkspacePumpEvent,
+        active_project_git_status, format_terminal_excerpt, git_result_matches_active,
+        next_workspace_event, open_github_from_palette, session_pr_refresh_delay,
+        session_pr_target_is_active, terminal_excerpt_block_reason, GitEvent,
+        WorkspacePumpEvent, TERMINAL_EXCERPT_LIMIT,
     };
+    use threadlane_ui_terminal::TerminalSelection;
     use threadlane_ui_state::updater::UpdaterEvent;
     use threadlane_ui_state::{AppState, SessionInfo, WorkspacePage};
     use std::cell::Cell;
@@ -2831,6 +3080,45 @@ mod tests {
 
         assert_eq!(state.workspace_page, WorkspacePage::GitHub);
         assert_eq!(notification_count.get(), 1);
+    }
+
+    #[test]
+    fn terminal_excerpt_block_reason_reports_disabled_states() {
+        let snapshot = |text: String| TerminalSelection {
+            text,
+            launched_in: PathBuf::from("/projects/one"),
+        };
+
+        assert_eq!(
+            terminal_excerpt_block_reason(None),
+            Some("Select terminal output first")
+        );
+        assert_eq!(
+            terminal_excerpt_block_reason(Some(&snapshot("  \n ".into()))),
+            Some("The terminal selection is empty — select output text first")
+        );
+        assert_eq!(
+            terminal_excerpt_block_reason(Some(&snapshot(
+                "x".repeat(TERMINAL_EXCERPT_LIMIT + 1)
+            ))),
+            Some("Select less terminal output (maximum 32 KiB)")
+        );
+        assert_eq!(
+            terminal_excerpt_block_reason(Some(&snapshot("cargo test failed".into()))),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_excerpt_labels_the_shell_and_outfences_the_text() {
+        let block = format_terminal_excerpt(2, Path::new("/repo/worktree"), "a `tick` and ```run");
+        assert!(block.starts_with("Terminal · Shell 2 · launched in /repo/worktree\n````\n"));
+        assert!(block.contains("\na `tick` and ```run\n"));
+        assert!(block.ends_with("\n````"));
+
+        // Ordinary text still gets the minimum three-backtick fence.
+        let plain = format_terminal_excerpt(1, Path::new("/repo"), "line");
+        assert_eq!(plain, "Terminal · Shell 1 · launched in /repo\n```\nline\n```");
     }
 
     #[tokio::test]

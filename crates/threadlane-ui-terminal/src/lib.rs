@@ -529,6 +529,28 @@ fn selection_bounds(
     }
 }
 
+fn selection_present(
+    anchor: Option<(u16, u16)>,
+    head: Option<(u16, u16)>,
+    cols: u16,
+) -> bool {
+    match (anchor, head) {
+        (Some(anchor), Some(head)) => selection_bounds(anchor, head, cols).is_some(),
+        _ => false,
+    }
+}
+
+fn selected_excerpt(
+    screen: &vt100::Screen,
+    anchor: Option<(u16, u16)>,
+    head: Option<(u16, u16)>,
+    cols: u16,
+) -> Option<String> {
+    let (anchor, head) = (anchor?, head?);
+    let (start, end) = selection_bounds(anchor, head, cols)?;
+    Some(screen.contents_between(start.0, start.1, end.0, end.1))
+}
+
 fn should_paint_cursor(is_focused: bool, terminal_hides_cursor: bool, blink_visible: bool) -> bool {
     is_focused && !terminal_hides_cursor && blink_visible
 }
@@ -554,6 +576,18 @@ struct TerminalFind {
     /// result set keeps the selection only while the same line is present.
     selected_hit: Option<TerminalSearchHit>,
     _subscription: Subscription,
+}
+
+/// A point-in-time copy of the user's terminal selection, detached from
+/// the live screen so later output, resize, or a shell restart can never
+/// mutate it.
+pub struct TerminalSelection {
+    /// Selected text as displayed, whitespace and Unicode preserved.
+    pub text: String,
+    /// The directory the shell was launched in — honest provenance for
+    /// the excerpt, not proof of the shell's current working directory
+    /// after a `cd`, and not a session worktree claim.
+    pub launched_in: PathBuf,
 }
 
 /// A persistent, focusable project shell backed by a real pseudo-terminal.
@@ -591,6 +625,18 @@ pub struct TerminalView {
 
 impl TerminalView {
     pub fn new(project: PathBuf, cx: &mut Context<Self>) -> Self {
+        Self::new_with_start(project, cx, true)
+    }
+
+    /// Same as `new` minus the real PTY: tests construct selection and
+    /// screen state by hand, and a live pty-reader thread would trip the
+    /// test scheduler's deterministic-thread guard.
+    #[cfg(test)]
+    fn new_for_test(project: PathBuf, cx: &mut Context<Self>) -> Self {
+        Self::new_with_start(project, cx, false)
+    }
+
+    fn new_with_start(project: PathBuf, cx: &mut Context<Self>, autostart: bool) -> Self {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         cx.spawn(async move |this, cx| loop {
             let wake = next_terminal_wake(
@@ -649,7 +695,9 @@ impl TerminalView {
             find: None,
             find_generation_seed: 0,
         };
-        terminal.start();
+        if autostart {
+            terminal.start();
+        }
         terminal
     }
 
@@ -1064,9 +1112,33 @@ impl TerminalView {
     }
 
     fn selected_text(&self) -> Option<String> {
-        let (anchor, head) = (self.selection_anchor?, self.selection_head?);
-        let (start, end) = selection_bounds(anchor, head, self.cols)?;
-        Some(self.screen.contents_between(start.0, start.1, end.0, end.1))
+        selected_excerpt(
+            &self.screen,
+            self.selection_anchor,
+            self.selection_head,
+            self.cols,
+        )
+    }
+
+    /// Whether a real selection currently covers at least one cell. A
+    /// cheap presence check for affordances tracking selection state —
+    /// read the text with [`selection_snapshot`](Self::selection_snapshot).
+    pub fn has_selection(&self) -> bool {
+        selection_present(self.selection_anchor, self.selection_head, self.cols)
+    }
+
+    /// Read-only copy of the current selection for cross-surface
+    /// handoffs. `None` while no real selection exists (no anchors, or a
+    /// zero-width drag). The text is copied out of the live screen at
+    /// call time, so coordinates are never reinterpreted against older
+    /// frames and later output, resize, or a restart cannot change the
+    /// snapshot.
+    pub fn selection_snapshot(&self) -> Option<TerminalSelection> {
+        let text = self.selected_text()?;
+        Some(TerminalSelection {
+            text,
+            launched_in: self.project.clone(),
+        })
     }
 
     fn clear_selection(&mut self) {
@@ -2049,9 +2121,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ansi_index_to_hsla, next_terminal_wake, rgb_to_hsla, selection_bounds, should_paint_cursor,
-        start_parser_worker, terminal_frame_policy, terminal_parse_budget_exhausted, ParserCommand,
-        PtyEvent, TerminalWake, TERMINAL_FIND_RESCAN_INTERVAL, TERMINAL_PARSE_BUDGET_PER_FRAME,
+        ansi_index_to_hsla, next_terminal_wake, rgb_to_hsla, selected_excerpt, selection_bounds,
+        selection_present, should_paint_cursor, start_parser_worker, terminal_frame_policy,
+        terminal_parse_budget_exhausted, ParserCommand, PtyEvent, TerminalWake,
+        TERMINAL_FIND_RESCAN_INTERVAL, TERMINAL_PARSE_BUDGET_PER_FRAME,
     };
 
     /// Receives worker events until a `SearchResults` event arrives.
@@ -2085,6 +2158,75 @@ mod tests {
             }
         }
         panic!("expected a terminal frame");
+    }
+
+    #[test]
+    fn terminal_selection_excerpt_follows_the_drag_endpoints() {
+        let mut parser = vt100::Parser::new(4, 20, 0);
+        parser.process(b"build failed\r\nsecond line");
+        let screen = parser.screen();
+
+        // No anchors — nothing selected.
+        assert!(selected_excerpt(screen, None, None, 20).is_none());
+        // A zero-width drag is not a selection.
+        assert!(!selection_present(Some((0, 0)), Some((0, 0)), 20));
+        assert!(selected_excerpt(screen, Some((0, 0)), Some((0, 0)), 20).is_none());
+        // Forward and reversed drags cover the same cells: a forward
+        // drag's head cell is exclusive, a reversed drag's anchor is
+        // extended by one to compensate.
+        assert!(selection_present(Some((0, 0)), Some((0, 12)), 20));
+        assert_eq!(
+            selected_excerpt(screen, Some((0, 0)), Some((0, 12)), 20).as_deref(),
+            Some("build failed")
+        );
+        assert_eq!(
+            selected_excerpt(screen, Some((0, 11)), Some((0, 0)), 20).as_deref(),
+            Some("build failed")
+        );
+        // Cross-line selections keep the line break.
+        assert_eq!(
+            selected_excerpt(screen, Some((0, 6)), Some((1, 6)), 20).as_deref(),
+            Some("failed\nsecond")
+        );
+        // Snapshots are recomputed against the current screen, never a
+        // remembered copy — output landing after the drag changes the
+        // next snapshot rather than being silently re-read as the old text.
+        parser.process(b"\x1b[Hchanged");
+        assert_ne!(
+            selected_excerpt(parser.screen(), Some((0, 6)), Some((1, 6)), 20).as_deref(),
+            Some("failed\nsecond")
+        );
+    }
+
+    #[gpui::test]
+    fn terminal_resize_invalidates_a_selection_instead_of_reinterpreting_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext as _;
+        let terminal = cx.update(|cx| {
+            cx.new(|cx| super::TerminalView::new_for_test(std::path::PathBuf::from("/tmp"), cx))
+        });
+        terminal.update(cx, |terminal, cx| {
+            let mut parser = vt100::Parser::new(4, 20, 0);
+            parser.process(b"select me");
+            terminal.apply_event(super::PtyEvent::Frame(super::TerminalFrame {
+                screen: parser.screen().clone(),
+                scrollback: 0,
+                scrollback_len: 0,
+                alt_screen: false,
+            }));
+            terminal.selection_anchor = Some((0, 0));
+            terminal.selection_head = Some((0, 9));
+            assert!(terminal.has_selection());
+            let snapshot = terminal.selection_snapshot().expect("selection snapshot");
+            assert_eq!(snapshot.text, "select me");
+            assert_eq!(snapshot.launched_in, std::path::PathBuf::from("/tmp"));
+            // A geometry change clears the selection rather than re-mapping
+            // the old cell coordinates onto the resized screen.
+            terminal.resize(8, 40, cx);
+            assert!(!terminal.has_selection());
+            assert!(terminal.selection_snapshot().is_none());
+        });
     }
 
     #[test]
