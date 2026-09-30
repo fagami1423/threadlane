@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.1.34](https://github.com/wheregmis/threadlane/compare/v0.1.33...v0.1.34) (2026-09-30)
+
+
+### Features
+
+* **right-panel:** simplify review rows and view diff label ([cf239cc](https://github.com/wheregmis/threadlane/commit/cf239cc3cc240531758afae6e352a22369207692))
+
+
+### Bug Fixes
+
+* **sidebar:** use foreground colors for the threadlane icon ([a515c60](https://github.com/wheregmis/threadlane/commit/a515c605f11dfeeb6c4051201cfbfeffbdd57526))
+
+
+### Maintenance
+
+* **deps:** bump gpui-component from `f8cd486` to `201b55a` ([7f016c6](https://github.com/wheregmis/threadlane/commit/7f016c6cd44697b15f6ed43b393d977601de9132))
+* **deps:** bump gpui-component from `f8cd486` to `201b55a` ([78c17f6](https://github.com/wheregmis/threadlane/commit/78c17f6bf844958a4da434592775e1281812e1bb))
+* **deps:** bump hotpath from 0.26.0 to 0.26.1 ([ebafc88](https://github.com/wheregmis/threadlane/commit/ebafc88f536f322e92d24997e70af9b06087fc1e))
+* **deps:** bump hotpath from 0.26.0 to 0.26.1 ([07e8934](https://github.com/wheregmis/threadlane/commit/07e8934d67608cdee74a60bd2fe6a00410fbae6c))
+* **deps:** bump thiserror from 2.0.20 to 2.0.21 ([bca44c4](https://github.com/wheregmis/threadlane/commit/bca44c42a6072612fde47f472bdd6f8469dadaee))
+* **deps:** bump thiserror from 2.0.20 to 2.0.21 ([179014c](https://github.com/wheregmis/threadlane/commit/179014c745de229d45520c2f703ea74068e70ab2))
+* **deps:** switch GPUI dependencies to pinned gpui-fast revision ([35b9970](https://github.com/wheregmis/threadlane/commit/35b9970ff08b67adbd4ba2adb3780853786dda88))
+
 ## [0.1.33](https://github.com/wheregmis/threadlane/compare/v0.1.32...v0.1.33) (2026-09-30)
 
 
