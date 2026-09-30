@@ -1013,6 +1013,22 @@ impl OpenAIClient {
         event_tx: mpsc::Sender<StreamEvent>,
     ) {
         if !self.is_codex() {
+            // GPT-6.1 Sol supports Chat Completions only without tool calling.
+            // Keep Codex on its existing Responses transport.
+            if payload.get("model").and_then(Value::as_str) == Some("gpt-6.1-sol")
+                && payload
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tools| !tools.is_empty())
+            {
+                let _ = event_tx
+                    .send(StreamEvent::Error(
+                        "gpt-6.1-sol tool calling requires the Responses API; API-key tool use is not supported yet. Use a Codex account or select another model."
+                            .into(),
+                    ))
+                    .await;
+                return;
+            }
             self.stream_sse(
                 "https://api.openai.com/v1/chat/completions",
                 payload,
@@ -1684,6 +1700,44 @@ mod tests {
         assert_eq!(models[1].supported_efforts, ["off"]);
         assert!(models[2].supported_efforts.is_empty());
         assert!(parse_subscription_models(&json!({})).is_empty());
+    }
+
+    #[tokio::test]
+    async fn gpt61_sol_api_key_tools_are_rejected_before_http() {
+        let mut client = OpenAIClient::new("sk-test".into(), None);
+        // An unreachable local proxy prevents any external request if the guard regresses.
+        client.client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:1").unwrap())
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        for (payload, rejected) in [
+            (
+                json!({"model": "gpt-6.1-sol", "tools": [{"type": "function"}]}),
+                true,
+            ),
+            (json!({"model": "gpt-6.1-sol", "tools": []}), false),
+            (json!({"model": "gpt-6.1-sol"}), false),
+            (
+                json!({"model": "gpt-6-sol", "tools": [{"type": "function"}]}),
+                false,
+            ),
+        ] {
+            let (tx, mut rx) = mpsc::channel(8);
+            client.stream_chat_completion(payload, None, tx).await;
+            let Some(StreamEvent::Error(message)) = rx.recv().await else {
+                panic!("expected preflight or local proxy error");
+            };
+            if rejected {
+                assert!(
+                    message.contains("gpt-6.1-sol tool calling requires the Responses API"),
+                    "{message}"
+                );
+            } else {
+                assert!(message.starts_with("HTTP request error:"), "{message}");
+            }
+            assert!(rx.recv().await.is_none());
+        }
     }
 
     #[tokio::test]
