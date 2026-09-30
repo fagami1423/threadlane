@@ -1653,7 +1653,6 @@ fn list_project_files_drops_index_entries_deleted_on_disk() {
     let inventory = list_project_files(dir.path()).unwrap();
     assert_eq!(inventory.paths, vec!["README.md".to_string()]);
 }
-||||||| e431be94
 
 fn viewed_page_fixture(
     nodes: &str,
