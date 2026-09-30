@@ -1601,6 +1601,19 @@ impl GitHubView {
         .detach();
     }
 
+    /// The loaded detail's URL when it belongs to the selected list row.
+    /// Same-number PRs in other repositories share the number, so the
+    /// URL check is what keeps one repo's detail out of another's writes.
+    fn selected_pr_detail_url(&self, key: &PrWorkspaceKey) -> Option<String> {
+        let detail = self.pr_detail.as_ref()?;
+        let selected = self
+            .pull_requests
+            .iter()
+            .find(|row| row.project == key.project && row.summary.number == key.number)?;
+        (detail.number == key.number && detail.url == selected.summary.url)
+            .then(|| detail.url.clone())
+    }
+
     /// Reads the signed-in account's Viewed markers for the selected PR.
     /// Called on Code-tab entry, explicit Refresh (via the detail refetch),
     /// and after writes — never on selection or render.
@@ -1608,14 +1621,15 @@ impl GitHubView {
         let Some(key) = self.current_pr_key() else {
             return;
         };
-        let Some(url) = self
-            .pr_detail
-            .as_ref()
-            .filter(|detail| detail.number == key.number)
-            .map(|detail| detail.url.clone())
-        else {
+        let Some(url) = self.selected_pr_detail_url(&key) else {
             return;
         };
+        self.refresh_pr_viewed_for(key, url, cx);
+    }
+
+    /// Readback for a specific PR — used after writes so the snapshot that
+    /// just changed is the one re-read, even if selection moved on.
+    fn refresh_pr_viewed_for(&mut self, key: PrWorkspaceKey, url: String, cx: &mut Context<Self>) {
         if !self.pr_viewed.refresh_allowed(&key) {
             return;
         }
@@ -1660,12 +1674,7 @@ impl GitHubView {
         let Some(key) = self.current_pr_key() else {
             return;
         };
-        let Some(url) = self
-            .pr_detail
-            .as_ref()
-            .filter(|detail| detail.number == key.number)
-            .map(|detail| detail.url.clone())
-        else {
+        let Some(url) = self.selected_pr_detail_url(&key) else {
             return;
         };
         let Some(pull_request_id) = self
@@ -1683,10 +1692,11 @@ impl GitHubView {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let work_dir = key.project.clone();
+            let write_url = url.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    (transport.write)(work_dir, url, pull_request_id, path, viewed)
+                    (transport.write)(work_dir, write_url, pull_request_id, path, viewed)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -1697,8 +1707,9 @@ impl GitHubView {
                 if applied && result.is_ok() {
                     // A confirmed write is only displayed once the readback
                     // agrees; an unconfirmed write stays blocked until a
-                    // refresh settles it.
-                    this.refresh_pr_viewed(cx);
+                    // refresh settles it. The readback targets the PR this
+                    // write landed on, not whatever is now selected.
+                    this.refresh_pr_viewed_for(key, url, cx);
                 }
             });
         })
@@ -3602,12 +3613,22 @@ impl GitHubView {
             .as_ref()
             .map(|detail| detail.files.as_slice())
             .unwrap_or(&[]);
-        let viewed_state = key.as_ref().and_then(|key| self.pr_viewed.get(key));
+        // The displayed detail may still belong to another same-numbered PR;
+        // viewed markers are per-repo state, so they only show when the URL
+        // proves the detail is the selected row's pull request.
+        let detail_matches = key
+            .as_ref()
+            .is_some_and(|key| self.selected_pr_detail_url(key).is_some());
+        let viewed_state = if detail_matches {
+            key.as_ref().and_then(|key| self.pr_viewed.get(key))
+        } else {
+            None
+        };
         let snapshot = viewed_state.and_then(|state| state.snapshot.as_ref());
         let loading = viewed_state.is_some_and(|state| state.loading);
         let (viewed_count, listed_count, all_viewed) =
             pr_viewed_progress(snapshot, listed_files);
-        let progress_label = if loading && snapshot.is_none() {
+        let progress_label = if (loading && snapshot.is_none()) || !detail_matches {
             "Loading viewed status…".to_owned()
         } else if all_viewed {
             "All listed files viewed".to_owned()
@@ -3663,6 +3684,11 @@ impl GitHubView {
                 }))
         });
         let next_target = next_unviewed_file(snapshot, listed_files, selected_path.as_deref());
+        let next_help: SharedString = if next_target.is_some() {
+            "Select the next file without a viewed marker".into()
+        } else {
+            "No other unviewed files".into()
+        };
         let toolbar = div()
             .w_full()
             .flex()
@@ -3688,11 +3714,8 @@ impl GitHubView {
                     .small()
                     .label("Next unviewed")
                     .disabled(next_target.is_none())
-                    .tooltip(if next_target.is_some() {
-                        "Select the next file without a viewed marker"
-                    } else {
-                        "No other unviewed files"
-                    })
+                    .accessibility_label(next_help.clone())
+                    .tooltip(next_help)
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.select_next_unviewed(cx);
                     })),
@@ -4516,6 +4539,7 @@ mod tests {
             summary: GitHubPullRequestSummary {
                 number: key.number,
                 title: "Inspect PR".into(),
+                url: "https://github.com/threadlane/app/pull/42".into(),
                 ..Default::default()
             },
         }];
@@ -7116,12 +7140,22 @@ mod tests {
         });
         view.update(cx, |view, cx| view.select_pr_tab(PrDetailTab::Code, cx));
 
-        // Selection moves to another PR before the delayed read lands; the
-        // detail URL guard refuses a read for the mismatched selection.
+        // Selection moves to a same-numbered PR in another repository before
+        // the delayed read lands; the still-displayed detail belongs to the
+        // first repo, so the URL guard refuses a read for the new selection.
         view.update(cx, |view, cx| {
             view.selected_pr = Some(GitHubItemKey {
-                project: PathBuf::from("/projects/app"),
-                number: 7,
+                project: PathBuf::from("/projects/other"),
+                number: 42,
+            });
+            view.pull_requests.push(ScopedPr {
+                project: PathBuf::from("/projects/other"),
+                project_name: "other".into(),
+                summary: GitHubPullRequestSummary {
+                    number: 42,
+                    url: "https://github.com/threadlane/other/pull/42".into(),
+                    ..Default::default()
+                },
             });
             view.refresh_pr_viewed(cx);
         });
@@ -7137,8 +7171,8 @@ mod tests {
                 .get(&key)
                 .is_some_and(|state| state.snapshot.is_some()));
             let other = PrWorkspaceKey {
-                project: PathBuf::from("/projects/app"),
-                number: 7,
+                project: PathBuf::from("/projects/other"),
+                number: 42,
             };
             assert!(view.pr_viewed.get(&other).is_none());
         });

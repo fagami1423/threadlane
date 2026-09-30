@@ -1603,6 +1603,28 @@ fn viewed_state_collection_flags_incomplete_and_rejects_inconsistent_pages() {
         pages.next().unwrap()
     })
     .is_err());
+
+    // A head change between pages means the merged markers would mix
+    // revisions; the read is rejected so a refresh can settle it.
+    let moved_head = viewed_page_fixture(
+        r#"{"path": "b.rs", "viewerViewedState": "UNVIEWED"}"#,
+        false,
+        None,
+    )
+    .replace("head123", "head456");
+    let mut pages = vec![
+        Ok(viewed_page_fixture(
+            r#"{"path": "a.rs", "viewerViewedState": "VIEWED"}"#,
+            true,
+            Some("cursor-2"),
+        )),
+        Ok(moved_head),
+    ]
+    .into_iter();
+    assert!(collect_pr_viewed_state(Path::new("/tmp/project"), &repository, 42, |_| {
+        pages.next().unwrap()
+    })
+    .is_err());
 }
 
 #[test]

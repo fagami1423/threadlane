@@ -1541,7 +1541,9 @@ pub(crate) fn collect_pr_viewed_state(
             )
         })?;
         if !state.pull_request_id.is_empty()
-            && (state.pull_request_id != page.pull_request_id || state.viewer != page.viewer)
+            && (state.pull_request_id != page.pull_request_id
+                || state.viewer != page.viewer
+                || state.head_oid != page.head_oid)
         {
             return Err(GitError::new(
                 work_dir,
