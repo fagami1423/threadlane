@@ -5240,7 +5240,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
 dependencies = [
  "bitflags 2.13.1",
+ "block2 0.6.2",
  "dispatch2",
+ "libc",
  "objc2 0.6.4",
 ]
 
@@ -8705,6 +8707,7 @@ dependencies = [
  "gpui-wry",
  "lb-wry",
  "objc2 0.6.4",
+ "objc2-core-foundation",
  "raw-window-handle",
  "rfd",
  "serde_json",
