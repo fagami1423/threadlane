@@ -6,6 +6,7 @@ use crate::test_support::{
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use threadlane_coding_agent::controller::SessionRuntimeStatus;
+use threadlane_protocol::AgentMessage;
 use threadlane_coding_agent::harness::CodingSessionHarness;
 use threadlane_runtime::harness::{
     OperationIntent, OperationOutcome, ProviderOutcome, Record, SessionStore, TraceString,
@@ -269,10 +270,10 @@ fn filesystem_root_is_not_an_attachable_project() {
 fn model_selection_resets_unsupported_reasoning_and_rejects_hidden_efforts() {
     use threadlane_protocol::ReasoningEffort;
     let mut state = AppState::load_from_registry(Vec::new());
-    state.available_models = vec![threadlane_ui_catalog::ModelOption {
+    state.available_models = vec![threadlane_daemon::catalog::ModelOption {
         id: "gpt-4o".into(),
         label: "GPT-4o".into(),
-        provider: threadlane_ui_catalog::ModelProvider::OpenAi,
+        provider: threadlane_daemon::catalog::ModelProvider::OpenAi,
     }];
     state.selected_model = "previous-model".into();
     state.reasoning_effort = ReasoningEffort::High;
@@ -521,10 +522,10 @@ async fn model_and_reasoning_pickers_persist_before_rebuild_and_next_request() {
         // Before hydration the picker can still show another session's
         // selection. Clicking it must update this session's stored model.
         state.selected_model = if has_runtime { "gpt-4o" } else { selected }.into();
-        state.available_models = vec![threadlane_ui_catalog::ModelOption {
+        state.available_models = vec![threadlane_daemon::catalog::ModelOption {
             id: selected.into(),
             label: "MiniMax M2.7".into(),
-            provider: threadlane_ui_catalog::ModelProvider::OpenCode,
+            provider: threadlane_daemon::catalog::ModelProvider::OpenCode,
         }];
         if has_runtime {
             state.active_session_runtime().unwrap();
@@ -578,10 +579,10 @@ fn model_picker_preserves_current_selection_while_runtime_is_busy() {
     let mut state = AppState::load_from_registry(Vec::new());
     activate_test_session(&mut state, "session", &session_file);
     state.selected_model = "gpt-4o".into();
-    state.available_models = vec![threadlane_ui_catalog::ModelOption {
+    state.available_models = vec![threadlane_daemon::catalog::ModelOption {
         id: "opencode-go/minimax-m2.7".into(),
         label: "MiniMax M2.7".into(),
-        provider: threadlane_ui_catalog::ModelProvider::OpenCode,
+        provider: threadlane_daemon::catalog::ModelProvider::OpenCode,
     }];
     let (runtime, _) = state.active_session_runtime().unwrap();
     runtime
@@ -4856,4 +4857,74 @@ fn worktree_setup_failure_and_cancellation_are_scoped_to_the_session() {
     assert!(state.active_session_id.is_none());
     assert!(state.session_status.is_none());
     assert!(state.session_runtimes.is_empty());
+}
+
+#[test]
+fn automation_navigation_preserves_chat_and_project_scope() {
+    let mut state = crate::AppState::load_from_registry(vec![]);
+    state.active_session_id = Some("original".into());
+    state.active_work_dir = Some(std::path::PathBuf::from("/project"));
+    state.sidebar_project_filter = Some(std::path::PathBuf::from("/filter"));
+    crate::controller::dispatch(&mut state, crate::actions::AppAction::OpenAutomations);
+    assert_eq!(state.workspace_page, crate::WorkspacePage::Automations);
+    assert_eq!(state.active_session_id.as_deref(), Some("original"));
+    assert_eq!(
+        state.active_work_dir,
+        Some(std::path::PathBuf::from("/project"))
+    );
+    assert_eq!(
+        state.sidebar_project_filter,
+        Some(std::path::PathBuf::from("/filter"))
+    );
+}
+
+#[test]
+fn completed_run_refresh_preserves_questions_from_a_later_chat_turn() {
+    use threadlane_automation::{Definition, RunStatus, Schedule, Store};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let mut store = Store::open(&root).unwrap();
+    store
+        .save(
+            Definition {
+                id: "automation-test".into(),
+                revision: 0,
+                name: "Test".into(),
+                prompt: "automation test prompt".into(),
+                project: root.clone(),
+                model: "gpt-4o".into(),
+                effort: "medium".into(),
+                worktree: false,
+                schedule: Schedule::Manual,
+                enabled: false,
+                notify_all: false,
+                anchor: 0,
+                next_at: None,
+                failures: 0,
+                paused_reason: None,
+            },
+            0,
+        )
+        .unwrap();
+    let id = store.enqueue("automation-test", false, 1).unwrap();
+    store
+        .update_run(&id, RunStatus::Succeeded, None, None, 2)
+        .unwrap();
+    let session_id = store.snapshot().runs[0].session_id.clone();
+    let mut state = crate::AppState::load_from_registry(vec![]);
+    state.pending_questions.insert(
+        session_id.clone(),
+        threadlane_protocol::QuestionRequest {
+            id: "later-turn-question".into(),
+            questions: vec![],
+        },
+    );
+    state.apply_automation_projection(crate::automation::Projection {
+        snapshot: store.snapshot().clone(),
+        ..Default::default()
+    });
+    assert_eq!(
+        state.pending_questions[&session_id].id,
+        "later-turn-question"
+    );
 }

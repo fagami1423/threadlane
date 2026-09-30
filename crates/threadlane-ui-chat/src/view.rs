@@ -4420,7 +4420,7 @@ impl ChatListView {
             let state = self.model.read(cx);
             let mut sections = HashMap::new();
             for option in &model_options {
-                if option.provider != threadlane_ui_catalog::ModelProvider::Acp {
+                if option.provider != threadlane_daemon::catalog::ModelProvider::Acp {
                     continue;
                 }
                 let Some(agent_id) = threadlane_acp_engine::acp_agent_id(&option.id) else {
@@ -4429,7 +4429,7 @@ impl ChatListView {
                 let options = if option.id == selected_model {
                     state.active_acp_config_options()
                 } else {
-                    threadlane_ui_catalog::cached_acp_config_options(agent_id)
+                    threadlane_daemon::catalog::cached_acp_config_options(agent_id)
                 };
                 sections.insert(agent_id.to_string(), options);
             }
@@ -5062,7 +5062,7 @@ impl ChatListView {
                             previous_provider = Some(option.provider);
                             menu.item(PopupMenuItem::label(option.provider.label()))
                         };
-                        if option.provider != threadlane_ui_catalog::ModelProvider::Acp {
+                        if option.provider != threadlane_daemon::catalog::ModelProvider::Acp {
                             let model = model_for_picker.clone();
                             let is_current = option.id == selected_model_for_picker;
                             let label = if is_current {
@@ -5163,7 +5163,7 @@ impl ChatListView {
                                 })
                             }
                             None => {
-                                let reason = threadlane_ui_catalog::cached_acp_error(&agent_key)
+                                let reason = threadlane_daemon::catalog::cached_acp_error(&agent_key)
                                     .map(|error| {
                                         let short: String = error.chars().take(120).collect();
                                         if error.chars().count() > 120 {
@@ -5197,11 +5197,11 @@ impl ChatListView {
 
         let effort_model = self.model.clone();
         let effort_options =
-            threadlane_ui_catalog::efforts_for_model(&selected_model, project_root.as_deref());
+            threadlane_daemon::catalog::efforts_for_model(&selected_model, project_root.as_deref());
         // Models without thinking (ACP agents, off-only registry entries)
         // offer no effort control instead of dead options.
         let show_effort_picker =
-            threadlane_ui_catalog::supports_reasoning(&selected_model, project_root.as_deref());
+            threadlane_daemon::catalog::supports_reasoning(&selected_model, project_root.as_deref());
         let effort_picker = Button::new("composer-reasoning-effort-picker")
             .debug_selector(|| "composer-reasoning-effort-picker".into())
             .icon(Icon::default().path("icons/effort.svg"))

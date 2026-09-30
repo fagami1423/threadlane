@@ -1,36 +1,36 @@
 //! Durable UI state for the Threadlane desktop app.
 //!
-//! This crate owns `AppState` (the session/project/composer/projection store),
-//! the session projection and discovery helpers, the chat turn services
-//! (`execute_prompt`, title generation, ACP config), and the agent-event
-//! adapter. It is intentionally GPUI-free: screens and the app shell import
-//! its modules directly.
+//! This crate owns `AppState` (the client-side session/project/composer store)
+//! and the app-intent boundary (`actions`/`controller`). The headless service
+//! layer it is built from — session discovery/projection, chat turn services,
+//! background services, worktree setup, automation, and the model catalog —
+//! lives in `threadlane-daemon`; the re-exports below keep the historical
+//! `threadlane_ui_state::` paths working for existing consumers, and new code
+//! should import `threadlane_daemon` directly.
 
 pub mod actions;
-pub mod automation;
-pub mod agent_events;
-mod app_state;
-pub mod chat;
 pub mod controller;
-mod discovery;
-pub mod events;
-pub mod projection;
-pub mod provider_auth;
-pub mod settings;
-mod types;
-pub mod updater;
-pub mod worktree_setup;
+mod app_state;
+pub mod types;
 
 #[cfg(any(test, feature = "test-support"))]
 mod test_support;
 
 pub use app_state::{close_work_needs_refresh, ActiveCloseWork, AppState};
-pub use events::{next_event_batch, next_event_batch_capped};
+pub use threadlane_daemon::{
+    agent_events, automation, chat, discovery, events, projection, provider_auth, settings,
+    updater, worktree_setup,
+};
+pub use threadlane_daemon::{
+    derive_session_attention, hash_session_identity, next_event_batch, next_event_batch_capped,
+    AttachedProject, ChatMessageInfo, ChatStreamEvent, ContextWindowInfo, MessageRole,
+    PendingComposerMessage, ProjectInfo, RunTiming, SessionAttention, SessionDiscoveryCache,
+    SessionDiscoveryCacheEntry, SessionHealth, SessionHydrationRequest, SessionInfo,
+    SessionMetricsInfo, SessionProjectionKey, SessionProjectionResult, SubagentActivityInfo,
+    SubagentActivityStatus, ToolActivityInfo, TrajectoryEntry, WorkMode,
+};
 pub use types::{
-    hash_session_identity, ChatMessageInfo, ChatStreamEvent, MessageRole, RequestedComposerInsert,
-    RequestedEditorTarget, SessionAttention, SessionHealth, SessionHydrationRequest, SessionInfo,
-    SubagentActivityInfo, SubagentActivityStatus, ToolActivityInfo, TrajectoryEntry, WorkMode,
-    GitHubTab, WorkspacePage,
+    GitHubTab, IssueWorkSelection, RequestedComposerInsert, RequestedEditorTarget, WorkspacePage,
 };
 
 #[cfg(any(test, feature = "test-support"))]
@@ -38,4 +38,4 @@ pub use test_support::{
     activate_test_session, generated_reported_session_path, reported_session_shape_state,
 };
 #[cfg(any(test, feature = "test-support"))]
-pub use types::TrajectoryDiagnostics;
+pub use threadlane_daemon::TrajectoryDiagnostics;

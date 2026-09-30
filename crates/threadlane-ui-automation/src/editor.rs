@@ -13,7 +13,7 @@ fn default_project(state: &AppState) -> Option<&std::path::PathBuf> {
         .map(|p| &p.work_dir)
 }
 
-fn project_model(models: &[threadlane_ui_catalog::ModelOption], preferred: &str) -> String {
+fn project_model(models: &[threadlane_daemon::catalog::ModelOption], preferred: &str) -> String {
     let mut native = models.iter().filter(|m| !m.id.starts_with("acp/"));
     native
         .clone()
@@ -48,7 +48,7 @@ fn calendar_days(cadence: &str, weekday: u32, original: &Schedule) -> Vec<u32> {
 mod tests {
     use super::{calendar_cadence, calendar_days, default_project, project_model};
     use threadlane_automation::Schedule;
-    use threadlane_ui_catalog::{ModelOption, ModelProvider};
+    use threadlane_daemon::catalog::{ModelOption, ModelProvider};
     use threadlane_ui_state::{activate_test_session, AppState};
 
     #[test]
@@ -128,7 +128,7 @@ struct Editor {
     busy: bool,
     error: Option<String>,
     _subscriptions: Vec<Subscription>,
-    models: Vec<threadlane_ui_catalog::ModelOption>,
+    models: Vec<threadlane_daemon::catalog::ModelOption>,
     is_git: bool,
     closed: bool,
 }
@@ -143,7 +143,7 @@ pub(super) fn open(
         return;
     };
     let definition = definition.unwrap_or_else(|| {
-        let models = threadlane_ui_catalog::available_models_for_project(Some(project));
+        let models = threadlane_daemon::catalog::available_models_for_project(Some(project));
         let selected_model = project_model(&models, &state.selected_model);
         let effort = threadlane_provider::model_registry::effective_effort(
             &selected_model,
@@ -219,7 +219,7 @@ pub(super) fn open(
                 }
             },
         ));
-        let models = threadlane_ui_catalog::available_models_for_project(Some(&definition.project));
+        let models = threadlane_daemon::catalog::available_models_for_project(Some(&definition.project));
         // Keep the safe worktree default until background discovery completes.
         let is_git = true;
         Editor {
@@ -376,7 +376,7 @@ impl Render for Editor {
                     this.definition.project = id.into();
                     this.is_git = true;
                     this.refresh_project(cx);
-                    this.models = threadlane_ui_catalog::available_models_for_project(Some(
+                    this.models = threadlane_daemon::catalog::available_models_for_project(Some(
                         &this.definition.project,
                     ));
                     this.definition.model = project_model(&this.models, &this.definition.model);
@@ -392,7 +392,7 @@ impl Render for Editor {
             },
         );
         let models = self.models.clone();
-        let model_label = threadlane_ui_catalog::selection_label(&self.definition.model, &models);
+        let model_label = threadlane_daemon::catalog::selection_label(&self.definition.model, &models);
         let choices = models
             .into_iter()
             .filter(|m| !m.id.starts_with("acp/"))
@@ -420,7 +420,7 @@ impl Render for Editor {
             },
         );
         let owner = cx.entity().downgrade();
-        let efforts = threadlane_ui_catalog::efforts_for_model(
+        let efforts = threadlane_daemon::catalog::efforts_for_model(
             &self.definition.model,
             Some(&self.definition.project),
         )
@@ -493,7 +493,7 @@ impl Render for Editor {
             .child(field("Project", project))
             .child(field("Model", model))
             .when(
-                threadlane_ui_catalog::supports_reasoning(
+                threadlane_daemon::catalog::supports_reasoning(
                     &self.definition.model,
                     Some(&self.definition.project),
                 ),

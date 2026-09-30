@@ -1,15 +1,13 @@
 [package]
-name = "threadlane-ui-state"
+name = "threadlane-daemon"
 version = "0.1.0"
 edition = "2021"
-description = "Durable UI state for the Threadlane desktop app: AppState, session projections, chat turn services, and agent-event adapters. GPUI-free."
+description = "Headless Threadlane services: session discovery/projection, chat turn services, provider auth, settings, updater, worktree setup, automation, and the model catalog. GPUI-free; the in-process core a future threadlane-daemon process wraps."
 
 [dependencies]
-async-trait = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 robius-open.workspace = true
-tempfile = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 threadlane-acp.workspace = true
@@ -27,18 +25,9 @@ threadlane-provider.workspace = true
 threadlane-runtime.workspace = true
 threadlane-skills.workspace = true
 threadlane-tools.workspace = true
-threadlane-daemon.workspace = true
 threadlane-updater.workspace = true
-
-[features]
-test-support = [
-    "dep:async-trait",
-    "dep:tempfile",
-    "threadlane-coding-agent/test-support",
-]
 
 [dev-dependencies]
 async-trait.workspace = true
 tempfile.workspace = true
 threadlane-coding-agent = { workspace = true, features = ["test-support"] }
-threadlane-skills.workspace = true

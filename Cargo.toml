@@ -37,7 +37,7 @@ threadlane-provider = { version = "0.1.0", path = "crates/threadlane-provider" }
 threadlane-runtime = { version = "0.1.0", path = "crates/threadlane-runtime" }
 threadlane-skills = { version = "0.1.0", path = "crates/threadlane-skills" }
 threadlane-tools = { version = "0.1.0", path = "crates/threadlane-tools" }
-threadlane-ui-catalog = { version = "0.1.0", path = "crates/threadlane-ui-catalog" }
+threadlane-daemon = { version = "0.1.0", path = "crates/threadlane-daemon" }
 threadlane-ui-automation = { version = "0.1.0", path = "crates/threadlane-ui-automation" }
 threadlane-ui-chat = { version = "0.1.0", path = "crates/threadlane-ui-chat" }
 threadlane-ui-editor = { version = "0.1.0", path = "crates/threadlane-ui-editor" }

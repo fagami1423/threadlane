@@ -624,12 +624,12 @@ impl SettingsView {
             );
         };
         let preferences = threadlane_project::subagent_settings::load(&project);
-        let available = threadlane_ui_catalog::available_models_for_project(Some(&project));
+        let available = threadlane_daemon::catalog::available_models_for_project(Some(&project));
         let available_for_fast = available.clone();
         let selected_fast_model = preferences.fast_model.clone();
         let fast_model_label = selected_fast_model
             .as_deref()
-            .map(|id| threadlane_ui_catalog::selection_label(id, &available))
+            .map(|id| threadlane_daemon::catalog::selection_label(id, &available))
             .unwrap_or_else(|| "Same as parent".into());
         let fast_model_entity = self.model.clone();
         let project_for_fast = project.clone();
@@ -713,7 +713,7 @@ impl SettingsView {
         let project_for_fast_reasoning = project.clone();
         let fast_for_model = preferences.fast_model.clone().unwrap_or_default();
         let show_fast_reasoning =
-            threadlane_ui_catalog::supports_reasoning(&fast_for_model, Some(&project));
+            threadlane_daemon::catalog::supports_reasoning(&fast_for_model, Some(&project));
         let fast_reasoning_picker = Button::new("fast-reasoning-picker")
             .label(fast_reasoning_label)
             .dropdown_caret(true)
@@ -722,7 +722,7 @@ impl SettingsView {
                 let project = project_for_fast_reasoning.clone();
                 let mut options: Vec<Option<threadlane_protocol::ReasoningEffort>> = vec![None];
                 options.extend(
-                    threadlane_ui_catalog::efforts_for_model(&fast_for_model, Some(&project))
+                    threadlane_daemon::catalog::efforts_for_model(&fast_for_model, Some(&project))
                         .into_iter()
                         .map(Some),
                 );

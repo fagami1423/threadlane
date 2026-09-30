@@ -82,7 +82,7 @@ pub struct IssueStartDialog {
     pub error: Option<String>,
     effort: ReasoningEffort,
     mode: OrchestratorMode,
-    models: Vec<threadlane_ui_catalog::ModelOption>,
+    models: Vec<threadlane_daemon::catalog::ModelOption>,
 }
 
 impl IssueStartDialog {
@@ -119,7 +119,7 @@ impl Render for IssueStartDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().colors;
         let selected = self.confirmation.model.clone();
-        let model_label = threadlane_ui_catalog::selection_label(&selected, &self.models);
+        let model_label = threadlane_daemon::catalog::selection_label(&selected, &self.models);
         let models = self.models.clone();
         let owner = cx.entity().downgrade();
         let model_picker = Button::new("issue-task-model")
@@ -161,11 +161,11 @@ impl Render for IssueStartDialog {
                     },
                 )
             });
-        let show_effort = threadlane_ui_catalog::supports_reasoning(
+        let show_effort = threadlane_daemon::catalog::supports_reasoning(
             &self.confirmation.model,
             Some(&self.work_dir),
         );
-        let efforts = threadlane_ui_catalog::efforts_for_model(
+        let efforts = threadlane_daemon::catalog::efforts_for_model(
             &self.confirmation.model,
             Some(&self.work_dir),
         );
@@ -311,7 +311,7 @@ pub fn open_issue_start_dialog(
         threadlane_git::is_git_repo(&work_dir),
         has_linked_task,
     );
-    let models = threadlane_ui_catalog::available_models_for_project(Some(&work_dir));
+    let models = threadlane_daemon::catalog::available_models_for_project(Some(&work_dir));
     let effort = effective_effort(&selected_model, reasoning_effort, Some(&work_dir));
     let start_enabled = confirmation.start_enabled;
     let start_label = confirmation.start_label;
@@ -494,7 +494,7 @@ mod tests {
     use super::{issue_start_confirmation, IssueStartDialog};
     use gpui::{AppContext, Modifiers, TestAppContext};
     use threadlane_protocol::{OrchestratorMode, ReasoningEffort};
-    use threadlane_ui_catalog::{ModelOption, ModelProvider};
+    use threadlane_daemon::catalog::{ModelOption, ModelProvider};
     use threadlane_ui_state::AppState;
 
     #[gpui::test]

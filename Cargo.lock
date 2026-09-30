@@ -8456,6 +8456,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "threadlane-daemon"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "robius-open",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "threadlane-acp",
+ "threadlane-acp-engine",
+ "threadlane-auth",
+ "threadlane-automation",
+ "threadlane-coding-agent",
+ "threadlane-context",
+ "threadlane-git",
+ "threadlane-permission",
+ "threadlane-project",
+ "threadlane-prompt",
+ "threadlane-protocol",
+ "threadlane-provider",
+ "threadlane-runtime",
+ "threadlane-skills",
+ "threadlane-tools",
+ "threadlane-updater",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "threadlane-git"
 version = "0.1.0"
 dependencies = [
@@ -8657,26 +8686,12 @@ dependencies = [
  "gpui-pre",
  "tempfile",
  "threadlane-automation",
+ "threadlane-daemon",
  "threadlane-git",
  "threadlane-protocol",
  "threadlane-provider",
- "threadlane-ui-catalog",
  "threadlane-ui-state",
  "threadlane-ui-theme",
-]
-
-[[package]]
-name = "threadlane-ui-catalog"
-version = "0.1.0"
-dependencies = [
- "threadlane-acp",
- "threadlane-acp-engine",
- "threadlane-auth",
- "threadlane-coding-agent",
- "threadlane-project",
- "threadlane-protocol",
- "threadlane-provider",
- "tracing",
 ]
 
 [[package]]
@@ -8695,11 +8710,11 @@ dependencies = [
  "threadlane-acp-engine",
  "threadlane-coding-agent",
  "threadlane-computer",
+ "threadlane-daemon",
  "threadlane-git",
  "threadlane-permission",
  "threadlane-protocol",
  "threadlane-skills",
- "threadlane-ui-catalog",
  "threadlane-ui-editor",
  "threadlane-ui-mirror",
  "threadlane-ui-state",
@@ -8729,11 +8744,11 @@ dependencies = [
  "rfd",
  "serde_json",
  "threadlane-coding-agent",
+ "threadlane-daemon",
  "threadlane-git",
  "threadlane-project",
  "threadlane-protocol",
  "threadlane-provider",
- "threadlane-ui-catalog",
  "threadlane-ui-state",
  "threadlane-ui-theme",
  "tokio",
@@ -8790,12 +8805,12 @@ dependencies = [
  "threadlane-acp",
  "threadlane-acp-engine",
  "threadlane-auth",
+ "threadlane-daemon",
  "threadlane-project",
  "threadlane-protocol",
  "threadlane-provider",
  "threadlane-runtime",
  "threadlane-skills",
- "threadlane-ui-catalog",
  "threadlane-ui-state",
  "threadlane-ui-theme",
  "threadlane-updater",
@@ -8813,8 +8828,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "threadlane-coding-agent",
+ "threadlane-daemon",
  "threadlane-git",
- "threadlane-ui-catalog",
  "threadlane-ui-state",
  "threadlane-ui-theme",
  "threadlane-updater",
@@ -8835,6 +8850,7 @@ dependencies = [
  "threadlane-automation",
  "threadlane-coding-agent",
  "threadlane-context",
+ "threadlane-daemon",
  "threadlane-git",
  "threadlane-permission",
  "threadlane-project",
@@ -8844,7 +8860,6 @@ dependencies = [
  "threadlane-runtime",
  "threadlane-skills",
  "threadlane-tools",
- "threadlane-ui-catalog",
  "threadlane-updater",
  "tokio",
  "tracing",
