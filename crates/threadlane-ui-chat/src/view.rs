@@ -1205,19 +1205,13 @@ impl ChatListView {
             let mut content = div().flex().items_center().min_w_0().child(summary);
             if added > 0 || removed > 0 {
                 content = content.child(" · ");
-            }
-            if added > 0 {
                 content = content.child(
                     div()
                         .debug_selector(|| "environment-changes-additions".into())
                         .text_color(theme.success)
                         .child(format!("+{added}")),
                 );
-            }
-            if added > 0 && removed > 0 {
                 content = content.child(" ");
-            }
-            if removed > 0 {
                 content = content.child(
                     div()
                         .debug_selector(|| "environment-changes-deletions".into())
