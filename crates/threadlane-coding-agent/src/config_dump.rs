@@ -12,7 +12,16 @@ pub fn dump_token_efficiency(args: &[String]) -> Result<(), String> {
         .and_then(|index| args.get(index + 1))
         .filter(|path| !path.starts_with("--"))
         .ok_or("--token-efficiency requires <session.jsonl>")?;
-    let store = threadlane_runtime::harness::JsonlStore::open_read_only(path)
+    let path = PathBuf::from(path);
+    if !path.try_exists().map_err(|error| error.to_string())?
+        && !path
+            .with_extension("harness.jsonl")
+            .try_exists()
+            .map_err(|error| error.to_string())?
+    {
+        return Err(format!("Session data does not exist: {}", path.display()));
+    }
+    let store = threadlane_runtime::harness::JsonlStore::open_read_only(&path)
         .map_err(|error| error.to_string())?;
     let report = threadlane_runtime::harness::project_token_efficiency(&store);
     println!(
@@ -20,6 +29,31 @@ pub fn dump_token_efficiency(args: &[String]) -> Result<(), String> {
         serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod token_efficiency_tests {
+    #[test]
+    fn report_rejects_missing_paths_but_accepts_existing_journals_and_legacy_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let args = vec![
+            "--token-efficiency".into(),
+            path.to_string_lossy().into_owned(),
+        ];
+        let error = super::dump_token_efficiency(&args).unwrap_err();
+        assert!(error.contains("Session data does not exist"), "{error}");
+        assert!(
+            !path.exists(),
+            "reporting must not create a missing journal"
+        );
+        std::fs::write(&path, "").unwrap();
+        super::dump_token_efficiency(&args).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(path.with_extension("harness.jsonl"), "").unwrap();
+        super::dump_token_efficiency(&args).unwrap();
+        assert!(!path.exists(), "a sidecar-only report remains read-only");
+    }
 }
 
 pub fn dump_config(args: &[String]) -> Result<(), String> {

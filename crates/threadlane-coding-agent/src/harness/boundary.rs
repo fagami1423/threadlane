@@ -93,6 +93,7 @@ impl CodingSessionHarness {
         run_id: &str,
         request: ProviderBoundaryRequest,
         config: &AgentConfig,
+        read_digests: &HashMap<String, String>,
     ) -> Result<ProviderBoundaryResult, String> {
         self.ensure_fresh()?;
         // No provider boundary may proceed after cancellation, even when the
@@ -136,7 +137,7 @@ impl CodingSessionHarness {
         };
         let mut current = with_system(self.model_context("main")?.messages());
         let mut visible =
-            self.provider_read_context(run_id, &current, request.tool_schema_json.as_deref());
+            self.provider_read_context(&current, request.tool_schema_json.as_deref(), read_digests);
         let pre_tokens = estimate_request_tokens(
             &visible,
             request.tool_schema_json.as_deref(),
@@ -182,8 +183,11 @@ impl CodingSessionHarness {
                 prepared,
             )?;
             current = with_system(self.model_context("main")?.messages());
-            visible =
-                self.provider_read_context(run_id, &current, request.tool_schema_json.as_deref());
+            visible = self.provider_read_context(
+                &current,
+                request.tool_schema_json.as_deref(),
+                read_digests,
+            );
             let post_tokens = estimate_request_tokens(
                 &visible,
                 request.tool_schema_json.as_deref(),
