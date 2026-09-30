@@ -11,6 +11,7 @@ use std::time::Duration;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::link::Link;
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
@@ -22,7 +23,9 @@ use gpui_component::tab::{Tab, TabBar};
 use gpui_component::tag::Tag;
 use gpui_component::text::{TextView, TextViewState};
 use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable};
-use threadlane_git::{GitHubIssueDetail, GitHubIssueRef, GitHubPrInfo, GitHubRepository};
+use threadlane_git::{
+    GitHubIssueDetail, GitHubIssueRef, GitHubPrInfo, GitHubRepository, PrFileViewedStatus,
+};
 
 use threadlane_ui_state::actions::AppAction;
 use threadlane_ui_state::controller;
@@ -398,6 +401,11 @@ pub struct GitHubView {
     pr_diff_body: Entity<TextViewState>,
     pr_selections: PrWorkspaceSelections,
     pr_drafts: PrCommentDrafts,
+    /// Per-PR Viewed marker lifecycle (personal reading state, kept per
+    /// workspace key so delayed results can't cross repos/PRs/accounts).
+    pr_viewed: PrViewedStates,
+    /// Read/write seam for viewed markers; tests substitute delayed fakes.
+    viewed_transport: PrViewedTransport,
     pr_comment_input: Entity<TextareaState>,
     pr_comment_input_key: Option<PrWorkspaceKey>,
     pr_reply_input: Entity<TextareaState>,
@@ -590,6 +598,8 @@ impl GitHubView {
             pr_diff_body,
             pr_selections: PrWorkspaceSelections::default(),
             pr_drafts: PrCommentDrafts::default(),
+            pr_viewed: PrViewedStates::default(),
+            viewed_transport: PrViewedTransport::default(),
             pr_comment_input,
             pr_comment_input_key: None,
             pr_reply_input,
@@ -1077,9 +1087,11 @@ impl GitHubView {
                         this.pr_file_list_state.reset(detail.files.len());
                         this.detail_body
                             .update(cx, |body, cx| body.set_text(&detail.body, cx));
+                        this.pr_viewed.observe_head(&key, &detail.head_oid);
                         this.pr_detail = Some(detail);
                         if this.pr_selections.tab(&key) == PrDetailTab::Code {
                             this.load_selected_diff(cx);
+                            this.refresh_pr_viewed(cx);
                         }
                     }
                     GitHubDetailResult::Issue(Err(error))
@@ -1449,6 +1461,7 @@ impl GitHubView {
         self.pr_selections.select_tab(key, tab);
         if tab == PrDetailTab::Code {
             self.load_selected_diff(cx);
+            self.refresh_pr_viewed(cx);
         }
         cx.notify();
     }
@@ -1586,6 +1599,152 @@ impl GitHubView {
             });
         })
         .detach();
+    }
+
+    /// The loaded detail's URL when it belongs to the selected list row.
+    /// Same-number PRs in other repositories share the number, so the
+    /// URL check is what keeps one repo's detail out of another's writes.
+    fn selected_pr_detail_url(&self, key: &PrWorkspaceKey) -> Option<String> {
+        let detail = self.pr_detail.as_ref()?;
+        let selected = self
+            .pull_requests
+            .iter()
+            .find(|row| row.project == key.project && row.summary.number == key.number)?;
+        (detail.number == key.number && detail.url == selected.summary.url)
+            .then(|| detail.url.clone())
+    }
+
+    /// Reads the signed-in account's Viewed markers for the selected PR.
+    /// Called on Code-tab entry, explicit Refresh (via the detail refetch),
+    /// and after writes — never on selection or render.
+    fn refresh_pr_viewed(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.current_pr_key() else {
+            return;
+        };
+        let Some(url) = self.selected_pr_detail_url(&key) else {
+            return;
+        };
+        self.refresh_pr_viewed_for(key, url, cx);
+    }
+
+    /// Readback for a specific PR — used after writes so the snapshot that
+    /// just changed is the one re-read, even if selection moved on.
+    fn refresh_pr_viewed_for(&mut self, key: PrWorkspaceKey, url: String, cx: &mut Context<Self>) {
+        if !self.pr_viewed.refresh_allowed(&key) {
+            return;
+        }
+        let token = self.pr_viewed.begin_read(&key);
+        let transport = self.viewed_transport.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let work_dir = key.project.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { (transport.read)(work_dir, url) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let applied = match result {
+                    Ok(state) => {
+                        let snapshot = PrViewedSnapshot {
+                            pull_request_id: state.pull_request_id,
+                            head_oid: state.head_oid,
+                            viewer: state.viewer,
+                            files: state
+                                .files
+                                .into_iter()
+                                .map(|file| (file.path, file.status))
+                                .collect(),
+                            complete: state.complete,
+                        };
+                        this.pr_viewed.complete_read(&key, token, snapshot)
+                    }
+                    Err(error) => this.pr_viewed.fail_read(&key, token, error),
+                };
+                if applied {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Writes one file's Viewed marker for the signed-in account. No dialog;
+    /// the marker stays pending until the readback agrees.
+    fn set_pr_file_viewed(&mut self, path: String, viewed: bool, cx: &mut Context<Self>) {
+        let Some(key) = self.current_pr_key() else {
+            return;
+        };
+        let Some(url) = self.selected_pr_detail_url(&key) else {
+            return;
+        };
+        let Some(pull_request_id) = self
+            .pr_viewed
+            .get(&key)
+            .and_then(|state| state.snapshot.as_ref())
+            .map(|snapshot| snapshot.pull_request_id.clone())
+        else {
+            return;
+        };
+        let Some(token) = self.pr_viewed.begin_write(&key, path.clone(), viewed) else {
+            return;
+        };
+        let transport = self.viewed_transport.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let work_dir = key.project.clone();
+            let write_url = url.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    (transport.write)(work_dir, write_url, pull_request_id, path, viewed)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let applied = this.pr_viewed.complete_write(&key, token, result.clone());
+                if applied {
+                    cx.notify();
+                }
+                if applied && result.is_ok() {
+                    // A confirmed write is only displayed once the readback
+                    // agrees; an unconfirmed write stays blocked until a
+                    // refresh settles it. The readback targets the PR this
+                    // write landed on, not whatever is now selected.
+                    this.refresh_pr_viewed_for(key, url, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Selects and reveals the next file without a confirmed Viewed marker.
+    /// Navigation never marks a file; the trigger keeps its focus.
+    fn select_next_unviewed(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.current_pr_key() else {
+            return;
+        };
+        let Some(detail) = self
+            .pr_detail
+            .as_ref()
+            .filter(|detail| detail.number == key.number)
+        else {
+            return;
+        };
+        let snapshot = self
+            .pr_viewed
+            .get(&key)
+            .and_then(|state| state.snapshot.as_ref());
+        let Some(target) = next_unviewed_file(
+            snapshot,
+            &detail.files,
+            self.pr_selections.selected_file(&key),
+        ) else {
+            return;
+        };
+        let path = target.to_owned();
+        if let Some(ix) = detail.files.iter().position(|file| file.path == path) {
+            self.pr_file_list_state.scroll_to_reveal_item(ix);
+        }
+        self.select_pr_file(path, cx);
     }
 
     fn linked_pr_task(
@@ -3088,14 +3247,21 @@ impl GitHubView {
             return div().into_any_element();
         };
         let selected = self.current_pr_file() == Some(file.path.as_str());
+        let marker = self
+            .current_pr_key()
+            .and_then(|key| self.pr_viewed.get(&key))
+            .and_then(|state| state.marker_label(&file.path));
         let path = file.path.clone();
         let theme = cx.theme().colors;
         div()
             .id(SharedString::from(format!("github-pr-file-{}", file.path)))
             .role(Role::ListItem)
             .aria_label(format!(
-                "{}: +{} −{}",
-                file.path, file.additions, file.deletions
+                "{}: +{} −{}{}",
+                file.path,
+                file.additions,
+                file.deletions,
+                marker.map(|text| format!(" · {text}")).unwrap_or_default()
             ))
             .aria_selected(selected)
             .px_3()
@@ -3131,8 +3297,11 @@ impl GitHubView {
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .child(format!(
-                        "+{} −{} · {}",
-                        file.additions, file.deletions, file.change_type
+                        "+{} −{} · {}{}",
+                        file.additions,
+                        file.deletions,
+                        file.change_type,
+                        marker.map(|text| format!(" · {text}")).unwrap_or_default()
                     )),
             )
             .into_any_element()
@@ -3438,6 +3607,130 @@ impl GitHubView {
         if file_count == 0 {
             return self.render_empty("No changed files reported.", cx);
         }
+        let key = self.current_pr_key();
+        let listed_files = self
+            .pr_detail
+            .as_ref()
+            .map(|detail| detail.files.as_slice())
+            .unwrap_or(&[]);
+        // The displayed detail may still belong to another same-numbered PR;
+        // viewed markers are per-repo state, so they only show when the URL
+        // proves the detail is the selected row's pull request.
+        let detail_matches = key
+            .as_ref()
+            .is_some_and(|key| self.selected_pr_detail_url(key).is_some());
+        let viewed_state = if detail_matches {
+            key.as_ref().and_then(|key| self.pr_viewed.get(key))
+        } else {
+            None
+        };
+        let snapshot = viewed_state.and_then(|state| state.snapshot.as_ref());
+        let loading = viewed_state.is_some_and(|state| state.loading);
+        let (viewed_count, listed_count, all_viewed) =
+            pr_viewed_progress(snapshot, listed_files);
+        let progress_label = if (loading && snapshot.is_none()) || !detail_matches {
+            "Loading viewed status…".to_owned()
+        } else if all_viewed {
+            "All listed files viewed".to_owned()
+        } else {
+            let mut label = format!("{viewed_count} of {listed_count} listed files viewed");
+            if snapshot.is_some_and(|snap| !snap.complete) {
+                label.push_str(" · status partial");
+            }
+            if loading {
+                label.push_str(" · refreshing…");
+            }
+            label
+        };
+        let selected_path = key
+            .as_ref()
+            .and_then(|key| self.pr_selections.selected_file(key))
+            .map(str::to_owned);
+        let viewed_checkbox = selected_path.clone().map(|path| {
+            let pending = viewed_state
+                .and_then(|state| state.pending_write.as_ref())
+                .filter(|write| write.path == path);
+            let checked = pending.map(|write| write.viewed).unwrap_or_else(|| {
+                snapshot.map(|snap| snap.status(&path)) == Some(PrFileViewedStatus::Viewed)
+            });
+            let enabled = viewed_state.is_some_and(|state| state.write_allowed(&path))
+                && !self.diff_loading
+                && self.diff_error.is_none();
+            let help: SharedString = if let Some(write) = pending {
+                if write.uncertain {
+                    format!("{path}: couldn't confirm — use Refresh to settle").into()
+                } else {
+                    format!("{path}: saving to GitHub…").into()
+                }
+            } else if enabled {
+                format!("{path}: saved to GitHub for your signed-in account").into()
+            } else if loading {
+                format!("{path}: loading viewed status…").into()
+            } else if self.diff_loading || self.diff_error.is_some() {
+                format!("{path}: load the diff before marking viewed").into()
+            } else {
+                format!("{path}: viewed status unavailable — refresh to retry").into()
+            };
+            let click_path = path.clone();
+            Checkbox::new("github-pr-viewed")
+                .accessibility_label(help.clone())
+                .label("Viewed")
+                .checked(checked)
+                .disabled(!enabled)
+                .small()
+                .tooltip(help)
+                .on_click(cx.listener(move |this, checked, _window, cx| {
+                    this.set_pr_file_viewed(click_path.clone(), *checked, cx);
+                }))
+        });
+        let next_target = next_unviewed_file(snapshot, listed_files, selected_path.as_deref());
+        let next_help: SharedString = if next_target.is_some() {
+            "Select the next file without a viewed marker".into()
+        } else {
+            "No other unviewed files".into()
+        };
+        let toolbar = div()
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_x_3()
+            .gap_y_1()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(progress_label),
+            )
+            .children(viewed_checkbox)
+            .child(div().flex_1())
+            .child(
+                Button::new("github-pr-next-unviewed")
+                    .ghost()
+                    .small()
+                    .label("Next unviewed")
+                    .disabled(next_target.is_none())
+                    .accessibility_label(next_help.clone())
+                    .tooltip(next_help)
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.select_next_unviewed(cx);
+                    })),
+            )
+            .children(
+                viewed_state
+                    .and_then(|state| state.error.clone())
+                    .map(|error| {
+                        div()
+                            .w_full()
+                            .text_xs()
+                            .text_color(theme.danger)
+                            .child(error)
+                    }),
+            );
         let diff_status = if self.diff_loading {
             Some(
                 div()
@@ -3463,9 +3756,16 @@ impl GitHubView {
             .size_full()
             .min_h_0()
             .flex()
+            .flex_col()
+            .child(toolbar)
             .child(
                 div()
-                    .id("github-pr-file-list")
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(
+                        div()
+                            .id("github-pr-file-list")
                     .role(Role::List)
                     .relative()
                     .w_64()
@@ -3505,6 +3805,7 @@ impl GitHubView {
                             .size_full()
                             .p_4()
                     })),
+            ),
             )
             .into_any_element()
     }
@@ -4149,18 +4450,22 @@ mod tests {
         linked_session_ids, linked_session_status, linked_sessions_across_projects,
         list_count_splice, merge_pr_timeline, pr_check_label, pr_diff_result_matches_request,
         pr_file_action_ix, pr_publish_control, pr_publish_refresh_matches_selection,
-        prepare_selected_diff, selected_file_diff, selected_issue_after_refresh, GitHubItemKey,
-        GitHubRequest, GitHubScope, GitHubStateFilter, GitHubTab, GitHubView, PrCommentControl,
-        PrCommentDrafts, PrCommentPhase, PrDetailTab, PrDiffRequest, PrFileAction, PrReadback,
-        PrReplyTarget, PrTimelineKind, PrWorkspaceKey, PrWorkspaceSelections, ScopedIssue,
+        next_unviewed_file, prepare_selected_diff, pr_viewed_progress, selected_file_diff,
+        selected_issue_after_refresh, GitHubItemKey, GitHubRequest, GitHubScope, GitHubStateFilter,
+        GitHubTab, GitHubView, PrCommentControl, PrCommentDrafts, PrCommentPhase, PrDetailTab,
+        PrDiffRequest, PrFileAction, PrReadback, PrReplyTarget, PrTimelineKind, PrViewedSnapshot,
+        PrViewedStates, PrViewedTransport, PrWorkspaceKey, PrWorkspaceSelections, ScopedIssue,
         ScopedPr,
     };
     use threadlane_ui_state::{AppState, SessionHealth, SessionInfo};
     use gpui::{AppContext as _, Focusable as _};
     use std::path::PathBuf;
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::sync::{Arc, Mutex};
     use threadlane_git::{
-        GitHubIssueRef, GitHubIssueSummary, GitHubPrFile, GitHubPrInfo, GitHubPullRequestSummary,
-        PrCheckStatus, PrConversationComment, PrReview, PrReviewComment,
+        GitHubIssueRef, GitHubIssueSummary, GitHubPrFile, GitHubPrFileViewed, GitHubPrInfo,
+        GitHubPrViewedState, GitHubPullRequestSummary, PrCheckStatus, PrConversationComment,
+        PrFileViewedStatus, PrReview, PrReviewComment,
     };
 
     fn issue(number: u64) -> GitHubIssueSummary {
@@ -4234,12 +4539,15 @@ mod tests {
             summary: GitHubPullRequestSummary {
                 number: key.number,
                 title: "Inspect PR".into(),
+                url: "https://github.com/threadlane/app/pull/42".into(),
                 ..Default::default()
             },
         }];
         view.pr_detail = Some(GitHubPrInfo {
             number: key.number,
             title: "Inspect PR".into(),
+            url: "https://github.com/threadlane/app/pull/42".into(),
+            head_oid: "head-42".into(),
             files: files.clone(),
             ..Default::default()
         });
@@ -6298,5 +6606,678 @@ mod tests {
             cx.notify();
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    fn pr_viewed_key() -> PrWorkspaceKey {
+        PrWorkspaceKey {
+            project: PathBuf::from("/projects/app"),
+            number: 42,
+        }
+    }
+
+    fn viewed_fixture(files: &[(&str, PrFileViewedStatus)]) -> GitHubPrViewedState {
+        GitHubPrViewedState {
+            pull_request_id: "PR-node-1".into(),
+            head_oid: "head-42".into(),
+            viewer: "octocat".into(),
+            files: files
+                .iter()
+                .map(|(path, status)| GitHubPrFileViewed {
+                    path: (*path).into(),
+                    status: *status,
+                })
+                .collect(),
+            complete: true,
+        }
+    }
+
+    fn viewed_snapshot(files: &[(&str, PrFileViewedStatus)]) -> PrViewedSnapshot {
+        let state = viewed_fixture(files);
+        PrViewedSnapshot {
+            pull_request_id: state.pull_request_id,
+            head_oid: state.head_oid,
+            viewer: state.viewer,
+            files: state
+                .files
+                .into_iter()
+                .map(|file| (file.path, file.status))
+                .collect(),
+            complete: state.complete,
+        }
+    }
+
+    /// Transport with test-driven reads/writes: every call announces itself on
+    /// a request channel, then blocks until the test sends the response.
+    /// Requests are observed with `recv()` (wait until issued) and
+    /// `try_recv()` (assert none issued after `run_until_parked`).
+    fn fake_viewed_transport() -> (
+        PrViewedTransport,
+        Receiver<String>,
+        Receiver<(String, String, bool)>,
+        Sender<Result<GitHubPrViewedState, String>>,
+        Sender<Result<(), String>>,
+    ) {
+        let (read_resp_tx, read_resp_rx) = channel::<Result<GitHubPrViewedState, String>>();
+        let (write_resp_tx, write_resp_rx) = channel::<Result<(), String>>();
+        let (read_req_tx, read_req_rx) = channel::<String>();
+        let (write_req_tx, write_req_rx) = channel::<(String, String, bool)>();
+        let read_resp_rx = Mutex::new(read_resp_rx);
+        let write_resp_rx = Mutex::new(write_resp_rx);
+        let transport = PrViewedTransport {
+            read: Arc::new(move |_dir, url| {
+                read_req_tx.send(url).unwrap();
+                read_resp_rx
+                    .lock()
+                    .unwrap()
+                    .recv()
+                    .unwrap_or_else(|_| Err("read dropped".to_owned()))
+            }),
+            write: Arc::new(move |_dir, _url, pull_request_id, path, viewed| {
+                write_req_tx.send((pull_request_id, path, viewed)).unwrap();
+                write_resp_rx
+                    .lock()
+                    .unwrap()
+                    .recv()
+                    .unwrap_or_else(|_| Err("write dropped".to_owned()))
+            }),
+        };
+        (transport, read_req_rx, write_req_rx, read_resp_tx, write_resp_tx)
+    }
+
+    #[test]
+    fn viewed_state_lifecycle_guards_writes_and_tokens() {
+        let key = pr_viewed_key();
+        let mut states = PrViewedStates::default();
+        // Nothing may be written without a confirmed snapshot.
+        assert!(states.begin_write(&key, "src/lib.rs".into(), true).is_none());
+        let first = states.begin_read(&key);
+        assert!(states.fail_read(&key, first, "offline".into()));
+        assert_eq!(states.get(&key).unwrap().error.as_deref(), Some("offline"));
+
+        let second = states.begin_read(&key);
+        // A stale completion for the older attempt is dropped.
+        assert!(!states.complete_read(&key, first, viewed_snapshot(&[])));
+        assert!(states.complete_read(
+            &key,
+            second,
+            viewed_snapshot(&[
+                ("src/lib.rs", PrFileViewedStatus::Viewed),
+                ("src/view.rs", PrFileViewedStatus::Unviewed),
+            ])
+        ));
+        let state = states.get(&key).unwrap();
+        assert!(state.error.is_none());
+        assert!(!state.loading);
+        assert_eq!(state.marker_label("src/lib.rs"), Some("Viewed"));
+        assert_eq!(state.marker_label("src/view.rs"), None);
+
+        // Writes require the observed head to match the snapshot's head.
+        assert!(states.begin_write(&key, "src/view.rs".into(), true).is_none());
+        states.observe_head(&key, "head-other");
+        assert!(states.begin_write(&key, "src/view.rs".into(), true).is_none());
+        states.observe_head(&key, "head-42");
+        let write = states.begin_write(&key, "src/view.rs".into(), true).unwrap();
+        // Repeat activation is blocked while a write is pending, and a
+        // refresh cannot race the unconfirmed mutation.
+        assert!(states.begin_write(&key, "src/view.rs".into(), true).is_none());
+        assert!(!states.refresh_allowed(&key));
+        assert_eq!(
+            states.get(&key).unwrap().marker_label("src/view.rs"),
+            Some("Saving…")
+        );
+        assert!(states.complete_write(&key, write, Ok(())));
+        assert!(states.refresh_allowed(&key));
+
+        // A confirmed write is still pending: no rewrites until its readback
+        // settles, and a failed readback is awaiting verification — not rolled
+        // back to the pre-write marker.
+        assert!(states.begin_write(&key, "src/lib.rs".into(), false).is_none());
+        let readback = states.begin_read(&key);
+        assert!(states.fail_read(&key, readback, "readback offline".into()));
+        let state = states.get(&key).unwrap();
+        assert_eq!(state.error.as_deref(), Some("readback offline"));
+        assert_eq!(
+            state.marker_label("src/view.rs"),
+            Some("Couldn't confirm — refresh to settle")
+        );
+        let settle = states.begin_read(&key);
+        assert!(states.complete_read(
+            &key,
+            settle,
+            viewed_snapshot(&[
+                ("src/lib.rs", PrFileViewedStatus::Viewed),
+                ("src/view.rs", PrFileViewedStatus::Viewed),
+            ])
+        ));
+        assert!(states.get(&key).unwrap().pending_write.is_none());
+
+        // An unconfirmed write stays blocked until a refresh settles it.
+        let write = states.begin_write(&key, "src/lib.rs".into(), false).unwrap();
+        assert!(states.complete_write(&key, write, Err("timed out".into())));
+        let state = states.get(&key).unwrap();
+        assert_eq!(state.error.as_deref(), Some("timed out"));
+        assert_eq!(
+            state.marker_label("src/lib.rs"),
+            Some("Couldn't confirm — refresh to settle")
+        );
+        assert!(states.begin_write(&key, "src/lib.rs".into(), false).is_none());
+        assert!(states.refresh_allowed(&key));
+        let readback = states.begin_read(&key);
+        assert!(states.complete_read(
+            &key,
+            readback,
+            viewed_snapshot(&[
+                ("src/lib.rs", PrFileViewedStatus::Unviewed),
+                ("src/view.rs", PrFileViewedStatus::Viewed),
+            ])
+        ));
+        let state = states.get(&key).unwrap();
+        assert!(state.pending_write.is_none());
+        assert!(state.error.is_none());
+        assert_eq!(state.marker_label("src/view.rs"), Some("Viewed"));
+        assert!(state.write_allowed("src/lib.rs"));
+    }
+
+    #[test]
+    fn next_unviewed_file_wraps_once_and_skips_viewed() {
+        let files = vec![
+            GitHubPrFile {
+                path: "a.rs".into(),
+                ..Default::default()
+            },
+            GitHubPrFile {
+                path: "b.rs".into(),
+                ..Default::default()
+            },
+            GitHubPrFile {
+                path: "dir/c.rs".into(),
+                ..Default::default()
+            },
+        ];
+        let snap = viewed_snapshot(&[
+            ("a.rs", PrFileViewedStatus::Viewed),
+            ("b.rs", PrFileViewedStatus::Unviewed),
+            ("dir/c.rs", PrFileViewedStatus::ChangedSinceViewed),
+        ]);
+        assert_eq!(next_unviewed_file(Some(&snap), &files, Some("a.rs")), Some("b.rs"));
+        // Wraps once past the end and skips viewed files.
+        assert_eq!(next_unviewed_file(Some(&snap), &files, Some("dir/c.rs")), Some("b.rs"));
+        // Never returns the current file.
+        assert_eq!(next_unviewed_file(Some(&snap), &files, Some("b.rs")), Some("dir/c.rs"));
+        // No snapshot → nothing is known-unviewed.
+        assert_eq!(next_unviewed_file(None, &files, Some("a.rs")), None);
+        let all_viewed = viewed_snapshot(&[
+            ("a.rs", PrFileViewedStatus::Viewed),
+            ("b.rs", PrFileViewedStatus::Viewed),
+            ("dir/c.rs", PrFileViewedStatus::Viewed),
+        ]);
+        assert_eq!(next_unviewed_file(Some(&all_viewed), &files, Some("a.rs")), None);
+        // A renamed basename does not inherit another path's marker.
+        let renamed = viewed_snapshot(&[("dir/c.rs", PrFileViewedStatus::Viewed)]);
+        let renamed_files = vec![
+            GitHubPrFile {
+                path: "other/c.rs".into(),
+                ..Default::default()
+            },
+            GitHubPrFile {
+                path: "d.rs".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            next_unviewed_file(Some(&renamed), &renamed_files, Some("d.rs")),
+            Some("other/c.rs")
+        );
+
+        let (viewed, total, all) = pr_viewed_progress(Some(&snap), &files);
+        assert_eq!((viewed, total, all), (1, 3, false));
+        let (viewed, total, all) = pr_viewed_progress(Some(&all_viewed), &files);
+        assert_eq!((viewed, total, all), (3, 3, true));
+        assert_eq!(pr_viewed_progress(None, &files), (0, 3, false));
+        // A file missing from the snapshot is not confirmed viewed.
+        let partial = viewed_snapshot(&[
+            ("a.rs", PrFileViewedStatus::Viewed),
+            ("b.rs", PrFileViewedStatus::Viewed),
+        ]);
+        assert_eq!(pr_viewed_progress(Some(&partial), &files), (2, 3, false));
+    }
+
+    /// Reads and writes run on the background executor during
+    /// `run_until_parked`, so responses are queued first and requests are
+    /// observed afterwards with `try_recv`; a wrongly-issued call blocks and
+    /// fails via timeout instead of passing silently.
+    #[gpui::test]
+    fn github_pr_viewed_markers_settle_through_readback(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            super::init(cx);
+        });
+        let key = pr_viewed_key();
+        let (transport, read_req, write_req, read_resp, write_resp) = fake_viewed_transport();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let model = cx.new(|_| AppState::default());
+            let mut view = GitHubView::new(model, window, cx);
+            view.viewed_transport = transport;
+            configure_pr_workspace(&mut view, cx);
+            view.pr_viewed.observe_head(&key, "head-42");
+            view
+        });
+
+        // Entering the Code tab queues one read: loading, no false zero.
+        view.update(cx, |view, cx| view.select_pr_tab(PrDetailTab::Code, cx));
+        view.read_with(cx, |view, _| {
+            let state = view.pr_viewed.get(&key).unwrap();
+            assert!(state.loading);
+            assert!(state.snapshot.is_none());
+        });
+        read_resp
+            .send(Ok(viewed_fixture(&[
+                ("src/lib.rs", PrFileViewedStatus::Viewed),
+                ("src/view.rs", PrFileViewedStatus::Unviewed),
+            ])))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            read_req.try_recv().unwrap(),
+            "https://github.com/threadlane/app/pull/42"
+        );
+        view.read_with(cx, |view, _| {
+            let state = view.pr_viewed.get(&key).unwrap();
+            assert!(!state.loading);
+            let snap = state.snapshot.as_ref().unwrap();
+            assert_eq!(snap.viewer, "octocat");
+            assert_eq!(snap.status("src/lib.rs"), PrFileViewedStatus::Viewed);
+            assert!(state.write_allowed("src/view.rs"));
+        });
+
+        // Check writes one mutation for the signed-in account's marker, with a
+        // visible pending label until the readback settles.
+        view.update(cx, |view, cx| {
+            view.set_pr_file_viewed("src/view.rs".into(), true, cx)
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.pr_viewed.get(&key).unwrap().marker_label("src/view.rs"),
+                Some("Saving…")
+            );
+        });
+        // Repeat activation is blocked while the write is pending.
+        view.update(cx, |view, cx| {
+            view.set_pr_file_viewed("src/lib.rs".into(), false, cx)
+        });
+        // A confirmed write triggers readback; the confirmed count only
+        // changes once the fresh snapshot lands.
+        write_resp.send(Ok(())).unwrap();
+        read_resp
+            .send(Ok(viewed_fixture(&[
+                ("src/lib.rs", PrFileViewedStatus::Viewed),
+                ("src/view.rs", PrFileViewedStatus::Viewed),
+            ])))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            write_req.try_recv().unwrap(),
+            ("PR-node-1".into(), "src/view.rs".into(), true)
+        );
+        assert!(write_req.try_recv().is_err());
+        assert_eq!(
+            read_req.try_recv().unwrap(),
+            "https://github.com/threadlane/app/pull/42"
+        );
+        view.read_with(cx, |view, _| {
+            let state = view.pr_viewed.get(&key).unwrap();
+            assert!(!state.loading);
+            assert!(state.error.is_none());
+            assert!(state.pending_write.is_none());
+            assert_eq!(
+                state.snapshot.as_ref().unwrap().status("src/view.rs"),
+                PrFileViewedStatus::Viewed
+            );
+            assert_eq!(state.marker_label("src/view.rs"), Some("Viewed"));
+        });
+    }
+
+    #[gpui::test]
+    fn github_pr_viewed_uncertain_write_blocks_until_refresh(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            super::init(cx);
+        });
+        let key = pr_viewed_key();
+        let (transport, read_req, write_req, read_resp, write_resp) = fake_viewed_transport();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let model = cx.new(|_| AppState::default());
+            let mut view = GitHubView::new(model, window, cx);
+            view.viewed_transport = transport;
+            configure_pr_workspace(&mut view, cx);
+            view.pr_viewed.observe_head(&key, "head-42");
+            view
+        });
+        view.update(cx, |view, cx| view.select_pr_tab(PrDetailTab::Code, cx));
+        read_resp
+            .send(Ok(viewed_fixture(&[
+                ("src/lib.rs", PrFileViewedStatus::Unviewed),
+                ("src/view.rs", PrFileViewedStatus::Unviewed),
+            ])))
+            .unwrap();
+        cx.run_until_parked();
+        read_req.try_recv().unwrap();
+
+        view.update(cx, |view, cx| {
+            view.set_pr_file_viewed("src/lib.rs".into(), true, cx)
+        });
+        write_resp.send(Err("request timed out".into())).unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            write_req.try_recv().unwrap(),
+            ("PR-node-1".into(), "src/lib.rs".into(), true)
+        );
+        view.read_with(cx, |view, _| {
+            let state = view.pr_viewed.get(&key).unwrap();
+            assert_eq!(state.error.as_deref(), Some("request timed out"));
+            assert_eq!(
+                state.marker_label("src/lib.rs"),
+                Some("Couldn't confirm — refresh to settle")
+            );
+            // The snapshot still reports the last confirmed state, not a guess.
+            assert_eq!(
+                state.snapshot.as_ref().unwrap().status("src/lib.rs"),
+                PrFileViewedStatus::Unviewed
+            );
+        });
+        // The uncertain outcome blocks another write until a refresh settles.
+        view.update(cx, |view, cx| {
+            view.set_pr_file_viewed("src/lib.rs".into(), true, cx)
+        });
+        cx.run_until_parked();
+        assert!(write_req.try_recv().is_err());
+        // Refresh settles it.
+        view.update(cx, |view, cx| view.refresh_pr_viewed(cx));
+        read_resp
+            .send(Ok(viewed_fixture(&[
+                ("src/lib.rs", PrFileViewedStatus::Viewed),
+                ("src/view.rs", PrFileViewedStatus::Unviewed),
+            ])))
+            .unwrap();
+        cx.run_until_parked();
+        read_req.try_recv().unwrap();
+        view.read_with(cx, |view, _| {
+            let state = view.pr_viewed.get(&key).unwrap();
+            assert!(state.error.is_none());
+            assert!(state.pending_write.is_none());
+            assert_eq!(
+                state.snapshot.as_ref().unwrap().status("src/lib.rs"),
+                PrFileViewedStatus::Viewed
+            );
+            assert!(state.write_allowed("src/lib.rs"));
+        });
+    }
+
+    #[gpui::test]
+    fn github_pr_viewed_failed_readback_stays_uncertain(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            super::init(cx);
+        });
+        let key = pr_viewed_key();
+        let (transport, read_req, write_req, read_resp, write_resp) = fake_viewed_transport();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let model = cx.new(|_| AppState::default());
+            let mut view = GitHubView::new(model, window, cx);
+            view.viewed_transport = transport;
+            configure_pr_workspace(&mut view, cx);
+            view.pr_viewed.observe_head(&key, "head-42");
+            view
+        });
+        view.update(cx, |view, cx| view.select_pr_tab(PrDetailTab::Code, cx));
+        read_resp
+            .send(Ok(viewed_fixture(&[
+                ("src/lib.rs", PrFileViewedStatus::Unviewed),
+                ("src/view.rs", PrFileViewedStatus::Unviewed),
+            ])))
+            .unwrap();
+        cx.run_until_parked();
+        read_req.try_recv().unwrap();
+
+        // The write is confirmed, but its readback fails: the marker is
+        // awaiting verification — blocked, never rolled back to pre-write.
+        view.update(cx, |view, cx| {
+            view.set_pr_file_viewed("src/lib.rs".into(), true, cx)
+        });
+        write_resp.send(Ok(())).unwrap();
+        read_resp.send(Err("connection reset".into())).unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            write_req.try_recv().unwrap(),
+            ("PR-node-1".into(), "src/lib.rs".into(), true)
+        );
+        read_req.try_recv().unwrap();
+        view.read_with(cx, |view, _| {
+            let state = view.pr_viewed.get(&key).unwrap();
+            assert!(!state.loading);
+            assert_eq!(state.error.as_deref(), Some("connection reset"));
+            assert!(state.pending_write.as_ref().unwrap().uncertain);
+            assert_eq!(
+                state.marker_label("src/lib.rs"),
+                Some("Couldn't confirm — refresh to settle")
+            );
+            assert!(!state.write_allowed("src/lib.rs"));
+            assert_eq!(
+                state.snapshot.as_ref().unwrap().status("src/lib.rs"),
+                PrFileViewedStatus::Unviewed
+            );
+        });
+        view.update(cx, |view, cx| {
+            view.set_pr_file_viewed("src/lib.rs".into(), true, cx)
+        });
+        cx.run_until_parked();
+        assert!(write_req.try_recv().is_err());
+        // A refresh settles it.
+        view.update(cx, |view, cx| view.refresh_pr_viewed(cx));
+        read_resp
+            .send(Ok(viewed_fixture(&[
+                ("src/lib.rs", PrFileViewedStatus::Viewed),
+                ("src/view.rs", PrFileViewedStatus::Unviewed),
+            ])))
+            .unwrap();
+        cx.run_until_parked();
+        read_req.try_recv().unwrap();
+        view.read_with(cx, |view, _| {
+            let state = view.pr_viewed.get(&key).unwrap();
+            assert!(state.pending_write.is_none());
+            assert!(state.error.is_none());
+            assert_eq!(
+                state.snapshot.as_ref().unwrap().status("src/lib.rs"),
+                PrFileViewedStatus::Viewed
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn github_pr_viewed_superseded_reads_and_blocked_refresh(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            super::init(cx);
+        });
+        let key = pr_viewed_key();
+        let (transport, read_req, write_req, read_resp, write_resp) = fake_viewed_transport();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let model = cx.new(|_| AppState::default());
+            let mut view = GitHubView::new(model, window, cx);
+            view.viewed_transport = transport;
+            configure_pr_workspace(&mut view, cx);
+            view.pr_viewed.observe_head(&key, "head-42");
+            view
+        });
+        // Two reads race: the refresh supersedes the entry read, so the
+        // superseded response is dropped even though it arrives first.
+        view.update(cx, |view, cx| view.select_pr_tab(PrDetailTab::Code, cx));
+        view.update(cx, |view, cx| view.refresh_pr_viewed(cx));
+        read_resp
+            .send(Ok(viewed_fixture(&[
+                ("src/lib.rs", PrFileViewedStatus::Viewed),
+                ("src/view.rs", PrFileViewedStatus::Viewed),
+            ])))
+            .unwrap();
+        read_resp
+            .send(Ok(viewed_fixture(&[
+                ("src/lib.rs", PrFileViewedStatus::Viewed),
+                ("src/view.rs", PrFileViewedStatus::Unviewed),
+            ])))
+            .unwrap();
+        cx.run_until_parked();
+        read_req.try_recv().unwrap();
+        read_req.try_recv().unwrap();
+        view.read_with(cx, |view, _| {
+            let state = view.pr_viewed.get(&key).unwrap();
+            assert!(!state.loading);
+            assert_eq!(
+                state.snapshot.as_ref().unwrap().status("src/view.rs"),
+                PrFileViewedStatus::Unviewed
+            );
+        });
+
+        // An in-flight write blocks refreshes until its readback.
+        view.update(cx, |view, cx| {
+            view.set_pr_file_viewed("src/view.rs".into(), true, cx)
+        });
+        view.update(cx, |view, cx| view.refresh_pr_viewed(cx));
+        write_resp.send(Ok(())).unwrap();
+        read_resp
+            .send(Ok(viewed_fixture(&[
+                ("src/lib.rs", PrFileViewedStatus::Viewed),
+                ("src/view.rs", PrFileViewedStatus::Viewed),
+            ])))
+            .unwrap();
+        cx.run_until_parked();
+        write_req.try_recv().unwrap();
+        // Exactly one more read — the write's own readback, never the
+        // refresh refused while the write was pending.
+        read_req.try_recv().unwrap();
+        assert!(read_req.try_recv().is_err());
+        view.read_with(cx, |view, _| {
+            let state = view.pr_viewed.get(&key).unwrap();
+            assert!(!state.loading);
+            assert_eq!(
+                state.snapshot.as_ref().unwrap().status("src/view.rs"),
+                PrFileViewedStatus::Viewed
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn github_pr_viewed_next_unviewed_selects_and_skips(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            super::init(cx);
+        });
+        let key = pr_viewed_key();
+        let (transport, read_req, write_req, read_resp, _write_resp) =
+            fake_viewed_transport();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let model = cx.new(|_| AppState::default());
+            let mut view = GitHubView::new(model, window, cx);
+            view.viewed_transport = transport;
+            configure_pr_workspace(&mut view, cx);
+            view
+        });
+        view.update(cx, |view, cx| view.select_pr_tab(PrDetailTab::Code, cx));
+        read_resp
+            .send(Ok(viewed_fixture(&[
+                ("src/lib.rs", PrFileViewedStatus::Viewed),
+                ("src/view.rs", PrFileViewedStatus::Unviewed),
+            ])))
+            .unwrap();
+        cx.run_until_parked();
+        read_req.try_recv().unwrap();
+        // From viewed lib.rs, Next unviewed selects view.rs — without marking.
+        view.update(cx, |view, cx| view.select_next_unviewed(cx));
+        cx.run_until_parked();
+        assert!(write_req.try_recv().is_err());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.current_pr_file(), Some("src/view.rs"));
+            assert_eq!(
+                view.pr_viewed
+                    .get(&key)
+                    .unwrap()
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .status("src/view.rs"),
+                PrFileViewedStatus::Unviewed
+            );
+        });
+        // Everything confirmed viewed: no other target exists.
+        view.update(cx, |view, cx| view.refresh_pr_viewed(cx));
+        read_resp
+            .send(Ok(viewed_fixture(&[
+                ("src/lib.rs", PrFileViewedStatus::Viewed),
+                ("src/view.rs", PrFileViewedStatus::Viewed),
+            ])))
+            .unwrap();
+        cx.run_until_parked();
+        read_req.try_recv().unwrap();
+        view.update(cx, |view, cx| view.select_next_unviewed(cx));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.current_pr_file(), Some("src/view.rs"));
+        });
+    }
+
+    #[gpui::test]
+    fn github_pr_viewed_results_stay_under_their_pr_key(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            super::init(cx);
+        });
+        let key = pr_viewed_key();
+        let (transport, read_req, _write_req, read_resp, _write_resp) =
+            fake_viewed_transport();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let model = cx.new(|_| AppState::default());
+            let mut view = GitHubView::new(model, window, cx);
+            view.viewed_transport = transport;
+            configure_pr_workspace(&mut view, cx);
+            view
+        });
+        view.update(cx, |view, cx| view.select_pr_tab(PrDetailTab::Code, cx));
+
+        // Selection moves to a same-numbered PR in another repository before
+        // the delayed read lands; the still-displayed detail belongs to the
+        // first repo, so the URL guard refuses a read for the new selection.
+        view.update(cx, |view, cx| {
+            view.selected_pr = Some(GitHubItemKey {
+                project: PathBuf::from("/projects/other"),
+                number: 42,
+            });
+            view.pull_requests.push(ScopedPr {
+                project: PathBuf::from("/projects/other"),
+                project_name: "other".into(),
+                summary: GitHubPullRequestSummary {
+                    number: 42,
+                    url: "https://github.com/threadlane/other/pull/42".into(),
+                    ..Default::default()
+                },
+            });
+            view.refresh_pr_viewed(cx);
+        });
+        read_resp
+            .send(Ok(viewed_fixture(&[("src/lib.rs", PrFileViewedStatus::Viewed)])))
+            .unwrap();
+        cx.run_until_parked();
+        read_req.try_recv().unwrap();
+        assert!(read_req.try_recv().is_err());
+        view.read_with(cx, |view, _| {
+            assert!(view
+                .pr_viewed
+                .get(&key)
+                .is_some_and(|state| state.snapshot.is_some()));
+            let other = PrWorkspaceKey {
+                project: PathBuf::from("/projects/other"),
+                number: 42,
+            };
+            assert!(view.pr_viewed.get(&other).is_none());
+        });
     }
 }

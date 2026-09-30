@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::Sizable;
 use threadlane_git::{
-    GitHubIssueDetail, GitHubIssueSummary, GitHubPrFile, GitHubPrInfo, GitHubPullRequestSummary,
+    GitHubIssueDetail, GitHubIssueSummary, GitHubPrFile, GitHubPrInfo, GitHubPrViewedState,
+    GitHubPullRequestSummary, PrFileViewedStatus,
 };
 
 use threadlane_ui_state::SessionInfo;
@@ -287,6 +289,299 @@ impl PrWorkspaceSelections {
             return;
         }
         state.selected_file = files.first().map(|file| file.path.clone());
+    }
+}
+
+/// Confirmed snapshot of one signed-in account's Viewed markers for a PR.
+/// Markers are keyed by exact path — renames never inherit a basename's state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PrViewedSnapshot {
+    /// GitHub node ID the mark/unmark mutations target.
+    pub pull_request_id: String,
+    /// Head OID the markers were read against.
+    pub head_oid: String,
+    /// Account these personal markers belong to.
+    pub viewer: String,
+    pub files: HashMap<String, PrFileViewedStatus>,
+    /// False when pagination stopped before every file was reported.
+    pub complete: bool,
+}
+
+impl PrViewedSnapshot {
+    pub fn status(&self, path: &str) -> PrFileViewedStatus {
+        self.files
+            .get(path)
+            .copied()
+            .unwrap_or(PrFileViewedStatus::Unknown)
+    }
+}
+
+/// One in-flight (or outcome-uncertain) viewed write for a single file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrViewedWrite {
+    pub path: String,
+    pub viewed: bool,
+    pub token: u64,
+    /// The transport confirmed the mutation; the write stays pending — not
+    /// counted, not rewritable — until its readback settles.
+    pub confirmed: bool,
+    /// The transport did not confirm the outcome; GitHub may have applied the
+    /// write. Another write is blocked until a refresh settles the state.
+    pub uncertain: bool,
+}
+
+/// Ephemeral viewed-marker lifecycle for one PR workspace. The last confirmed
+/// snapshot is retained across refreshes so failures never read as a zero.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PrViewedState {
+    pub snapshot: Option<PrViewedSnapshot>,
+    pub loading: bool,
+    pub error: Option<String>,
+    /// Latest head OID observed by the PR detail fetch; writes require the
+    /// snapshot to have been read against the same head.
+    pub observed_head_oid: String,
+    /// Most recent read/write generation; delayed results are dropped unless
+    /// their token still matches.
+    pub token: u64,
+    pub pending_write: Option<PrViewedWrite>,
+}
+
+impl PrViewedState {
+    /// A file's marker may only be written from a settled, current snapshot.
+    pub fn write_allowed(&self, path: &str) -> bool {
+        let Some(snapshot) = &self.snapshot else {
+            return false;
+        };
+        !self.loading
+            && self.pending_write.is_none()
+            && !self.observed_head_oid.is_empty()
+            && snapshot.head_oid == self.observed_head_oid
+            && snapshot.files.contains_key(path)
+    }
+
+    /// Marker text for a file row: status first, then write/read phase.
+    pub fn marker_label(&self, path: &str) -> Option<&'static str> {
+        if let Some(write) = &self.pending_write {
+            if write.path == path {
+                return Some(if write.uncertain {
+                    "Couldn't confirm — refresh to settle"
+                } else {
+                    "Saving…"
+                });
+            }
+        }
+        match self.snapshot.as_ref().map(|snap| snap.status(path)) {
+            Some(PrFileViewedStatus::Viewed) => Some("Viewed"),
+            Some(PrFileViewedStatus::ChangedSinceViewed) => Some("Changed since viewed"),
+            Some(PrFileViewedStatus::Unviewed) | Some(PrFileViewedStatus::Unknown) | None => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PrViewedStates {
+    pub by_pr: HashMap<PrWorkspaceKey, PrViewedState>,
+    pub next_token: u64,
+}
+
+impl PrViewedStates {
+    pub fn get(&self, key: &PrWorkspaceKey) -> Option<&PrViewedState> {
+        self.by_pr.get(key)
+    }
+
+    /// Refreshes are blocked while a write is still in flight — a read racing
+    /// an unconfirmed mutation could return pre-write state. Uncertain and
+    /// confirmed-but-unverified writes are exactly what a refresh settles.
+    pub fn refresh_allowed(&self, key: &PrWorkspaceKey) -> bool {
+        !self.by_pr.get(key).is_some_and(|state| {
+            state
+                .pending_write
+                .as_ref()
+                .is_some_and(|write| !(write.uncertain || write.confirmed))
+        })
+    }
+
+    /// Head observed by the latest detail fetch; a mismatch disables writes
+    /// until a fresh viewed read catches up.
+    pub fn observe_head(&mut self, key: &PrWorkspaceKey, head_oid: &str) {
+        self.by_pr.entry(key.clone()).or_default().observed_head_oid = head_oid.to_owned();
+    }
+
+    pub fn begin_read(&mut self, key: &PrWorkspaceKey) -> u64 {
+        self.next_token = self.next_token.saturating_add(1);
+        let token = self.next_token;
+        let state = self.by_pr.entry(key.clone()).or_default();
+        state.loading = true;
+        state.token = token;
+        token
+    }
+
+    /// A settled read reflects every completed write and re-arms writes.
+    pub fn complete_read(
+        &mut self,
+        key: &PrWorkspaceKey,
+        token: u64,
+        snapshot: PrViewedSnapshot,
+    ) -> bool {
+        let Some(state) = self.by_pr.get_mut(key) else {
+            return false;
+        };
+        if state.token != token {
+            return false;
+        }
+        state.loading = false;
+        state.error = None;
+        state.pending_write = None;
+        state.snapshot = Some(snapshot);
+        true
+    }
+
+    pub fn fail_read(&mut self, key: &PrWorkspaceKey, token: u64, error: String) -> bool {
+        let Some(state) = self.by_pr.get_mut(key) else {
+            return false;
+        };
+        if state.token != token || !state.loading {
+            return false;
+        }
+        state.loading = false;
+        // A confirmed write whose readback failed is awaiting verification,
+        // not rolled back: the marker stays blocked until a refresh settles.
+        if let Some(write) = state.pending_write.as_mut() {
+            write.uncertain = true;
+        }
+        state.error = Some(error);
+        true
+    }
+
+    /// Starting a write bumps the generation so an older in-flight read can no
+    /// longer overwrite newer write/readback state.
+    pub fn begin_write(&mut self, key: &PrWorkspaceKey, path: String, viewed: bool) -> Option<u64> {
+        if !self
+            .by_pr
+            .get(key)
+            .is_some_and(|state| state.write_allowed(&path))
+        {
+            return None;
+        }
+        self.next_token = self.next_token.saturating_add(1);
+        let token = self.next_token;
+        let state = self.by_pr.entry(key.clone()).or_default();
+        state.token = token;
+        state.error = None;
+        state.pending_write = Some(PrViewedWrite {
+            path,
+            viewed,
+            token,
+            confirmed: false,
+            uncertain: false,
+        });
+        Some(token)
+    }
+
+    /// Result of a write. Ok means GitHub confirmed; Err may mean the write
+    /// landed anyway, so the file stays blocked until a read settles it.
+    /// Returns true when the token still matches (caller refreshes on Ok).
+    pub fn complete_write(&mut self, key: &PrWorkspaceKey, token: u64, result: Result<(), String>) -> bool {
+        let Some(state) = self.by_pr.get_mut(key) else {
+            return false;
+        };
+        let Some(write) = state.pending_write.as_mut() else {
+            return false;
+        };
+        if write.token != token {
+            return false;
+        }
+        match result {
+            Ok(()) => {
+                // Transport confirmed; keep the write pending until the
+                // readback settles so a failed readback marks it uncertain
+                // rather than silently re-arming the old marker.
+                write.confirmed = true;
+            }
+            Err(error) => {
+                write.uncertain = true;
+                state.error = Some(error);
+            }
+        }
+        true
+    }
+}
+
+/// Confirmed viewed/total counts over the listed files plus whether every
+/// listed file is confirmed Viewed. Unknown and unviewed never count.
+pub fn pr_viewed_progress(
+    snapshot: Option<&PrViewedSnapshot>,
+    listed_files: &[GitHubPrFile],
+) -> (usize, usize, bool) {
+    let total = listed_files.len();
+    let Some(snapshot) = snapshot else {
+        return (0, total, false);
+    };
+    let viewed = listed_files
+        .iter()
+        .filter(|file| snapshot.status(&file.path) == PrFileViewedStatus::Viewed)
+        .count();
+    (viewed, total, viewed == total && total > 0)
+}
+
+/// First file after `current` (wrapping once) whose marker is not confirmed
+/// Viewed. Never returns `current`, so "no other target" disables the button.
+/// Without a confirmed snapshot nothing is known-unviewed.
+pub fn next_unviewed_file<'a>(
+    snapshot: Option<&PrViewedSnapshot>,
+    listed_files: &'a [GitHubPrFile],
+    current: Option<&str>,
+) -> Option<&'a str> {
+    let snapshot = snapshot?;
+    if listed_files.is_empty() {
+        return None;
+    }
+    let current_index = current
+        .and_then(|path| listed_files.iter().position(|file| file.path == path));
+    let (start, limit) = match current_index {
+        Some(index) => (index + 1, listed_files.len() - 1),
+        None => (0, listed_files.len()),
+    };
+    listed_files
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(limit)
+        .map(|file| file.path.as_str())
+        .find(|path| snapshot.status(path) != PrFileViewedStatus::Viewed)
+}
+
+/// Transport seam for viewed-marker reads/writes. Production calls the `gh`
+/// transport in threadlane-git; interaction tests substitute delayed fakes so
+/// they never shell out or mutate real pull requests.
+#[derive(Clone)]
+pub struct PrViewedTransport {
+    /// (work_dir, pr_url) -> confirmed markers for the signed-in viewer.
+    pub read:
+        Arc<dyn Fn(PathBuf, String) -> Result<GitHubPrViewedState, String> + Send + Sync>,
+    /// (work_dir, pr_url, pull_request_id, path, viewed) -> GitHub confirmed.
+    pub write:
+        Arc<dyn Fn(PathBuf, String, String, String, bool) -> Result<(), String> + Send + Sync>,
+}
+
+impl Default for PrViewedTransport {
+    fn default() -> Self {
+        Self {
+            read: Arc::new(|work_dir, url| {
+                threadlane_git::pull_request_viewed_state(&work_dir, &url)
+                    .map_err(|error| error.message)
+            }),
+            write: Arc::new(|work_dir, url, pull_request_id, path, viewed| {
+                threadlane_git::set_pull_request_file_viewed(
+                    &work_dir,
+                    &url,
+                    &pull_request_id,
+                    &path,
+                    viewed,
+                )
+                .map_err(|error| error.message)
+            }),
+        }
     }
 }
 
