@@ -86,6 +86,15 @@ url = "2.5"
 vt100 = "0.16"
 wasmi = "2.0"
 
+# GPUI Kit's snapshot facades must all resolve to the same gpui-fast runtime.
+# Pinned to the compatibility support merged in longbridge/gpui-fast#23.
+[patch.crates-io]
+gpui-pre = { git = "https://github.com/longbridge/gpui-fast", rev = "1b381adb68a6e5a4550f73b0cd29a231ce6c7281" }
+gpui-pre-platform = { git = "https://github.com/longbridge/gpui-fast", rev = "1b381adb68a6e5a4550f73b0cd29a231ce6c7281" }
+gpui-pre-macros = { git = "https://github.com/longbridge/gpui-fast", rev = "1b381adb68a6e5a4550f73b0cd29a231ce6c7281" }
+gpui-pre-sum-tree = { git = "https://github.com/longbridge/gpui-fast", rev = "1b381adb68a6e5a4550f73b0cd29a231ce6c7281" }
+gpui-pre-web = { git = "https://github.com/longbridge/gpui-fast", rev = "1b381adb68a6e5a4550f73b0cd29a231ce6c7281" }
+
 [profile.dev]
 opt-level = 0
 debug = 0
@@ -118,13 +127,14 @@ debug-assertions = false
 [profile.dev.package.threadlane-gpui]
 opt-level = 2
 
-[profile.dev.package.gpui-pre]
+# Optimize the implementation crates, not the gpui-pre compatibility facades.
+[profile.dev.package.gpui]
 opt-level = 3
 
-[profile.dev.package.gpui-pre-platform]
+[profile.dev.package.gpui_platform]
 opt-level = 3
 
-[profile.dev.package.gpui-pre-macros]
+[profile.dev.package.gpui_macros]
 opt-level = 3
 
 [profile.dev.package.gpui-component]
