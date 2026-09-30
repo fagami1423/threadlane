@@ -3983,7 +3983,6 @@ fn environment_git_menu_dispatches_commands_and_dismisses(cx: &mut gpui::TestApp
     });
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    cx.update(|window, cx| window.draw(cx).clear(cx));
     let menu = cx.debug_bounds("environment-git-actions").unwrap();
     cx.simulate_click(menu.center(), gpui::Modifiers::default());
     cx.run_until_parked();
@@ -4453,5 +4452,336 @@ fn conversation_outline_focuses_and_jumps_to_prompts(cx: &mut gpui::TestAppConte
     chat.read_with(cx, |chat, _| {
         assert!(!chat.outline_open, "session switch closes the outline");
         assert!(chat.outline_selected_id.is_none());
+    });
+}
+
+fn file_completion_repo(files: &[&str]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let init = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git must be on PATH");
+    assert!(init.status.success(), "git init failed: {init:?}");
+    for file in files {
+        let path = dir.path().join(file);
+        std::fs::create_dir_all(path.parent().expect("repo-relative file"))
+            .expect("parent dir");
+        std::fs::write(path, "contents").expect("file write");
+    }
+    dir
+}
+
+fn mount_chat_with_work_dir<'a>(
+    cx: &'a mut gpui::TestAppContext,
+    work_dir: Option<std::path::PathBuf>,
+) -> (
+    gpui::Entity<super::ChatListView>,
+    gpui::Entity<threadlane_ui_state::AppState>,
+    &'a mut gpui::VisualTestContext,
+) {
+    use gpui::AppContext as _;
+
+    cx.update(gpui_component::init);
+    cx.update(super::init);
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::default();
+        state.active_work_dir = work_dir;
+        state.is_new_task = false;
+        state
+    });
+    let retained = model.clone();
+    let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let capture = holder.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        capture.replace(Some(chat.clone()));
+        gpui_component::Root::new(chat, window, cx)
+    });
+    let mounted = holder.borrow().as_ref().expect("mounted chat").clone();
+    (mounted, retained, cx)
+}
+
+#[gpui::test]
+fn composer_at_completion_inserts_code_span_and_preserves_text(
+    cx: &mut gpui::TestAppContext,
+) {
+    let repo = file_completion_repo(&["README.md", "src/main.rs"]);
+    let (chat, _model, cx) =
+        mount_chat_with_work_dir(cx, Some(repo.path().to_path_buf()));
+    cx.run_until_parked();
+    cx.update(|window, cx| chat.update(cx, |chat, cx| chat.focus_composer(window, cx)));
+    cx.run_until_parked();
+
+    cx.simulate_input("run @");
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    chat.read_with(cx, |chat, _| {
+        assert!(
+            matches!(
+                chat.file_completion.as_ref().map(|state| &state.status),
+                Some(super::file_completion::FileCompletionStatus::Ready(_))
+            ),
+            "picker must finish loading the git inventory"
+        );
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-completion-list").is_some());
+
+    // Empty query sorts shortest-path-first: README.md wins over src/main.rs.
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(
+            chat.input_state.read(cx).value().as_ref(),
+            "run `README.md` ",
+            "only the @ trigger range is replaced by the code span"
+        );
+        assert!(chat.file_completion.is_none(), "picker closes after insert");
+    });
+}
+
+#[gpui::test]
+fn composer_at_completion_filters_and_never_submits_on_enter(
+    cx: &mut gpui::TestAppContext,
+) {
+    let repo = file_completion_repo(&["src/main.rs", "src/lib.rs", "notes.md"]);
+    let (chat, _model, cx) =
+        mount_chat_with_work_dir(cx, Some(repo.path().to_path_buf()));
+    cx.run_until_parked();
+    cx.update(|window, cx| chat.update(cx, |chat, cx| chat.focus_composer(window, cx)));
+    cx.run_until_parked();
+
+    // A query matching nothing must still own Enter: submission clears the
+    // composer, so an unchanged value proves it never reached Send/Queue.
+    cx.simulate_input("@zzz");
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(chat.input_state.read(cx).value().as_ref(), "@zzz");
+    });
+
+    // Narrowing then accepting mid-list inserts the selected relative path.
+    chat.update_in(cx, |chat, _window, cx| {
+        chat.input_state.update(cx, |input, cx| {
+            input.set_selected_range(0..4, cx);
+        });
+    });
+    cx.simulate_input("open @src/");
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    chat.read_with(cx, |chat, _| {
+        assert!(matches!(
+            chat.file_completion.as_ref().map(|state| &state.status),
+            Some(super::file_completion::FileCompletionStatus::Ready(_))
+        ));
+    });
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, _| {
+        assert_eq!(chat.selected_file_index, 1, "Down selects the second row");
+    });
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(
+            chat.input_state.read(cx).value().as_ref(),
+            "open `src/main.rs` "
+        );
+    });
+}
+
+#[gpui::test]
+fn composer_at_completion_escape_dismisses_and_keeps_query(
+    cx: &mut gpui::TestAppContext,
+) {
+    let repo = file_completion_repo(&["README.md"]);
+    let (chat, _model, cx) =
+        mount_chat_with_work_dir(cx, Some(repo.path().to_path_buf()));
+    cx.run_until_parked();
+    cx.update(|window, cx| chat.update(cx, |chat, cx| chat.focus_composer(window, cx)));
+    cx.run_until_parked();
+
+    cx.simulate_input("look @RE");
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-completion-list").is_some());
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, cx| {
+        assert!(chat.dismiss_file_menu, "Escape only dismisses the menu");
+        assert_eq!(
+            chat.input_state.read(cx).value().as_ref(),
+            "look @RE",
+            "the typed query is preserved"
+        );
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("file-completion-list").is_none(),
+        "dismissed menu no longer renders"
+    );
+}
+
+#[gpui::test]
+fn composer_at_completion_ignores_interiors_and_noncollapsed_selection(
+    cx: &mut gpui::TestAppContext,
+) {
+    let repo = file_completion_repo(&["README.md"]);
+    let (chat, _model, cx) =
+        mount_chat_with_work_dir(cx, Some(repo.path().to_path_buf()));
+    cx.run_until_parked();
+    cx.update(|window, cx| chat.update(cx, |chat, cx| chat.focus_composer(window, cx)));
+    cx.run_until_parked();
+
+    for text in ["mail user@exa", "https://x/@y", "keep@tag"] {
+        chat.update_in(cx, |chat, window, cx| {
+            chat.input_state.update(cx, |input, cx| {
+                input.set_value(text, window, cx);
+                input.set_selected_range(text.len()..text.len(), cx);
+            });
+            chat.sync_file_completion(cx);
+        });
+        cx.run_until_parked();
+        chat.read_with(cx, |chat, cx| {
+            assert!(
+                !chat.file_menu_open(cx),
+                "interior @ in {text:?} must not open the picker"
+            );
+        });
+    }
+
+    // A non-collapsed selection suppresses the trigger even inside a valid @.
+    chat.update_in(cx, |chat, window, cx| {
+        chat.input_state.update(cx, |input, cx| {
+            input.set_value("open @RE", window, cx);
+            input.set_selected_range(0..8, cx);
+        });
+        chat.sync_file_completion(cx);
+    });
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, cx| {
+        assert!(!chat.file_menu_open(cx), "selection suppresses the trigger");
+    });
+}
+
+#[gpui::test]
+fn composer_at_completion_reports_unsupported_root(cx: &mut gpui::TestAppContext) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (chat, model, cx) =
+        mount_chat_with_work_dir(cx, Some(dir.path().to_path_buf()));
+    cx.run_until_parked();
+    cx.update(|window, cx| chat.update(cx, |chat, cx| chat.focus_composer(window, cx)));
+    cx.run_until_parked();
+
+    cx.simulate_input("@");
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, _| {
+        assert!(
+            matches!(
+                chat.file_completion.as_ref().map(|state| &state.status),
+                Some(super::file_completion::FileCompletionStatus::Unsupported(_))
+            ),
+            "a non-Git root is Unsupported, never an empty match list"
+        );
+    });
+
+    // No project attached at all gets its own explanation, not "no matches".
+    // Detaching the project counts as a session switch and clears the old
+    // picker; typing again re-syncs into the new scope.
+    model.update(cx, |state, cx| {
+        state.active_work_dir = None;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.simulate_input("@");
+    cx.run_until_parked();
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, _| {
+        let reason = chat.file_completion.as_ref().and_then(|state| {
+            match &state.status {
+                super::file_completion::FileCompletionStatus::Unsupported(reason) => {
+                    Some(reason.clone())
+                }
+                _ => None,
+            }
+        });
+        assert_eq!(
+            reason.as_deref(),
+            Some("Attach a project to search files")
+        );
+    });
+}
+
+#[gpui::test]
+fn composer_at_completion_deleted_file_refreshes_instead_of_inserting(
+    cx: &mut gpui::TestAppContext,
+) {
+    let repo = file_completion_repo(&["src/gone.rs", "src/kept.rs"]);
+    let (chat, _model, cx) =
+        mount_chat_with_work_dir(cx, Some(repo.path().to_path_buf()));
+    cx.run_until_parked();
+    cx.update(|window, cx| chat.update(cx, |chat, cx| chat.focus_composer(window, cx)));
+    cx.run_until_parked();
+
+    cx.simulate_input("use @src/");
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    // The file disappears between enumeration and Enter: apply must refresh
+    // the inventory and keep the draft, not insert a stale path.
+    std::fs::remove_file(repo.path().join("src/gone.rs")).expect("delete");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(chat.input_state.read(cx).value().as_ref(), "use @src/");
+        assert!(matches!(
+            chat.file_completion.as_ref().map(|state| &state.status),
+            Some(super::file_completion::FileCompletionStatus::Ready(_))
+        ));
+    });
+}
+
+#[gpui::test]
+fn composer_at_completion_resyncs_when_root_changes(cx: &mut gpui::TestAppContext) {
+    let plain = tempfile::tempdir().expect("non-git dir");
+    let repo = file_completion_repo(&["src/ready.rs"]);
+    let (chat, model, cx) =
+        mount_chat_with_work_dir(cx, Some(plain.path().to_path_buf()));
+    cx.run_until_parked();
+    cx.update(|window, cx| chat.update(cx, |chat, cx| chat.focus_composer(window, cx)));
+    cx.run_until_parked();
+
+    cx.simulate_input("@ready");
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, _| {
+        assert!(
+            matches!(
+                chat.file_completion.as_ref().map(|state| &state.status),
+                Some(super::file_completion::FileCompletionStatus::Unsupported(_))
+            ),
+            "non-git root reports Unsupported"
+        );
+    });
+
+    // The root changes without a composer edit (worktree finished
+    // preparing): the next rendered frame must resync rather than leave a
+    // stale Unsupported state swallowing Enter.
+    model.update(cx, |state, _| {
+        state.active_work_dir = Some(repo.path().to_path_buf());
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, cx| {
+        match chat.file_completion.as_ref().map(|state| &state.status) {
+            Some(super::file_completion::FileCompletionStatus::Ready(inventory)) => {
+                assert!(inventory.paths.contains(&"src/ready.rs".to_string()));
+            }
+            _ => panic!("expected Ready after root change"),
+        }
+        assert!(chat.file_menu_open(cx), "picker stays open across resync");
     });
 }

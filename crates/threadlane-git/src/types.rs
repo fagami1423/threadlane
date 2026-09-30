@@ -134,6 +134,49 @@ pub struct GitHubPrFile {
     pub change_type: String,
 }
 
+/// Per-account review marker GitHub keeps for one file of a pull request.
+/// These are personal reading markers, not approval or review state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrFileViewedStatus {
+    Unviewed,
+    Viewed,
+    /// Was viewed, then GitHub dismissed the marker after a push changed the file.
+    ChangedSinceViewed,
+    /// The file was not covered by the fetched viewed-state pages.
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitHubPrFileViewed {
+    pub path: String,
+    pub status: PrFileViewedStatus,
+}
+
+/// Viewed markers for every reported pull request file, scoped to the
+/// signed-in viewer that produced the read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GitHubPrViewedState {
+    /// GraphQL node ID required by the mark/unmark mutations.
+    pub pull_request_id: String,
+    /// Head OID the markers were read against.
+    pub head_oid: String,
+    /// Login of the account these personal markers belong to.
+    pub viewer: String,
+    pub files: Vec<GitHubPrFileViewed>,
+    /// False when pagination stopped before every file was reported.
+    pub complete: bool,
+}
+
+impl GitHubPrViewedState {
+    pub fn file_status(&self, path: &str) -> PrFileViewedStatus {
+        self.files
+            .iter()
+            .find(|file| file.path == path)
+            .map(|file| file.status)
+            .unwrap_or(PrFileViewedStatus::Unknown)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PullRequestReviewCommentDraft {
     pub(crate) path: String,
