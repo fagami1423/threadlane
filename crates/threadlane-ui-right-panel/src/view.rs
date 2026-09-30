@@ -2111,23 +2111,6 @@ impl RightPanelView {
         };
 
         let row_id = SharedString::from(format!("review-file-{path}"));
-        let stage_path = path.clone();
-        // Trailing stage toggle (t3code ChangesView right-edge checkbox): a
-        // checked box means the file is staged.
-        let stage_chk = Checkbox::new(SharedString::from(format!("stage-chk-{path}")))
-            .accessibility_label(if is_staged { "Unstage file" } else { "Stage file" })
-            .checked(is_staged)
-            .small()
-            .tooltip(if is_staged { "Unstage file" } else { "Stage file" })
-            .on_click(cx.listener(move |this, checked, window, cx| {
-                let action = if *checked {
-                    GitAction::StageFile(stage_path.clone())
-                } else {
-                    GitAction::UnstageFile(stage_path.clone())
-                };
-                this.run_git_action(action, window, cx);
-            }));
-
         div()
             .id(row_id)
             .debug_selector(|| "review-file-row".into())
@@ -2270,7 +2253,6 @@ impl RightPanelView {
                             .child(format!("\u{2212}{}", file.deletions))
                     }))
             }))
-            .child(stage_chk)
             .context_menu({
                 let path = context_path.clone();
                 let absolute_path = absolute_path.clone();
@@ -3177,9 +3159,7 @@ impl RightPanelView {
                                 })
                                 .child(
                                     Button::new("view-combined-diff-btn")
-                                        .label(format!(
-                                            "View Diff +{total_additions_all} \u{2212}{total_deletions_all}"
-                                        ))
+                                        .label("View Diff")
                                         .accessibility_label(
                                             "Open combined diff of all changes",
                                         )
