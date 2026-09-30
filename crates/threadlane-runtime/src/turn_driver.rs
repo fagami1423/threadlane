@@ -259,7 +259,11 @@ impl<'a> TurnDriver<'a> {
                 .map_err(|error| format!("context preparation failed: {error}"));
                 match prepared {
                     Ok(prepared) => {
-                        self.turn.lock().await.messages = prepared.messages.clone();
+                        self.turn.lock().await.messages = prepared
+                            .canonical_messages
+                            .as_ref()
+                            .unwrap_or(&prepared.messages)
+                            .clone();
                         boundary_result = Some(prepared);
                     }
                     Err(error) => {
@@ -287,7 +291,10 @@ impl<'a> TurnDriver<'a> {
             let (stream_tx, mut stream_rx) = mpsc::channel(100);
             let client = self.provider_client.clone();
             let payload_cache_key = self.prompt_cache_key.clone();
-            let request_messages = self.turn.lock().await.messages.clone();
+            let request_messages = match boundary_result.as_ref() {
+                Some(prepared) => prepared.messages.clone(),
+                None => self.turn.lock().await.messages.clone(),
+            };
             let request = {
                 let turn = self.turn.lock().await;
                 RuntimeRequest {
@@ -316,7 +323,14 @@ impl<'a> TurnDriver<'a> {
                                 .min(u32::MAX as usize) as u32
                         })
                         .unwrap_or(0);
-                    let status = if normalized.is_some() {
+                    let reduced = boundary_result
+                        .as_ref()
+                        .and_then(|prepared| prepared.canonical_messages.as_ref())
+                        .and_then(|messages| messages.get(idx))
+                        .is_some_and(|canonical| canonical != message);
+                    let status = if normalized.is_some() && reduced {
+                        ContextItemStatus::Truncated
+                    } else if normalized.is_some() {
                         ContextItemStatus::Active
                     } else {
                         ContextItemStatus::Omitted
@@ -338,7 +352,9 @@ impl<'a> TurnDriver<'a> {
                             token_estimate,
                             status,
                             digest_sha256,
-                            label: None,
+                            label: reduced.then(|| {
+                                TraceString::new("request-only reduction").expect("static label")
+                            }),
                         });
                     }
                 }

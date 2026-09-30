@@ -4,6 +4,24 @@ use crate::options::{CodingAgentOptions, HarnessCompositionSnapshot};
 use threadlane_skills::SkillManager;
 use threadlane_wasi::WasiExtensionManager;
 
+/// Read-only JSON report; never initialize providers, extensions, or the UI.
+pub fn dump_token_efficiency(args: &[String]) -> Result<(), String> {
+    let path = args
+        .iter()
+        .position(|arg| arg == "--token-efficiency")
+        .and_then(|index| args.get(index + 1))
+        .filter(|path| !path.starts_with("--"))
+        .ok_or("--token-efficiency requires <session.jsonl>")?;
+    let store = threadlane_runtime::harness::JsonlStore::open_read_only(path)
+        .map_err(|error| error.to_string())?;
+    let report = threadlane_runtime::harness::project_token_efficiency(&store);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+    );
+    Ok(())
+}
+
 pub fn dump_config(args: &[String]) -> Result<(), String> {
     let project_index = args
         .iter()

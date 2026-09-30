@@ -135,20 +135,24 @@ impl CodingSessionHarness {
                 .collect::<Vec<_>>()
         };
         let mut current = with_system(self.model_context("main")?.messages());
+        let mut visible =
+            self.provider_read_context(run_id, &current, request.tool_schema_json.as_deref());
         let pre_tokens = estimate_request_tokens(
-            &current,
+            &visible,
             request.tool_schema_json.as_deref(),
             &CompactionParams::from(config),
         );
         if pre_tokens < budget.trigger_tokens && !request.overflow_recovery {
-            return Ok(boundary_result(
-                current,
+            let mut result = boundary_result(
+                visible,
                 budget,
                 self.compaction_generation(),
                 None,
                 provider_attempt,
                 provider_request_id,
-            ));
+            );
+            result.canonical_messages = Some(current);
+            return Ok(result);
         }
         let reason = if request.overflow_recovery {
             CompactionReason::OverflowRecovery
@@ -178,20 +182,24 @@ impl CodingSessionHarness {
                 prepared,
             )?;
             current = with_system(self.model_context("main")?.messages());
+            visible =
+                self.provider_read_context(run_id, &current, request.tool_schema_json.as_deref());
             let post_tokens = estimate_request_tokens(
-                &current,
+                &visible,
                 request.tool_schema_json.as_deref(),
                 &CompactionParams::from(config),
             );
             if post_tokens < budget.trigger_tokens {
-                return Ok(boundary_result(
-                    current,
+                let mut result = boundary_result(
+                    visible,
                     budget,
                     self.compaction_generation(),
                     Some(post_tokens),
                     provider_attempt,
                     provider_request_id,
-                ));
+                );
+                result.canonical_messages = Some(current);
+                return Ok(result);
             }
             if index == 1 {
                 return Err(format!(

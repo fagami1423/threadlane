@@ -1010,6 +1010,7 @@ mod tests {
                     preparer_tools.lock().unwrap().push(tools);
                     preparer_order.lock().unwrap().push("prepared");
                     Ok(ProviderBoundaryResult {
+                        canonical_messages: None,
                         messages: request.messages,
                         context_limit: 128_000,
                         context_limit_is_estimate: true,
@@ -1329,6 +1330,7 @@ mod tests {
                     &threadlane_context::BudgetConfig::from(&AgentConfig::default()),
                 );
                 Ok(ProviderBoundaryResult {
+                    canonical_messages: None,
                     messages: request.messages,
                     context_limit: budget.limit,
                     context_limit_is_estimate: budget.limit_is_estimate,
@@ -1455,6 +1457,7 @@ mod tests {
                     .unwrap()
                     .push(request.overflow_recovery);
                 Ok(ProviderBoundaryResult {
+                    canonical_messages: None,
                     messages: request.messages,
                     context_limit: 128_000,
                     context_limit_is_estimate: false,

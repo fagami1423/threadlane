@@ -177,6 +177,9 @@ pub fn build_system_prompt(options: SystemPromptBuildOptions<'_>) -> String {
             add_tool_guideline(
                 "When invoking `subagent`, specify clear custom `instructions` and the minimum required `tools` for each subagent.",
             );
+            add_tool_guideline(
+                "Pass relevant context_refs instead of copying file bodies; request concise actions and verification evidence. Use hub revive for follow-ups on an existing lane. Judge delegation by total parent-plus-child tokens, including coordination and failed attempts, rather than child model price alone.",
+            );
             if available_tool_names.contains("hub") {
                 add_tool_guideline(
                     "Parallel siblings coordinate live via their `message_peer` tool (address by agent role, lane name, or `all`); pass `wait=false` to spawn persistent background workers and supervise them with `hub list`, `hub send`, `hub read`, `hub revive`, `hub kill`, and `hub wait`.",
