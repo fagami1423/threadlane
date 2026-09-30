@@ -213,10 +213,7 @@ impl ChatListView {
         };
         let (matches, has_more) =
             filter_file_matches(query, &inventory.paths, FILE_COMPLETION_RESULT_LIMIT);
-        (
-            matches.into_iter().cloned().collect(),
-            has_more || inventory.truncated,
-        )
+        (matches.into_iter().cloned().collect(), has_more)
     }
 
     /// Replace the live trigger range with `path` as a Markdown code span.

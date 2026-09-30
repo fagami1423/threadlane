@@ -5449,8 +5449,17 @@ impl ChatListView {
             self.current_file_trigger(cx)
         };
         // A trigger can exist without picker state (e.g. a restored draft
-        // ending in `@`, whose set_value emits no Change): sync next effect.
-        if file_trigger.is_some() && self.file_completion.is_none() {
+        // ending in `@`, whose set_value emits no Change), and stored state
+        // can go stale without a Change event — e.g. an `Unsupported` state
+        // recorded while the session worktree was still preparing. Resync
+        // whenever the resolved root no longer matches the retained one.
+        let git_root = self.model.read(cx).active_git_work_dir();
+        let file_state_stale = self
+            .file_completion
+            .as_ref()
+            .map(|state| state.root.as_deref() != git_root.as_deref())
+            .unwrap_or(true);
+        if file_trigger.is_some() && file_state_stale {
             cx.defer_in(window, |this, _window, cx| {
                 this.sync_file_completion(cx);
             });

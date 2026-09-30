@@ -1486,7 +1486,6 @@ fn list_project_files_reports_tracked_and_nonignored_untracked() {
     fs::write(dir.path().join(".threadlane/state.json"), "{}\n").unwrap();
 
     let inventory = list_project_files(dir.path()).unwrap();
-    assert!(!inventory.truncated);
     assert_eq!(inventory.non_utf8_skipped, 0);
     assert!(inventory.paths.contains(&"tracked.rs".to_string()));
     assert!(inventory.paths.contains(&"src/lib.rs".to_string()));
@@ -1638,4 +1637,19 @@ fn list_project_files_does_not_traverse_external_symlinks() {
         .paths
         .iter()
         .any(|path| path.contains("outside") || path.starts_with("link-out/")));
+}
+
+#[test]
+fn list_project_files_drops_index_entries_deleted_on_disk() {
+    let dir = tempdir().unwrap();
+    init_repo(dir.path());
+    fs::write(dir.path().join("gone.rs"), "x\n").unwrap();
+    run_git(dir.path(), &["add", "gone.rs"]);
+    run_git(dir.path(), &["commit", "-qm", "add gone"]);
+
+    fs::remove_file(dir.path().join("gone.rs")).unwrap();
+    // The index still names `gone.rs` until the deletion is staged, but the
+    // file does not exist, so it must not be offered for insertion.
+    let inventory = list_project_files(dir.path()).unwrap();
+    assert_eq!(inventory.paths, vec!["README.md".to_string()]);
 }

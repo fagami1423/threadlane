@@ -1363,17 +1363,11 @@ pub fn is_git_repo(work_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Maximum paths [`list_project_files`] returns before marking the inventory
-/// truncated.
-pub const FILE_INVENTORY_LIMIT: usize = 20_000;
-
 /// The files `git ls-files` reports for a repository, de-duplicated.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GitFileInventory {
     /// Repository-relative file paths (`/` separated), sorted.
     pub paths: Vec<String>,
-    /// Output exceeded [`FILE_INVENTORY_LIMIT`]; `paths` is a bounded prefix.
-    pub truncated: bool,
     /// Names that were not valid UTF-8 and were skipped rather than mangled.
     pub non_utf8_skipped: usize,
 }
@@ -1392,9 +1386,12 @@ pub enum FileInventoryError {
 /// Runs `git ls-files -z --cached --others --exclude-standard`, so results are
 /// tracked files plus non-ignored untracked files; names ignored by
 /// `.gitignore`/`.git/info/exclude`/global excludes are never enumerated.
-/// `.git` and `.threadlane` entries are excluded on top of that, duplicate
-/// names (tracked + untracked) are removed, and non-UTF-8 names are counted
-/// and skipped instead of being lossy-decoded into replacement characters.
+/// Index entries whose worktree file is gone (`ls-files --deleted`: unstaged
+/// deletions, sparse-checkout omissions) are subtracted so every listed path
+/// exists on disk. `.git` and `.threadlane` entries are excluded on top of
+/// that, duplicate names (tracked + untracked) are removed, and non-UTF-8
+/// names are counted and skipped instead of being lossy-decoded into
+/// replacement characters.
 ///
 /// Only names are handled: no file content is read and no symlink is
 /// traversed. The inventory is purely Git's index/worktree name list.
@@ -1413,6 +1410,14 @@ pub fn list_project_files(work_dir: &Path) -> Result<GitFileInventory, FileInven
         ],
     )
     .map_err(FileInventoryError::Failed)?;
+    // Index entries survive unstaged deletions; without this they would be
+    // selectable but could never pass the on-disk existence check at insert.
+    let deleted_output = command_bytes(work_dir, &["ls-files", "-z", "--deleted"])
+        .map_err(FileInventoryError::Failed)?;
+    let deleted: HashSet<&[u8]> = deleted_output
+        .split(|byte| *byte == 0)
+        .filter(|raw| !raw.is_empty())
+        .collect();
 
     let mut inventory = GitFileInventory::default();
     let mut seen = HashSet::new();
@@ -1424,6 +1429,9 @@ pub fn list_project_files(work_dir: &Path) -> Result<GitFileInventory, FileInven
             inventory.non_utf8_skipped += 1;
             continue;
         };
+        if deleted.contains(raw) {
+            continue;
+        }
         if path == ".git"
             || path == ".threadlane"
             || path.starts_with(".git/")
@@ -1437,8 +1445,6 @@ pub fn list_project_files(work_dir: &Path) -> Result<GitFileInventory, FileInven
         }
     }
     inventory.paths.sort();
-    inventory.truncated = inventory.paths.len() > FILE_INVENTORY_LIMIT;
-    inventory.paths.truncate(FILE_INVENTORY_LIMIT);
     Ok(inventory)
 }
 

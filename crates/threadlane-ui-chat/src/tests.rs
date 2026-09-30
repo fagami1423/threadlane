@@ -4743,3 +4743,45 @@ fn composer_at_completion_deleted_file_refreshes_instead_of_inserting(
         ));
     });
 }
+
+#[gpui::test]
+fn composer_at_completion_resyncs_when_root_changes(cx: &mut gpui::TestAppContext) {
+    let plain = tempfile::tempdir().expect("non-git dir");
+    let repo = file_completion_repo(&["src/ready.rs"]);
+    let (chat, model, cx) =
+        mount_chat_with_work_dir(cx, Some(plain.path().to_path_buf()));
+    cx.run_until_parked();
+    cx.update(|window, cx| chat.update(cx, |chat, cx| chat.focus_composer(window, cx)));
+    cx.run_until_parked();
+
+    cx.simulate_input("@ready");
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, _| {
+        assert!(
+            matches!(
+                chat.file_completion.as_ref().map(|state| &state.status),
+                Some(super::file_completion::FileCompletionStatus::Unsupported(_))
+            ),
+            "non-git root reports Unsupported"
+        );
+    });
+
+    // The root changes without a composer edit (worktree finished
+    // preparing): the next rendered frame must resync rather than leave a
+    // stale Unsupported state swallowing Enter.
+    model.update(cx, |state, _| {
+        state.active_work_dir = Some(repo.path().to_path_buf());
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, cx| {
+        match chat.file_completion.as_ref().map(|state| &state.status) {
+            Some(super::file_completion::FileCompletionStatus::Ready(inventory)) => {
+                assert!(inventory.paths.contains(&"src/ready.rs".to_string()));
+            }
+            _ => panic!("expected Ready after root change"),
+        }
+        assert!(chat.file_menu_open(cx), "picker stays open across resync");
+    });
+}
