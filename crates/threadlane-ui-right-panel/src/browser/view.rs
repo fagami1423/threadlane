@@ -28,6 +28,10 @@ const DEFAULT_URL: &str = "https://github.com/wheregmis/threadlane";
 struct BrowserTab {
     id: usize,
     url: String,
+    /// URL requested but not yet committed by the webview. While set, the
+    /// address bar shows it instead of the live URL, which still reports the
+    /// previous page during provisional navigation.
+    pending_url: Option<String>,
     webview: Option<Entity<gpui_wry::WebView>>,
 }
 
@@ -42,6 +46,7 @@ pub struct BrowserView {
     next_tab_id: usize,
     annotating: bool,
     annotate_task: Option<Task<()>>,
+    url_watch_task: Option<Task<()>>,
     visible: bool,
     _annotation_escape: Subscription,
 }
@@ -73,6 +78,7 @@ impl BrowserView {
             next_tab_id: 1,
             annotating: false,
             annotate_task: None,
+            url_watch_task: None,
             visible: false,
             _annotation_escape: Self::annotation_escape_subscription(cx),
         };
@@ -105,7 +111,7 @@ impl BrowserView {
             Some(AddressTarget::Search(query)) => search_url(&query),
         };
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            tab.url = url.clone();
+            tab.pending_url = Some(url.clone());
             if let Some(webview) = tab.webview.clone() {
                 webview.update(cx, |view, _| view.load_url(&url));
             }
@@ -152,6 +158,7 @@ impl BrowserView {
         self.tabs.push(BrowserTab {
             id,
             url: url.to_string(),
+            pending_url: Some(url.to_string()),
             webview: Some(webview),
         });
         self.switch_tab(id, window, cx);
@@ -163,7 +170,7 @@ impl BrowserView {
         if self.tabs.len() <= 1 {
             let url = DEFAULT_URL.to_string();
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                tab.url = url.clone();
+                tab.pending_url = Some(url.clone());
                 if let Some(webview) = tab.webview.clone() {
                     webview.update(cx, |view, _| view.load_url(&url));
                 }
@@ -197,6 +204,7 @@ impl BrowserView {
         let url = self.tabs[position].url.clone();
         if self.tabs[position].webview.is_none() {
             let webview = self.spawn_webview(&url, window, cx);
+            self.tabs[position].pending_url = Some(url.clone());
             self.tabs[position].webview = Some(webview);
         }
         self.sync_active_visibility(cx);
@@ -239,11 +247,37 @@ impl BrowserView {
     /// Mirrors the active tab URL into the address bar. Render-owned
     /// (it needs the window) and guarded: never clobbers focused typing,
     /// and no-ops once in sync so it cannot loop renders.
-    fn sync_address_bar(&self, window: &mut Window, cx: &mut Context<Self>) {
+    fn sync_address_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Prefer the live URL: in-page navigation (SPA pushes, redirects,
+        // link clicks) never updates `tab.url`, so the bar went stale. While
+        // a requested navigation is still provisional WKWebView reports the
+        // old page, so keep showing the pending URL until the live one
+        // commits to it or diverges (redirect / in-page nav wins the race).
         let url = self
             .tabs
-            .get(self.active_tab)
-            .map(|tab| tab.url.clone())
+            .get_mut(self.active_tab)
+            .map(|tab| {
+                let live = tab
+                    .webview
+                    .as_ref()
+                    .and_then(|webview| webview.read(cx).raw().url().ok())
+                    .filter(|url| !url.is_empty());
+                match (tab.pending_url.clone(), live) {
+                    (Some(pending), Some(live)) if live == pending => {
+                        tab.url = live.clone();
+                        tab.pending_url = None;
+                        live
+                    }
+                    (Some(_), Some(live)) if live != tab.url => {
+                        tab.pending_url = None;
+                        tab.url = live.clone();
+                        live
+                    }
+                    (Some(pending), _) => pending,
+                    (None, Some(live)) => live,
+                    (None, None) => tab.url.clone(),
+                }
+            })
             .unwrap_or_default();
         let focused = self
             .address_input
@@ -262,7 +296,7 @@ impl BrowserView {
     /// render ([`Self::sync_address_bar`]), so no window is needed here.
     pub fn load_url(&mut self, url: &str, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            tab.url = url.to_string();
+            tab.pending_url = Some(url.to_string());
             if let Some(webview) = tab.webview.clone() {
                 webview.update(cx, |view, _| view.load_url(url));
             }
@@ -310,12 +344,16 @@ impl BrowserView {
     }
 
     /// Capture the rendered viewport as JPEG bytes with width and height.
+    /// `crop` is an optional `[x, y, w, h]` rect in view points (≈ CSS pixels
+    /// at page zoom 1); `None` snapshots the whole viewport.
     pub fn take_snapshot(
         &self,
+        crop: Option<[f64; 4]>,
         cx: &App,
     ) -> Result<tokio::sync::oneshot::Receiver<Result<(Vec<u8>, u32, u32), String>>, String> {
         use block2::RcBlock;
         use objc2::runtime::AnyObject;
+        use objc2_core_foundation::{CGPoint, CGRect, CGSize};
         use wry::WebViewExtMacOS;
 
         let webview = self
@@ -373,12 +411,32 @@ impl BrowserView {
         });
 
         unsafe {
-            let nil_config: *mut AnyObject = std::ptr::null_mut();
+            // WKSnapshotConfiguration::rect is in WKWebView view coordinates;
+            // when unset the full bounds are captured. The crop comes from the
+            // picker's viewport-space getBoundingClientRect union, which lines
+            // up while page zoom is 1.
+            let config: *mut AnyObject = if let Some([x, y, w, h]) = crop {
+                let class = objc2::runtime::AnyClass::get(c"WKSnapshotConfiguration")
+                    .ok_or_else(|| "WKSnapshotConfiguration class missing.".to_string())?;
+                let config: *mut AnyObject = objc2::msg_send![class, new];
+                if config.is_null() {
+                    return Err("Failed to create WKSnapshotConfiguration.".to_string());
+                }
+                let rect = CGRect::new(CGPoint::new(x, y), CGSize::new(w, h));
+                let _: () = objc2::msg_send![config, setRect: rect];
+                config
+            } else {
+                std::ptr::null_mut()
+            };
             let _: () = objc2::msg_send![
                 &*wk_wv,
-                takeSnapshotWithConfiguration: nil_config,
+                takeSnapshotWithConfiguration: config,
                 completionHandler: &*block
             ];
+            // `new` returned a +1 object; WebKit retains it for the call.
+            if !config.is_null() {
+                let _: () = objc2::msg_send![config, release];
+            }
         }
 
         Ok(rx)
@@ -392,30 +450,87 @@ impl BrowserView {
         }
     }
 
-    pub fn reload(&mut self, cx: &mut Context<Self>) {
-        let url = self
-            .current_url(cx)
-            .filter(|url| !url.is_empty())
-            .unwrap_or_else(|| DEFAULT_URL.to_string());
+    pub fn go_forward(&mut self, cx: &mut Context<Self>) {
         if let Some(webview) = self.active_webview() {
-            webview.update(cx, |view, _| view.load_url(&url));
+            webview.update(cx, |view, _| {
+                // wry has no forward(); go straight to the history entry.
+                let _ = view.raw().evaluate_script("history.forward();");
+            });
+        }
+    }
+
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        if let Some(webview) = self.active_webview() {
+            // wry reload() is a real reload: bypassing the cache is the user's
+            // call, unlike re-navigating which resubmits nothing for POSTs.
+            let _ = webview.update(cx, |view, _| view.raw().reload());
         }
         cx.notify();
     }
 
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.visible = visible;
+        if visible {
+            self.start_url_watch(cx);
+        } else {
+            self.url_watch_task.take();
+        }
         self.sync_active_visibility(cx);
+    }
+
+    /// Adopts live webview URL changes so in-page navigation (link clicks,
+    /// SPA pushes, history moves) refreshes the address bar. wry gives no
+    /// commit callback, so this polls while the panel is visible and renders
+    /// only when the URL actually changed.
+    fn start_url_watch(&mut self, cx: &mut Context<Self>) {
+        if self.url_watch_task.is_some() {
+            return;
+        }
+        self.url_watch_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(700))
+                    .await;
+                let keep_running = this
+                    .update(cx, |this, cx| {
+                        if !this.visible {
+                            return false;
+                        }
+                        let Some(tab) = this.tabs.get_mut(this.active_tab) else {
+                            return true;
+                        };
+                        let live = tab
+                            .webview
+                            .as_ref()
+                            .and_then(|webview| webview.read(cx).raw().url().ok())
+                            .filter(|url| !url.is_empty());
+                        if let Some(live) = live {
+                            if live != tab.url {
+                                // Committed — to the pending request or a
+                                // redirect / in-page move. Adopt it.
+                                tab.url = live;
+                                tab.pending_url = None;
+                                cx.notify();
+                            }
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_running {
+                    break;
+                }
+            }
+        }));
     }
 
     pub fn is_annotating(&self) -> bool {
         self.annotating
     }
 
-    /// Toggles the click-to-annotate picker. While active, hovering
-    /// highlights elements and clicking one attaches its description plus a
-    /// viewport snapshot to the chat composer.
-    pub fn toggle_annotate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Toggles the annotate overlay. While active, the in-page picker selects
+    /// elements and collects an optional comment; attaching hands the
+    /// description plus an element-cropped snapshot to the chat composer.
+    pub fn toggle_annotate(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.annotating {
             self.stop_annotate(cx);
             cx.notify();
@@ -430,11 +545,34 @@ impl BrowserView {
         };
         self.annotating = true;
         cx.notify();
-        let view = cx.entity().downgrade();
-        let model = self.model.clone();
         self.annotate_task = Some(cx.spawn(async move |this, cx| {
-            // Best-effort install confirmation; the picker works regardless.
-            let _ = install.await;
+            // The picker bails with "retry" while the document is mid-load;
+            // reinstall briefly rather than dropping the user's session.
+            let mut installed = install
+                .await
+                .map(|raw| unwrap_callback_payload(&raw))
+                .unwrap_or_default();
+            let mut install_retries = 0u8;
+            while installed.trim_matches('"') == "retry" && install_retries < 3 {
+                install_retries += 1;
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(400))
+                    .await;
+                let retry = this
+                    .update(cx, |this, cx| {
+                        this.evaluate_script(&annotate_install_js(), cx).ok()
+                    })
+                    .ok()
+                    .flatten();
+                installed = match retry {
+                    Some(receiver) => receiver
+                        .await
+                        .map(|raw| unwrap_callback_payload(&raw))
+                        .unwrap_or_default(),
+                    None => break,
+                };
+            }
+            let mut misses = 0u8;
             loop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(300))
@@ -445,8 +583,23 @@ impl BrowserView {
                     })
                     .ok()
                     .flatten();
-                let Some(poll) = poll else { break };
-                let Ok(raw) = poll.await else { break };
+                // Transient eval failures (navigation, teardown) shouldn't end
+                // the session; several misses in a row mean the page is gone.
+                let Some(poll) = poll else {
+                    misses += 1;
+                    if misses >= 8 {
+                        break;
+                    }
+                    continue;
+                };
+                let Ok(raw) = poll.await else {
+                    misses += 1;
+                    if misses >= 8 {
+                        break;
+                    }
+                    continue;
+                };
+                misses = 0;
                 let payload = unwrap_callback_payload(&raw);
                 // The callback wrapper has already been removed above.
                 let parsed = serde_json::from_str::<serde_json::Value>(&payload).ok();
@@ -467,10 +620,6 @@ impl BrowserView {
                 }
                 // Picker cancelled (Escape reports active=false): stop.
                 if !active.is_some_and(|value| value.as_bool().unwrap_or(false)) {
-                    let _ = this.update(cx, |this, cx| {
-                        this.stop_annotate(cx);
-                        cx.notify();
-                    });
                     break;
                 }
                 // Still waiting: keep the task alive only while the view does.
@@ -478,6 +627,14 @@ impl BrowserView {
                     break;
                 }
             }
+            // Any exit that didn't deliver a pick still owes the view a
+            // cleared annotating flag (finish_annotation does its own).
+            let _ = this.update(cx, |this, cx| {
+                if this.annotating {
+                    this.stop_annotate(cx);
+                    cx.notify();
+                }
+            });
         }));
     }
 
@@ -507,22 +664,6 @@ impl BrowserView {
             cx.notify();
             return;
         };
-        let tag = pick
-            .get("tag")
-            .and_then(|value| value.as_str())
-            .unwrap_or("element");
-        let text = pick
-            .get("text")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let selector = pick
-            .get("selector")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let href = pick
-            .get("href")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
         let page_title = pick
             .get("title")
             .and_then(|value| value.as_str())
@@ -531,29 +672,66 @@ impl BrowserView {
             .get("url")
             .and_then(|value| value.as_str())
             .unwrap_or("");
-        let rect = pick.get("rect");
-        let geometry = rect
-            .map(|rect| {
-                format!(
-                    "{}x{} at ({},{})",
-                    rect.get("w").and_then(|value| value.as_u64()).unwrap_or(0),
-                    rect.get("h").and_then(|value| value.as_u64()).unwrap_or(0),
-                    rect.get("x").and_then(|value| value.as_i64()).unwrap_or(0),
-                    rect.get("y").and_then(|value| value.as_i64()).unwrap_or(0),
-                )
-            })
-            .unwrap_or_else(|| "unknown geometry".to_string());
-        let mut note = format!(
-            "[Browser annotation — {page_title}]({page_url})\nElement: <{tag}> `{selector}` {geometry}"
-        );
-        if !text.is_empty() {
-            note.push_str(&format!("\nContent: \"{text}\""));
+        let comment = pick
+            .get("comment")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        // Devin-style compact note: the cropped image carries the visual
+        // context, so text only needs enough to locate the element —
+        // tag + selector, an identifying name or link, and the comment.
+        let element_line = |element: &serde_json::Value| {
+            let tag = element
+                .get("tag")
+                .and_then(|value| value.as_str())
+                .unwrap_or("element");
+            let selector = element
+                .get("selector")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let mut line = format!("<{tag}>");
+            if !selector.is_empty() {
+                line.push_str(&format!(" `{selector}`"));
+            }
+            if let Some(name) = ["name", "text"].iter().find_map(|key| {
+                element
+                    .get(key)
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty())
+            }) {
+                line.push_str(&format!(" \"{name}\""));
+            }
+            if let Some(href) = element
+                .get("href")
+                .and_then(|value| value.as_str())
+                .filter(|href| !href.is_empty())
+            {
+                line.push_str(&format!(" → {href}"));
+            }
+            line
+        };
+        let elements: Vec<&serde_json::Value> = pick
+            .get("elements")
+            .and_then(|value| value.as_array())
+            .map(|elements| elements.iter().collect())
+            .unwrap_or_default();
+        let mut note = format!("[Browser annotation — {page_title}]({page_url})");
+        if !comment.is_empty() {
+            note.push_str(&format!(": {comment}"));
         }
-        if !href.is_empty() {
-            note.push_str(&format!("\nLink: {href}"));
+        if elements.len() == 1 {
+            note.push_str(&format!(" — {}", element_line(elements[0])));
+        } else {
+            for element in &elements {
+                note.push_str(&format!("\n• {}", element_line(element)));
+            }
         }
-        // Viewport snapshot alongside the note, like an attached screenshot.
-        let snapshot = self.take_snapshot(cx).ok();
+        // Snapshot cropped to the annotated element union so the attachment
+        // shows context around the target instead of the whole viewport.
+        let crop = pick.get("crop").and_then(|rect| {
+            let get = |key: &str| rect.get(key).and_then(|value| value.as_f64());
+            Some([get("x")?, get("y")?, get("w")?, get("h")?])
+        });
+        let snapshot = self.take_snapshot(crop, cx).ok();
         let model = self.model.clone();
         cx.spawn(async move |_this, cx| {
             let mut images = Vec::new();
@@ -653,6 +831,17 @@ impl Render for BrowserView {
                             })),
                     )
                     .child(
+                        Button::new("browser-forward")
+                            .icon(IconName::ArrowRight)
+                            .accessibility_label("Go forward")
+                            .tooltip("Go forward")
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.go_forward(cx);
+                            })),
+                    )
+                    .child(
                         Button::new("browser-reload")
                             .icon(Icon::default().path("icons/refresh-cw.svg"))
                             .accessibility_label("Reload page")
@@ -669,12 +858,12 @@ impl Render for BrowserView {
                             .accessibility_label(if annotating {
                                 "Stop annotating"
                             } else {
-                                "Annotate page element"
+                                "Annotate page elements"
                             })
                             .tooltip(if annotating {
-                                "Annotating — click a page element (Esc cancels)"
+                                "Annotating — click elements, then attach (Esc cancels)"
                             } else {
-                                "Annotate: pick a page element into the composer"
+                                "Annotate: pick page elements into the composer"
                             })
                             .ghost()
                             .xsmall()
@@ -826,7 +1015,7 @@ impl Render for BrowserView {
                                 .text_xs()
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(cx.theme().warning)
-                                .child("Click a page element \u{2014} Esc cancels"),
+                                .child("Click elements, Enter attaches \u{2014} Esc cancels"),
                         ),
                 )
             })
@@ -928,6 +1117,7 @@ mod browser_tabs_tests {
                 next_tab_id: 12,
                 annotating: false,
                 annotate_task: None,
+                url_watch_task: None,
                 visible: false,
                 _annotation_escape: BrowserView::annotation_escape_subscription(cx),
             });
@@ -937,6 +1127,7 @@ mod browser_tabs_tests {
                     .map(|id| BrowserTab {
                         id,
                         url: format!("https://long-subdomain-{id}.example.com"),
+                        pending_url: None,
                         webview: None,
                     })
                     .collect();
@@ -1021,8 +1212,8 @@ mod browser_tabs_tests {
             let focus = browser.read(cx).focus_handle.clone();
             focus.focus(window, cx);
             assert!(browser.read(cx).focus_handle.contains_focused(window, cx));
-            // Back, Reload, Annotate, then the address input.
-            for _ in 0..4 {
+            // Back, Forward, Reload, Annotate, then the address input.
+            for _ in 0..5 {
                 window.focus_next(cx);
             }
             assert!(browser

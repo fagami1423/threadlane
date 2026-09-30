@@ -5703,7 +5703,7 @@ fn start_browser_request(
                 let Some(browser) = panel.browser.clone() else {
                     return BrowserReply::Ready(Err("The browser panel is not ready.".to_string()));
                 };
-                match browser.update(cx, |browser, cx| browser.take_snapshot(cx)) {
+                match browser.update(cx, |browser, cx| browser.take_snapshot(None, cx)) {
                     Ok(rx) => BrowserReply::PendingSnapshot(rx),
                     Err(err) => BrowserReply::Ready(Err(err)),
                 }
