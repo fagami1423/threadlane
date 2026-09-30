@@ -158,6 +158,60 @@ pub fn project_run_timing(store: &impl SessionStore) -> Option<crate::types::Run
     })
 }
 
+/// The newest successful main-lane Run completion in a session journal.
+///
+/// An `OperationFinished { lane: "main", outcome: Completed }` qualifies only
+/// when its `run_id` correlates to an `OperationStarted { intent: Run,
+/// lane: "main" }` — compaction and navigation operations, tool/subagent
+/// finishes, aborts, failures, and declines never produce a token. Records
+/// arrive in seq order, so the last qualifying finish wins; a failed or
+/// aborted run after the last success never erases it.
+pub fn project_latest_run_completion(
+    store: &impl SessionStore,
+) -> Option<crate::types::RunCompletionToken> {
+    use threadlane_runtime::harness::{OperationIntent, OperationOutcome, Record};
+    let mut started_run_ids = std::collections::HashSet::new();
+    let mut latest = None;
+    for record in store.records() {
+        match record {
+            Record::OperationStarted {
+                id,
+                lane,
+                intent: OperationIntent::Run,
+                ..
+            } if lane == "main" => {
+                started_run_ids.insert(id.clone());
+            }
+            Record::OperationFinished {
+                id,
+                seq,
+                lane,
+                run_id,
+                outcome: OperationOutcome::Completed,
+                ..
+            } if lane == "main" && started_run_ids.contains(run_id) => {
+                latest = Some(crate::types::RunCompletionToken {
+                    record_id: id.clone(),
+                    run_id: run_id.clone(),
+                    seq: *seq,
+                });
+            }
+            _ => {}
+        }
+    }
+    latest
+}
+
+/// File-level wrapper for the acknowledgment token captured before a
+/// transcript load: `Ok(None)` confirms no qualifying completion, `Err`
+/// reports an unreadable journal so callers never acknowledge a guess.
+pub fn compute_latest_run_completion(
+    session_file: &Path,
+) -> Result<Option<crate::types::RunCompletionToken>, String> {
+    let store = JsonlStore::open_read_only(session_file).map_err(|error| error.to_string())?;
+    Ok(project_latest_run_completion(&store))
+}
+
 pub fn project_subagents_from_store(store: &impl SessionStore) -> Vec<SubagentActivityInfo> {
     use threadlane_runtime::harness::{Record, SubagentLifecyclePhase};
 
@@ -1330,4 +1384,199 @@ pub fn project_context_window(store: &JsonlStore) -> Option<ContextWindowInfo> {
         }
     }
     Some(info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_latest_run_completion, project_latest_run_completion};
+    use crate::types::RunCompletionToken;
+    use threadlane_runtime::harness::{
+        JsonlStore, OperationIntent, OperationOutcome, Record, SessionStore,
+    };
+
+    fn started(id: &str, seq: u64, lane: &str, intent: OperationIntent) -> Record {
+        Record::OperationStarted {
+            id: id.into(),
+            seq,
+            lane: lane.into(),
+            timestamp: seq,
+            wall_time_ms: Some(seq),
+            source_leaf_id: None,
+            intent,
+        }
+    }
+
+    fn finished(id: &str, seq: u64, lane: &str, run_id: &str, outcome: OperationOutcome) -> Record {
+        Record::OperationFinished {
+            id: id.into(),
+            seq,
+            lane: lane.into(),
+            timestamp: seq,
+            wall_time_ms: Some(seq),
+            run_id: run_id.into(),
+            outcome,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn latest_run_completion_reports_last_successful_main_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let mut store = JsonlStore::open(&path).unwrap();
+        store
+            .append_record(started("run-a", 1, "main", OperationIntent::Run))
+            .unwrap();
+        store
+            .append_record(finished(
+                "finish-a",
+                2,
+                "main",
+                "run-a",
+                OperationOutcome::Completed,
+            ))
+            .unwrap();
+        store
+            .append_record(started("run-b", 3, "main", OperationIntent::Run))
+            .unwrap();
+        store
+            .append_record(finished(
+                "finish-b",
+                4,
+                "main",
+                "run-b",
+                OperationOutcome::Completed,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            project_latest_run_completion(&store),
+            Some(RunCompletionToken {
+                record_id: "finish-b".into(),
+                run_id: "run-b".into(),
+                seq: 4,
+            })
+        );
+        assert_eq!(
+            compute_latest_run_completion(&path).unwrap(),
+            project_latest_run_completion(&store)
+        );
+    }
+
+    #[test]
+    fn latest_run_completion_ignores_non_run_non_main_and_unfinished_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let mut store = JsonlStore::open(&path).unwrap();
+        // Compaction and navigation are not runs.
+        store
+            .append_record(started("compact", 1, "main", OperationIntent::Compaction))
+            .unwrap();
+        store
+            .append_record(finished(
+                "finish-compact",
+                2,
+                "main",
+                "compact",
+                OperationOutcome::Completed,
+            ))
+            .unwrap();
+        store
+            .append_record(started("nav", 3, "main", OperationIntent::Navigation))
+            .unwrap();
+        store
+            .append_record(finished(
+                "finish-nav",
+                4,
+                "main",
+                "nav",
+                OperationOutcome::Completed,
+            ))
+            .unwrap();
+        // A subagent-lane finish is not a main-lane result.
+        store
+            .append_record(started("sub-run", 5, "subagent:research", OperationIntent::Run))
+            .unwrap();
+        store
+            .append_record(finished(
+                "finish-sub",
+                6,
+                "subagent:research",
+                "sub-run",
+                OperationOutcome::Completed,
+            ))
+            .unwrap();
+        // The store itself rejects finishes for unknown run ids, so an
+        // orphaned finish can never fabricate a completion.
+        assert!(project_latest_run_completion(&store).is_none());
+
+        // Failed, aborted, and declined main runs leave the marker unset…
+        store
+            .append_record(started("run-fail", 7, "main", OperationIntent::Run))
+            .unwrap();
+        store
+            .append_record(finished(
+                "finish-fail",
+                8,
+                "main",
+                "run-fail",
+                OperationOutcome::Failed,
+            ))
+            .unwrap();
+        store
+            .append_record(started("run-abort", 9, "main", OperationIntent::Run))
+            .unwrap();
+        store
+            .append_record(finished(
+                "finish-abort",
+                10,
+                "main",
+                "run-abort",
+                OperationOutcome::Aborted,
+            ))
+            .unwrap();
+        assert!(project_latest_run_completion(&store).is_none());
+
+        // …but a success keeps its token when a later run fails.
+        store
+            .append_record(started("run-ok", 11, "main", OperationIntent::Run))
+            .unwrap();
+        store
+            .append_record(finished(
+                "finish-ok",
+                12,
+                "main",
+                "run-ok",
+                OperationOutcome::Completed,
+            ))
+            .unwrap();
+        store
+            .append_record(started("run-later", 13, "main", OperationIntent::Run))
+            .unwrap();
+        store
+            .append_record(finished(
+                "finish-later",
+                14,
+                "main",
+                "run-later",
+                OperationOutcome::Failed,
+            ))
+            .unwrap();
+        assert_eq!(
+            project_latest_run_completion(&store),
+            Some(RunCompletionToken {
+                record_id: "finish-ok".into(),
+                run_id: "run-ok".into(),
+                seq: 12,
+            })
+        );
+    }
+
+    #[test]
+    fn compute_latest_run_completion_errors_on_unreadable_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("broken.jsonl");
+        std::fs::write(&path, "{ not json\n").unwrap();
+        assert!(compute_latest_run_completion(&path).is_err());
+    }
 }

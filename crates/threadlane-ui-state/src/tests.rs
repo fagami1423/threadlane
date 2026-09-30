@@ -1,5 +1,7 @@
 use super::*;
-use crate::projection::{compute_full_session_projection, compute_session_messages};
+use crate::projection::{
+    compute_full_session_projection, compute_latest_run_completion, compute_session_messages,
+};
 use crate::test_support::{
     activate_test_session, generated_reported_session_path, reported_session_shape_state,
 };
@@ -310,6 +312,7 @@ fn active_git_work_dir_uses_the_active_session_checkout_when_available() {
         github_issue: None,
         is_worktree: true,
         worktree_available: true,
+        completion_summary: SessionCompletionSummary::Unknown,
     });
     state.active_session_id = Some("session".into());
 
@@ -427,6 +430,7 @@ fn opening_a_file_targets_the_active_session_checkout() {
             github_issue: None,
             is_worktree: true,
             worktree_available: true,
+            completion_summary: SessionCompletionSummary::Unknown,
         }],
         is_expanded: true,
     }];
@@ -758,6 +762,7 @@ fn test_session(id: &str, session_file: &Path) -> SessionInfo {
         github_issue: None,
         is_worktree: false,
         worktree_available: true,
+        completion_summary: SessionCompletionSummary::Unknown,
     }
 }
 
@@ -2552,6 +2557,7 @@ fn begin_new_task_returns_from_a_session_worktree_to_its_project_root() {
             github_issue: None,
             is_worktree: true,
             worktree_available: true,
+            completion_summary: SessionCompletionSummary::Unknown,
         }],
         is_expanded: true,
     });
@@ -2571,8 +2577,15 @@ fn begin_new_task_returns_from_a_session_worktree_to_its_project_root() {
 fn apply_pending_hydration(state: &mut AppState) {
     let request = state.pending_hydrations.pop().unwrap();
     if request.reload_messages {
+        let presented_completion =
+            compute_latest_run_completion(&request.session_file).ok().flatten();
         let messages = compute_session_messages(&request.session_file).unwrap();
-        state.apply_session_messages(&request.session_id, &request.session_file, messages);
+        state.apply_session_messages(
+            &request.session_id,
+            &request.session_file,
+            messages,
+            presented_completion,
+        );
     }
     let projection = compute_full_session_projection(&request.session_file).unwrap();
     state.apply_session_hydration(&request.session_id, &request.session_file, projection);
@@ -3534,6 +3547,7 @@ fn session_switch_preserves_live_trajectory_and_applies_deferred_events() {
             github_issue: None,
             is_worktree: false,
             worktree_available: true,
+            completion_summary: SessionCompletionSummary::Unknown,
         }],
         is_expanded: true,
     });
@@ -4466,6 +4480,7 @@ fn worktree_session_state(work_dir: &Path, session_id: &str, worktree_dir: &Path
         github_issue: None,
         is_worktree: true,
         worktree_available: true,
+        completion_summary: SessionCompletionSummary::Unknown,
     });
     state
 }
@@ -4926,5 +4941,150 @@ fn completed_run_refresh_preserves_questions_from_a_later_chat_turn() {
     assert_eq!(
         state.pending_questions[&session_id].id,
         "later-turn-question"
+    );
+}
+
+fn run_completion(seq: u64) -> RunCompletionToken {
+    RunCompletionToken {
+        record_id: format!("finish-{seq}"),
+        run_id: format!("run-{seq}"),
+        seq,
+    }
+}
+
+#[test]
+fn session_seen_baseline_hides_existing_history_and_tracks_new_completions() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().to_path_buf();
+    let session_file = project.join(".threadlane/sessions/session.jsonl");
+    let mut session = test_session("session", &session_file);
+    session.work_dir = project.clone();
+    session.runtime_work_dir = project.clone();
+    session.completion_summary = SessionCompletionSummary::Latest(run_completion(7));
+
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.projects.push(ProjectInfo {
+        name: "project".into(),
+        work_dir: project.clone(),
+        sessions: Vec::new(),
+        is_expanded: true,
+    });
+
+    // First successful discovery after upgrade baselines existing history —
+    // a previously unseen result predating the marker is never reported.
+    assert!(state.apply_session_refresh(project.clone(), vec![session.clone()], 0));
+    assert!(!state.session_has_unseen_result(&session));
+
+    // A newer confirmed completion marks the row until it is presented.
+    session.completion_summary = SessionCompletionSummary::Latest(run_completion(9));
+    assert!(state.apply_session_refresh(project.clone(), vec![session.clone()], 0));
+    assert!(state.session_has_unseen_result(&session));
+
+    // Temporary absence keeps the watermark instead of rebaselining.
+    assert!(state.apply_session_refresh(project.clone(), Vec::new(), 0));
+    assert!(state.apply_session_refresh(project.clone(), vec![session.clone()], 0));
+    assert!(state.session_has_unseen_result(&session));
+}
+
+#[test]
+fn registered_session_reports_first_result_instead_of_baselines() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().to_path_buf();
+    let session_file = project.join(".threadlane/sessions/session.jsonl");
+    let mut session = test_session("session", &session_file);
+    session.work_dir = project.clone();
+    session.runtime_work_dir = project.clone();
+    session.completion_summary = SessionCompletionSummary::Latest(run_completion(4));
+
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.projects.push(ProjectInfo {
+        name: "project".into(),
+        work_dir: project.clone(),
+        sessions: Vec::new(),
+        is_expanded: true,
+    });
+    state.register_session_seen(&project, "session");
+
+    assert!(state.apply_session_refresh(project.clone(), vec![session.clone()], 0));
+    assert!(state.session_has_unseen_result(&session));
+}
+
+#[test]
+fn acknowledged_presented_completion_clears_the_marker() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().to_path_buf();
+    let session_file = project.join(".threadlane/sessions/session.jsonl");
+    let mut session = test_session("session", &session_file);
+    session.work_dir = project.clone();
+    session.runtime_work_dir = project.clone();
+    session.completion_summary = SessionCompletionSummary::Latest(run_completion(7));
+
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.projects.push(ProjectInfo {
+        name: "project".into(),
+        work_dir: project.clone(),
+        sessions: Vec::new(),
+        is_expanded: true,
+    });
+    state.active_work_dir = Some(project.clone());
+    state.active_session_id = Some("session".into());
+    assert!(state.apply_session_refresh(project.clone(), vec![session.clone()], 0));
+    session.completion_summary = SessionCompletionSummary::Latest(run_completion(9));
+    assert!(state.apply_session_refresh(project.clone(), vec![session.clone()], 0));
+    assert!(state.session_has_unseen_result(&session));
+
+    // The hydrate captured token 9 and the transcript applied: presenting it
+    // acknowledges exactly that completion.
+    state.apply_session_messages(
+        "session",
+        &session_file,
+        Vec::new(),
+        Some(run_completion(9)),
+    );
+    assert!(state.acknowledge_presented_completion());
+    assert!(!state.session_has_unseen_result(&session));
+    assert!(!state.acknowledge_presented_completion());
+
+    // A presentation that could not confirm a token never acknowledges.
+    session.completion_summary = SessionCompletionSummary::Latest(run_completion(11));
+    assert!(state.apply_session_refresh(project.clone(), vec![session.clone()], 0));
+    assert!(state.session_has_unseen_result(&session));
+    state.apply_session_messages("session", &session_file, Vec::new(), None);
+    assert!(!state.acknowledge_presented_completion());
+    assert!(state.session_has_unseen_result(&session));
+
+    // A stale presentation for a different session file is also refused.
+    state.apply_session_messages(
+        "session",
+        Path::new("/elsewhere/session.jsonl"),
+        Vec::new(),
+        Some(run_completion(11)),
+    );
+    assert!(!state.acknowledge_presented_completion());
+    assert!(state.session_has_unseen_result(&session));
+}
+
+#[test]
+fn session_work_dir_for_file_prefers_the_canonical_project() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    let worktree = project.join(".threadlane/worktrees/session");
+    let session_file = worktree.join(".threadlane/sessions/session.jsonl");
+    let mut session = test_session("session", &session_file);
+    session.work_dir = project.clone();
+    session.runtime_work_dir = worktree.clone();
+    session.is_worktree = true;
+
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.projects.push(ProjectInfo {
+        name: "project".into(),
+        work_dir: project.clone(),
+        sessions: vec![session],
+        is_expanded: true,
+    });
+
+    assert_eq!(
+        state.session_work_dir_for_file(&session_file),
+        Some(project)
     );
 }

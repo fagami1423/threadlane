@@ -334,15 +334,31 @@ enum DateGroup {
 #[derive(Clone)]
 enum HistoryRow {
     Group(DateGroup),
-    Session(SessionInfo, SessionAttention),
+    /// The bool records whether the session showed a New result marker when
+    /// the rows were built, so a marker toggling on an otherwise identical
+    /// row can invalidate its cached height.
+    Session(SessionInfo, SessionAttention, bool),
 }
 
 fn same_history_row_identity(left: &HistoryRow, right: &HistoryRow) -> bool {
     match (left, right) {
         (HistoryRow::Group(left), HistoryRow::Group(right)) => left == right,
-        (HistoryRow::Session(left, _), HistoryRow::Session(right, _)) => {
+        (HistoryRow::Session(left, ..), HistoryRow::Session(right, ..)) => {
             left.id == right.id && left.work_dir == right.work_dir
         }
+        _ => false,
+    }
+}
+
+/// Signals affecting a session row's height (the signals row renders only
+/// when at least one applies). Compared when row identities match so the
+/// ListState can remeasure exactly the rows that gained or lost height.
+fn history_row_height_inputs(left: &HistoryRow, right: &HistoryRow) -> bool {
+    match (left, right) {
+        (
+            HistoryRow::Session(_, left_attention, left_unseen),
+            HistoryRow::Session(_, right_attention, right_unseen),
+        ) => left_attention != right_attention || left_unseen != right_unseen,
         _ => false,
     }
 }
@@ -371,34 +387,41 @@ fn flatten_history_sessions(
     now: u64,
 ) -> Vec<HistoryRow> {
     flatten_history_sessions_with_pins(
-        sessions.into_iter().map(|(s, a)| (s, a, false)).collect(),
+        sessions
+            .into_iter()
+            .map(|(s, a)| (s, a, false, false))
+            .collect(),
         now,
     )
 }
 
 fn flatten_history_sessions_with_pins(
-    mut sessions: Vec<(SessionInfo, SessionAttention, bool)>,
+    mut sessions: Vec<(SessionInfo, SessionAttention, bool, bool)>,
     now: u64,
 ) -> Vec<HistoryRow> {
-    sessions.sort_by(|(left, left_attention, left_pinned), (right, right_attention, right_pinned)| {
-        let left_group = history_group_with_pin(*left_pinned, *left_attention, left.updated_at, now);
-        let right_group = history_group_with_pin(*right_pinned, *right_attention, right.updated_at, now);
-        left_group
-            .rank()
-            .cmp(&right_group.rank())
-            .then_with(|| right.updated_at.cmp(&left.updated_at))
-            .then_with(|| left.title.cmp(&right.title))
-    });
+    sessions.sort_by(
+        |(left, left_attention, left_pinned, _), (right, right_attention, right_pinned, _)| {
+            let left_group =
+                history_group_with_pin(*left_pinned, *left_attention, left.updated_at, now);
+            let right_group =
+                history_group_with_pin(*right_pinned, *right_attention, right.updated_at, now);
+            left_group
+                .rank()
+                .cmp(&right_group.rank())
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+                .then_with(|| left.title.cmp(&right.title))
+        },
+    );
 
     let mut rows = Vec::with_capacity(sessions.len() + DateGroup::COUNT);
     let mut previous_group = None;
-    for (session, attention, pinned) in sessions {
+    for (session, attention, pinned, has_unseen_result) in sessions {
         let group = history_group_with_pin(pinned, attention, session.updated_at, now);
         if previous_group != Some(group) {
             rows.push(HistoryRow::Group(group));
             previous_group = Some(group);
         }
-        rows.push(HistoryRow::Session(session, attention));
+        rows.push(HistoryRow::Session(session, attention, has_unseen_result));
     }
     rows
 }
@@ -522,7 +545,11 @@ pub struct SidebarView {
     _subscriptions: Vec<Subscription>,
 }
 
-fn sidebar_session_fingerprint(session: &SessionInfo, attention: SessionAttention) -> u64 {
+fn sidebar_session_fingerprint(
+    session: &SessionInfo,
+    attention: SessionAttention,
+    has_unseen_result: bool,
+) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -530,6 +557,7 @@ fn sidebar_session_fingerprint(session: &SessionInfo, attention: SessionAttentio
     session.work_dir.hash(&mut hasher);
     session.session_file.hash(&mut hasher);
     session.updated_at.hash(&mut hasher);
+    has_unseen_result.hash(&mut hasher);
     match session.github_issue.as_ref() {
         Some(issue) => {
             true.hash(&mut hasher);
@@ -605,8 +633,12 @@ fn sidebar_fingerprint(state: &AppState, now: u64) -> u64 {
         project.name.hash(&mut hasher);
         project.work_dir.hash(&mut hasher);
         for session in &project.sessions {
-            sidebar_session_fingerprint(session, state.session_attention(session))
-                .hash(&mut hasher);
+            sidebar_session_fingerprint(
+                session,
+                state.session_attention(session),
+                state.session_has_unseen_result(session),
+            )
+            .hash(&mut hasher);
         }
     }
     // Hash-map iteration is stable between notifications unless the map changes;
@@ -1242,6 +1274,7 @@ impl SidebarView {
         } else {
             "local checkout"
         };
+        let has_unseen_result = self.model.read(cx).session_has_unseen_result(session);
         let session_tooltip = format!(
             "{}\n{} · {}\nBranch: {branch_display} ({worktree_display})\n{} · {}",
             session_identity.tooltip,
@@ -1250,6 +1283,11 @@ impl SidebarView {
             time_ago,
             attention.label(),
         );
+        let session_tooltip = if has_unseen_result {
+            format!("{session_tooltip}\nNew result: a finished run has output you have not seen yet")
+        } else {
+            session_tooltip
+        };
 
         let work_dir = session.work_dir.clone();
         let session_id = session.id.clone();
@@ -1301,13 +1339,19 @@ impl SidebarView {
             .map(|branch| format!(", branch {branch}"))
             .unwrap_or_default();
         let pinned_prefix = if is_pinned { "Pinned, " } else { "" };
+        let unseen_suffix = if has_unseen_result {
+            ", new result"
+        } else {
+            ""
+        };
         let session_row_label = format!(
-            "{pinned_prefix}{}, project {}, {}, {}{}",
+            "{pinned_prefix}{}, project {}, {}, {}{}{}",
             session_title,
             project,
             attention.label(),
             time_ago,
             branch_suffix,
+            unseen_suffix,
         );
 
         let pr_info = session_pr_info(session, &self.model.read(cx).git_prs).cloned();
@@ -1383,6 +1427,27 @@ impl SidebarView {
         // quiet sessions collapse back to two rows.
         let mut context_items = Vec::new();
         let mut signal_items = Vec::new();
+        if has_unseen_result {
+            signal_items.push(
+                div()
+                    .id(SharedString::from(format!(
+                        "session-new-result-{}",
+                        session.id
+                    )))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .px_1p5()
+                    .py(rems(0.125))
+                    .rounded_full()
+                    .bg(theme.muted.opacity(0.2))
+                    .text_xs()
+                    .font_medium()
+                    .text_color(theme.muted_foreground)
+                    .child("New result")
+                    .into_any_element(),
+            );
+        }
         context_items.push(
             div()
                 .flex()
@@ -1628,7 +1693,11 @@ impl SidebarView {
                                     let id = session.id.clone();
                                     move || format!("session-title-{id}")
                                 })
-                                .accessibility_label(session_title.clone())
+                                .accessibility_label(if has_unseen_result {
+                                    format!("{session_title} — New result")
+                                } else {
+                                    session_title.clone()
+                                })
                                 .ghost()
                                 .xsmall()
                                 .compact()
@@ -2506,7 +2575,8 @@ impl SidebarView {
                 }
                 let attention = state.session_attention(session);
                 let is_pinned = state.is_session_pinned(&session.work_dir, &session.id);
-                sessions.push((session.clone(), attention, is_pinned));
+                let has_unseen_result = state.session_has_unseen_result(session);
+                sessions.push((session.clone(), attention, is_pinned, has_unseen_result));
             }
         }
         flatten_history_sessions_with_pins(sessions, now)
@@ -2589,7 +2659,7 @@ impl SidebarView {
                     )
                     .into_any_element()
             }
-            Some(HistoryRow::Session(session, attention)) => {
+            Some(HistoryRow::Session(session, attention, _has_unseen_result)) => {
                 let state = self.model.read(cx);
                 let is_active = state.workspace_page == WorkspacePage::Chat
                     && state.active_work_dir.as_ref() == Some(&session.work_dir)
@@ -2627,6 +2697,22 @@ impl SidebarView {
             });
             if !same_rows {
                 self.history_list_state.reset(rows.len());
+            } else if let Some((_, cached)) = self.history_cache.as_ref() {
+                // The ListState caches measured heights per index; a row that
+                // gains or loses a signals row (attention, New result) keeps
+                // a stale height unless its range is remeasured.
+                let mut remeasure: Option<(usize, usize)> = None;
+                for (index, (left, right)) in cached.iter().zip(&rows).enumerate() {
+                    if history_row_height_inputs(left, right) {
+                        match &mut remeasure {
+                            Some((_, last)) => *last = index + 1,
+                            slot => *slot = Some((index, index + 1)),
+                        }
+                    }
+                }
+                if let Some((start, end)) = remeasure {
+                    self.history_list_state.remeasure_items(start..end);
+                }
             }
             self.history_cache = Some((fingerprint, rows));
         }
@@ -2756,7 +2842,9 @@ mod tests {
     };
     use std::collections::HashMap;
     use threadlane_git::GitHubPrInfo;
-    use threadlane_ui_state::{SessionAttention, SessionHealth, SessionInfo};
+    use threadlane_ui_state::{
+        SessionAttention, SessionCompletionSummary, SessionHealth, SessionInfo,
+    };
 
     #[gpui::test]
     fn update_control_stays_beside_settings_and_tracks_progress(cx: &mut gpui::TestAppContext) {
@@ -2887,6 +2975,7 @@ mod tests {
             github_issue: None,
             is_worktree: false,
             worktree_available: true,
+            completion_summary: SessionCompletionSummary::Unknown,
         }
     }
 
@@ -3051,26 +3140,26 @@ mod tests {
 
         assert!(matches!(rows[0], HistoryRow::Group(DateGroup::NeedsYou)));
         assert!(
-            matches!(&rows[1], HistoryRow::Session(item, SessionAttention::NeedsYou) if item.id == "needs-newer")
+            matches!(&rows[1], HistoryRow::Session(item, SessionAttention::NeedsYou, _) if item.id == "needs-newer")
         );
         assert!(
-            matches!(&rows[2], HistoryRow::Session(item, SessionAttention::NeedsYou) if item.id == "needs-older")
+            matches!(&rows[2], HistoryRow::Session(item, SessionAttention::NeedsYou, _) if item.id == "needs-older")
         );
         assert!(matches!(rows[3], HistoryRow::Group(DateGroup::Working)));
         assert!(
-            matches!(&rows[4], HistoryRow::Session(item, SessionAttention::Working) if item.id == "working")
+            matches!(&rows[4], HistoryRow::Session(item, SessionAttention::Working, _) if item.id == "working")
         );
         assert!(matches!(rows[5], HistoryRow::Group(DateGroup::Today)));
         assert!(
-            matches!(&rows[6], HistoryRow::Session(item, SessionAttention::Ready) if item.id == "ready-today")
+            matches!(&rows[6], HistoryRow::Session(item, SessionAttention::Ready, _) if item.id == "ready-today")
         );
         assert!(matches!(rows[7], HistoryRow::Group(DateGroup::Yesterday)));
         assert!(
-            matches!(&rows[8], HistoryRow::Session(item, SessionAttention::Idle) if item.id == "idle-yesterday")
+            matches!(&rows[8], HistoryRow::Session(item, SessionAttention::Idle, _) if item.id == "idle-yesterday")
         );
         assert!(same_history_row_identity(
             &rows[1],
-            &HistoryRow::Session(session("needs-newer"), SessionAttention::Idle)
+            &HistoryRow::Session(session("needs-newer"), SessionAttention::Idle, false)
         ));
         assert!(!same_history_row_identity(&rows[1], &rows[4]));
     }
@@ -3087,24 +3176,24 @@ mod tests {
 
         let rows = flatten_history_sessions_with_pins(
             vec![
-                (working, SessionAttention::Working, false),
-                (needs_newer, SessionAttention::NeedsYou, false),
-                (pinned_idle, SessionAttention::Idle, true),
+                (working, SessionAttention::Working, false, false),
+                (needs_newer, SessionAttention::NeedsYou, false, false),
+                (pinned_idle, SessionAttention::Idle, true, false),
             ],
             now,
         );
 
         assert!(matches!(rows[0], HistoryRow::Group(DateGroup::Pinned)));
         assert!(
-            matches!(&rows[1], HistoryRow::Session(item, SessionAttention::Idle) if item.id == "pinned-idle")
+            matches!(&rows[1], HistoryRow::Session(item, SessionAttention::Idle, _) if item.id == "pinned-idle")
         );
         assert!(matches!(rows[2], HistoryRow::Group(DateGroup::NeedsYou)));
         assert!(
-            matches!(&rows[3], HistoryRow::Session(item, SessionAttention::NeedsYou) if item.id == "needs-newer")
+            matches!(&rows[3], HistoryRow::Session(item, SessionAttention::NeedsYou, _) if item.id == "needs-newer")
         );
         assert!(matches!(rows[4], HistoryRow::Group(DateGroup::Working)));
         assert!(
-            matches!(&rows[5], HistoryRow::Session(item, SessionAttention::Working) if item.id == "working")
+            matches!(&rows[5], HistoryRow::Session(item, SessionAttention::Working, _) if item.id == "working")
         );
     }
 
@@ -3219,13 +3308,13 @@ mod tests {
     fn changing_a_session_branch_changes_the_sidebar_fingerprint() {
         let mut item = session("session");
         item.git_branch = Some("feature/one".into());
-        let first = sidebar_session_fingerprint(&item, SessionAttention::Idle);
+        let first = sidebar_session_fingerprint(&item, SessionAttention::Idle, false);
 
         item.git_branch = Some("feature/two".into());
 
         assert_ne!(
             first,
-            sidebar_session_fingerprint(&item, SessionAttention::Idle)
+            sidebar_session_fingerprint(&item, SessionAttention::Idle, false)
         );
     }
 
@@ -3234,8 +3323,18 @@ mod tests {
         let item = session("session");
 
         assert_ne!(
-            sidebar_session_fingerprint(&item, SessionAttention::Idle),
-            sidebar_session_fingerprint(&item, SessionAttention::NeedsYou)
+            sidebar_session_fingerprint(&item, SessionAttention::Idle, false),
+            sidebar_session_fingerprint(&item, SessionAttention::NeedsYou, false)
+        );
+    }
+
+    #[test]
+    fn unseen_result_changes_the_sidebar_fingerprint() {
+        let item = session("session");
+
+        assert_ne!(
+            sidebar_session_fingerprint(&item, SessionAttention::Idle, false),
+            sidebar_session_fingerprint(&item, SessionAttention::Idle, true)
         );
     }
 
@@ -3251,7 +3350,7 @@ mod tests {
             url: "https://github.com/threadlane/app/issues/42".into(),
         });
 
-        let before = sidebar_session_fingerprint(&item, SessionAttention::Idle);
+        let before = sidebar_session_fingerprint(&item, SessionAttention::Idle, false);
         let identity = sidebar_session_identity(&item);
         assert_eq!(identity.title, "#42 Fix linked task browser");
         assert!(identity.tooltip.contains("threadlane/app"));
@@ -3272,7 +3371,7 @@ mod tests {
         });
         assert_ne!(
             before,
-            sidebar_session_fingerprint(&item, SessionAttention::Idle)
+            sidebar_session_fingerprint(&item, SessionAttention::Idle, false)
         );
     }
 }
