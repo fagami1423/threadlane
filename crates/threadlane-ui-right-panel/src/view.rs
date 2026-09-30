@@ -4579,7 +4579,7 @@ impl RightPanelView {
                 status.branch.as_deref() != Some(branch)
                     && status.default_branch.as_deref() != Some(branch)
                     && status.branch_details.iter().any(|info| {
-                        info.name == branch && !info.is_current && !info.is_default
+                        info.name == branch && !info.is_current && !info.is_default && !info.is_remote
                     })
             })
     }
@@ -5901,10 +5901,15 @@ mod dialog_keyboard_tests {
                         threadlane_git::GitBranchInfo { name: "main".into(), is_default: true, ..Default::default() },
                         threadlane_git::GitBranchInfo { name: "current".into(), is_current: true, ..Default::default() },
                         threadlane_git::GitBranchInfo { name: "feature".into(), ..Default::default() },
+                        threadlane_git::GitBranchInfo {
+                            name: "origin/feature".into(),
+                            is_remote: true,
+                            ..Default::default()
+                        },
                     ],
                     ..Default::default()
                 });
-                for branch in ["main", "current", "missing"] {
+                for branch in ["main", "current", "missing", "origin/feature"] {
                     assert!(!panel.can_delete_branch(&project, branch));
                     panel.confirm_delete_branch(project.clone(), branch.into(), window, cx);
                     assert!(!window.has_active_dialog(cx));
