@@ -322,6 +322,9 @@ pub struct PrViewedWrite {
     pub path: String,
     pub viewed: bool,
     pub token: u64,
+    /// The transport confirmed the mutation; the write stays pending — not
+    /// counted, not rewritable — until its readback settles.
+    pub confirmed: bool,
     /// The transport did not confirm the outcome; GitHub may have applied the
     /// write. Another write is blocked until a refresh settles the state.
     pub uncertain: bool,
@@ -387,14 +390,14 @@ impl PrViewedStates {
     }
 
     /// Refreshes are blocked while a write is still in flight — a read racing
-    /// an unconfirmed mutation could return pre-write state. An uncertain
-    /// (finished but unconfirmed) write is exactly what a refresh settles.
+    /// an unconfirmed mutation could return pre-write state. Uncertain and
+    /// confirmed-but-unverified writes are exactly what a refresh settles.
     pub fn refresh_allowed(&self, key: &PrWorkspaceKey) -> bool {
         !self.by_pr.get(key).is_some_and(|state| {
             state
                 .pending_write
                 .as_ref()
-                .is_some_and(|write| !write.uncertain)
+                .is_some_and(|write| !(write.uncertain || write.confirmed))
         })
     }
 
@@ -469,6 +472,7 @@ impl PrViewedStates {
             path,
             viewed,
             token,
+            confirmed: false,
             uncertain: false,
         });
         Some(token)
@@ -489,10 +493,10 @@ impl PrViewedStates {
         }
         match result {
             Ok(()) => {
-                // Transport confirmed; the marker is only counted once the
-                // readback this triggers settles, and writes stay disabled
-                // while that read is in flight.
-                state.pending_write = None;
+                // Transport confirmed; keep the write pending until the
+                // readback settles so a failed readback marks it uncertain
+                // rather than silently re-arming the old marker.
+                write.confirmed = true;
             }
             Err(error) => {
                 write.uncertain = true;

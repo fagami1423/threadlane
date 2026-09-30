@@ -6728,6 +6728,29 @@ mod tests {
         assert!(states.complete_write(&key, write, Ok(())));
         assert!(states.refresh_allowed(&key));
 
+        // A confirmed write is still pending: no rewrites until its readback
+        // settles, and a failed readback is awaiting verification — not rolled
+        // back to the pre-write marker.
+        assert!(states.begin_write(&key, "src/lib.rs".into(), false).is_none());
+        let readback = states.begin_read(&key);
+        assert!(states.fail_read(&key, readback, "readback offline".into()));
+        let state = states.get(&key).unwrap();
+        assert_eq!(state.error.as_deref(), Some("readback offline"));
+        assert_eq!(
+            state.marker_label("src/view.rs"),
+            Some("Couldn't confirm — refresh to settle")
+        );
+        let settle = states.begin_read(&key);
+        assert!(states.complete_read(
+            &key,
+            settle,
+            viewed_snapshot(&[
+                ("src/lib.rs", PrFileViewedStatus::Viewed),
+                ("src/view.rs", PrFileViewedStatus::Viewed),
+            ])
+        ));
+        assert!(states.get(&key).unwrap().pending_write.is_none());
+
         // An unconfirmed write stays blocked until a refresh settles it.
         let write = states.begin_write(&key, "src/lib.rs".into(), false).unwrap();
         assert!(states.complete_write(&key, write, Err("timed out".into())));
@@ -6987,6 +7010,86 @@ mod tests {
                 PrFileViewedStatus::Viewed
             );
             assert!(state.write_allowed("src/lib.rs"));
+        });
+    }
+
+    #[gpui::test]
+    fn github_pr_viewed_failed_readback_stays_uncertain(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            super::init(cx);
+        });
+        let key = pr_viewed_key();
+        let (transport, read_req, write_req, read_resp, write_resp) = fake_viewed_transport();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let model = cx.new(|_| AppState::default());
+            let mut view = GitHubView::new(model, window, cx);
+            view.viewed_transport = transport;
+            configure_pr_workspace(&mut view, cx);
+            view.pr_viewed.observe_head(&key, "head-42");
+            view
+        });
+        view.update(cx, |view, cx| view.select_pr_tab(PrDetailTab::Code, cx));
+        read_resp
+            .send(Ok(viewed_fixture(&[
+                ("src/lib.rs", PrFileViewedStatus::Unviewed),
+                ("src/view.rs", PrFileViewedStatus::Unviewed),
+            ])))
+            .unwrap();
+        cx.run_until_parked();
+        read_req.try_recv().unwrap();
+
+        // The write is confirmed, but its readback fails: the marker is
+        // awaiting verification — blocked, never rolled back to pre-write.
+        view.update(cx, |view, cx| {
+            view.set_pr_file_viewed("src/lib.rs".into(), true, cx)
+        });
+        write_resp.send(Ok(())).unwrap();
+        read_resp.send(Err("connection reset".into())).unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            write_req.try_recv().unwrap(),
+            ("PR-node-1".into(), "src/lib.rs".into(), true)
+        );
+        read_req.try_recv().unwrap();
+        view.read_with(cx, |view, _| {
+            let state = view.pr_viewed.get(&key).unwrap();
+            assert!(!state.loading);
+            assert_eq!(state.error.as_deref(), Some("connection reset"));
+            assert!(state.pending_write.as_ref().unwrap().uncertain);
+            assert_eq!(
+                state.marker_label("src/lib.rs"),
+                Some("Couldn't confirm — refresh to settle")
+            );
+            assert!(!state.write_allowed("src/lib.rs"));
+            assert_eq!(
+                state.snapshot.as_ref().unwrap().status("src/lib.rs"),
+                PrFileViewedStatus::Unviewed
+            );
+        });
+        view.update(cx, |view, cx| {
+            view.set_pr_file_viewed("src/lib.rs".into(), true, cx)
+        });
+        cx.run_until_parked();
+        assert!(write_req.try_recv().is_err());
+        // A refresh settles it.
+        view.update(cx, |view, cx| view.refresh_pr_viewed(cx));
+        read_resp
+            .send(Ok(viewed_fixture(&[
+                ("src/lib.rs", PrFileViewedStatus::Viewed),
+                ("src/view.rs", PrFileViewedStatus::Unviewed),
+            ])))
+            .unwrap();
+        cx.run_until_parked();
+        read_req.try_recv().unwrap();
+        view.read_with(cx, |view, _| {
+            let state = view.pr_viewed.get(&key).unwrap();
+            assert!(state.pending_write.is_none());
+            assert!(state.error.is_none());
+            assert_eq!(
+                state.snapshot.as_ref().unwrap().status("src/lib.rs"),
+                PrFileViewedStatus::Viewed
+            );
         });
     }
 
