@@ -1823,6 +1823,9 @@ impl SidebarView {
                 let open_work_dir = context_work_dir.clone();
                 let open_session_id = context_session_id.clone();
                 let copy_session_id = context_session_id.clone();
+                let fork_model = context_model.clone();
+                let fork_work_dir = context_work_dir.clone();
+                let fork_session_id = context_session_id.clone();
                 let copy_project_path = context_work_dir.to_string_lossy().into_owned();
                 let copy_session_file = copy_session_file.clone();
                 let export_log_model = context_model.clone();
@@ -1886,6 +1889,42 @@ impl SidebarView {
                             );
                             cx.notify();
                         });
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new("Fork Session").on_click(move |_event, window, cx| {
+                        let work = fork_model.read(cx).prepare_session_fork(
+                            fork_work_dir.clone(),
+                            fork_session_id.clone(),
+                        );
+                        let work = match work {
+                            Ok(work) => work,
+                            Err(error) => {
+                                window.push_notification(error, cx);
+                                return;
+                            }
+                        };
+                        window.push_notification("Forking session… The fork will use the same checkout.", cx);
+                        let model = fork_model.clone();
+                        let project = fork_work_dir.clone();
+                        cx.spawn(async move |cx| {
+                            let result = cx
+                                .background_executor()
+                                .spawn(async move { work() })
+                                .await;
+                            let _ = model.update(cx, |state, cx| {
+                                match result {
+                                    Ok((id, sessions)) => {
+                                        state.finish_session_fork(project, id, sessions);
+                                    }
+                                    Err(error) => {
+                                        state.session_status = Some(format!("Could not fork session: {error}"));
+                                    }
+                                }
+                                cx.notify();
+                            });
+                        })
+                        .detach();
                     }),
                 )
                 .item(

@@ -24,7 +24,18 @@ pub fn effective_session_work_dir(
         return canonical_work_dir.to_path_buf();
     }
 
-    let inferred = canonical_work_dir.join(".threadlane/worktrees").join(id);
+    // A recovery fork shares the original checkout, not its execution state.
+    // Accept only one normal path component; metadata must not escape the project.
+    let owner = facts
+        .get("worktree_owner")
+        .map(String::as_str)
+        .filter(|owner| {
+            let mut components = Path::new(owner).components();
+            matches!(components.next(), Some(std::path::Component::Normal(_)))
+                && components.next().is_none()
+        })
+        .unwrap_or(id);
+    let inferred = canonical_work_dir.join(".threadlane/worktrees").join(owner);
     let candidate = facts
         .get("worktree_path")
         .map(PathBuf::from)

@@ -656,6 +656,19 @@ impl JsonlStore {
         Ok((session_id, preferred_leaf, entries, records))
     }
 
+    /// Read recoverable main-lane entries without reducing a damaged journal.
+    /// Repeated durable identities are one entry, but identical messages with
+    /// distinct identities remain separate conversation occurrences.
+    pub fn recover_main_entries(path: &Path) -> io::Result<Vec<Entry>> {
+        let lines = read_strict::<SessionLine>(path)?;
+        let (_, _, entries, _) = classify_lines(path, lines);
+        let mut seen = std::collections::HashSet::new();
+        Ok(entries
+            .into_iter()
+            .filter(|entry| entry.lane == "main" && seen.insert(entry.id.clone()))
+            .collect())
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
