@@ -2738,6 +2738,7 @@ impl Render for WorkspaceView {
                         Button::new("terminal-open-link")
                             .label("Open link…")
                             .tooltip("Links in visible output")
+                            .accessibility_label("Open link… — Links in visible output")
                             .ghost()
                             .small()
                             .on_click(move |_, window, cx| {
