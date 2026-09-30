@@ -8314,6 +8314,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "threadlane-client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde_json",
+ "threadlane-daemon",
+ "threadlane-protocol",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
 name = "threadlane-coding-agent"
 version = "0.1.0"
 dependencies = [
@@ -8389,6 +8403,7 @@ name = "threadlane-daemon"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures",
  "robius-open",
  "serde",
  "serde_json",
@@ -8410,7 +8425,9 @@ dependencies = [
  "threadlane-tools",
  "threadlane-updater",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -8779,6 +8796,7 @@ dependencies = [
  "threadlane-acp-engine",
  "threadlane-auth",
  "threadlane-automation",
+ "threadlane-client",
  "threadlane-coding-agent",
  "threadlane-context",
  "threadlane-daemon",
@@ -8830,6 +8848,7 @@ dependencies = [
  "rfd",
  "threadlane-coding-agent",
  "threadlane-git",
+ "threadlane-protocol",
  "threadlane-ui-automation",
  "threadlane-ui-chat",
  "threadlane-ui-editor",

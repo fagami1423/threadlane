@@ -1,0 +1,15 @@
+[package]
+name = "threadlane-client"
+version = "0.1.0"
+edition = "2021"
+description = "DaemonClient abstraction and transports for the Threadlane daemon: LocalDaemon wraps DaemonCore in-process (desktop default), RemoteDaemon speaks the threadlane-protocol::daemon session contract over WebSocket."
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+threadlane-daemon.workspace = true
+threadlane-protocol.workspace = true

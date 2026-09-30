@@ -17,6 +17,7 @@ threadlane-auth = { version = "0.1.0", path = "crates/threadlane-auth" }
 threadlane-automation = { version = "0.1.0", path = "crates/threadlane-automation" }
 threadlane-benchmarks = { version = "0.0.0", path = "crates/threadlane-benchmarks" }
 threadlane-browser = { version = "0.1.0", path = "crates/threadlane-browser" }
+threadlane-client = { version = "0.1.0", path = "crates/threadlane-client" }
 threadlane-coding-agent = { version = "0.1.0", path = "crates/threadlane-coding-agent" }
 threadlane-compaction = { version = "0.1.0", path = "crates/threadlane-compaction" }
 threadlane-computer = { version = "0.1.0", path = "crates/threadlane-computer" }

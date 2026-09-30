@@ -281,6 +281,25 @@ impl WorkspaceView {
         cx: &mut AsyncApp,
     ) {
         cx.spawn(async move |cx| {
+            // Remote mode: the daemon owns projection and runtime construction;
+            // the HydrateSession command answers with a SessionSnapshot event.
+            let remote = model.update(cx, |state, _cx| {
+                if state.daemon_remote {
+                    state.dispatch_command(
+                        threadlane_protocol::daemon::SessionCommand::HydrateSession {
+                            request: request.clone(),
+                        },
+                    );
+                }
+                state.daemon_remote
+            });
+            if remote {
+                return;
+            }
+            let hydrate_work_dir = request
+                .runtime_options
+                .as_ref()
+                .map(|options| options.work_dir.clone());
             // Runtime construction loads WASI extensions through wasmi and must
             // not run on GPUI's 512 KiB GCD worker stacks. The blocking-pool
             // task starts now and overlaps the transcript projection below.
@@ -367,6 +386,7 @@ impl WorkspaceView {
                 match runtime {
                     Some(Ok(runtime)) => {
                         let runtime = state.register_session_runtime(
+                            hydrate_work_dir.clone().unwrap_or_default(),
                             request.session_file.clone(),
                             runtime,
                         );

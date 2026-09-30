@@ -539,9 +539,9 @@ async fn model_and_reasoning_pickers_persist_before_rebuild_and_next_request() {
         state.set_reasoning_effort(ReasoningEffort::High);
 
         assert_eq!(state.selected_model, selected);
-        assert_eq!(state.session_runtimes[&session_file].model(), selected);
+        assert_eq!(state.daemon_core.runtime_for_file(&session_file).unwrap().model(), selected);
         assert_eq!(
-            state.session_runtimes[&session_file].reasoning_effort(),
+            state.daemon_core.runtime_for_file(&session_file).unwrap().reasoning_effort(),
             ReasoningEffort::High
         );
         assert_eq!(
@@ -616,7 +616,7 @@ fn model_picker_preserves_current_selection_while_runtime_is_busy() {
             .contains("settings are still loading")
     );
     assert!(Arc::ptr_eq(
-        &state.session_runtimes[&session_file],
+        &state.daemon_core.runtime_for_file(&session_file).unwrap(),
         &runtime
     ));
     assert_eq!(
@@ -666,7 +666,7 @@ fn model_picker_ignores_acp_replies_from_replaced_or_inactive_runtimes() {
     activate_test_session(&mut state, "session", &file_a);
     state.selected_model = "acp/test".into();
     let (old, _) = state.active_session_runtime().unwrap();
-    state.session_runtimes.remove(&file_a);
+    state.daemon_core.drop_runtime(&file_a);
     let (current, _) = state.active_session_runtime().unwrap();
     let reply = |runtime: &Arc<SessionRuntime>, label: &str, error: Option<&str>| {
         SessionEvent::AcpConfigOptions {
@@ -1856,7 +1856,7 @@ fn issue_work_failure_never_selects_or_runs_in_canonical_checkout() {
     assert!(!error.is_empty());
     assert!(state.active_session_id.is_none());
     assert!(state.projects[0].sessions.is_empty());
-    assert!(state.session_runtimes.is_empty());
+    assert!(state.daemon_core.runtimes().is_empty());
     assert!(!work_dir.join(".threadlane/sessions").exists());
 }
 
@@ -2312,7 +2312,7 @@ async fn durable_projections_and_hydration_are_scoped_by_session_file() {
     let projection_a = compute_full_session_projection(&file_a).unwrap();
     let projection_b = compute_full_session_projection(&file_b).unwrap();
     let expected_b_billed = projection_b.metrics.billed_input_tokens();
-    let expected_b_processed = projection_b.token_efficiency.usage.processed_tokens();
+    let expected_b_processed = projection_b.token_efficiency.as_ref().unwrap().usage.processed_tokens();
     let mut state = AppState::load_from_registry(Vec::new());
     activate_test_session(&mut state, "same-session", &file_a);
     state.apply_session_hydration("same-session", &file_a, projection_a);
@@ -2701,7 +2701,7 @@ fn startup_restores_the_most_recent_project_and_its_sessions() {
         Some(recent_project.as_path())
     );
     assert_eq!(state.active_session_id.as_deref(), Some("recent-session"));
-    assert!(state.session_runtimes.is_empty());
+    assert!(state.daemon_core.runtimes().is_empty());
     assert_eq!(
         state
             .projects
@@ -4443,7 +4443,7 @@ async fn one_time_permission_rejects_stale_and_persistent_decisions() {
     state.active_work_dir = Some(root.path().to_path_buf());
     state.active_session_id = Some(session_id.into());
     let runtime = state.ensure_session_runtime(root.path().to_path_buf(), session_file.clone());
-    assert!(state.session_runtimes.contains_key(&session_file));
+    assert!(state.daemon_core.runtime_for_file(&session_file).is_some());
     assert!(state.scheduler_results.contains_key(&session_file));
     let handle = runtime.permission_handle();
     let (events, mut rx) = tokio::sync::broadcast::channel(4);
@@ -4473,7 +4473,7 @@ async fn one_time_permission_rejects_stale_and_persistent_decisions() {
     assert_eq!(pending.await.unwrap(), Some(PermissionDecision::AllowOnce));
     assert!(!state.pending_permissions.contains_key(session_id));
     state.finish_session_removal(root.path(), session_id);
-    assert!(!state.session_runtimes.contains_key(&session_file));
+    assert!(state.daemon_core.runtime_for_file(&session_file).is_none());
     assert!(!state.scheduler_results.contains_key(&session_file));
 }
 
@@ -4708,7 +4708,7 @@ fn pr_review_actions_reject_missing_checkout_without_dispatch_or_tracking() {
     }
     assert!(state.active_session_id.is_none());
     assert!(state.pr_review_tracking.is_empty());
-    assert!(state.session_runtimes.is_empty());
+    assert!(state.daemon_core.runtimes().is_empty());
 }
 
 #[test]
@@ -4819,7 +4819,7 @@ fn worktree_setup_failure_and_cancellation_are_scoped_to_the_session() {
         state.active_worktree_setup().unwrap().error.as_deref(),
         Some("invalid base")
     );
-    assert!(state.session_runtimes.is_empty());
+    assert!(state.daemon_core.runtimes().is_empty());
     state.cancel_generation().unwrap();
     assert!(setup.cancelled.load(std::sync::atomic::Ordering::Relaxed));
     assert_eq!(
@@ -4882,7 +4882,7 @@ fn worktree_setup_failure_and_cancellation_are_scoped_to_the_session() {
     assert!(!state.worktree_setups.contains_key(&id));
     assert!(state.active_session_id.is_none());
     assert!(state.session_status.is_none());
-    assert!(state.session_runtimes.is_empty());
+    assert!(state.daemon_core.runtimes().is_empty());
 }
 
 #[test]

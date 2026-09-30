@@ -78,9 +78,14 @@ pub struct SessionProjectionResult {
     pub plan: SessionPlan,
     pub trajectory: Vec<TrajectoryEntry>,
     pub subagents: Vec<SubagentActivityInfo>,
-    pub diagnostics: threadlane_runtime::harness::SessionDiagnostics,
+    /// `None` on snapshots that came over the wire: diagnostics are a
+    /// daemon-local panel the `SessionEvent::SessionSnapshot` contract
+    /// deliberately does not carry, so `None` means "keep what the client
+    /// already computed" rather than "empty".
+    pub diagnostics: Option<threadlane_runtime::harness::SessionDiagnostics>,
     pub metrics: SessionMetricsInfo,
-    pub token_efficiency: threadlane_runtime::harness::TokenEfficiencyReport,
+    /// `None` for the same reason as `diagnostics`.
+    pub token_efficiency: Option<threadlane_runtime::harness::TokenEfficiencyReport>,
     pub token_usage: TokenUsage,
     pub context_window: Option<ContextWindowInfo>,
 }

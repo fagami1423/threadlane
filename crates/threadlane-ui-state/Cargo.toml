@@ -27,6 +27,7 @@ threadlane-provider.workspace = true
 threadlane-runtime.workspace = true
 threadlane-skills.workspace = true
 threadlane-tools.workspace = true
+threadlane-client.workspace = true
 threadlane-daemon.workspace = true
 threadlane-updater.workspace = true
 

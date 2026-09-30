@@ -1,0 +1,872 @@
+//! Daemon-owned session core.
+//!
+//! [`DaemonCore`] is the in-process owner of everything a standalone
+//! `threadlane-daemon` process would hold: the live `SessionRuntime` map
+//! (keyed by session file, addressed by `session_id`), pending worktree
+//! setups, session/model configuration, and the `SessionEvent` journal that
+//! fans out to every attached client. `AppState` embeds it today through
+//! `LocalDaemon`; the daemon binary wraps it behind the WebSocket transport
+//! that `RemoteDaemon` speaks — the same `dispatch(SessionCommand)` entry
+//! point serves both.
+//!
+//! Event flow: producers (chat turns, ACP tasks, worktree setup, hydration)
+//! send into the ingest channel; a pump on the shared Tokio reactor appends
+//! each event to a bounded journal and broadcasts it to subscribers. A
+//! reconnecting client replays the journal tail and then tails live events —
+//! the attach-mid-run semantics the wire contract promises.
+
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
+
+use tokio::sync::{broadcast, mpsc};
+
+use threadlane_coding_agent::controller::{
+    spawn_session_runtime_construction, SessionRuntime,
+};
+use threadlane_protocol::browser::BrowserBridge;
+use threadlane_protocol::daemon::{
+    ProjectInfo, SessionCommand, SessionEvent, SessionHydrationRequest, SessionInfo,
+    SessionSnapshot, WorktreeSetup,
+};
+use threadlane_protocol::orchestration::ModelRoles;
+use threadlane_protocol::ReasoningEffort;
+use threadlane_runtime::harness::SessionStore;
+
+use crate::discovery::canonical_session_file;
+use crate::projection::{
+    compute_full_session_projection, compute_session_messages, coding_agent_options,
+};
+
+/// How many recent events a reconnecting client can replay. Sized to a long
+/// busy session: tail events are deltas, so a full snapshot is fetched via
+/// `GetSessionSnapshot` for anything older.
+const JOURNAL_CAPACITY: usize = 4096;
+/// Broadcast lag headroom per subscriber before `Lagged` drops events.
+const BROADCAST_CAPACITY: usize = 1024;
+
+/// Where a session's runtime was built to execute. `work_dir` is the
+/// effective execution directory (the worktree for worktree sessions).
+#[derive(Clone, Debug)]
+pub struct SessionIdentity {
+    pub session_file: PathBuf,
+    pub work_dir: PathBuf,
+}
+
+/// The session-owning half of the daemon, transport-agnostic.
+pub struct DaemonCore {
+    /// Live runtimes keyed by session file (the canonical identity path).
+    runtimes: Mutex<HashMap<PathBuf, Arc<SessionRuntime>>>,
+    /// `session_id` → file/work_dir, populated at registration and hydration.
+    identities: Mutex<HashMap<String, SessionIdentity>>,
+    /// In-flight worktree preparations, for `CancelWorktreeSetup`.
+    worktree_setups: Mutex<HashMap<String, WorktreeSetup>>,
+    /// Events producers write into; pumped onto the journal + broadcast.
+    ingest_tx: mpsc::UnboundedSender<SessionEvent>,
+    broadcast_tx: broadcast::Sender<SessionEvent>,
+    journal: Arc<Mutex<VecDeque<SessionEvent>>>,
+    /// Host-provided browser bridge resolved at runtime construction — the
+    /// desktop embeds a live bridge; a standalone daemon serves
+    /// `BrowserBridge::unavailable()`.
+    browser_bridge: RwLock<BrowserBridge>,
+    /// Model selection shared by new/lazy runtime constructions, seeded by
+    /// the host and kept current by `SetModel`.
+    model: RwLock<String>,
+    model_roles: RwLock<ModelRoles>,
+    effort: RwLock<ReasoningEffort>,
+}
+
+impl DaemonCore {
+    /// Start the core and its event pump on the shared Tokio reactor.
+    pub fn new() -> Result<Arc<Self>, String> {
+        let (ingest_tx, mut ingest_rx) = mpsc::unbounded_channel::<SessionEvent>();
+        let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let journal: Arc<Mutex<VecDeque<SessionEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
+        {
+            let broadcast_tx = broadcast_tx.clone();
+            let journal = journal.clone();
+            crate::chat::executor()?.spawn(async move {
+                while let Some(event) = ingest_rx.recv().await {
+                    let mut journal = journal.lock().expect("daemon journal poisoned");
+                    journal.push_back(event.clone());
+                    while journal.len() > JOURNAL_CAPACITY {
+                        journal.pop_front();
+                    }
+                    drop(journal);
+                    // Slow subscribers drop via Lagged rather than blocking
+                    // the whole daemon on one client's backlog.
+                    let _ = broadcast_tx.send(event);
+                }
+            });
+        }
+        Ok(Arc::new(Self {
+            runtimes: Mutex::new(HashMap::new()),
+            identities: Mutex::new(HashMap::new()),
+            worktree_setups: Mutex::new(HashMap::new()),
+            ingest_tx,
+            broadcast_tx,
+            journal,
+            browser_bridge: RwLock::new(BrowserBridge::unavailable()),
+            model: RwLock::new(String::new()),
+            model_roles: RwLock::new(ModelRoles::default()),
+            effort: RwLock::new(ReasoningEffort::default()),
+        }))
+    }
+
+    /// The host (desktop shell, or the standalone binary's own browser
+    /// surface once one exists) installs the bridge every lazily-built
+    /// runtime shares.
+    pub fn set_browser_bridge(&self, bridge: BrowserBridge) {
+        *self.browser_bridge.write().expect("browser bridge poisoned") = bridge;
+    }
+
+    /// Seed the model/effort/roles a host already selected (AppState embeds
+    /// the core after restoring its own persisted selection).
+    pub fn seed_config(&self, model: String, roles: ModelRoles, effort: ReasoningEffort) {
+        *self.model.write().expect("model poisoned") = model;
+        *self.model_roles.write().expect("model roles poisoned") = roles;
+        *self.effort.write().expect("effort poisoned") = effort;
+    }
+
+    /// Channel producers write `SessionEvent`s into (turns, ACP tasks,
+    /// worktree setup). The pump owns every subscriber downstream.
+    pub fn event_sender(&self) -> mpsc::UnboundedSender<SessionEvent> {
+        self.ingest_tx.clone()
+    }
+
+    /// A live event subscription (journal replay is the caller's choice —
+    /// [`Self::subscribe_with_tail`] bundles both for attach flows).
+    pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
+        self.broadcast_tx.subscribe()
+    }
+
+    /// Attach semantics: replay the bounded journal tail, then tail live.
+    /// The broadcast subscription is created while the journal is locked, so
+    /// an event can never fall between the tail snapshot and the live feed —
+    /// the tail boundary is exactly-once.
+    pub fn subscribe_with_tail(&self) -> (Vec<SessionEvent>, broadcast::Receiver<SessionEvent>) {
+        let journal = self.journal.lock().expect("daemon journal poisoned");
+        let receiver = self.broadcast_tx.subscribe();
+        let tail: Vec<SessionEvent> = journal.iter().cloned().collect();
+        (tail, receiver)
+    }
+
+    /// All events since the tail snapshot — used by transports that must
+    /// bridge a `Lagged` gap into a `DaemonError` for the client.
+    pub fn journal_tail(&self) -> Vec<SessionEvent> {
+        self.journal
+            .lock()
+            .expect("daemon journal poisoned")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    // -- runtime registry -------------------------------------------------
+
+    /// Register a runtime under its session identity so commands addressed
+    /// by `session_id` resolve.
+    pub fn register_runtime(
+        &self,
+        session_id: &str,
+        work_dir: PathBuf,
+        session_file: PathBuf,
+        runtime: Arc<SessionRuntime>,
+    ) -> Arc<SessionRuntime> {
+        {
+            let mut runtimes = self.runtimes.lock().expect("runtimes poisoned");
+            if let Some(existing) = runtimes.get(&session_file) {
+                return existing.clone();
+            }
+            runtimes.insert(session_file.clone(), runtime.clone());
+        }
+        self.identities
+            .lock()
+            .expect("identities poisoned")
+            .insert(session_id.to_string(), SessionIdentity { session_file, work_dir });
+        runtime
+    }
+
+    pub fn runtime_for_file(&self, session_file: &Path) -> Option<Arc<SessionRuntime>> {
+        self.runtimes
+            .lock()
+            .expect("runtimes poisoned")
+            .get(session_file)
+            .cloned()
+    }
+
+    /// Snapshot of `(session_file, runtime)` pairs for status sweeps.
+    pub fn runtimes(&self) -> Vec<(PathBuf, Arc<SessionRuntime>)> {
+        self.runtimes
+            .lock()
+            .expect("runtimes poisoned")
+            .iter()
+            .map(|(file, runtime)| (file.clone(), runtime.clone()))
+            .collect()
+    }
+
+    /// Drop a runtime so the next access rebuilds it with current config
+    /// (model/effort/mode switching works by invalidation).
+    pub fn drop_runtime(&self, session_file: &Path) -> Option<Arc<SessionRuntime>> {
+        self.runtimes
+            .lock()
+            .expect("runtimes poisoned")
+            .remove(session_file)
+    }
+
+    /// `session_id` ↔ file: canonical layout is `<work_dir>/.threadlane/
+    /// sessions/<session_id>.jsonl`, so the stem is always the id.
+    pub fn session_id_for_file(session_file: &Path) -> Option<String> {
+        session_file
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string)
+    }
+
+    fn identity(&self, session_id: &str) -> Option<SessionIdentity> {
+        self.identities
+            .lock()
+            .expect("identities poisoned")
+            .get(session_id)
+            .cloned()
+    }
+
+    /// Record where a session lives without attaching a runtime (hydration
+    /// projection and deletion need it before/without construction).
+    pub fn register_identity(&self, session_id: &str, work_dir: PathBuf, session_file: PathBuf) {
+        self.identities
+            .lock()
+            .expect("identities poisoned")
+            .insert(session_id.to_string(), SessionIdentity { session_file, work_dir });
+    }
+
+    /// Resolve `session_id` to a live runtime when one is registered.
+    pub fn runtime_for_session(&self, session_id: &str) -> Option<Arc<SessionRuntime>> {
+        let runtimes = self.runtimes.lock().expect("runtimes poisoned");
+        if let Some(identity) = self.identity(session_id) {
+            if let Some(runtime) = runtimes.get(&identity.session_file) {
+                return Some(runtime.clone());
+            }
+        }
+        // Fallback for runtimes registered before their identity (or by a
+        // host that only knows the file): the canonical stem is the id.
+        runtimes
+            .iter()
+            .find(|(file, _)| Self::session_id_for_file(file).as_deref() == Some(session_id))
+            .map(|(_, runtime)| runtime.clone())
+    }
+
+    /// Resolve `session_id` to a runtime, constructing one lazily when the
+    /// session is known but idle. Construction goes through the shared
+    /// blocking pool — wasmi needs real stacks.
+    pub async fn ensure_runtime(
+        &self,
+        session_id: &str,
+        work_dir: &Path,
+    ) -> Result<Arc<SessionRuntime>, String> {
+        if let Some(runtime) = self.runtime_for_session(session_id) {
+            return Ok(runtime);
+        }
+        // A worktree-prepared session parks its runtime under the session id
+        // before the transcript exists; the first prompt claims it.
+        if let Some(prepared) = crate::runtimes::take_prepared_runtime(session_id) {
+            return Ok(self.register_runtime(
+                session_id,
+                work_dir.to_path_buf(),
+                prepared.session_file.clone(),
+                prepared,
+            ));
+        }
+        let session_file = self
+            .identity(session_id)
+            .map(|identity| identity.session_file)
+            .unwrap_or_else(|| canonical_session_file(work_dir, session_id));
+        let options = coding_agent_options(
+            work_dir.to_path_buf(),
+            session_file.clone(),
+            self.model.read().expect("model poisoned").clone(),
+            self.model_roles.read().expect("model roles poisoned").clone(),
+            self.browser_bridge
+                .read()
+                .expect("browser bridge poisoned")
+                .clone(),
+        );
+        let runtime = spawn_session_runtime_construction(options)
+            .await
+            .map_err(|error| format!("session runtime construction failed: {error}"))?;
+        Ok(self.register_runtime(
+            session_id,
+            work_dir.to_path_buf(),
+            session_file,
+            runtime,
+        ))
+    }
+
+    /// Construct a runtime with explicit hydration options rather than the
+    /// core's current selection (hydration pins the session's own model).
+    async fn hydrate_runtime(
+        &self,
+        request: &SessionHydrationRequest,
+    ) -> Result<Option<Arc<SessionRuntime>>, String> {
+        let Some(options) = &request.runtime_options else {
+            return Ok(None);
+        };
+        self.register_identity(
+            &request.session_id,
+            options.work_dir.clone(),
+            request.session_file.clone(),
+        );
+        if let Some(runtime) = self.runtime_for_file(&request.session_file) {
+            return Ok(Some(runtime));
+        }
+        let agent_options = coding_agent_options(
+            options.work_dir.clone(),
+            request.session_file.clone(),
+            options.model.clone(),
+            options.model_roles.clone(),
+            self.browser_bridge
+                .read()
+                .expect("browser bridge poisoned")
+                .clone(),
+        );
+        let runtime = spawn_session_runtime_construction(agent_options).await
+        .map_err(|error| format!("session runtime construction failed: {error}"))?;
+        Ok(Some(self.register_runtime(
+            &request.session_id,
+            options.work_dir.clone(),
+            request.session_file.clone(),
+            runtime,
+        )))
+    }
+
+    // -- command surface --------------------------------------------------
+
+    /// Execute one [`SessionCommand`]. Errors are also surfaced to clients
+    /// as `SessionEvent::DaemonError` so remote callers see failures the
+    /// transport cannot return.
+    pub async fn dispatch(self: &Arc<Self>, command: SessionCommand) -> Result<(), String> {
+        let result = self.dispatch_inner(command).await;
+        if let Err(error) = &result {
+            let _ = self.ingest_tx.send(SessionEvent::DaemonError {
+                session_id: None,
+                message: error.clone(),
+            });
+        }
+        result
+    }
+
+    async fn dispatch_inner(self: &Arc<Self>, command: SessionCommand) -> Result<(), String> {
+        match command {
+            SessionCommand::SubmitPrompt {
+                session_id,
+                work_dir,
+                text,
+                images,
+                effort,
+                acp_config,
+            } => {
+                let runtime = self.ensure_runtime(&session_id, &work_dir).await?;
+                *self.effort.write().expect("effort poisoned") = effort;
+                if runtime.is_generating() {
+                    // Queue a follow-up rather than erroring — a busy turn
+                    // picks it up when it settles.
+                    runtime
+                        .work_handle
+                        .try_queue_follow_up_with_images(text, images)
+                        .map(|_| ())
+                        .map_err(|_| "session is busy and the follow-up queue is full".to_string())
+                } else {
+                    crate::chat::execute_prompt(
+                        runtime,
+                        work_dir,
+                        session_id,
+                        text,
+                        images,
+                        effort,
+                        self.ingest_tx.clone(),
+                        acp_config,
+                    )
+                }
+            }
+            SessionCommand::CancelRun { session_id } => {
+                let runtime = self
+                    .runtime_for_session(&session_id)
+                    .ok_or_else(|| format!("no live runtime for session {session_id}"))?;
+                crate::chat::cancel_prompt(runtime, session_id, self.ingest_tx.clone())
+            }
+            SessionCommand::AnswerPermission {
+                session_id,
+                request_id,
+                decision,
+            } => {
+                let runtime = self
+                    .runtime_for_session(&session_id)
+                    .ok_or_else(|| format!("no live runtime for session {session_id}"))?;
+                if runtime.resolve_permission(&request_id, decision) {
+                    Ok(())
+                } else {
+                    Err(format!("permission request {request_id} is no longer pending"))
+                }
+            }
+            SessionCommand::AnswerQuestion { session_id, answer } => {
+                let runtime = self
+                    .runtime_for_session(&session_id)
+                    .ok_or_else(|| format!("no live runtime for session {session_id}"))?;
+                let request_id = answer.request_id.clone();
+                if runtime.resolve_question(&request_id, answer) {
+                    Ok(())
+                } else {
+                    Err(format!("question request {request_id} is no longer pending"))
+                }
+            }
+            SessionCommand::SetModel { session_id, model } => {
+                *self.model.write().expect("model poisoned") = model.clone();
+                self.switch_runtime_fact(&session_id, "model", &model, "changing models")
+            }
+            SessionCommand::SetReasoningEffort {
+                session_id,
+                effort,
+            } => {
+                *self.effort.write().expect("effort poisoned") = effort;
+                self.switch_runtime_fact(
+                    &session_id,
+                    "reasoning_effort",
+                    effort.label(),
+                    "changing reasoning effort",
+                )
+            }
+            SessionCommand::SetModelRoles { session_id, roles } => {
+                *self.model_roles.write().expect("model roles poisoned") = roles.clone();
+                if let Some(runtime) = self.runtime_for_session(&session_id) {
+                    runtime.set_model_roles(roles).await;
+                }
+                Ok(())
+            }
+            SessionCommand::SetOrchestratorMode { session_id, mode } => {
+                let identity = self
+                    .identity(&session_id)
+                    .ok_or_else(|| format!("unknown session {session_id}"))?;
+                let mut settings =
+                    threadlane_project::subagent_settings::load(&identity.work_dir);
+                settings.orchestrator_mode = mode;
+                threadlane_project::subagent_settings::save(&identity.work_dir, &settings)
+                    .map_err(|error| format!("could not save orchestrator mode: {error}"))?;
+                if let Some(runtime) = self.runtime_for_session(&session_id) {
+                    if runtime.is_generating() {
+                        // Persisted settings apply to the next turn; keep the
+                        // live runtime rather than dropping it mid-run.
+                        return Ok(());
+                    }
+                    self.drop_runtime(&identity.session_file);
+                }
+                Ok(())
+            }
+            SessionCommand::LoadAcpConfigOptions { session_id } => {
+                let runtime = self
+                    .runtime_for_session(&session_id)
+                    .ok_or_else(|| format!("no live runtime for session {session_id}"))?;
+                crate::chat::load_acp_config_options(
+                    runtime,
+                    session_id,
+                    self.ingest_tx.clone(),
+                )
+            }
+            SessionCommand::SetAcpConfigOption {
+                session_id,
+                config_id,
+                value,
+            } => {
+                let runtime = self
+                    .runtime_for_session(&session_id)
+                    .ok_or_else(|| format!("no live runtime for session {session_id}"))?;
+                crate::chat::set_acp_config_option(
+                    runtime,
+                    session_id,
+                    config_id,
+                    value,
+                    self.ingest_tx.clone(),
+                )
+            }
+            SessionCommand::HydrateSession { request } => self.hydrate_session(request).await,
+            SessionCommand::PrepareWorktree { setup } => {
+                crate::worktree_setup::persist_request(&setup)?;
+                // Options carry the *project* dir: the setup flow moves
+                // execution into the worktree as it creates it.
+                let options = coding_agent_options(
+                    setup.project.clone(),
+                    setup.session_file.clone(),
+                    setup.model.clone(),
+                    self.model_roles.read().expect("model roles poisoned").clone(),
+                    self.browser_bridge
+                        .read()
+                        .expect("browser bridge poisoned")
+                        .clone(),
+                );
+                self.worktree_setups
+                    .lock()
+                    .expect("worktree setups poisoned")
+                    .insert(setup.session_id.clone(), setup.clone());
+                crate::worktree_setup::start(setup, options, self.ingest_tx.clone())
+            }
+            SessionCommand::CancelWorktreeSetup { session_id } => {
+                if let Some(setup) = self
+                    .worktree_setups
+                    .lock()
+                    .expect("worktree setups poisoned")
+                    .remove(&session_id)
+                {
+                    setup.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                // Release any parked runtime a completed setup left behind.
+                let _ = crate::runtimes::take_prepared_runtime(&session_id);
+                Ok(())
+            }
+            SessionCommand::DeleteSession {
+                session_id,
+                session_file,
+                delete_worktree,
+            } => self.delete_session(&session_id, &session_file, delete_worktree),
+            SessionCommand::AddProject { work_dir } => {
+                let sessions = crate::discovery::discover_sessions_in_project(&work_dir);
+                let name = work_dir
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let _ = self.ingest_tx.send(SessionEvent::ProjectChanged {
+                    project: ProjectInfo {
+                        name,
+                        work_dir,
+                        sessions,
+                        is_expanded: true,
+                    },
+                });
+                Ok(())
+            }
+            SessionCommand::RemoveProject { work_dir } => {
+                let _ = self.ingest_tx.send(SessionEvent::ProjectChanged {
+                    project: ProjectInfo {
+                        name: work_dir
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        work_dir,
+                        sessions: Vec::new(),
+                        is_expanded: false,
+                    },
+                });
+                Ok(())
+            }
+            SessionCommand::RefreshCatalog { work_dir } => {
+                crate::chat::executor()?.spawn(async move {
+                    crate::catalog::refresh_discovered_models().await;
+                    crate::catalog::refresh_acp_models(work_dir).await;
+                });
+                Ok(())
+            }
+            SessionCommand::TerminalInput { .. } | SessionCommand::TerminalResize { .. } => {
+                Err("terminal PTYs are client-local; wire them to the daemon when the web client lands".to_string())
+            }
+            SessionCommand::GetProjectState { work_dir } => {
+                let sessions = crate::discovery::discover_sessions_in_project(&work_dir);
+                let name = work_dir
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let _ = self.ingest_tx.send(SessionEvent::ProjectChanged {
+                    project: ProjectInfo {
+                        name,
+                        work_dir,
+                        sessions,
+                        is_expanded: true,
+                    },
+                });
+                Ok(())
+            }
+            SessionCommand::GetSessionSnapshot { session_id } => {
+                self.emit_session_snapshot(&session_id)
+            }
+        }
+    }
+
+    /// `set_fact` on the session's live agent, then drop the runtime so the
+    /// next access rebuilds it (credentials and providers re-resolve).
+    fn switch_runtime_fact(
+        &self,
+        session_id: &str,
+        fact: &str,
+        value: &str,
+        action: &str,
+    ) -> Result<(), String> {
+        let Some(identity) = self.identity(session_id) else {
+            // No attached session: the new selection is already stored and
+            // applies to whatever runtime is built next.
+            return Ok(());
+        };
+        let Some(runtime) = self.runtime_for_file(&identity.session_file) else {
+            return Ok(());
+        };
+        if runtime.is_generating() {
+            return Err(format!("stop the current turn before {action}"));
+        }
+        if let Some(error) = runtime.harness_error() {
+            return Err(error.to_string());
+        }
+        match runtime.agent.try_lock() {
+            Ok(mut agent) => agent
+                .set_fact(fact, value)
+                .map_err(|error| format!("could not switch: {error}"))?,
+            Err(_) => {
+                return Err("agent settings are still loading; try again shortly".to_string())
+            }
+        }
+        self.drop_runtime(&identity.session_file);
+        Ok(())
+    }
+
+    /// Project the durable transcript and emit `SessionSnapshot` (attach
+    /// mid-run: snapshot first, live tail continues after it).
+    fn emit_session_snapshot(&self, session_id: &str) -> Result<(), String> {
+        let identity = self
+            .identity(session_id)
+            .ok_or_else(|| format!("unknown session {session_id}"))?;
+        let snapshot = self.build_snapshot(session_id, &identity)?;
+        let _ = self.ingest_tx.send(SessionEvent::SessionSnapshot {
+            session_id: session_id.to_string(),
+            snapshot: Box::new(snapshot),
+        });
+        Ok(())
+    }
+
+    fn build_snapshot(
+        &self,
+        session_id: &str,
+        identity: &SessionIdentity,
+    ) -> Result<SessionSnapshot, String> {
+        let session = crate::discovery::discover_sessions_in_project(&identity.work_dir)
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .unwrap_or_else(|| SessionInfo {
+                id: session_id.to_string(),
+                session_file: identity.session_file.clone(),
+                work_dir: identity.work_dir.clone(),
+                runtime_work_dir: identity.work_dir.clone(),
+                ..SessionInfo::default()
+            });
+        // Diagnostics and token efficiency stay daemon-local; the wire
+        // snapshot carries the fields a remote client can render.
+        let projection = compute_full_session_projection(&identity.session_file)
+            .map_err(|error| format!("could not project session {session_id}: {error}"))?;
+        let messages = compute_session_messages(&identity.session_file).unwrap_or_default();
+        Ok(SessionSnapshot {
+            session,
+            messages,
+            trajectory: projection.trajectory,
+            subagents: projection.subagents,
+            plan: projection.plan,
+            metrics: projection.metrics,
+            token_usage: projection.token_usage,
+            context_window: projection.context_window,
+            run_timing: projection.run_timing,
+        })
+    }
+
+    /// `HydrateSession`: register identity, (re)build the runtime when
+    /// `runtime_options` asks for it, then answer with a snapshot.
+    async fn hydrate_session(
+        self: &Arc<Self>,
+        request: SessionHydrationRequest,
+    ) -> Result<(), String> {
+        let identity = self.identity(&request.session_id);
+        let work_dir = request
+            .runtime_options
+            .as_ref()
+            .map(|options| options.work_dir.clone())
+            .or_else(|| identity.as_ref().map(|identity| identity.work_dir.clone()))
+            // The canonical layout puts the transcript inside the project's
+            // `.threadlane/sessions/`; fall back to its owning root.
+            .or_else(|| {
+                request
+                    .session_file
+                    .parent()
+                    .and_then(|sessions| sessions.parent())
+                    .and_then(|threadlane| threadlane.parent())
+                    .map(|root| root.to_path_buf())
+            })
+            .ok_or_else(|| {
+                format!(
+                    "cannot resolve work dir for session {}",
+                    request.session_id
+                )
+            })?;
+        self.register_identity(
+            &request.session_id,
+            work_dir.clone(),
+            request.session_file.clone(),
+        );
+        self.hydrate_runtime(&request).await?;
+        let resolved = SessionIdentity {
+            session_file: request.session_file.clone(),
+            work_dir,
+        };
+        let snapshot = self
+            .build_snapshot(&request.session_id, &resolved)
+            .unwrap_or_default();
+        let _ = self.ingest_tx.send(SessionEvent::SessionSnapshot {
+            session_id: request.session_id,
+            snapshot: Box::new(snapshot),
+        });
+        Ok(())
+    }
+
+    /// `DeleteSession`: archive the transcript, drop the runtime, remove
+    /// the session file, and — when requested and clean — its worktree.
+    fn delete_session(
+        &self,
+        session_id: &str,
+        session_file: &Path,
+        delete_worktree: bool,
+    ) -> Result<(), String> {
+        if let Some(runtime) = self.runtime_for_file(session_file) {
+            if runtime.is_generating() {
+                return Err("stop the running generation before deleting this session".into());
+            }
+        }
+        let identity = self.identity(session_id);
+        let work_dir = identity
+            .as_ref()
+            .map(|identity| identity.work_dir.clone())
+            .or_else(|| {
+                session_file
+                    .parent()
+                    .and_then(|sessions| sessions.parent())
+                    .and_then(|threadlane| threadlane.parent())
+                    .map(|root| root.to_path_buf())
+            })
+            .ok_or_else(|| format!("cannot resolve work dir for session {session_id}"))?;
+
+        // Archive the transcript first: deletion destroys the JSONL, and a
+        // failed delete must never lose history silently.
+        let archive_dir = work_dir.join(".threadlane/sessions/archive");
+        std::fs::create_dir_all(&archive_dir).map_err(|error| error.to_string())?;
+        let file_name = session_file
+            .file_name()
+            .ok_or_else(|| "session file has no file name".to_string())?;
+        if session_file.exists() {
+            std::fs::copy(session_file, archive_dir.join(file_name))
+                .map_err(|error| error.to_string())?;
+        }
+        if delete_worktree {
+            if let Some(worktree_dir) =
+                Self::session_worktree_dir(&work_dir, session_id)
+            {
+                // Another session may share the checkout; refuse to delete it.
+                let shared = crate::discovery::discover_session_stubs_in_project(&work_dir)
+                    .iter()
+                    .any(|session| {
+                        session.id != session_id
+                            && session.is_worktree
+                            && session.runtime_work_dir == worktree_dir
+                    });
+                if shared {
+                    return Err(
+                        "this worktree is used by another session; keep the worktree".into(),
+                    );
+                }
+                if worktree_dir.exists() {
+                    // Untracked Threadlane bookkeeping inside the checkout
+                    // never blocks deletion; every other change does.
+                    let dirty = threadlane_git::inspect(&worktree_dir)
+                        .map_err(|error| error.to_string())?
+                        .files
+                        .iter()
+                        .any(|file| {
+                            !(file.is_untracked() && file.path.starts_with(".threadlane/"))
+                        });
+                    if dirty {
+                        return Err(
+                            "commit or discard worktree changes before deleting this session"
+                                .into(),
+                        );
+                    }
+                    threadlane_git::remove_worktree(&work_dir, &worktree_dir, true)
+                        .map_err(|error| error.to_string())?;
+                    threadlane_tools::remove_worktree_cargo_target_dir(&worktree_dir);
+                    if let Err(error) = threadlane_git::prune_worktrees(&work_dir) {
+                        tracing::warn!("worktree prune failed: {error}");
+                    }
+                }
+            }
+        }
+        self.drop_runtime(session_file);
+        Self::remove_file_if_present(&canonical_session_file(&work_dir, session_id))?;
+        Self::remove_file_if_present(session_file)?;
+        self.identities
+            .lock()
+            .expect("identities poisoned")
+            .remove(session_id);
+        Ok(())
+    }
+
+    fn remove_file_if_present(path: &Path) -> Result<(), String> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// The worktree checkout a session owns, from its durable stub facts —
+    /// the same resolution the desktop uses for session_worktree_path.
+    fn session_worktree_dir(work_dir: &Path, session_id: &str) -> Option<PathBuf> {
+        let stub = canonical_session_file(work_dir, session_id);
+        let store = threadlane_runtime::harness::JsonlStore::open_read_only(&stub).ok()?;
+        let facts = store.facts();
+        if !facts
+            .get("is_worktree")
+            .is_some_and(|value| value == "true")
+        {
+            return None;
+        }
+        let canonical_work_dir =
+            std::fs::canonicalize(work_dir).unwrap_or_else(|_| work_dir.to_path_buf());
+        Some(crate::discovery::effective_session_work_dir(
+            &canonical_work_dir,
+            session_id,
+            &facts,
+        ))
+    }
+
+    /// Track (or clear) an in-flight worktree setup so cancel requests land.
+    pub fn track_worktree_setup(&self, session_id: &str, setup: Option<WorktreeSetup>) {
+        let mut setups = self.worktree_setups.lock().expect("worktree setups poisoned");
+        match setup {
+            Some(setup) => {
+                setups.insert(session_id.to_string(), setup);
+            }
+            None => {
+                setups.remove(session_id);
+            }
+        }
+    }
+
+    /// Stages still advertised for a session's worktree preparation.
+    pub fn worktree_setup(&self, session_id: &str) -> Option<WorktreeSetup> {
+        self.worktree_setups
+            .lock()
+            .expect("worktree setups poisoned")
+            .get(session_id)
+            .cloned()
+    }
+}
+
+impl std::fmt::Debug for DaemonCore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DaemonCore")
+            .field("runtimes", &self.runtimes.lock().map(|map| map.len()))
+            .finish_non_exhaustive()
+    }
+}

@@ -2866,7 +2866,7 @@ fn environment_token_efficiency_follows_durable_session_hydration(cx: &mut gpui:
     )
     .unwrap();
     let projection = threadlane_daemon::projection::compute_full_session_projection(&file).unwrap();
-    assert_eq!(projection.token_efficiency.usage.processed_tokens(), 200);
+    assert_eq!(projection.token_efficiency.as_ref().unwrap().usage.processed_tokens(), 200);
     cx.update(gpui_component::init);
     let model = cx.new(|_| {
         let mut state = threadlane_ui_state::AppState::default();
