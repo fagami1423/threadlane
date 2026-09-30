@@ -334,15 +334,31 @@ enum DateGroup {
 #[derive(Clone)]
 enum HistoryRow {
     Group(DateGroup),
-    Session(SessionInfo, SessionAttention),
+    /// The bool records whether the session showed a New result marker when
+    /// the rows were built, so a marker toggling on an otherwise identical
+    /// row can invalidate its cached height.
+    Session(SessionInfo, SessionAttention, bool),
 }
 
 fn same_history_row_identity(left: &HistoryRow, right: &HistoryRow) -> bool {
     match (left, right) {
         (HistoryRow::Group(left), HistoryRow::Group(right)) => left == right,
-        (HistoryRow::Session(left, _), HistoryRow::Session(right, _)) => {
+        (HistoryRow::Session(left, ..), HistoryRow::Session(right, ..)) => {
             left.id == right.id && left.work_dir == right.work_dir
         }
+        _ => false,
+    }
+}
+
+/// Signals affecting a session row's height (the signals row renders only
+/// when at least one applies). Compared when row identities match so the
+/// ListState can remeasure exactly the rows that gained or lost height.
+fn history_row_height_inputs(left: &HistoryRow, right: &HistoryRow) -> bool {
+    match (left, right) {
+        (
+            HistoryRow::Session(_, left_attention, left_unseen),
+            HistoryRow::Session(_, right_attention, right_unseen),
+        ) => left_attention != right_attention || left_unseen != right_unseen,
         _ => false,
     }
 }
@@ -371,34 +387,41 @@ fn flatten_history_sessions(
     now: u64,
 ) -> Vec<HistoryRow> {
     flatten_history_sessions_with_pins(
-        sessions.into_iter().map(|(s, a)| (s, a, false)).collect(),
+        sessions
+            .into_iter()
+            .map(|(s, a)| (s, a, false, false))
+            .collect(),
         now,
     )
 }
 
 fn flatten_history_sessions_with_pins(
-    mut sessions: Vec<(SessionInfo, SessionAttention, bool)>,
+    mut sessions: Vec<(SessionInfo, SessionAttention, bool, bool)>,
     now: u64,
 ) -> Vec<HistoryRow> {
-    sessions.sort_by(|(left, left_attention, left_pinned), (right, right_attention, right_pinned)| {
-        let left_group = history_group_with_pin(*left_pinned, *left_attention, left.updated_at, now);
-        let right_group = history_group_with_pin(*right_pinned, *right_attention, right.updated_at, now);
-        left_group
-            .rank()
-            .cmp(&right_group.rank())
-            .then_with(|| right.updated_at.cmp(&left.updated_at))
-            .then_with(|| left.title.cmp(&right.title))
-    });
+    sessions.sort_by(
+        |(left, left_attention, left_pinned, _), (right, right_attention, right_pinned, _)| {
+            let left_group =
+                history_group_with_pin(*left_pinned, *left_attention, left.updated_at, now);
+            let right_group =
+                history_group_with_pin(*right_pinned, *right_attention, right.updated_at, now);
+            left_group
+                .rank()
+                .cmp(&right_group.rank())
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+                .then_with(|| left.title.cmp(&right.title))
+        },
+    );
 
     let mut rows = Vec::with_capacity(sessions.len() + DateGroup::COUNT);
     let mut previous_group = None;
-    for (session, attention, pinned) in sessions {
+    for (session, attention, pinned, has_unseen_result) in sessions {
         let group = history_group_with_pin(pinned, attention, session.updated_at, now);
         if previous_group != Some(group) {
             rows.push(HistoryRow::Group(group));
             previous_group = Some(group);
         }
-        rows.push(HistoryRow::Session(session, attention));
+        rows.push(HistoryRow::Session(session, attention, has_unseen_result));
     }
     rows
 }
@@ -2552,7 +2575,8 @@ impl SidebarView {
                 }
                 let attention = state.session_attention(session);
                 let is_pinned = state.is_session_pinned(&session.work_dir, &session.id);
-                sessions.push((session.clone(), attention, is_pinned));
+                let has_unseen_result = state.session_has_unseen_result(session);
+                sessions.push((session.clone(), attention, is_pinned, has_unseen_result));
             }
         }
         flatten_history_sessions_with_pins(sessions, now)
@@ -2635,7 +2659,7 @@ impl SidebarView {
                     )
                     .into_any_element()
             }
-            Some(HistoryRow::Session(session, attention)) => {
+            Some(HistoryRow::Session(session, attention, _has_unseen_result)) => {
                 let state = self.model.read(cx);
                 let is_active = state.workspace_page == WorkspacePage::Chat
                     && state.active_work_dir.as_ref() == Some(&session.work_dir)
@@ -2673,6 +2697,22 @@ impl SidebarView {
             });
             if !same_rows {
                 self.history_list_state.reset(rows.len());
+            } else if let Some((_, cached)) = self.history_cache.as_ref() {
+                // The ListState caches measured heights per index; a row that
+                // gains or loses a signals row (attention, New result) keeps
+                // a stale height unless its range is remeasured.
+                let mut remeasure: Option<(usize, usize)> = None;
+                for (index, (left, right)) in cached.iter().zip(&rows).enumerate() {
+                    if history_row_height_inputs(left, right) {
+                        match &mut remeasure {
+                            Some((_, last)) => *last = index + 1,
+                            slot => *slot = Some((index, index + 1)),
+                        }
+                    }
+                }
+                if let Some((start, end)) = remeasure {
+                    self.history_list_state.remeasure_items(start..end);
+                }
             }
             self.history_cache = Some((fingerprint, rows));
         }
@@ -3100,26 +3140,26 @@ mod tests {
 
         assert!(matches!(rows[0], HistoryRow::Group(DateGroup::NeedsYou)));
         assert!(
-            matches!(&rows[1], HistoryRow::Session(item, SessionAttention::NeedsYou) if item.id == "needs-newer")
+            matches!(&rows[1], HistoryRow::Session(item, SessionAttention::NeedsYou, _) if item.id == "needs-newer")
         );
         assert!(
-            matches!(&rows[2], HistoryRow::Session(item, SessionAttention::NeedsYou) if item.id == "needs-older")
+            matches!(&rows[2], HistoryRow::Session(item, SessionAttention::NeedsYou, _) if item.id == "needs-older")
         );
         assert!(matches!(rows[3], HistoryRow::Group(DateGroup::Working)));
         assert!(
-            matches!(&rows[4], HistoryRow::Session(item, SessionAttention::Working) if item.id == "working")
+            matches!(&rows[4], HistoryRow::Session(item, SessionAttention::Working, _) if item.id == "working")
         );
         assert!(matches!(rows[5], HistoryRow::Group(DateGroup::Today)));
         assert!(
-            matches!(&rows[6], HistoryRow::Session(item, SessionAttention::Ready) if item.id == "ready-today")
+            matches!(&rows[6], HistoryRow::Session(item, SessionAttention::Ready, _) if item.id == "ready-today")
         );
         assert!(matches!(rows[7], HistoryRow::Group(DateGroup::Yesterday)));
         assert!(
-            matches!(&rows[8], HistoryRow::Session(item, SessionAttention::Idle) if item.id == "idle-yesterday")
+            matches!(&rows[8], HistoryRow::Session(item, SessionAttention::Idle, _) if item.id == "idle-yesterday")
         );
         assert!(same_history_row_identity(
             &rows[1],
-            &HistoryRow::Session(session("needs-newer"), SessionAttention::Idle)
+            &HistoryRow::Session(session("needs-newer"), SessionAttention::Idle, false)
         ));
         assert!(!same_history_row_identity(&rows[1], &rows[4]));
     }
@@ -3136,24 +3176,24 @@ mod tests {
 
         let rows = flatten_history_sessions_with_pins(
             vec![
-                (working, SessionAttention::Working, false),
-                (needs_newer, SessionAttention::NeedsYou, false),
-                (pinned_idle, SessionAttention::Idle, true),
+                (working, SessionAttention::Working, false, false),
+                (needs_newer, SessionAttention::NeedsYou, false, false),
+                (pinned_idle, SessionAttention::Idle, true, false),
             ],
             now,
         );
 
         assert!(matches!(rows[0], HistoryRow::Group(DateGroup::Pinned)));
         assert!(
-            matches!(&rows[1], HistoryRow::Session(item, SessionAttention::Idle) if item.id == "pinned-idle")
+            matches!(&rows[1], HistoryRow::Session(item, SessionAttention::Idle, _) if item.id == "pinned-idle")
         );
         assert!(matches!(rows[2], HistoryRow::Group(DateGroup::NeedsYou)));
         assert!(
-            matches!(&rows[3], HistoryRow::Session(item, SessionAttention::NeedsYou) if item.id == "needs-newer")
+            matches!(&rows[3], HistoryRow::Session(item, SessionAttention::NeedsYou, _) if item.id == "needs-newer")
         );
         assert!(matches!(rows[4], HistoryRow::Group(DateGroup::Working)));
         assert!(
-            matches!(&rows[5], HistoryRow::Session(item, SessionAttention::Working) if item.id == "working")
+            matches!(&rows[5], HistoryRow::Session(item, SessionAttention::Working, _) if item.id == "working")
         );
     }
 

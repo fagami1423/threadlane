@@ -164,6 +164,10 @@ pub struct AppState {
     presented_completion: Option<(SessionProjectionKey, RunCompletionToken)>,
     /// One-shot flag so a failed session_seen write surfaces exactly once.
     session_seen_save_failed: bool,
+    /// False until the first automation projection has been applied — its
+    /// runs are restored history and must not be registered as new in-app
+    /// sessions.
+    automation_runs_restored: bool,
 }
 
 impl Default for AppState {
@@ -276,9 +280,11 @@ impl AppState {
     /// completion newer than its acknowledged watermark — the sidebar "New
     /// result" marker.
     pub fn session_has_unseen_result(&self, session: &SessionInfo) -> bool {
+        // A project whose store has not loaded yet cannot claim unseen
+        // results — baselining happens with the next successful discovery.
         self.session_seen
             .get(&Self::session_seen_key(&session.work_dir))
-            .is_none_or(|store| store.has_unseen(session))
+            .is_some_and(|store| store.has_unseen(session))
     }
 
     /// Registers a session created in-app (before its first prompt runs) so
@@ -626,6 +632,7 @@ impl AppState {
             session_seen_writer: crate::session_seen::SessionSeenWriter::spawn(),
             presented_completion: None,
             session_seen_save_failed: false,
+            automation_runs_restored: false,
             pending_permissions: HashMap::new(),
             pending_questions: HashMap::new(),
             pending_hydrations: Vec::new(),
@@ -774,6 +781,26 @@ impl AppState {
             .map(|run| &run.definition.project).collect();
         for project in changed {
             self.request_session_refresh(project);
+        }
+        // Sessions an automation created during this app's lifetime are
+        // registered before their first run completes so a fast background
+        // finish still earns a New result marker. Runs present in the very
+        // first applied projection are restored history — discovery's
+        // baseline decides them instead.
+        let to_register: Vec<(PathBuf, String)> = if self.automation_runs_restored {
+            projection
+                .snapshot
+                .runs
+                .iter()
+                .filter(|run| !previous.contains_key(&run.id))
+                .map(|run| (run.definition.project.clone(), run.session_id.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.automation_runs_restored = true;
+        for (project, session_id) in to_register {
+            self.register_session_seen(&project, &session_id);
         }
         self.pending_permissions.extend(projection.permissions.clone());
         self.pending_questions.extend(projection.questions.clone());
@@ -2442,6 +2469,10 @@ impl AppState {
         let record = threadlane_project::register_project(&canonical)?;
 
         let discovered_sessions = discover_sessions_in_project(&canonical);
+        // Attaching a project counts as its first successful discovery pass:
+        // pre-existing history is baselined so the sidebar never reports
+        // already-known results as new.
+        self.baseline_session_seen(&discovered_sessions);
         let session_to_restore = record
             .last_session_id
             .filter(|session_id| {
@@ -3868,7 +3899,12 @@ impl AppState {
         }
         Ok(changed)
     }
-    pub fn drain_chat_stream(&mut self, mut events: Vec<ChatStreamEvent>) -> bool {
+    /// Observes serialized session_seen writes: a failed store is re-marked
+    /// dirty so the next mutation retries the full write, and the warning
+    /// surfaces once. A later success clears the flag. Returns true when
+    /// visible state changed.
+    pub fn drain_session_seen_write_results(&mut self) -> bool {
+        let mut changed = false;
         while let Some(result) = self.session_seen_writer.try_recv_result() {
             match result.error {
                 Some(error) => {
@@ -3887,10 +3923,21 @@ impl AppState {
                                 .into(),
                         );
                     }
+                    changed = true;
                 }
-                None => self.session_seen_save_failed = false,
+                None => {
+                    if self.session_seen_save_failed {
+                        self.session_seen_save_failed = false;
+                        changed = true;
+                    }
+                }
             }
         }
+        changed
+    }
+
+    pub fn drain_chat_stream(&mut self, mut events: Vec<ChatStreamEvent>) -> bool {
+        let seen_changed = self.drain_session_seen_write_results();
         let scheduler_files: Vec<PathBuf> = self.scheduler_results.keys().cloned().collect();
         for session_file in scheduler_files {
             if let Some(receiver) = self.scheduler_results.get_mut(&session_file) {
@@ -3927,7 +3974,7 @@ impl AppState {
             .and_then(|session_id| self.deferred_stream_events.remove(session_id))
             .unwrap_or_default()
             .into_iter();
-        let mut changed = false;
+        let mut changed = seen_changed;
 
         for event in deferred.chain(events) {
             match event {
@@ -4236,6 +4283,7 @@ impl AppState {
                     }
                     changed = true;
                     self.is_generating = false;
+                    let successful = !matches!(&result, Some(Err(_)));
                     let (role, content) = match result {
                         Some(Ok(content)) => (MessageRole::Assistant, content),
                         Some(Err(error)) => (MessageRole::Error, error),
@@ -4257,6 +4305,17 @@ impl AppState {
                         reasoning_expanded: false,
                     });
                     self.session_status = Some(status);
+                    // A successful scheduled completion must also capture its
+                    // presented-completion token via a real transcript load;
+                    // the inline append above cannot acknowledge the marker.
+                    if successful {
+                        self.pending_hydrations.push(SessionHydrationRequest {
+                            session_id: session_id.clone(),
+                            session_file: session_file.clone(),
+                            reload_messages: true,
+                            runtime_options: None,
+                        });
+                    }
                     if let Some(work_dir) = self.session_work_dir_for_file(&session_file) {
                         self.request_session_refresh(&work_dir);
                     }

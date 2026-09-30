@@ -78,12 +78,11 @@ impl SessionSeenStore {
 
     /// Registers a session created in-app before its first run so a later
     /// discovery baseline cannot retroactively acknowledge its first result.
+    /// An already-tracked id keeps its watermark — a repeat registration
+    /// must never regress an acknowledgment.
     pub fn register(&mut self, session_id: &str) {
-        if self
-            .acknowledged
-            .insert(session_id.to_string(), None)
-            .is_none()
-        {
+        if !self.acknowledged.contains_key(session_id) {
+            self.acknowledged.insert(session_id.to_string(), None);
             self.dirty = true;
         }
     }
@@ -130,12 +129,18 @@ impl SessionSeenStore {
     }
 
     /// True while the session's latest confirmed completion is newer than the
-    /// acknowledged watermark.
+    /// acknowledged watermark, judged by the same monotonic journal-seq rule
+    /// as `acknowledge`: a restored or truncated journal reporting an older
+    /// completion can never produce a marker that acknowledgment then
+    /// refuses to clear.
     pub fn has_unseen(&self, session: &SessionInfo) -> bool {
         let SessionCompletionSummary::Latest(token) = &session.completion_summary else {
             return false;
         };
-        self.acknowledged_token(&session.id) != Some(token)
+        match self.acknowledged.get(&session.id) {
+            Some(Some(existing)) => token.seq > existing.seq,
+            _ => true,
+        }
     }
 
     /// Serialized snapshot pending write; clears the dirty flag once handed
@@ -317,6 +322,10 @@ mod tests {
         assert!(!store.acknowledge("session", &token(9)));
         assert!(!store.acknowledge("session", &token(4)));
         assert_eq!(store.acknowledged_token("session"), Some(&token(9)));
+        // A journal reporting a completion at or below the watermark is not
+        // unseen — otherwise acknowledging could never clear the marker.
+        let older = session("session", SessionCompletionSummary::Latest(token(4)));
+        assert!(!store.has_unseen(&older));
         // A newer completion re-arms the marker.
         let newer = session("session", SessionCompletionSummary::Latest(token(10)));
         assert!(store.has_unseen(&newer));

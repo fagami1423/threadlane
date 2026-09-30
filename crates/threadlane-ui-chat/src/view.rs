@@ -750,7 +750,13 @@ impl ChatListView {
             cx.background_executor().timer(Duration::from_secs(1)).await;
             if this
                 .update(cx, |view, cx| {
-                    if view.model.read(cx).is_generating {
+                    // The chat pump only wakes on stream events, so session_seen
+                    // write results are also observed here — a failed save
+                    // otherwise sits unobserved until the next chat event.
+                    let seen_changed = view
+                        .model
+                        .update(cx, |state, _| state.drain_session_seen_write_results());
+                    if view.model.read(cx).is_generating || seen_changed {
                         cx.notify();
                     }
                 })
