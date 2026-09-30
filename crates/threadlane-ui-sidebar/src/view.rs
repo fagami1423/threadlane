@@ -1893,27 +1893,38 @@ impl SidebarView {
                 )
                 .item(
                     PopupMenuItem::new("Fork Session").on_click(move |_event, window, cx| {
-                        fork_model.update(cx, |state, cx| {
-                            let previous_session = state.active_session_id.clone();
-                            controller::dispatch(
-                                state,
-                                AppAction::ForkSession {
-                                    work_dir: fork_work_dir.clone(),
-                                    session_id: fork_session_id.clone(),
-                                },
-                            );
-                            if state.active_session_id == previous_session {
-                                if let Some(error) = state.session_status.clone() {
-                                    window.push_notification(error, cx);
-                                }
-                            } else {
-                                window.push_notification(
-                                    "Session forked with recovered context. Both sessions use the same checkout.",
-                                    cx,
-                                );
+                        let work = fork_model.read(cx).prepare_session_fork(
+                            fork_work_dir.clone(),
+                            fork_session_id.clone(),
+                        );
+                        let work = match work {
+                            Ok(work) => work,
+                            Err(error) => {
+                                window.push_notification(error, cx);
+                                return;
                             }
-                            cx.notify();
-                        });
+                        };
+                        window.push_notification("Forking session… The fork will use the same checkout.", cx);
+                        let model = fork_model.clone();
+                        let project = fork_work_dir.clone();
+                        cx.spawn(async move |cx| {
+                            let result = cx
+                                .background_executor()
+                                .spawn(async move { work() })
+                                .await;
+                            let _ = model.update(cx, |state, cx| {
+                                match result {
+                                    Ok((id, sessions)) => {
+                                        state.finish_session_fork(project, id, sessions);
+                                    }
+                                    Err(error) => {
+                                        state.session_status = Some(format!("Could not fork session: {error}"));
+                                    }
+                                }
+                                cx.notify();
+                            });
+                        })
+                        .detach();
                     }),
                 )
                 .item(

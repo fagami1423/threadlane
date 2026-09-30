@@ -5,9 +5,7 @@ impl CodingSessionHarness {
     /// operations, provider continuation handles, queues, or tool-call protocol.
     /// The original remains the authoritative, unmodified diagnostic transcript.
     pub fn fork_to_path(source: &Path, destination: &Path) -> Result<(), String> {
-        // A broken reducer must not prevent recovery of readable transcript
-        // entries. Reuse the UI's raw, paged reader rather than parsing JSONL
-        // ourselves (it also understands atomic frames and legacy records).
+        // Recovery bypasses reduction but retains durable entry identities.
         fs::metadata(source)
             .map_err(|error| format!("Could not read the source session: {error}"))?;
         let source_store = JsonlStore::open_read_only(source).ok();
@@ -29,25 +27,10 @@ impl CodingSessionHarness {
         {
             context.messages()
         } else {
-            let mut pages = Vec::new();
-            let mut cursor = None;
-            loop {
-                let page = threadlane_runtime::harness::read_transcript_page(source, cursor, 40)
-                    .map_err(|error| format!("Could not recover the source transcript: {error}"))?;
-                pages.push(page.items);
-                cursor = page.next_cursor;
-                if !page.has_older {
-                    break;
-                }
-            }
-            pages
+            JsonlStore::recover_main_entries(source)
+                .map_err(|error| format!("Could not recover the source transcript: {error}"))?
                 .into_iter()
-                .rev()
-                .flatten()
-                .filter_map(|item| match item {
-                    threadlane_runtime::harness::TranscriptItem::Message(message) => Some(message),
-                    _ => None,
-                })
+                .map(|entry| entry.message)
                 .collect()
         };
         if let Some(parent) = destination.parent() {
@@ -74,6 +57,9 @@ impl CodingSessionHarness {
             }
             fork.set_fact("main", "forked_from", source_id.to_owned())?;
             fork.set_fact("main", "name", format!("{title} (fork)"))?;
+            let mut actions = Vec::with_capacity(messages.len());
+            let mut parent_id = None;
+            let first_seq = fork.store.store().next_sequence();
             for message in messages {
                 let recovered = match message {
                     message @ (AgentMessage::User { .. } | AgentMessage::UserWithImages { .. }) => {
@@ -122,8 +108,26 @@ impl CodingSessionHarness {
                     }
                     AgentMessage::System { .. } => continue,
                 };
-                fork.append_message(recovered)?;
+                let seq = first_seq + actions.len() as u64;
+                let id = format!("fork-entry-{seq}");
+                actions.push(threadlane_runtime::harness::EffectAction::AppendEntry {
+                    entry: HarnessEntry {
+                        id: id.clone(),
+                        parent_id,
+                        lane: "main".into(),
+                        seq,
+                        timestamp: timestamp(),
+                        message: recovered,
+                        surface_op: threadlane_runtime::harness::SurfaceOperation::Append,
+                        terminate: false,
+                    },
+                });
+                parent_id = Some(id);
             }
+            fork.store
+                .store_mut()
+                .append_actions_atomically(&actions)
+                .map_err(|error| error.to_string())?;
             Ok(())
         })();
         if result.is_err() {

@@ -1671,7 +1671,7 @@ fn fork_session_rejects_missing_checkout_and_unknown_session_without_switching()
 }
 
 #[test]
-fn fork_session_in_project_root_rejects_running_source_then_dispatches() {
+fn fork_session_preparation_defers_io_and_selection_until_worker_completion() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().canonicalize().unwrap();
     let mut state = issue_work_state(&project);
@@ -1686,13 +1686,17 @@ fn fork_session_in_project_root_rejects_running_source_then_dispatches() {
             .contains("Stop")
     );
     runtime.finish_generation(None);
-    crate::controller::dispatch(
-        &mut state,
-        crate::actions::AppAction::ForkSession {
-            work_dir: project.clone(),
-            session_id: source_id.clone(),
-        },
-    );
+    let work = state
+        .prepare_session_fork(project.clone(), source_id.clone())
+        .unwrap();
+    assert_eq!(state.active_session_id.as_deref(), Some(source_id.as_str()));
+    assert_eq!(discover_sessions_in_project(&project).len(), 1);
+    let (id, sessions) = std::thread::spawn(work).join().unwrap().unwrap();
+    assert_eq!(state.active_session_id.as_deref(), Some(source_id.as_str()));
+    // A foreground change made while the worker ran must not be overwritten.
+    state.projects[0].sessions.clear();
+    state.finish_session_fork(project.clone(), id, sessions);
+    assert_eq!(state.projects[0].sessions.len(), 1);
     assert_ne!(state.active_session_id.as_deref(), Some(source_id.as_str()));
     let fork = state.active_session_info().unwrap();
     assert!(!fork.is_worktree);

@@ -1327,11 +1327,15 @@ impl AppState {
         self.pending_hydrations.push(request);
     }
 
-    pub(crate) fn fork_session(
-        &mut self,
+    /// Snapshot the source and return blocking work without doing journal I/O.
+    /// Execute the returned closure off the foreground thread, then deliver its
+    /// result to `finish_session_fork` on the foreground thread.
+    pub fn prepare_session_fork(
+        &self,
         work_dir: PathBuf,
         session_id: String,
-    ) -> Result<String, String> {
+    ) -> Result<impl FnOnce() -> Result<(String, Vec<SessionInfo>), String> + Send + 'static, String>
+    {
         let source = self
             .projects
             .iter()
@@ -1347,9 +1351,6 @@ impl AppState {
         if self.worktree_setups.contains_key(&session_id) {
             return Err("Finish or cancel worktree setup before forking this session".into());
         }
-        if !source.runtime_work_dir.is_dir() {
-            return Err("Recreate the missing worktree before forking this session".into());
-        }
         if self
             .session_runtimes
             .get(&source.session_file)
@@ -1357,55 +1358,93 @@ impl AppState {
         {
             return Err("Stop the running generation before forking this session".into());
         }
-        let id = format!(
-            "session_{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-        let destination = canonical_session_file(&work_dir, &id);
-        threadlane_coding_agent::harness::CodingSessionHarness::fork_to_path(
-            &source.session_file,
-            &destination,
-        )?;
-        if source.is_worktree {
-            let result = (|| {
-                use threadlane_coding_agent::harness::CodingSessionHarness;
-                let owner = source
-                    .runtime_work_dir
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .ok_or("Worktree has no valid owner")?;
-                for (key, value) in [
-                    ("is_worktree", "true"),
-                    ("worktree_owner", owner),
-                    (
-                        "worktree_path",
-                        source.runtime_work_dir.to_str().ok_or("Worktree path is not UTF-8")?,
-                    ),
-                ] {
-                    CodingSessionHarness::append_fact_to_path(
-                        &destination, "main", key, value, None,
-                    )?;
-                }
-                Ok::<(), String>(())
-            })();
-            if let Err(error) = result {
-                Self::remove_file_if_present(&destination)?;
-                return Err(error);
+        Ok(move || {
+            if !source.runtime_work_dir.is_dir() {
+                return Err("Recreate the missing worktree before forking this session".into());
             }
-        }
-        if let Some(project) = self
+            let id = format!(
+                "session_{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            );
+            let destination = canonical_session_file(&work_dir, &id);
+            threadlane_coding_agent::harness::CodingSessionHarness::fork_to_path(
+                &source.session_file,
+                &destination,
+            )?;
+            if source.is_worktree {
+                let result = (|| {
+                    use threadlane_coding_agent::harness::CodingSessionHarness;
+                    let owner = source
+                        .runtime_work_dir
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or("Worktree has no valid owner")?;
+                    for (key, value) in [
+                        ("is_worktree", "true"),
+                        ("worktree_owner", owner),
+                        (
+                            "worktree_path",
+                            source
+                                .runtime_work_dir
+                                .to_str()
+                                .ok_or("Worktree path is not UTF-8")?,
+                        ),
+                    ] {
+                        CodingSessionHarness::append_fact_to_path(
+                            &destination,
+                            "main",
+                            key,
+                            value,
+                            None,
+                        )?;
+                    }
+                    Ok::<(), String>(())
+                })();
+                if let Err(error) = result {
+                    Self::remove_file_if_present(&destination)?;
+                    return Err(error);
+                }
+            }
+            Ok((id, discover_sessions_in_project(&work_dir)))
+        })
+    }
+
+    pub fn finish_session_fork(
+        &mut self,
+        work_dir: PathBuf,
+        id: String,
+        sessions: Vec<SessionInfo>,
+    ) {
+        let Some(project) = self
             .projects
             .iter_mut()
             .find(|project| project.work_dir == work_dir)
-        {
-            project.sessions = discover_sessions_in_project(&work_dir);
+        else {
+            return;
+        };
+        // Only merge the newly created session: the background snapshot may
+        // predate unrelated session additions/removals on the foreground.
+        if let Some(session) = sessions.into_iter().find(|session| session.id == id) {
+            project.sessions.retain(|session| session.id != id);
+            project.sessions.insert(0, session);
         }
         self.session_refresh_generation = self.session_refresh_generation.wrapping_add(1);
-        self.select_session(work_dir.clone(), id.clone());
+        self.select_session(work_dir.clone(), id);
         self.request_session_refresh(&work_dir);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fork_session(
+        &mut self,
+        work_dir: PathBuf,
+        session_id: String,
+    ) -> Result<String, String> {
+        let work = self.prepare_session_fork(work_dir.clone(), session_id)?;
+        let (id, sessions) = work()?;
+        self.finish_session_fork(work_dir, id.clone(), sessions);
         Ok(id)
     }
 

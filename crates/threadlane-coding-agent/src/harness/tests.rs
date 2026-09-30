@@ -6,9 +6,54 @@ fn temp_session() -> (tempfile::TempDir, PathBuf) {
 }
 
 #[test]
+fn fork_session_commits_large_context_in_one_entry_batch() {
+    let (dir, source) = temp_session();
+    let mut original = CodingSessionHarness::open(&source).unwrap();
+    let actions = (0..2000)
+        .map(
+            |index| threadlane_runtime::harness::EffectAction::AppendEntry {
+                entry: HarnessEntry {
+                    id: format!("entry-{index}"),
+                    parent_id: (index > 0).then(|| format!("entry-{}", index - 1)),
+                    lane: "main".into(),
+                    seq: index + 1,
+                    timestamp: timestamp(),
+                    message: AgentMessage::user(format!("message-{index}"), vec![]),
+                    surface_op: threadlane_runtime::harness::SurfaceOperation::Append,
+                    terminate: false,
+                },
+            },
+        )
+        .collect::<Vec<_>>();
+    original
+        .store
+        .store_mut()
+        .append_actions_atomically(&actions)
+        .unwrap();
+    let destination = dir.path().join("fork.jsonl");
+    CodingSessionHarness::fork_to_path(&source, &destination).unwrap();
+    let fork = JsonlStore::open_read_only(&destination).unwrap();
+    assert_eq!(
+        fork.model_context("main").unwrap().messages(),
+        original.store.model_context("main").unwrap().messages()
+    );
+    assert_eq!(
+        fs::read_to_string(destination)
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("#!threadlane-atomic-v1 "))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn fork_session_recovers_transcript_when_source_reduction_fails() {
     let (dir, source) = temp_session();
     let mut original = CodingSessionHarness::open(&source).unwrap();
+    original
+        .append_message(AgentMessage::user("Keep this context", vec![]))
+        .unwrap();
     original
         .append_message(AgentMessage::user("Keep this context", vec![]))
         .unwrap();
@@ -20,11 +65,12 @@ fn fork_session_recovers_transcript_when_source_reduction_fails() {
     let destination = dir.path().join("recovered.jsonl");
     CodingSessionHarness::fork_to_path(&source, &destination).unwrap();
     let fork = JsonlStore::open_read_only(destination).unwrap();
-    assert!(
-        fork.model_context("main")
-            .unwrap()
-            .messages()
-            .contains(&AgentMessage::user("Keep this context", vec![]))
+    assert_eq!(
+        fork.model_context("main").unwrap().messages(),
+        vec![
+            AgentMessage::user("Keep this context", vec![]),
+            AgentMessage::user("Keep this context", vec![]),
+        ]
     );
     assert_eq!(fs::read(source).unwrap(), before);
 }
