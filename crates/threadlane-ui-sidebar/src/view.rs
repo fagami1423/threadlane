@@ -863,9 +863,9 @@ impl SidebarView {
                                 div()
                                     .size(rems(1.5))
                                     .rounded_lg()
-                                    .bg(theme.primary.opacity(0.12))
+                                    .bg(theme.foreground.opacity(0.12))
                                     .border_1()
-                                    .border_color(theme.primary.opacity(0.2))
+                                    .border_color(theme.foreground.opacity(0.2))
                                     .flex()
                                     .items_center()
                                     .justify_center()
@@ -873,7 +873,7 @@ impl SidebarView {
                                         Icon::default()
                                             .path("icons/threadlane.svg")
                                             .size_4()
-                                            .text_color(theme.primary),
+                                            .text_color(theme.foreground),
                                     ),
                             )
                             .child(
