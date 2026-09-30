@@ -140,6 +140,7 @@ pub enum GitAction {
     CheckoutStash(String),
     CheckoutCarry(String),
     CreateBranch(String),
+    DeleteBranch(String),
     Merge(String),
     PopStash(Option<usize>),
     DropStash(Option<usize>),

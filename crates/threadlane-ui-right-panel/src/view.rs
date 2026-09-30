@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
+use gpui_component::dialog::DialogButtonProps;
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Editor, EditorState, Input, InputEvent, InputState, TabSize};
 use gpui_component::list::ListItem;
@@ -1086,6 +1087,7 @@ impl RightPanelView {
             GitAction::CheckoutStash(b) => format!("Stashing changes & switching to {b}…"),
             GitAction::CheckoutCarry(b) => format!("Switching to {b} with changes…"),
             GitAction::CreateBranch(b) => format!("Creating branch {b}…"),
+            GitAction::DeleteBranch(b) => format!("Deleting branch {b}…"),
             GitAction::Merge(b) => format!("Merging {b}…"),
             GitAction::PopStash(_) => "Restoring stashed changes…".to_string(),
             GitAction::DropStash(_) => "Discarding stash…".to_string(),
@@ -1173,6 +1175,11 @@ impl RightPanelView {
                     GitAction::CreateBranch(branch) => {
                         threadlane_git::create_branch(&work_dir, branch)
                             .map_err(|e| e.to_string())?;
+                    }
+                    GitAction::DeleteBranch(branch) => {
+                        threadlane_git::delete_branch(&work_dir, branch, false)
+                            .map_err(|e| e.to_string())?;
+                        action_message = Some(format!("Deleted local branch {branch}"));
                     }
                     GitAction::Merge(branch) => {
                         threadlane_git::merge(&work_dir, branch).map_err(|e| e.to_string())?;
@@ -4565,6 +4572,55 @@ impl RightPanelView {
             )
     }
 
+    fn can_delete_branch(&self, project: &Path, branch: &str) -> bool {
+        !self.git_busy
+            && self.project.as_deref() == Some(project)
+            && self.git_status.as_ref().is_some_and(|status| {
+                status.branch.as_deref() != Some(branch)
+                    && status.default_branch.as_deref() != Some(branch)
+                    && status.branch_details.iter().any(|info| {
+                        info.name == branch && !info.is_current && !info.is_default
+                    })
+            })
+    }
+
+    fn confirm_delete_branch(
+        &mut self,
+        project: PathBuf,
+        branch: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_delete_branch(&project, &branch) {
+            return;
+        }
+        let panel = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let panel = panel.clone();
+            let project = project.clone();
+            let branch = branch.clone();
+            alert
+                .title(format!("Delete branch “{branch}”?"))
+                .description(format!(
+                    "Delete the local branch in {}. Remote branches and worktrees will not be removed. Unmerged branches and branches checked out in a worktree cannot be deleted.",
+                    project.display()
+                ))
+                .button_props(DialogButtonProps::default()
+                    .ok_text("Delete")
+                    .ok_variant(ButtonVariant::Danger)
+                    .show_cancel(true))
+                .on_ok(move |_, window, cx| {
+                    let _ = panel.update(cx, |panel, cx| {
+                        // Recheck after confirmation: the panel may now show another project.
+                        if panel.can_delete_branch(&project, &branch) {
+                            panel.run_git_action(GitAction::DeleteBranch(branch.clone()), window, cx);
+                        }
+                    });
+                    true
+                })
+        });
+    }
+
     fn render_branch_section(
         &self,
         title: &'static str,
@@ -4590,7 +4646,14 @@ impl RightPanelView {
                 let is_current = branch.is_current;
                 let rel_time = branch.relative_time.clone();
                 let branch_name_for_click = name.clone();
+                let menu_name = name.clone();
+                let panel = cx.entity().downgrade();
+                let project = self.project.clone();
                 Button::new(SharedString::from(format!("branch-row-{}", name)))
+                    .debug_selector({
+                        let name = name.clone();
+                        move || format!("branch-row-{name}")
+                    })
                     .accessibility_label(if is_current {
                         format!("Current branch {name}, already checked out")
                     } else {
@@ -4691,6 +4754,30 @@ impl RightPanelView {
                                     .child(rel_time)
                             })),
                     )
+                    .context_menu(move |menu, _, cx| {
+                        let copy_name = menu_name.clone();
+                        let delete_name = menu_name.clone();
+                        let delete_panel = panel.clone();
+                        let delete_project = project.clone();
+                        let can_delete = panel.upgrade().is_some_and(|panel| {
+                            project.as_deref().is_some_and(|project| {
+                                panel.read(cx).can_delete_branch(project, &menu_name)
+                            })
+                        });
+                        menu.item(PopupMenuItem::new("Copy branch name").on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(copy_name.clone()));
+                        }))
+                        .separator()
+                        .item(PopupMenuItem::new("Delete branch…")
+                            .disabled(!can_delete)
+                            .on_click(move |_, window, cx| {
+                                if let Some(project) = delete_project.clone() {
+                                    let _ = delete_panel.update(cx, |panel, cx| {
+                                        panel.confirm_delete_branch(project, delete_name.clone(), window, cx);
+                                    });
+                                }
+                            }))
+                    })
             }))
     }
 
@@ -5762,7 +5849,7 @@ mod dialog_keyboard_tests {
     use super::RightPanelView;
     use gpui::{
         AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, Render, Role,
-        StatefulInteractiveElement, Styled, TestAppContext, Window, div,
+        ParentElement, StatefulInteractiveElement, Styled, TestAppContext, Window, div,
     };
     use gpui_component::{Root, WindowExt};
     use threadlane_ui_state::AppState;
@@ -5781,9 +5868,108 @@ mod dialog_keyboard_tests {
                 .role(Role::Application)
                 .tab_group()
                 .size_full()
+                .child(self.panel.update(cx, |panel, cx| {
+                    let branches = panel.git_status.as_ref()
+                        .map(|s| s.branch_details.clone()).unwrap_or_default();
+                    panel.render_branch_section("BRANCHES", branches, cx)
+                        .into_any_element()
+                }))
         }
     }
 
+    #[gpui::test]
+    fn branch_deletion_requires_confirmation_and_keeps_project_scope(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let model = cx.new(|_| AppState::default());
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let capture = captured.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let panel = cx.new(|cx| RightPanelView::new(model, window, cx));
+            let trigger = cx.focus_handle();
+            trigger.focus(window, cx);
+            *capture.borrow_mut() = Some(panel.clone());
+            Root::new(cx.new(|_| Host { panel, trigger }), window, cx)
+        });
+        let panel = captured.borrow_mut().take().unwrap();
+        let project = std::path::PathBuf::from("/test/project");
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.project = Some(project.clone());
+                panel.git_status = Some(threadlane_git::GitStatus {
+                    branch: Some("current".into()),
+                    branch_details: vec![
+                        threadlane_git::GitBranchInfo { name: "main".into(), is_default: true, ..Default::default() },
+                        threadlane_git::GitBranchInfo { name: "current".into(), is_current: true, ..Default::default() },
+                        threadlane_git::GitBranchInfo { name: "feature".into(), ..Default::default() },
+                    ],
+                    ..Default::default()
+                });
+                for branch in ["main", "current", "missing"] {
+                    assert!(!panel.can_delete_branch(&project, branch));
+                    panel.confirm_delete_branch(project.clone(), branch.into(), window, cx);
+                    assert!(!window.has_active_dialog(cx));
+                }
+                assert!(!panel.can_delete_branch(std::path::Path::new("/other"), "feature"));
+                panel.git_busy = true;
+                assert!(!panel.can_delete_branch(&project, "feature"));
+                panel.git_busy = false;
+                assert!(panel.can_delete_branch(&project, "feature"));
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let row = cx.debug_bounds("branch-row-feature").unwrap();
+        for keys in ["down enter", "down down enter"] {
+            cx.simulate_event(gpui::MouseDownEvent {
+                button: gpui::MouseButton::Right,
+                position: row.center(),
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.simulate_keystrokes(keys);
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                assert!(
+                    !panel.read(cx).git_busy,
+                    "right-click must not checkout or delete"
+                );
+                if keys == "down enter" {
+                    assert_eq!(
+                        cx.read_from_clipboard().unwrap().text().as_deref(),
+                        Some("feature")
+                    );
+                    assert!(!window.has_active_dialog(cx));
+                } else {
+                    assert!(window.has_active_dialog(cx));
+                }
+            });
+        }
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(!window.has_active_dialog(cx));
+            assert!(!panel.read(cx).git_busy);
+            panel.update(cx, |panel, cx| {
+                panel.confirm_delete_branch(project.clone(), "feature".into(), window, cx);
+                panel.project = Some("/test/other-project".into());
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(!window.has_active_dialog(cx));
+            assert!(
+                !panel.read(cx).git_busy,
+                "stale confirmation must not run Git in another project"
+            );
+        });
+    }
     #[gpui::test]
     fn git_dialogs_dismiss_with_escape_and_restore_focus(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);

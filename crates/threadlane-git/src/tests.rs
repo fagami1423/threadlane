@@ -778,6 +778,40 @@ fn github_mutation_args_rejects_zero_or_mismatched_review_url_numbers() {
 }
 
 #[test]
+fn safe_branch_deletion_preserves_unmerged_and_checked_out_branches() {
+    let dir = tempdir().unwrap();
+    run_git(dir.path(), &["init", "-b", "main"]);
+    run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+    run_git(dir.path(), &["config", "user.name", "Test"]);
+    run_git(dir.path(), &["config", "core.hooksPath", "/dev/null"]);
+    fs::write(dir.path().join("base.txt"), "base\n").unwrap();
+    run_git(dir.path(), &["add", "."]);
+    run_git(dir.path(), &["commit", "-qm", "initial"]);
+    assert!(delete_branch(dir.path(), "main", false).is_err());
+
+    create_branch(dir.path(), "unmerged").unwrap();
+    fs::write(dir.path().join("feature.txt"), "keep this work\n").unwrap();
+    run_git(dir.path(), &["add", "."]);
+    run_git(dir.path(), &["commit", "-qm", "feature"]);
+    checkout(dir.path(), "main").unwrap();
+    assert!(delete_branch(dir.path(), "unmerged", false).is_err());
+    assert!(diff_branch(dir.path(), "unmerged")
+        .unwrap()
+        .contains("keep this work"));
+
+    let worktree = dir.path().join("linked");
+    run_git(
+        dir.path(),
+        &["worktree", "add", "-b", "linked", worktree.to_str().unwrap()],
+    );
+    assert!(delete_branch(dir.path(), "linked", false).is_err());
+    assert!(worktree.join("base.txt").exists());
+    let branches = list_branches_detailed(dir.path(), None).unwrap();
+    for name in ["main", "unmerged", "linked"] {
+        assert!(branches.iter().any(|branch| branch.name == name));
+    }
+}
+#[test]
 fn branch_lifecycle_and_merge() {
     let dir = tempdir().unwrap();
     run_git(dir.path(), &["init", "-b", "main"]);
