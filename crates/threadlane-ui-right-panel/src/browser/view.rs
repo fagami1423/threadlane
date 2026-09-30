@@ -240,10 +240,18 @@ impl BrowserView {
     /// (it needs the window) and guarded: never clobbers focused typing,
     /// and no-ops once in sync so it cannot loop renders.
     fn sync_address_bar(&self, window: &mut Window, cx: &mut Context<Self>) {
+        // Prefer the live URL: in-page navigation (SPA pushes, redirects,
+        // link clicks) never updates `tab.url`, so the bar went stale.
         let url = self
             .tabs
             .get(self.active_tab)
-            .map(|tab| tab.url.clone())
+            .map(|tab| {
+                tab.webview
+                    .as_ref()
+                    .and_then(|webview| webview.read(cx).raw().url().ok())
+                    .filter(|url| !url.is_empty())
+                    .unwrap_or_else(|| tab.url.clone())
+            })
             .unwrap_or_default();
         let focused = self
             .address_input
@@ -310,12 +318,16 @@ impl BrowserView {
     }
 
     /// Capture the rendered viewport as JPEG bytes with width and height.
+    /// `crop` is an optional `[x, y, w, h]` rect in view points (≈ CSS pixels
+    /// at page zoom 1); `None` snapshots the whole viewport.
     pub fn take_snapshot(
         &self,
+        crop: Option<[f64; 4]>,
         cx: &App,
     ) -> Result<tokio::sync::oneshot::Receiver<Result<(Vec<u8>, u32, u32), String>>, String> {
         use block2::RcBlock;
         use objc2::runtime::AnyObject;
+        use objc2_core_foundation::{CGPoint, CGRect, CGSize};
         use wry::WebViewExtMacOS;
 
         let webview = self
@@ -373,10 +385,26 @@ impl BrowserView {
         });
 
         unsafe {
-            let nil_config: *mut AnyObject = std::ptr::null_mut();
+            // WKSnapshotConfiguration::rect is in WKWebView view coordinates;
+            // when unset the full bounds are captured. The crop comes from the
+            // picker's viewport-space getBoundingClientRect union, which lines
+            // up while page zoom is 1.
+            let config: *mut AnyObject = if let Some([x, y, w, h]) = crop {
+                let class = objc2::runtime::AnyClass::get(c"WKSnapshotConfiguration")
+                    .ok_or_else(|| "WKSnapshotConfiguration class missing.".to_string())?;
+                let config: *mut AnyObject = objc2::msg_send![class, new];
+                if config.is_null() {
+                    return Err("Failed to create WKSnapshotConfiguration.".to_string());
+                }
+                let rect = CGRect::new(CGPoint::new(x, y), CGSize::new(w, h));
+                let _: () = objc2::msg_send![config, setRect: rect];
+                config
+            } else {
+                std::ptr::null_mut()
+            };
             let _: () = objc2::msg_send![
                 &*wk_wv,
-                takeSnapshotWithConfiguration: nil_config,
+                takeSnapshotWithConfiguration: config,
                 completionHandler: &*block
             ];
         }
@@ -392,13 +420,20 @@ impl BrowserView {
         }
     }
 
-    pub fn reload(&mut self, cx: &mut Context<Self>) {
-        let url = self
-            .current_url(cx)
-            .filter(|url| !url.is_empty())
-            .unwrap_or_else(|| DEFAULT_URL.to_string());
+    pub fn go_forward(&mut self, cx: &mut Context<Self>) {
         if let Some(webview) = self.active_webview() {
-            webview.update(cx, |view, _| view.load_url(&url));
+            webview.update(cx, |view, _| {
+                // wry has no forward(); go straight to the history entry.
+                let _ = view.raw().evaluate_script("history.forward();");
+            });
+        }
+    }
+
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        if let Some(webview) = self.active_webview() {
+            // wry reload() is a real reload: bypassing the cache is the user's
+            // call, unlike re-navigating which resubmits nothing for POSTs.
+            let _ = webview.update(cx, |view, _| view.raw().reload());
         }
         cx.notify();
     }
@@ -412,10 +447,10 @@ impl BrowserView {
         self.annotating
     }
 
-    /// Toggles the click-to-annotate picker. While active, hovering
-    /// highlights elements and clicking one attaches its description plus a
-    /// viewport snapshot to the chat composer.
-    pub fn toggle_annotate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Toggles the annotate overlay. While active, the in-page picker selects
+    /// elements and collects an optional comment; attaching hands the
+    /// description plus an element-cropped snapshot to the chat composer.
+    pub fn toggle_annotate(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.annotating {
             self.stop_annotate(cx);
             cx.notify();
@@ -430,11 +465,34 @@ impl BrowserView {
         };
         self.annotating = true;
         cx.notify();
-        let view = cx.entity().downgrade();
-        let model = self.model.clone();
         self.annotate_task = Some(cx.spawn(async move |this, cx| {
-            // Best-effort install confirmation; the picker works regardless.
-            let _ = install.await;
+            // The picker bails with "retry" while the document is mid-load;
+            // reinstall briefly rather than dropping the user's session.
+            let mut installed = install
+                .await
+                .map(|raw| unwrap_callback_payload(&raw))
+                .unwrap_or_default();
+            let mut install_retries = 0u8;
+            while installed.trim_matches('"') == "retry" && install_retries < 3 {
+                install_retries += 1;
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(400))
+                    .await;
+                let retry = this
+                    .update(cx, |this, cx| {
+                        this.evaluate_script(&annotate_install_js(), cx).ok()
+                    })
+                    .ok()
+                    .flatten();
+                installed = match retry {
+                    Some(receiver) => receiver
+                        .await
+                        .map(|raw| unwrap_callback_payload(&raw))
+                        .unwrap_or_default(),
+                    None => break,
+                };
+            }
+            let mut misses = 0u8;
             loop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(300))
@@ -445,8 +503,23 @@ impl BrowserView {
                     })
                     .ok()
                     .flatten();
-                let Some(poll) = poll else { break };
-                let Ok(raw) = poll.await else { break };
+                // Transient eval failures (navigation, teardown) shouldn't end
+                // the session; several misses in a row mean the page is gone.
+                let Some(poll) = poll else {
+                    misses += 1;
+                    if misses >= 8 {
+                        break;
+                    }
+                    continue;
+                };
+                let Ok(raw) = poll.await else {
+                    misses += 1;
+                    if misses >= 8 {
+                        break;
+                    }
+                    continue;
+                };
+                misses = 0;
                 let payload = unwrap_callback_payload(&raw);
                 // The callback wrapper has already been removed above.
                 let parsed = serde_json::from_str::<serde_json::Value>(&payload).ok();
@@ -467,10 +540,6 @@ impl BrowserView {
                 }
                 // Picker cancelled (Escape reports active=false): stop.
                 if !active.is_some_and(|value| value.as_bool().unwrap_or(false)) {
-                    let _ = this.update(cx, |this, cx| {
-                        this.stop_annotate(cx);
-                        cx.notify();
-                    });
                     break;
                 }
                 // Still waiting: keep the task alive only while the view does.
@@ -478,6 +547,14 @@ impl BrowserView {
                     break;
                 }
             }
+            // Any exit that didn't deliver a pick still owes the view a
+            // cleared annotating flag (finish_annotation does its own).
+            let _ = this.update(cx, |this, cx| {
+                if this.annotating {
+                    this.stop_annotate(cx);
+                    cx.notify();
+                }
+            });
         }));
     }
 
@@ -507,22 +584,6 @@ impl BrowserView {
             cx.notify();
             return;
         };
-        let tag = pick
-            .get("tag")
-            .and_then(|value| value.as_str())
-            .unwrap_or("element");
-        let text = pick
-            .get("text")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let selector = pick
-            .get("selector")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let href = pick
-            .get("href")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
         let page_title = pick
             .get("title")
             .and_then(|value| value.as_str())
@@ -531,29 +592,86 @@ impl BrowserView {
             .get("url")
             .and_then(|value| value.as_str())
             .unwrap_or("");
-        let rect = pick.get("rect");
-        let geometry = rect
-            .map(|rect| {
-                format!(
-                    "{}x{} at ({},{})",
-                    rect.get("w").and_then(|value| value.as_u64()).unwrap_or(0),
-                    rect.get("h").and_then(|value| value.as_u64()).unwrap_or(0),
-                    rect.get("x").and_then(|value| value.as_i64()).unwrap_or(0),
-                    rect.get("y").and_then(|value| value.as_i64()).unwrap_or(0),
-                )
-            })
-            .unwrap_or_else(|| "unknown geometry".to_string());
-        let mut note = format!(
-            "[Browser annotation — {page_title}]({page_url})\nElement: <{tag}> `{selector}` {geometry}"
-        );
-        if !text.is_empty() {
-            note.push_str(&format!("\nContent: \"{text}\""));
+        let comment = pick
+            .get("comment")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let mut note = format!("[Browser annotation — {page_title}]({page_url})");
+        if !comment.is_empty() {
+            note.push_str(&format!("\nComment: {comment}"));
         }
-        if !href.is_empty() {
-            note.push_str(&format!("\nLink: {href}"));
+        let elements: Vec<&serde_json::Value> = pick
+            .get("elements")
+            .and_then(|value| value.as_array())
+            .map(|elements| elements.iter().collect())
+            .unwrap_or_default();
+        let numbered = elements.len() > 1;
+        for (index, element) in elements.iter().enumerate() {
+            let label = if numbered {
+                format!("Element {}", index + 1)
+            } else {
+                "Element".to_string()
+            };
+            let tag = element
+                .get("tag")
+                .and_then(|value| value.as_str())
+                .unwrap_or("element");
+            let selector = element
+                .get("selector")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let geometry = element
+                .get("rect")
+                .map(|rect| {
+                    format!(
+                        "{}x{} at ({},{})",
+                        rect.get("w").and_then(|value| value.as_u64()).unwrap_or(0),
+                        rect.get("h").and_then(|value| value.as_u64()).unwrap_or(0),
+                        rect.get("x").and_then(|value| value.as_i64()).unwrap_or(0),
+                        rect.get("y").and_then(|value| value.as_i64()).unwrap_or(0),
+                    )
+                })
+                .unwrap_or_else(|| "unknown geometry".to_string());
+            note.push_str(&format!("\n{label}: <{tag}> `{selector}` {geometry}"));
+            for (key, prefix) in [
+                ("role", "Role: "),
+                ("name", "Name: \""),
+                ("text", "Text: \""),
+            ] {
+                let Some(value) = element.get(key).and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                if value.is_empty() {
+                    continue;
+                }
+                if prefix.ends_with('"') {
+                    note.push_str(&format!("\n  {prefix}{value}\""));
+                } else {
+                    note.push_str(&format!("\n  {prefix}{value}"));
+                }
+            }
+            if let Some(href) = element
+                .get("href")
+                .and_then(|value| value.as_str())
+                .filter(|href| !href.is_empty())
+            {
+                note.push_str(&format!("\n  Link: {href}"));
+            }
+            if let Some(html) = element
+                .get("html")
+                .and_then(|value| value.as_str())
+                .filter(|html| !html.is_empty())
+            {
+                note.push_str(&format!("\n  HTML: `{html}`"));
+            }
         }
-        // Viewport snapshot alongside the note, like an attached screenshot.
-        let snapshot = self.take_snapshot(cx).ok();
+        // Snapshot cropped to the annotated element union so the attachment
+        // shows context around the target instead of the whole viewport.
+        let crop = pick.get("crop").and_then(|rect| {
+            let get = |key: &str| rect.get(key).and_then(|value| value.as_f64());
+            Some([get("x")?, get("y")?, get("w")?, get("h")?])
+        });
+        let snapshot = self.take_snapshot(crop, cx).ok();
         let model = self.model.clone();
         cx.spawn(async move |_this, cx| {
             let mut images = Vec::new();
@@ -653,6 +771,17 @@ impl Render for BrowserView {
                             })),
                     )
                     .child(
+                        Button::new("browser-forward")
+                            .icon(IconName::ArrowRight)
+                            .accessibility_label("Go forward")
+                            .tooltip("Go forward")
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.go_forward(cx);
+                            })),
+                    )
+                    .child(
                         Button::new("browser-reload")
                             .icon(Icon::default().path("icons/refresh-cw.svg"))
                             .accessibility_label("Reload page")
@@ -669,12 +798,12 @@ impl Render for BrowserView {
                             .accessibility_label(if annotating {
                                 "Stop annotating"
                             } else {
-                                "Annotate page element"
+                                "Annotate page elements"
                             })
                             .tooltip(if annotating {
-                                "Annotating — click a page element (Esc cancels)"
+                                "Annotating — click elements, then attach (Esc cancels)"
                             } else {
-                                "Annotate: pick a page element into the composer"
+                                "Annotate: pick page elements into the composer"
                             })
                             .ghost()
                             .xsmall()
@@ -826,7 +955,7 @@ impl Render for BrowserView {
                                 .text_xs()
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(cx.theme().warning)
-                                .child("Click a page element \u{2014} Esc cancels"),
+                                .child("Click elements, Enter attaches \u{2014} Esc cancels"),
                         ),
                 )
             })
@@ -1021,8 +1150,8 @@ mod browser_tabs_tests {
             let focus = browser.read(cx).focus_handle.clone();
             focus.focus(window, cx);
             assert!(browser.read(cx).focus_handle.contains_focused(window, cx));
-            // Back, Reload, Annotate, then the address input.
-            for _ in 0..4 {
+            // Back, Forward, Reload, Annotate, then the address input.
+            for _ in 0..5 {
                 window.focus_next(cx);
             }
             assert!(browser

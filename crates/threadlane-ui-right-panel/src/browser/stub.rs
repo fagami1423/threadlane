@@ -67,6 +67,8 @@ impl BrowserView {
 
     pub fn go_back(&mut self, _cx: &mut Context<Self>) {}
 
+    pub fn go_forward(&mut self, _cx: &mut Context<Self>) {}
+
     pub fn reload(&mut self, _cx: &mut Context<Self>) {}
 
     pub fn current_url(&self, _cx: &App) -> Option<String> {
@@ -83,6 +85,7 @@ impl BrowserView {
 
     pub fn take_snapshot(
         &self,
+        _crop: Option<[f64; 4]>,
         _cx: &App,
     ) -> Result<tokio::sync::oneshot::Receiver<Result<(Vec<u8>, u32, u32), String>>, String> {
         Err("The embedded browser is available on macOS only.".to_string())
