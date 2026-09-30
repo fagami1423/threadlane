@@ -1212,7 +1212,7 @@ fn tracked_diff(
     path: Option<&str>,
     options: DiffOptions,
 ) -> Result<String, GitError> {
-    let mut args = vec!["diff", "--no-ext-diff"];
+    let mut args = vec!["diff", "--no-ext-diff", "--no-textconv"];
     if options.ignore_whitespace {
         args.push("--ignore-all-space");
     }
@@ -1245,26 +1245,65 @@ fn tracked_diff(
     }
 }
 
-fn untracked_diff(work_dir: &Path, path: &str, options: DiffOptions) -> Result<String, GitError> {
-    validate_diff_path(work_dir, path)?;
-    let null_source = if cfg!(windows) { "NUL" } else { "/dev/null" };
-    let mut args = vec!["diff", "--no-ext-diff", "--no-index"];
+fn untracked_diff(work_dir: &Path, paths: &str, options: DiffOptions) -> Result<String, GitError> {
+    if paths.is_empty() {
+        return Ok(String::new());
+    }
+    for path in paths.split('\0').filter(|path| !path.is_empty()) {
+        validate_diff_path(work_dir, path)?;
+    }
+    let io_error =
+        |error| GitError::new(work_dir, format!("could not prepare untracked diff: {error}"));
+    let scratch = tempfile::tempdir().map_err(io_error)?;
+    let objects = scratch.path().join("objects");
+    let pathspec = scratch.path().join("paths");
+    std::fs::create_dir(&objects).map_err(io_error)?;
+    std::fs::write(&pathspec, paths).map_err(io_error)?;
+    let git = || {
+        let mut command = Command::new("git");
+        command
+            .current_dir(work_dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_INDEX_FILE", scratch.path().join("index"))
+            .env("GIT_OBJECT_DIRECTORY", &objects)
+            .args(["-c", "core.splitIndex=false", "-c", "core.fsmonitor=false"]);
+        command
+    };
+    let run = |command: &mut Command| {
+        #[cfg(test)]
+        COMMAND_SPAWNS.set(COMMAND_SPAWNS.get() + 1);
+        let output = command
+            .output()
+            .map_err(|error| GitError::new(work_dir, format!("could not start git: {error}")))?;
+        if !output.status.success() {
+            return Err(GitError::new(
+                work_dir,
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    run(git()
+        .args([
+            "--literal-pathspecs",
+            "add",
+            "--intent-to-add",
+            "--pathspec-from-file",
+        ])
+        .arg(&pathspec)
+        .arg("--pathspec-file-nul"))?;
+    let mut diff = git();
+    diff.args([
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--ita-invisible-in-index",
+        "--relative",
+    ]);
     if options.ignore_whitespace {
-        args.push("--ignore-all-space");
+        diff.arg("--ignore-all-space");
     }
-    args.extend(["--", null_source, path]);
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(work_dir)
-        .output()
-        .map_err(|error| GitError::new(work_dir, format!("could not start git: {error}")))?;
-    match output.status.code() {
-        Some(0 | 1) => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
-        _ => Err(GitError::new(
-            work_dir,
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        )),
-    }
+    run(diff.arg("--"))
 }
 
 fn untracked_paths(work_dir: &Path, path: Option<&str>) -> Result<String, GitError> {
@@ -1281,12 +1320,11 @@ pub fn diff_file_with_options(
 ) -> Result<String, GitError> {
     validate_diff_path(work_dir, path)?;
     let mut diff = tracked_diff(work_dir, Some(path), options)?;
-    for path in untracked_paths(work_dir, Some(path))?
-        .split('\0')
-        .filter(|p| !p.is_empty())
-    {
-        diff.push_str(&untracked_diff(work_dir, path, options)?);
-    }
+    diff.push_str(&untracked_diff(
+        work_dir,
+        &untracked_paths(work_dir, Some(path))?,
+        options,
+    )?);
     Ok(diff)
 }
 
@@ -1296,12 +1334,11 @@ pub fn worktree_diff_with_options(
     options: DiffOptions,
 ) -> Result<String, GitError> {
     let mut diff = tracked_diff(work_dir, None, options)?;
-    for path in untracked_paths(work_dir, None)?
-        .split('\0')
-        .filter(|p| !p.is_empty())
-    {
-        diff.push_str(&untracked_diff(work_dir, path, options)?);
-    }
+    diff.push_str(&untracked_diff(
+        work_dir,
+        &untracked_paths(work_dir, None)?,
+        options,
+    )?);
     Ok(diff)
 }
 

@@ -296,6 +296,72 @@ fn local_diff_options_preserve_errors_and_path_validation() {
 }
 
 #[test]
+fn local_diff_batches_untracked_files_without_repository_writes() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    init_diff_repo(root);
+    run_git(root, &["config", "core.splitIndex", "true"]);
+    fs::create_dir(root.join("new")).unwrap();
+    for i in 0..500 {
+        fs::write(root.join(format!("new/{i}.txt")), format!("file {i}\n")).unwrap();
+    }
+    fs::write(root.join("literal[1].txt"), "").unwrap();
+    let index = fs::read(root.join(".git/index")).unwrap();
+    let empty_oid = command(root, &["hash-object", "--stdin"]).unwrap();
+    let empty_oid = empty_oid.trim();
+    let empty_object = root
+        .join(".git/objects")
+        .join(&empty_oid[..2])
+        .join(&empty_oid[2..]);
+    assert!(!empty_object.exists());
+    for ignore_whitespace in [false, true] {
+        COMMAND_SPAWNS.set(0);
+        let diff = worktree_diff_with_options(root, DiffOptions { ignore_whitespace }).unwrap();
+        assert_eq!(COMMAND_SPAWNS.get(), 4);
+        assert_eq!(diff.matches("diff --git ").count(), 501);
+        assert!(diff.contains("a/new/499.txt b/new/499.txt"));
+        assert!(diff.contains("literal[1].txt"));
+        assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+        assert!(!empty_object.exists());
+        assert!(!fs::read_dir(root.join(".git")).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("sharedindex.")
+        }));
+        assert_eq!(
+            fs::read_to_string(root.join("new/499.txt")).unwrap(),
+            "file 499\n"
+        );
+    }
+}
+
+#[test]
+fn local_diff_disables_configured_text_conversion() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    init_diff_repo(root);
+    fs::write(root.join(".gitattributes"), "*.txt diff=review-test\n").unwrap();
+    run_git(root, &["config", "diff.review-test.textconv", "git --version"]);
+    fs::write(root.join("tracked.txt"), "new value\n").unwrap();
+    fs::write(root.join("new.txt"), "untracked value\n").unwrap();
+    for ignore_whitespace in [false, true] {
+        let options = DiffOptions { ignore_whitespace };
+        assert!(diff_file_with_options(root, "tracked.txt", options)
+            .unwrap()
+            .contains("+new value"));
+        assert!(diff_file_with_options(root, "new.txt", options)
+            .unwrap()
+            .contains("+untracked value"));
+        let diff = worktree_diff_with_options(root, options).unwrap();
+        assert!(diff.contains("+new value"));
+        assert!(diff.contains("+untracked value"));
+        assert!(!diff.contains("git version"));
+    }
+}
+
+#[test]
 fn parses_branch_and_change_state() {
     let status = parse_status(
             Path::new("/tmp/project"),

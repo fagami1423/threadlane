@@ -304,6 +304,7 @@ pub enum PanelEvent {
         status: Result<GitStatus, String>,
         action_error: Option<String>,
         action_message: Option<String>,
+        checkout_succeeded: bool,
     },
     CommitFilesLoaded {
         sha: String,

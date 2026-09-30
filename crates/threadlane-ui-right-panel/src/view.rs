@@ -68,6 +68,8 @@ pub struct RightPanelView {
     review_diff_options: threadlane_git::DiffOptions,
     review_diff_request: Option<ReviewDiffRequest>,
     review_diff_state: Option<ReviewDiffState>,
+    #[cfg(test)]
+    review_diff_load_count: usize,
     git_status: Option<GitStatus>,
     draft_pr_context_revision: u64,
     review_error: Option<String>,
@@ -75,6 +77,7 @@ pub struct RightPanelView {
     generated_commit_message: Option<String>,
     should_clear_commit_message: bool,
     git_busy: bool,
+    git_checkout_pending: bool,
     git_message_pending: bool,
     pub(crate) git_feedback: Option<String>,
     pending_git_notifications: Vec<Notification>,
@@ -321,6 +324,8 @@ impl RightPanelView {
             review_diff_options: threadlane_git::DiffOptions::default(),
             review_diff_request: None,
             review_diff_state: None,
+            #[cfg(test)]
+            review_diff_load_count: 0,
             git_status: None,
             draft_pr_context_revision: 0,
             review_error: None,
@@ -328,6 +333,7 @@ impl RightPanelView {
             generated_commit_message: None,
             should_clear_commit_message: false,
             git_busy: false,
+            git_checkout_pending: false,
             git_message_pending: false,
             git_feedback: None,
             pending_git_notifications: Vec::new(),
@@ -389,6 +395,7 @@ impl RightPanelView {
         self.review_diff_options = threadlane_git::DiffOptions::default();
         self.review_diff_request = None;
         self.review_diff_state = None;
+        self.git_checkout_pending = false;
         self.git_status = None;
         self.review_error = None;
         self.git_feedback = None;
@@ -584,7 +591,7 @@ impl RightPanelView {
 
     pub(crate) fn refresh_surface(&mut self, surface: Surface, cx: &mut Context<Self>) {
         if surface == Surface::Review {
-            self.reload_review_diff(cx);
+            self.invalidate_review_diff(cx);
         }
         let Some(project) = self.project.clone() else {
             return;
@@ -637,8 +644,23 @@ impl RightPanelView {
     }
 
     fn reload_review_diff(&mut self, cx: &mut Context<Self>) {
+        if self.git_checkout_pending {
+            return;
+        }
         if let Some(request) = &self.review_diff_request {
             self.open_review_diff(request.target.clone(), cx);
+        }
+    }
+
+    fn invalidate_review_diff(&mut self, cx: &mut Context<Self>) {
+        self.review_diff_revision = self.review_diff_revision.wrapping_add(1);
+        if let Some(request) = &mut self.review_diff_request {
+            request.revision = self.review_diff_revision;
+            self.pending_document = None;
+            self.review_diff_state = Some(ReviewDiffState::Loading);
+            self.document_state
+                .update(cx, |state, cx| state.set_text("", cx));
+            cx.notify();
         }
     }
 
@@ -663,6 +685,14 @@ impl RightPanelView {
         self.is_dirty = false;
         self.document_state
             .update(cx, |state, cx| state.set_text("", cx));
+        if self.git_checkout_pending {
+            cx.notify();
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.review_diff_load_count += 1;
+        }
         cx.spawn(async move |this, cx| {
             let background_request = request.clone();
             let result = cx
@@ -710,7 +740,8 @@ impl RightPanelView {
         result: Result<String, threadlane_git::GitError>,
         cx: &mut Context<Self>,
     ) {
-        if self.review_diff_request.as_ref() != Some(&request)
+        if self.git_checkout_pending
+            || self.review_diff_request.as_ref() != Some(&request)
             || self.project.as_ref() != Some(&request.project)
             || self.model.read(cx).active_git_work_dir().as_ref() != Some(&request.project)
         {
@@ -881,7 +912,9 @@ impl RightPanelView {
                 status,
                 action_error,
                 action_message,
+                checkout_succeeded,
             } => {
+                self.git_checkout_pending = false;
                 if self.project.as_ref() != Some(&project) {
                     // The action is complete, but its project is no longer active.
                     // Release the guard without applying stale status to the new project.
@@ -889,6 +922,12 @@ impl RightPanelView {
                     return;
                 }
                 self.git_busy = false;
+                if checkout_succeeded {
+                    self.review_diff_options = threadlane_git::DiffOptions::default();
+                    if self.review_diff_request.is_some() {
+                        self.close_document(cx);
+                    }
+                }
                 match status {
                     Ok(status) => {
                         self.model.update(cx, |state, cx| {
@@ -922,6 +961,7 @@ impl RightPanelView {
                     }
                     Err(status_error) => {
                         self.review_error = Some(status_error.clone());
+                        self.reload_review_diff(cx);
                         let message = action_error.unwrap_or(status_error);
                         self.git_feedback = Some(message.clone());
                         self.pending_git_notifications
@@ -1154,17 +1194,16 @@ impl RightPanelView {
             return;
         }
 
-        if matches!(
+        let checkout = matches!(
             action,
             GitAction::Checkout(_)
                 | GitAction::CheckoutStash(_)
                 | GitAction::CheckoutCarry(_)
                 | GitAction::CreateBranch(_)
-        ) {
-            self.review_diff_options = threadlane_git::DiffOptions::default();
-            if self.review_diff_request.is_some() {
-                self.close_document(cx);
-            }
+        );
+        self.git_checkout_pending = checkout;
+        if checkout {
+            self.invalidate_review_diff(cx);
         }
         self.git_busy = true;
         let feedback = match &action {
@@ -1386,6 +1425,7 @@ impl RightPanelView {
                 project: work_dir,
                 status,
                 action_error: action_result.as_ref().err().cloned(),
+                checkout_succeeded: checkout && action_result.is_ok(),
                 action_message: action_result.ok().flatten(),
             });
         });
@@ -6398,7 +6438,7 @@ mod browser_editor_safety_tests {
 
 #[cfg(test)]
 mod review_diff_tests {
-    use super::{ReviewDiffState, ReviewDiffTarget, RightPanelView, Surface};
+    use super::{GitAction, PanelEvent, ReviewDiffState, ReviewDiffTarget, RightPanelView, Surface};
     use gpui::{
         AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, TestAppContext,
         Window, div, px,
@@ -6421,6 +6461,164 @@ mod review_diff_tests {
                 .h_96()
                 .child(self.panel.update(cx, |panel, cx| panel.render_files(cx)))
         }
+    }
+
+    #[gpui::test]
+    fn review_refresh_invalidates_then_starts_one_diff_after_status(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let model = cx.new(|_| {
+            let mut state = AppState::default();
+            state.active_work_dir = Some(PathBuf::from("/workspace"));
+            state
+        });
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let capture = captured.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let panel = cx.new(|cx| RightPanelView::new(model, window, cx));
+            *capture.borrow_mut() = Some(panel.clone());
+            Root::new(panel, window, cx)
+        });
+        let panel = captured.borrow_mut().take().unwrap();
+        panel.update(cx, |panel, cx| {
+            let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+            panel.event_tx = event_tx;
+            panel.open_combined_diff(cx);
+            panel.set_ignore_whitespace(true, cx);
+            let old = panel.review_diff_request.clone().unwrap();
+            panel.apply_review_diff_result(old.clone(), Ok("old patch".into()), cx);
+            let loads = panel.review_diff_load_count;
+            panel.refresh_surface(Surface::Review, cx);
+            assert_eq!(panel.review_diff_load_count, loads);
+            assert!(panel.pending_document.is_none());
+            assert!(matches!(
+                panel.review_diff_state,
+                Some(ReviewDiffState::Loading)
+            ));
+            panel.apply_review_diff_result(old, Ok("stale patch".into()), cx);
+            assert!(matches!(
+                panel.review_diff_state,
+                Some(ReviewDiffState::Loading)
+            ));
+            panel.apply_event(
+                PanelEvent::ReviewLoaded {
+                    project: PathBuf::from("/workspace"),
+                    status: Some(threadlane_git::GitStatus::default()),
+                    files: Vec::new(),
+                    error: None,
+                },
+                cx,
+            );
+            assert_eq!(panel.review_diff_load_count, loads + 1);
+            let request = panel.review_diff_request.as_ref().unwrap();
+            assert_eq!(request.target, ReviewDiffTarget::AllChanges);
+            assert!(request.options.ignore_whitespace);
+        });
+    }
+
+    #[gpui::test]
+    fn review_checkout_failure_retains_target_and_filter(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let model = cx.new(|_| {
+            let mut state = AppState::default();
+            state.active_work_dir = Some(PathBuf::from("/workspace"));
+            state
+        });
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let capture = captured.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let panel = cx.new(|cx| RightPanelView::new(model, window, cx));
+            *capture.borrow_mut() = Some(panel.clone());
+            Root::new(panel, window, cx)
+        });
+        let panel = captured.borrow_mut().take().unwrap();
+        panel.update(cx, |panel, cx| {
+            let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+            panel.event_tx = event_tx;
+            let status = threadlane_git::GitStatus {
+                branch: Some("main".into()),
+                ..threadlane_git::GitStatus::default()
+            };
+            panel.replace_git_status(Some(status.clone()), cx);
+            for target in [
+                ReviewDiffTarget::AllChanges,
+                ReviewDiffTarget::File("selected.txt".into()),
+            ] {
+                for action in [
+                    GitAction::Checkout("other".into()),
+                    GitAction::CheckoutStash("other".into()),
+                    GitAction::CheckoutCarry("other".into()),
+                    GitAction::CreateBranch("other".into()),
+                ] {
+                    panel.open_review_diff(target.clone(), cx);
+                    panel.set_ignore_whitespace(true, cx);
+                    let old = panel.review_diff_request.clone().unwrap();
+                    let loads = panel.review_diff_load_count;
+                    panel.run_git_action_without_window(action, cx);
+                    assert!(panel.review_diff_options.ignore_whitespace);
+                    assert_eq!(panel.review_diff_request.as_ref().unwrap().target, target);
+                    panel.apply_review_diff_result(old, Ok("old checkout patch".into()), cx);
+                    assert!(matches!(
+                        panel.review_diff_state,
+                        Some(ReviewDiffState::Loading)
+                    ));
+                    panel.set_ignore_whitespace(false, cx);
+                    panel.set_ignore_whitespace(true, cx);
+                    assert_eq!(panel.review_diff_load_count, loads);
+                    let pending = panel.review_diff_request.clone().unwrap();
+                    panel.apply_review_diff_result(
+                        pending,
+                        Ok("pending checkout patch".into()),
+                        cx,
+                    );
+                    assert!(matches!(
+                        panel.review_diff_state,
+                        Some(ReviewDiffState::Loading)
+                    ));
+                    panel.apply_event(
+                        PanelEvent::ActionFinished {
+                            project: PathBuf::from("/workspace"),
+                            status: if target == ReviewDiffTarget::AllChanges {
+                                Ok(status.clone())
+                            } else {
+                                Err("status unavailable".into())
+                            },
+                            action_error: Some("checkout rejected".into()),
+                            action_message: None,
+                            checkout_succeeded: false,
+                        },
+                        cx,
+                    );
+                    assert!(!panel.git_busy);
+                    assert_eq!(panel.review_diff_load_count, loads + 1);
+                    let retry = panel.review_diff_request.clone().unwrap();
+                    assert_eq!(retry.target, target);
+                    assert!(retry.options.ignore_whitespace);
+                    panel.apply_review_diff_result(
+                        retry,
+                        Ok("retained checkout patch".into()),
+                        cx,
+                    );
+                    assert!(matches!(
+                        panel.review_diff_state,
+                        Some(ReviewDiffState::Ready { empty: false })
+                    ));
+                }
+            }
+            panel.run_git_action_without_window(GitAction::Checkout("main".into()), cx);
+            panel.apply_event(
+                PanelEvent::ActionFinished {
+                    project: PathBuf::from("/workspace"),
+                    status: Err("status unavailable".into()),
+                    action_error: None,
+                    action_message: None,
+                    checkout_succeeded: true,
+                },
+                cx,
+            );
+            assert!(!panel.review_diff_options.ignore_whitespace);
+            assert!(panel.review_diff_request.is_none());
+            assert!(panel.document_title.is_none());
+        });
     }
 
     #[gpui::test]
