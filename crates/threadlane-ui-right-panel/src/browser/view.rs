@@ -111,7 +111,6 @@ impl BrowserView {
             Some(AddressTarget::Search(query)) => search_url(&query),
         };
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            tab.url = url.clone();
             tab.pending_url = Some(url.clone());
             if let Some(webview) = tab.webview.clone() {
                 webview.update(cx, |view, _| view.load_url(&url));
@@ -171,7 +170,6 @@ impl BrowserView {
         if self.tabs.len() <= 1 {
             let url = DEFAULT_URL.to_string();
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                tab.url = url.clone();
                 tab.pending_url = Some(url.clone());
                 if let Some(webview) = tab.webview.clone() {
                     webview.update(cx, |view, _| view.load_url(&url));
@@ -266,6 +264,7 @@ impl BrowserView {
                     .filter(|url| !url.is_empty());
                 match (tab.pending_url.clone(), live) {
                     (Some(pending), Some(live)) if live == pending => {
+                        tab.url = live.clone();
                         tab.pending_url = None;
                         live
                     }
@@ -297,7 +296,6 @@ impl BrowserView {
     /// render ([`Self::sync_address_bar`]), so no window is needed here.
     pub fn load_url(&mut self, url: &str, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            tab.url = url.to_string();
             tab.pending_url = Some(url.to_string());
             if let Some(webview) = tab.webview.clone() {
                 webview.update(cx, |view, _| view.load_url(url));

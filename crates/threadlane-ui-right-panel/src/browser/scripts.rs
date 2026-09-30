@@ -524,11 +524,7 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
   style.textContent = [
     ".box{position:fixed;pointer-events:none;border:2px solid;border-radius:3px;box-sizing:border-box;display:none}",
     ".tag{position:fixed;pointer-events:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:280px;background:#111827;color:#f9fafb;font:11px/1.4 ui-monospace,monospace;padding:1px 6px;border-radius:4px;display:none}",
-    ".card{position:fixed;pointer-events:auto;display:none;align-items:center;gap:6px;max-width:calc(100vw - 12px);box-sizing:border-box;background:#15181f;border:1px solid rgba(255,255,255,0.15);border-radius:999px;padding:5px 6px 5px 12px;box-shadow:0 8px 24px rgba(0,0,0,0.45);color:#f9fafb;font:12px/1.4 -apple-system,system-ui,sans-serif;white-space:nowrap}",
-    ".card input{flex:1 1 auto;min-width:40px;width:170px;background:transparent;border:0;outline:none;color:#f9fafb;font:12px/1.4 -apple-system,system-ui,sans-serif;padding:0}",
-    ".card input::placeholder{color:rgba(249,250,251,0.45)}",
-    ".attach{flex:none;width:22px;height:22px;border-radius:50%;border:0;background:" + PICK_BORDER + ";color:#fff;font:600 12px/1 -apple-system,system-ui,sans-serif;cursor:pointer;padding:0}",
-    ".count{font-size:11px;opacity:0.65;flex:0 1 auto;min-width:0;max-width:120px;overflow:hidden;text-overflow:ellipsis}",
+    ".card{position:fixed;pointer-events:auto;display:none;box-sizing:border-box;background:#15181f;border:1px solid rgba(255,255,255,0.15);border-radius:17px;box-shadow:0 8px 24px rgba(0,0,0,0.45)}",
   ].join("\n");
   shadow.appendChild(style);
   const root = document.createElement("div");
@@ -540,24 +536,33 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
   hoverBox.style.background = HOVER_FILL;
   root.appendChild(hoverBox);
 
-  const card = document.createElement("div");
+  // The comment pill lives in a same-origin srcdoc iframe, not the page DOM:
+  // events inside an iframe document never propagate to the parent document,
+  // so page listeners — capture or bubble — cannot observe comment keystrokes.
+  // It talks back through postMessage keyed on the iframe's contentWindow.
+  const card = document.createElement("iframe");
   card.className = "card";
-  const countLabel = document.createElement("span");
-  countLabel.className = "count";
-  const comment = document.createElement("input");
-  comment.type = "text";
-  comment.placeholder = "Add a comment…";
-  comment.setAttribute("aria-label", "Annotation comment");
-  const attach = document.createElement("button");
-  attach.type = "button";
-  attach.className = "attach";
-  attach.textContent = "\u21b5";
-  attach.title = "Attach";
-  attach.setAttribute("aria-label", "Attach annotation");
-  card.appendChild(countLabel);
-  card.appendChild(comment);
-  card.appendChild(attach);
+  card.setAttribute(
+    "srcdoc",
+    "<style>" +
+      "html,body{margin:0;height:100%;background:#15181f;overflow:hidden}" +
+      ".row{display:flex;align-items:center;gap:6px;height:100%;box-sizing:border-box;padding:4px 6px 4px 12px;color:#f9fafb;font:12px/1.4 -apple-system,system-ui,sans-serif;white-space:nowrap}" +
+      ".count{font-size:11px;opacity:0.65;flex:0 1 auto;min-width:0;max-width:120px;overflow:hidden;text-overflow:ellipsis}" +
+      "#c{flex:1 1 auto;min-width:40px;background:transparent;border:0;outline:none;color:#f9fafb;font:12px/1.4 -apple-system,system-ui,sans-serif;padding:0}" +
+      "#c::placeholder{color:rgba(249,250,251,0.45)}" +
+      "#a{flex:none;width:22px;height:22px;border-radius:50%;border:0;background:" + PICK_BORDER + ";color:#fff;font:600 12px/1 -apple-system,system-ui,sans-serif;cursor:pointer;padding:0}" +
+      "</style>" +
+      "<div class=row><span id=count class=count></span>" +
+      "<input id=c type=text placeholder='Add a comment\u2026' aria-label='Annotation comment'>" +
+      "<button id=a type=button aria-label='Attach annotation' title='Attach'>\u21b5</button></div>" +
+      "<script>(function(){var i=document.getElementById('c'),a=document.getElementById('a');" +
+      "function s(m){parent.postMessage({tlane:m},'*')}" +
+      "i.addEventListener('keydown',function(e){if(e.isComposing)return;if(e.key==='Enter'){e.preventDefault();s('commit')}else if(e.key==='Escape'){e.preventDefault();s('cancel')}});" +
+      "a.addEventListener('click',function(){s('commit')});" +
+      "})();</" + "script>",
+  );
   root.appendChild(card);
+  const cardEl = (id) => card.contentDocument && card.contentDocument.getElementById(id);
 
   const selected = new Map();
   let hovered = null;
@@ -606,9 +611,11 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
   };
 
   const positionCard = (bounds) => {
-    card.style.display = "flex";
-    const w = card.offsetWidth;
-    const h = card.offsetHeight;
+    const w = Math.min(360, window.innerWidth - 12);
+    const h = 34;
+    card.style.width = w + "px";
+    card.style.height = h + "px";
+    card.style.display = "block";
     const gap = 8;
     let left = bounds.left + (bounds.right - bounds.left) / 2 - w / 2;
     let top = bounds.bottom + gap;
@@ -624,8 +631,11 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
       card.style.display = "none";
       return;
     }
-    countLabel.textContent =
-      selected.size === 1 ? shortLabel(selected.keys().next().value) : selected.size + " selected";
+    const count = cardEl("count");
+    if (count) {
+      count.textContent =
+        selected.size === 1 ? shortLabel(selected.keys().next().value) : selected.size + " selected";
+    }
     positionCard(bounds);
   };
 
@@ -711,7 +721,7 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
     // the attached image.
     root.style.display = "none";
     window.__tlane_pick = {
-      comment: normalize(comment.value, COMMENT_MAX),
+      comment: normalize((cardEl("c") && cardEl("c").value) || "", COMMENT_MAX),
       elements,
       crop,
       viewport: { w: Math.round(window.innerWidth), h: Math.round(window.innerHeight) },
@@ -722,9 +732,7 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
   };
 
   const isolate = (event, prevent) => {
-    // Events aimed at overlay controls retarget to `host` here. They must
-    // keep descending into the shadow tree — stopping propagation at the
-    // window capture phase would starve the textarea and Attach button.
+    // Events aimed at overlay nodes retarget to `host` here; leave them be.
     if (isOverlayNode(event.target)) return true;
     if (prevent && event.cancelable) event.preventDefault();
     event.stopImmediatePropagation();
@@ -749,7 +757,10 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
       toggleSelect(el, event.shiftKey);
       pointer.needsHitTest = true;
       repaint();
-      if (selected.size > 0) comment.focus({ preventScroll: true });
+      if (selected.size > 0) {
+        const input = cardEl("c");
+        if (input) input.focus({ preventScroll: true });
+      }
     }
   };
 
@@ -761,8 +772,6 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
       uninstall();
       return;
     }
-    // Overlay keystrokes retarget to `host`; let them descend into the
-    // shadow tree so the comment box receives its input.
     if (isOverlayNode(event.target)) return;
     // Keep the page from observing picker keystrokes (space scrolls,
     // single-letter shortcuts, etc.) while a session is live.
@@ -782,6 +791,7 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
     window.removeEventListener("keydown", onKeyDown, true);
     window.removeEventListener("scroll", scheduleFrame, true);
     window.removeEventListener("resize", scheduleFrame);
+    window.removeEventListener("message", onMessage);
     if (frame !== null) cancelAnimationFrame(frame);
     frame = null;
     host.remove();
@@ -798,35 +808,16 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
     isolate(event, true);
   };
 
-  // Key handling for the comment box lives inside the shadow tree: the
-  // window-level listener only ever sees the retargeted host as target.
-  comment.addEventListener("keydown", (event) => {
-    if (event.isComposing) return;
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      commit();
-    }
-  });
-  attach.addEventListener("click", (event) => {
-    event.stopPropagation();
-    commit();
-  });
+  // Commit/cancel arrive from the pill iframe via postMessage; the source
+  // check pins them to our frame so a page cannot spoof them.
+  const onMessage = (event) => {
+    if (event.source !== card.contentWindow) return;
+    const action = event.data && event.data.tlane;
+    if (action === "commit") commit();
+    else if (action === "cancel") uninstall();
+  };
 
-  // Events dispatched to shadow controls (comment box, Attach) bubble back up
-  // through `host`, retargeted — page-level document/window listeners would
-  // observe them (single-letter shortcuts, delegated clicks). Capture legs
-  // above must stay untouched or the event never reaches the textarea, so the
-  // bubble is cut at the host: the shadow tree already saw its event, and the
-  // page stays deaf. Listeners die with the host node on uninstall.
-  for (const type of [
-    "keydown", "keypress", "keyup", "input", "beforeinput",
-    "compositionstart", "compositionupdate", "compositionend",
-    "pointerdown", "pointerup", "mousedown", "mouseup",
-    "click", "dblclick", "auxclick", "contextmenu", "focusin", "focusout",
-  ]) {
-    host.addEventListener(type, (event) => event.stopPropagation());
-  }
-
+  window.addEventListener("message", onMessage);
   window.addEventListener("pointermove", onPointerMove, true);
   window.addEventListener("pointerdown", onPointerDown, true);
   window.addEventListener("pointerup", onPointerUp, true);
