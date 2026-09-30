@@ -11,7 +11,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::{ActiveTheme, Icon, IconName, Selectable, Sizable};
+use gpui_component::{ActiveTheme, Icon, IconName, Selectable, Sizable, WindowExt};
 use threadlane_ui_state::{AppState, RequestedComposerInsert};
 
 use super::address::{resolve_address, search_url, AddressTarget};
@@ -126,17 +126,20 @@ impl BrowserView {
         url: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Entity<super::webview::ComposedWebView> {
+    ) -> Result<Entity<super::webview::ComposedWebView>, String> {
         use raw_window_handle::HasWindowHandle;
 
-        let window_handle = window.window_handle().expect("window handle");
+        let window_handle = window
+            .window_handle()
+            .map_err(|_| "Browser window is unavailable. Retry Open link…".to_string())?;
         let builder = wry::WebViewBuilder::new();
         #[cfg(debug_assertions)]
         let builder = builder.with_devtools(true);
         let builder = builder.with_initialization_script(super::scripts::console_interceptor_js());
-        let wry_webview = builder
-            .build_as_child(&window_handle)
-            .expect("wry child webview");
+        let wry_webview = builder.build_as_child(&window_handle).map_err(|_| {
+            "Browser could not start. Retry Open link… or choose Open in default browser."
+                .to_string()
+        })?;
         let webview = cx.new(|cx| super::webview::ComposedWebView::new(wry_webview, window, cx));
         webview.update(cx, |view, _| view.load_url(url));
         // Inactive tabs stay hidden until selected.
@@ -144,16 +147,39 @@ impl BrowserView {
             view.hide();
             cx.notify();
         });
-        webview
+        Ok(webview)
     }
 
     /// Open a URL in a new tab and switch to it. Needs a window to create
     /// the tab's webview; callers without one use [`Self::load_url`], which
     /// reuses the active tab's existing view.
     pub fn open_tab(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(error) = self.try_open_tab(url, window, cx) {
+            window.push_notification(error, cx);
+        }
+    }
+
+    pub fn focus_address(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            let url = tab.pending_url.as_ref().unwrap_or(&tab.url).clone();
+            self.address_input
+                .update(cx, |input, cx| input.set_value(url, window, cx));
+        }
+        self.address_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+    }
+
+    pub fn try_open_tab(
+        &mut self,
+        url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let webview = self.spawn_webview(url, window, cx)?;
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        let webview = self.spawn_webview(url, window, cx);
         self.tabs.push(BrowserTab {
             id,
             url: url.to_string(),
@@ -161,6 +187,7 @@ impl BrowserView {
             webview: Some(webview),
         });
         self.switch_tab(id, window, cx);
+        Ok(())
     }
 
     /// Close a tab. The last tab becomes a fresh default tab instead of
@@ -205,7 +232,13 @@ impl BrowserView {
         self.active_tab = position;
         let url = self.tabs[position].url.clone();
         if self.tabs[position].webview.is_none() {
-            let webview = self.spawn_webview(&url, window, cx);
+            let webview = match self.spawn_webview(&url, window, cx) {
+                Ok(webview) => webview,
+                Err(error) => {
+                    window.push_notification(error, cx);
+                    return;
+                }
+            };
             self.tabs[position].pending_url = Some(url.clone());
             self.tabs[position].webview = Some(webview);
         }
@@ -1252,6 +1285,26 @@ mod browser_tabs_tests {
                 .focus_handle(cx)
                 .is_focused(window));
             assert!(browser.read(cx).focus_handle.contains_focused(window, cx));
+        });
+        cx.update(|window, cx| {
+            browser.update(cx, |browser, cx| {
+                let before = browser.tabs(cx);
+                let active = browser.active_tab_id();
+                let next_id = browser.next_tab_id;
+                // Test windows have no native handle: failure is recoverable and atomic.
+                assert!(browser
+                    .try_open_tab("http://localhost:3000/", window, cx)
+                    .is_err());
+                assert_eq!(browser.tabs(cx), before);
+                assert_eq!(browser.active_tab_id(), active);
+                assert_eq!(browser.next_tab_id, next_id);
+                browser.focus_address(window, cx);
+                assert!(browser
+                    .address_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window));
+            })
         });
         browser.update(cx, |browser, cx| {
             browser.annotating = true;

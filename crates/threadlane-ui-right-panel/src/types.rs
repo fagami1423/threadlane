@@ -79,6 +79,35 @@ pub enum ReviewViewMode {
     Tree,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReviewDiffTarget {
+    File(String),
+    AllChanges,
+}
+
+impl ReviewDiffTarget {
+    pub(crate) fn title(&self) -> String {
+        match self {
+            Self::File(path) => format!("Review · {path}"),
+            Self::AllChanges => "Review · All changes".into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReviewDiffRequest {
+    pub project: PathBuf,
+    pub target: ReviewDiffTarget,
+    pub options: threadlane_git::DiffOptions,
+    pub revision: u64,
+}
+
+pub(crate) enum ReviewDiffState {
+    Loading,
+    Ready { empty: bool },
+    Failed(String),
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Surface {
     Trajectory,
@@ -275,6 +304,7 @@ pub enum PanelEvent {
         status: Result<GitStatus, String>,
         action_error: Option<String>,
         action_message: Option<String>,
+        checkout_succeeded: bool,
     },
     CommitFilesLoaded {
         sha: String,
