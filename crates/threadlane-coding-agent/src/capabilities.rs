@@ -843,8 +843,20 @@ async fn dispatch_hook_requests_isolated(
 /// verbatim while every `run_command` was refused.
 pub(crate) fn read_only_policy_block_message(tool_name: &str) -> String {
     format!(
-        "Tool `{tool_name}` is blocked because read-only tool policy is ACTIVE. Use read-only tools (read_file, grep_search, list_dir, get_repo_map) instead; do not retry blocked tools until the policy is lifted."
+        "Tool `{tool_name}` is blocked because read-only tool policy is ACTIVE. Use read-only tools (read_file, grep_search, list_dir, get_repo_map, manage_memory with read/recall/status) instead; do not retry blocked tools until the policy is lifted."
     )
+}
+
+fn memory_tool_mutates(tool_name: &str, arguments: Option<&str>) -> bool {
+    match tool_name {
+        "save_memory" | "consolidate_memory" => true,
+        "manage_memory" => !arguments
+            .and_then(|args| serde_json::from_str::<Value>(args).ok())
+            .is_some_and(|args| {
+                matches!(args["action"].as_str(), Some("read" | "recall" | "status"))
+            }),
+        _ => false,
+    }
 }
 
 pub(crate) fn extension_before_tool_hook_handler(
@@ -860,18 +872,19 @@ pub(crate) fn extension_before_tool_hook_handler(
             let policy = *tool_policy.lock().await;
             let tool_name = context.tool_name.as_deref().unwrap_or("");
             if policy == ToolPolicy::ReadOnly
-                && matches!(
-                    tool_name,
-                    "write_file"
-                        | "edit_file"
-                        | "edit_file_hashline"
-                        | "edit_files_hashline"
-                        | "apply_workspace_edit_plan"
-                        | "write"
-                        | "edit"
-                        | "run_command"
-                        | MANAGE_SUBAGENT_BRANCH_TOOL_NAME
-                )
+                && (memory_tool_mutates(tool_name, context.tool_arguments.as_deref())
+                    || matches!(
+                        tool_name,
+                        "write_file"
+                            | "edit_file"
+                            | "edit_file_hashline"
+                            | "edit_files_hashline"
+                            | "apply_workspace_edit_plan"
+                            | "write"
+                            | "edit"
+                            | "run_command"
+                            | MANAGE_SUBAGENT_BRANCH_TOOL_NAME
+                    ))
             {
                 return Err(read_only_policy_block_message(tool_name));
             }
@@ -1199,13 +1212,36 @@ mod github_tests {
 
 #[cfg(test)]
 mod read_only_policy_tests {
-    use super::read_only_policy_block_message;
+    use super::{memory_tool_mutates, read_only_policy_block_message};
+
+    #[test]
+    fn read_only_memory_actions_are_allowed_and_mutations_are_blocked() {
+        for action in ["read", "recall", "status"] {
+            assert!(!memory_tool_mutates(
+                "manage_memory",
+                Some(&serde_json::json!({"action":action}).to_string())
+            ));
+        }
+        for action in ["save", "consolidate", "remember", "forget", "unknown"] {
+            assert!(memory_tool_mutates(
+                "manage_memory",
+                Some(&serde_json::json!({"action":action}).to_string())
+            ));
+        }
+        assert!(memory_tool_mutates("manage_memory", Some("invalid")));
+        assert!(memory_tool_mutates("manage_memory", None));
+        assert!(memory_tool_mutates("save_memory", Some("{}")));
+        assert!(!memory_tool_mutates("read_memory", Some("{}")));
+    }
 
     #[test]
     fn block_message_names_alternatives_and_forbids_retry() {
         let message = read_only_policy_block_message("run_command");
         assert!(message.contains("`run_command`"), "lost cause: {message}");
         assert!(message.contains("read_file"), "no alternative: {message}");
-        assert!(message.contains("do not retry"), "no retry guard: {message}");
+        assert!(
+            message.contains("do not retry"),
+            "no retry guard: {message}"
+        );
     }
 }

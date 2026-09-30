@@ -2903,6 +2903,260 @@ mod compaction_sync_tests {
         requests: Mutex<Vec<Vec<AgentMessage>>>,
     }
 
+    struct ProjectMemoryProvider {
+        requests: Mutex<Vec<Vec<AgentMessage>>>,
+        update: Option<String>,
+    }
+
+    #[async_trait]
+    impl ProviderPort for ProjectMemoryProvider {
+        async fn stream_request(
+            &self,
+            request: RuntimeRequest,
+            events: tokio::sync::mpsc::Sender<RuntimeStreamEvent>,
+        ) {
+            let attempt = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(serde_json::from_value(request.messages).unwrap());
+                requests.len()
+            };
+            let call = self.update.as_ref().and_then(|update| match attempt {
+                1 => Some(("manage_memory", update.clone())),
+                2 => Some((
+                    "write_file",
+                    serde_json::json!({"path":"parser.rs", "content":"changed source"}).to_string(),
+                )),
+                _ => None,
+            });
+            let tool_calls = call
+                .map(|(name, arguments)| {
+                    vec![RuntimeToolCall {
+                        id: format!("memory-{attempt}"),
+                        r#type: "function".into(),
+                        function: RuntimeToolCallFunction {
+                            name: name.into(),
+                            arguments,
+                        },
+                        thought_signature: None,
+                    }]
+                })
+                .unwrap_or_default();
+            if tool_calls.is_empty() {
+                events
+                    .send(RuntimeStreamEvent::ContentToken("done".into()))
+                    .await
+                    .unwrap();
+            }
+            events
+                .send(RuntimeStreamEvent::Finished {
+                    tool_calls,
+                    usage: RuntimeUsage::default(),
+                })
+                .await
+                .unwrap();
+        }
+        async fn fetch_deferred(&self, _: &str, _: &str) -> Result<DeferredResponse, String> {
+            Ok(DeferredResponse::Pending)
+        }
+        async fn cancel_deferred(&self, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn provider_kind(&self, _: &str) -> &'static str {
+            "test"
+        }
+    }
+
+    fn memory_messages(messages: &[AgentMessage]) -> Vec<&str> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                AgentMessage::User { content }
+                    if content.starts_with("<threadlane-project-memory>") =>
+                {
+                    Some(content.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn project_memory_refreshes_each_request_without_entering_durable_history() {
+        for checkpoint in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let path = root.join("session.jsonl");
+            std::fs::write(root.join("parser.rs"), "original source").unwrap();
+            let digest = crate::durable::sha256_hex(b"original source");
+            let mut note = serde_json::json!({"action":"remember", "key":"parser-storage", "content":"Parser owns initial storage.",
+                "sources":[{"path":"parser.rs", "sha256":digest}]});
+            threadlane_tools::try_execute_tool_in_workspace("manage_memory", &note.to_string(), root)
+                .unwrap();
+            note["content"] = serde_json::json!("Parser owns updated storage.");
+            let provider = Arc::new(ProjectMemoryProvider {
+                requests: Mutex::new(Vec::new()),
+                update: Some(note.to_string()),
+            });
+            let options = |root: &std::path::Path, file: std::path::PathBuf| CodingAgentOptions {
+                api_key: "test-key".into(),
+                account_id: None,
+                model: "test-model".into(),
+                work_dir: root.into(),
+                session_file: Some(file),
+                system_prompt: SystemPromptConfig::default(),
+                agent_config: None,
+                coding_config: None,
+                browser: BrowserBridge::unavailable(),
+            };
+            let mut agent =
+                CodingAgent::new_with_provider(options(root, path.clone()), provider.clone());
+            if checkpoint {
+                agent
+                    .persist_harness_compaction("Earlier task context", &[], 0, 0)
+                    .unwrap();
+            }
+            assert!(agent
+                .handle_input_with_images("Inspect parser storage", vec![])
+                .await
+                .is_none());
+            {
+                let requests = provider.requests.lock().unwrap();
+                assert_eq!(requests.len(), 3);
+                assert!(memory_messages(&requests[0])[0].contains("initial storage"));
+                assert!(memory_messages(&requests[1])[0].contains("updated storage"));
+                assert_eq!(
+                    memory_messages(&requests[1]).len(),
+                    1,
+                    "recall must not accumulate"
+                );
+                assert!(
+                    memory_messages(&requests[2]).is_empty(),
+                    "changed evidence is stale"
+                );
+            }
+            assert!(memory_messages(&agent.agent.messages().await).is_empty());
+            drop(agent);
+            let store = JsonlStore::open_read_only(&path).unwrap();
+            assert!(memory_messages(&store.model_context("main").unwrap().messages()).is_empty());
+            let manifests: Vec<_> = store
+                .records()
+                .iter()
+                .filter_map(|record| match record {
+                    Record::ContextManifestCaptured {
+                        items,
+                        total_estimated_tokens,
+                        context_limit,
+                        ..
+                    } => {
+                        assert!((total_estimated_tokens.unwrap() as usize) < context_limit.unwrap());
+                        let items = serde_json::to_value(items).unwrap();
+                        Some(
+                            items
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .filter(|item| item["label"] == "project memory recall")
+                                .count(),
+                        )
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(manifests, vec![1, 1, 0]);
+            assert!(store.model_context("main").unwrap().messages().iter().any(|message| matches!(message,
+                AgentMessage::Tool { name, content, is_error:false, .. } if name == "manage_memory" && content.contains("remembered"))));
+
+            std::fs::write(root.join("parser.rs"), "original source").unwrap();
+            let next_provider = Arc::new(ProjectMemoryProvider {
+                requests: Mutex::new(Vec::new()),
+                update: None,
+            });
+            let mut next = CodingAgent::new_with_provider(
+                options(root, root.join("next.jsonl")),
+                next_provider.clone(),
+            );
+            assert!(next
+                .handle_input_with_images("Inspect parser storage", vec![])
+                .await
+                .is_none());
+            assert!(
+                memory_messages(&next_provider.requests.lock().unwrap()[0])[0]
+                    .contains("updated storage")
+            );
+            assert!(next
+                .handle_input_with_images("Continue", vec![])
+                .await
+                .is_none());
+            assert_eq!(
+                memory_messages(&next_provider.requests.lock().unwrap()[1]).len(),
+                1
+            );
+
+            // Child agents use AgentRuntime directly and can have narrow tool
+            // whitelists. Exercise that same shared request seam without adding
+            // manage_memory to their allowed tools.
+            let child_provider = Arc::new(ProjectMemoryProvider {
+                requests: Mutex::new(Vec::new()),
+                update: None,
+            });
+            let child_path = root.join("child.jsonl");
+            let mut child_harness =
+                threadlane_runtime::harness::AgentHarness::new(JsonlStore::open(&child_path).unwrap());
+            let accepted = child_harness
+                .accept_prompt_and_drive_on_lane(
+                    "subagent-worker",
+                    "child-run",
+                    AgentMessage::user("Inspect parser storage", Vec::new()),
+                )
+                .unwrap();
+            drop(child_harness);
+            let mut child = threadlane_runtime::AgentRuntime::new_with_provider(
+                "test-key",
+                None,
+                "test-model",
+                Some(&child_path),
+                threadlane_runtime::AgentConfig::default(),
+                child_provider.clone(),
+            )
+            .unwrap();
+            child.work_dir = Some(root.into());
+            child.turn.lock().await.project_root = Some(root.into());
+            child.set_allowed_tool_names(Some(["read_file".to_string()].into_iter().collect()));
+            child
+                .sync_turn_from_model_context_on_lane("subagent-worker")
+                .await
+                .unwrap();
+            child
+                .run_accepted(
+                    "child-run",
+                    "subagent-worker",
+                    accepted.accepted_through_seq,
+                )
+                .await;
+            assert_eq!(
+                memory_messages(&child_provider.requests.lock().unwrap()[0]).len(),
+                1
+            );
+            assert!(memory_messages(&child.messages().await).is_empty());
+
+            let other = tempfile::tempdir().unwrap();
+            let other_provider = Arc::new(ProjectMemoryProvider {
+                requests: Mutex::new(Vec::new()),
+                update: None,
+            });
+            let mut unrelated = CodingAgent::new_with_provider(
+                options(other.path(), other.path().join("session.jsonl")),
+                other_provider.clone(),
+            );
+            assert!(unrelated
+                .handle_input_with_images("Inspect parser storage", vec![])
+                .await
+                .is_none());
+            assert!(memory_messages(&other_provider.requests.lock().unwrap()[0]).is_empty());
+            assert!(!other.path().join(".threadlane/memory.json").exists());
+        }
+    }
+
     #[async_trait]
     impl ProviderPort for ReadContextProvider {
         async fn stream_request(

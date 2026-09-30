@@ -664,67 +664,7 @@ impl BrowserView {
             cx.notify();
             return;
         };
-        let page_title = pick
-            .get("title")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let page_url = pick
-            .get("url")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let comment = pick
-            .get("comment")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        // Devin-style compact note: the cropped image carries the visual
-        // context, so text only needs enough to locate the element —
-        // tag + selector, an identifying name or link, and the comment.
-        let element_line = |element: &serde_json::Value| {
-            let tag = element
-                .get("tag")
-                .and_then(|value| value.as_str())
-                .unwrap_or("element");
-            let selector = element
-                .get("selector")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let mut line = format!("<{tag}>");
-            if !selector.is_empty() {
-                line.push_str(&format!(" `{selector}`"));
-            }
-            if let Some(name) = ["name", "text"].iter().find_map(|key| {
-                element
-                    .get(key)
-                    .and_then(|value| value.as_str())
-                    .filter(|value| !value.is_empty())
-            }) {
-                line.push_str(&format!(" \"{name}\""));
-            }
-            if let Some(href) = element
-                .get("href")
-                .and_then(|value| value.as_str())
-                .filter(|href| !href.is_empty())
-            {
-                line.push_str(&format!(" → {href}"));
-            }
-            line
-        };
-        let elements: Vec<&serde_json::Value> = pick
-            .get("elements")
-            .and_then(|value| value.as_array())
-            .map(|elements| elements.iter().collect())
-            .unwrap_or_default();
-        let mut note = format!("[Browser annotation — {page_title}]({page_url})");
-        if !comment.is_empty() {
-            note.push_str(&format!(": {comment}"));
-        }
-        if elements.len() == 1 {
-            note.push_str(&format!(" — {}", element_line(elements[0])));
-        } else {
-            for element in &elements {
-                note.push_str(&format!("\n• {}", element_line(element)));
-            }
-        }
+        let note = format_annotation_note(&pick);
         // Snapshot cropped to the annotated element union so the attachment
         // shows context around the target instead of the whole viewport.
         let crop = pick.get("crop").and_then(|rect| {
@@ -1064,6 +1004,92 @@ impl Render for BrowserView {
     }
 }
 
+/// Formats a picked annotation into a compact, human-readable note for the composer.
+/// If a user comment was typed, places the comment clearly at the top.
+pub fn format_annotation_note(pick: &serde_json::Value) -> String {
+    let comment = pick
+        .get("comment")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    let page_title = pick
+        .get("title")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    let page_url = pick
+        .get("url")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+
+    let element_line = |element: &serde_json::Value| {
+        let tag = element
+            .get("tag")
+            .and_then(|value| value.as_str())
+            .unwrap_or("element");
+        let selector = element
+            .get("selector")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let mut line = format!("<{tag}>");
+        if !selector.is_empty() {
+            line.push_str(&format!(" `{selector}`"));
+        }
+        if let Some(name) = ["name", "text"].iter().find_map(|key| {
+            element
+                .get(key)
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+        }) {
+            line.push_str(&format!(" \"{name}\""));
+        }
+        if let Some(href) = element
+            .get("href")
+            .and_then(|value| value.as_str())
+            .filter(|href| !href.is_empty())
+        {
+            line.push_str(&format!(" → {href}"));
+        }
+        line
+    };
+
+    let elements: Vec<&serde_json::Value> = pick
+        .get("elements")
+        .and_then(|value| value.as_array())
+        .map(|elements| elements.iter().collect())
+        .unwrap_or_default();
+
+    let context_tag = if !page_title.is_empty() && !page_url.is_empty() {
+        format!("[Browser: {page_title}]({page_url})")
+    } else if !page_url.is_empty() {
+        format!("[Browser: {page_url}]({page_url})")
+    } else if !page_title.is_empty() {
+        format!("[Browser: {page_title}]")
+    } else {
+        "[Browser annotation]".to_string()
+    };
+
+    let mut note = String::new();
+    if !comment.is_empty() {
+        note.push_str(comment);
+        note.push_str("\n\n");
+    }
+
+    if elements.len() == 1 {
+        note.push_str(&format!("{context_tag} — {}", element_line(elements[0])));
+    } else if !elements.is_empty() {
+        note.push_str(&context_tag);
+        for element in &elements {
+            note.push_str(&format!("\n• {}", element_line(element)));
+        }
+    } else {
+        note.push_str(&context_tag);
+    }
+
+    note
+}
+
 #[cfg(test)]
 mod browser_tabs_tests {
     // Narrow import: `use super::*` pulls GPUI macros into test scope and
@@ -1255,6 +1281,45 @@ mod browser_tabs_tests {
         assert_eq!(
             tab_title("https://very-long-subdomain-name.example.com/x"),
             "very-long-subdomain-name…"
+        );
+    }
+
+    #[test]
+    fn format_annotation_note_places_comment_first() {
+        let pick = serde_json::json!({
+            "title": "Example Domain",
+            "url": "https://example.com",
+            "comment": "Fix this button color",
+            "elements": [{
+                "tag": "button",
+                "selector": "#submit-btn",
+                "name": "Submit"
+            }]
+        });
+        let note = super::format_annotation_note(&pick);
+        assert_eq!(
+            note,
+            "Fix this button color\n\n[Browser: Example Domain](https://example.com) — <button> `#submit-btn` \"Submit\""
+        );
+    }
+
+    #[test]
+    fn format_annotation_note_without_comment() {
+        let pick = serde_json::json!({
+            "title": "Example Domain",
+            "url": "https://example.com",
+            "comment": "",
+            "elements": [{
+                "tag": "a",
+                "selector": "a.nav-link",
+                "text": "Home",
+                "href": "/home"
+            }]
+        });
+        let note = super::format_annotation_note(&pick);
+        assert_eq!(
+            note,
+            "[Browser: Example Domain](https://example.com) — <a> `a.nav-link` \"Home\" → /home"
         );
     }
 }
