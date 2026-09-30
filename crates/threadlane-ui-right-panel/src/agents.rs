@@ -1003,7 +1003,7 @@ mod tests {
     fn selected_agent_activity_fits_below_profile_strip(cx: &mut gpui::TestAppContext) {
         use gpui::{px, size, AppContext as _};
         use threadlane_protocol::{AgentEvent, SubagentProgressUpdate};
-        use threadlane_ui_state::{AppState, ChatStreamEvent};
+        use threadlane_ui_state::{AppState, SessionEvent};
 
         cx.update(gpui_component::init);
         let model = cx.new(|_| {
@@ -1011,7 +1011,7 @@ mod tests {
             state.active_work_dir = Some(std::env::temp_dir().join("threadlane-agent-layout-test"));
             state.active_session_id = Some("session".into());
             state.drain_chat_stream(vec![
-                ChatStreamEvent::Agent {
+                SessionEvent::Agent {
                     session_id: "session".into(),
                     event: AgentEvent::SubagentQueued {
                         run_id: 1,
@@ -1020,7 +1020,7 @@ mod tests {
                         task: "Inspect the repository".into(),
                     },
                 },
-                ChatStreamEvent::Agent {
+                SessionEvent::Agent {
                     session_id: "session".into(),
                     event: AgentEvent::SubagentStarted {
                         run_id: 1,
@@ -1071,7 +1071,7 @@ mod tests {
             },
         ] {
             model.update(cx, |state, cx| {
-                state.drain_chat_stream(vec![ChatStreamEvent::Agent {
+                state.drain_chat_stream(vec![SessionEvent::Agent {
                     session_id: "session".into(),
                     event: AgentEvent::SubagentUpdate {
                         run_id: 1,

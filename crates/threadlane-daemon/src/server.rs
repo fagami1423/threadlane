@@ -1,0 +1,184 @@
+//! WebSocket transport for [`DaemonCore`]: the standalone binary serves
+//! this, and tests drive the real protocol roundtrip through it.
+//!
+//! Framing: one bare `SessionCommand` JSON per inbound text frame;
+//! `{"seq": N, "event": SessionEvent}` frames outbound — the journal tail
+//! newer than the client's `?since=` cursor on attach, then live broadcast.
+//! Errors travel as `DaemonError` events, so no error frame shape exists.
+//! `seq` is the daemon's journal sequence; synthesized frames (undecodable
+//! commands, lag notices) carry `seq: 0`.
+
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use futures::{SinkExt, StreamExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio_tungstenite::tungstenite::Message;
+
+use threadlane_protocol::daemon::{SessionCommand, SessionEvent};
+
+use crate::core::DaemonCore;
+
+/// Accept loop: every connection gets a [`serve_connection`] task.
+pub async fn serve(listener: TcpListener, core: Arc<DaemonCore>, token: Option<String>) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                let core = core.clone();
+                let token = token.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = serve_connection(core, stream, peer, token).await {
+                        tracing::debug!(%peer, %error, "daemon connection ended");
+                    }
+                });
+            }
+            Err(error) => tracing::warn!(%error, "daemon accept failed"),
+        }
+    }
+}
+
+/// One outbound frame: the journal sequence (0 for frames the daemon
+/// synthesizes outside the journal, like lag notices) plus the event.
+fn wire_frame(seq: u64, event: &SessionEvent) -> Result<Message, serde_json::Error> {
+    serde_json::to_string(&serde_json::json!({ "seq": seq, "event": event }))
+        .map(|text| Message::Text(text.into()))
+}
+
+/// The client's last-seen journal sequence from `?since=` on the connect
+/// URL; absent or unparsable means a full tail replay.
+fn since_param(request: &Request) -> u64 {
+    request
+        .uri()
+        .query()
+        .and_then(|query| {
+            query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("since="))
+        })
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// One client: journal tail, live broadcast, command loop.
+async fn serve_connection(
+    core: Arc<DaemonCore>,
+    stream: TcpStream,
+    peer: SocketAddr,
+    token: Option<String>,
+) -> Result<(), String> {
+    let since: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let handshake_since = since.clone();
+    let socket = tokio_tungstenite::accept_hdr_async(
+        stream,
+        move |request: &Request, response: Response| {
+            // Browsers always send Origin; native clients do not. Refuse
+            // browser pages outright: a website could otherwise open
+            // ws://127.0.0.1 and drive the daemon (submit prompts, answer
+            // its own permission requests) — cross-site WebSocket
+            // hijacking, which CORS does not cover.
+            if request.headers().contains_key("Origin") {
+                return Err(tokio_tungstenite::tungstenite::http::Response::builder()
+                    .status(403)
+                    .body(Some("forbidden origin".to_string()))
+                    .expect("static 403 response"));
+            }
+            if let Some(token) = &token {
+                let presented = request
+                    .headers()
+                    .get("Authorization")
+                    .and_then(|value| value.to_str().ok());
+                if presented != Some(format!("Bearer {token}").as_str()) {
+                    return Err(tokio_tungstenite::tungstenite::http::Response::builder()
+                        .status(401)
+                        .body(Some("unauthorized".to_string()))
+                        .expect("static 401 response"));
+                }
+            }
+            handshake_since.store(since_param(request), Ordering::SeqCst);
+            Ok(response)
+        },
+    )
+    .await
+    .map_err(|error| format!("websocket handshake failed: {error}"))?;
+    tracing::info!(%peer, "daemon client attached");
+
+    // All outbound traffic funnels through one bounded channel: the
+    // journal tail is seeded first, then a forwarder streams live
+    // broadcast events. Bounded on purpose — a slow socket backs the
+    // forwarder up into the broadcast receiver, where it surfaces as
+    // `Lagged` (client gets a dropped-events notice) instead of growing
+    // an unbounded queue per stalled client.
+    let (out_tx, mut out_rx) = mpsc::channel::<Message>(256);
+    let error_tx = out_tx.clone();
+    let (tail, mut broadcast_rx) =
+        core.subscribe_with_tail(since.load(Ordering::SeqCst));
+    for (seq, event) in tail {
+        let frame = wire_frame(seq, &event).map_err(|error| error.to_string())?;
+        if out_tx.send(frame).await.is_err() {
+            return Ok(());
+        }
+    }
+    tokio::spawn(async move {
+        loop {
+            let (seq, event) = match broadcast_rx.recv().await {
+                Ok(pair) => pair,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    (0, SessionEvent::DaemonError {
+                        session_id: None,
+                        message: format!("dropped {skipped} daemon events; refresh the session"),
+                    })
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            };
+            let Ok(frame) = wire_frame(seq, &event) else {
+                continue;
+            };
+            if out_tx.send(frame).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    let (mut write, mut read) = socket.split();
+    tokio::spawn(async move {
+        while let Some(message) = out_rx.recv().await {
+            if write.send(message).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    while let Some(message) = read.next().await {
+        match message {
+            Ok(Message::Text(text)) => {
+                match serde_json::from_str::<SessionCommand>(&text) {
+                    Ok(command) => {
+                        // Dispatch errors also reach this client as
+                        // DaemonError events — no error frame shape needed.
+                        if let Err(error) = core.clone().dispatch(command).await {
+                            tracing::warn!(%peer, %error, "daemon command rejected");
+                        }
+                    }
+                    Err(error) => {
+                        // A jammed client misses the notice rather than
+                        // stalling the command loop on its backlog.
+                        if let Ok(frame) = wire_frame(0, &SessionEvent::DaemonError {
+                            session_id: None,
+                            message: format!("undecodable command: {error}"),
+                        }) {
+                            let _ = error_tx.try_send(frame);
+                        }
+                    }
+                }
+            }
+            Ok(Message::Close(_)) | Err(_) => break,
+            // tungstenite answers Ping frames itself when we don't split the
+            // stream; any that surface here are safe to ignore.
+            Ok(_) => {}
+        }
+    }
+    Ok(())
+}

@@ -448,7 +448,7 @@ fn opening_a_file_targets_the_active_session_checkout() {
     );
 }
 
-fn take_stream_events(state: &mut AppState, limit: usize) -> Vec<ChatStreamEvent> {
+fn take_stream_events(state: &mut AppState, limit: usize) -> Vec<SessionEvent> {
     let receiver = state.stream_rx.as_mut().unwrap();
     std::iter::from_fn(|| receiver.try_recv().ok())
         .take(limit)
@@ -539,9 +539,9 @@ async fn model_and_reasoning_pickers_persist_before_rebuild_and_next_request() {
         state.set_reasoning_effort(ReasoningEffort::High);
 
         assert_eq!(state.selected_model, selected);
-        assert_eq!(state.session_runtimes[&session_file].model(), selected);
+        assert_eq!(state.daemon_core.runtime_for_file(&session_file).unwrap().model(), selected);
         assert_eq!(
-            state.session_runtimes[&session_file].reasoning_effort(),
+            state.daemon_core.runtime_for_file(&session_file).unwrap().reasoning_effort(),
             ReasoningEffort::High
         );
         assert_eq!(
@@ -616,7 +616,7 @@ fn model_picker_preserves_current_selection_while_runtime_is_busy() {
             .contains("settings are still loading")
     );
     assert!(Arc::ptr_eq(
-        &state.session_runtimes[&session_file],
+        &state.daemon_core.runtime_for_file(&session_file).unwrap(),
         &runtime
     ));
     assert_eq!(
@@ -666,12 +666,13 @@ fn model_picker_ignores_acp_replies_from_replaced_or_inactive_runtimes() {
     activate_test_session(&mut state, "session", &file_a);
     state.selected_model = "acp/test".into();
     let (old, _) = state.active_session_runtime().unwrap();
-    state.session_runtimes.remove(&file_a);
+    state.daemon_core.drop_runtime(&file_a);
     let (current, _) = state.active_session_runtime().unwrap();
     let reply = |runtime: &Arc<SessionRuntime>, label: &str, error: Option<&str>| {
-        ChatStreamEvent::AcpConfigOptions {
+        SessionEvent::AcpConfigOptions {
             session_id: "session".into(),
-            source: Arc::downgrade(runtime),
+            session_file: runtime.session_file.clone(),
+            runtime_instance: runtime.instance_id(),
             options: vec![
                 serde_json::from_value(serde_json::json!({
                     "id": "model", "name": "Model", "category": "model",
@@ -773,7 +774,7 @@ fn inactive_permission_is_visible_before_session_selection() {
     let session = test_session("background", Path::new("/project/background.jsonl"));
     let request = permission_request("permission-1");
 
-    let changed = state.drain_chat_stream(vec![ChatStreamEvent::Agent {
+    let changed = state.drain_chat_stream(vec![SessionEvent::Agent {
         session_id: session.id.clone(),
         event: AgentEvent::PermissionRequested {
             request: request.clone(),
@@ -790,7 +791,7 @@ fn inactive_permission_is_visible_before_session_selection() {
     assert_eq!(deferred.len(), 1);
     assert!(matches!(
         &deferred[0],
-        ChatStreamEvent::Agent {
+        SessionEvent::Agent {
             session_id,
             event: AgentEvent::PermissionRequested { request: deferred },
         } if session_id == &session.id && deferred == &request
@@ -803,12 +804,12 @@ fn inactive_finished_clears_live_permission_attention() {
     state.active_session_id = Some("foreground".into());
     let session = test_session("background", Path::new("/project/background.jsonl"));
     let request = permission_request("permission-1");
-    assert!(state.drain_chat_stream(vec![ChatStreamEvent::Agent {
+    assert!(state.drain_chat_stream(vec![SessionEvent::Agent {
         session_id: session.id.clone(),
         event: AgentEvent::PermissionRequested { request },
     }]));
 
-    let changed = state.drain_chat_stream(vec![ChatStreamEvent::Finished {
+    let changed = state.drain_chat_stream(vec![SessionEvent::Finished {
         session_id: session.id.clone(),
         session_file: session.session_file.clone(),
     }]);
@@ -818,8 +819,8 @@ fn inactive_finished_clears_live_permission_attention() {
     assert_eq!(state.session_attention(&session), SessionAttention::Idle);
     let deferred = &state.deferred_stream_events[&session.id];
     assert_eq!(deferred.len(), 2);
-    assert!(matches!(deferred[0], ChatStreamEvent::Agent { .. }));
-    assert!(matches!(deferred[1], ChatStreamEvent::Finished { .. }));
+    assert!(matches!(deferred[0], SessionEvent::Agent { .. }));
+    assert!(matches!(deferred[1], SessionEvent::Finished { .. }));
 }
 
 #[test]
@@ -846,7 +847,7 @@ fn scheduled_completion_updates_only_matching_active_session() {
         state.session_attention(&background),
         SessionAttention::Ready
     );
-    assert!(state.drain_chat_stream(vec![ChatStreamEvent::Scheduled {
+    assert!(state.drain_chat_stream(vec![SessionEvent::Scheduled {
         session_id: background.id.clone(),
         session_file: state.session_file(Path::new("/project"), &background.id),
         result: Some(Err("background failure".into())),
@@ -864,7 +865,7 @@ fn scheduled_completion_updates_only_matching_active_session() {
     }));
     state.active_session_id = Some(active.id.clone());
     let active_file = state.session_file(Path::new("/project"), &active.id);
-    assert!(state.drain_chat_stream(vec![ChatStreamEvent::Scheduled {
+    assert!(state.drain_chat_stream(vec![SessionEvent::Scheduled {
         session_id: active.id.clone(),
         session_file: active_file,
         result: Some(Err("scheduled failure".into())),
@@ -875,7 +876,7 @@ fn scheduled_completion_updates_only_matching_active_session() {
         message.role == MessageRole::Error && message.content == "scheduled failure"
     }));
     let active_file = state.session_file(Path::new("/project"), &active.id);
-    assert!(state.drain_chat_stream(vec![ChatStreamEvent::Scheduled {
+    assert!(state.drain_chat_stream(vec![SessionEvent::Scheduled {
         session_id: active.id.clone(),
         session_file: active_file,
         result: None,
@@ -893,7 +894,7 @@ fn active_question_stays_pending_until_answered() {
     state.active_work_dir = Some(Path::new("/project").to_path_buf());
     let request = question_request("question-1");
 
-    let changed = state.drain_chat_stream(vec![ChatStreamEvent::Agent {
+    let changed = state.drain_chat_stream(vec![SessionEvent::Agent {
         session_id: session.id.clone(),
         event: AgentEvent::QuestionRequested {
             request: request.clone(),
@@ -917,7 +918,7 @@ fn active_question_stays_pending_until_answered() {
     // Finished arm always drops the pending entry.
     assert!(!state.resolve_active_question(&request.id));
     assert_eq!(state.pending_questions.get(&session.id), Some(&request));
-    let changed = state.drain_chat_stream(vec![ChatStreamEvent::Finished {
+    let changed = state.drain_chat_stream(vec![SessionEvent::Finished {
         session_id: session.id.clone(),
         session_file: session.session_file.clone(),
     }]);
@@ -1081,14 +1082,14 @@ fn inactive_start_and_error_wake_attention_observers() {
     );
     runtime.begin_generation().unwrap();
 
-    assert!(state.drain_chat_stream(vec![ChatStreamEvent::Agent {
+    assert!(state.drain_chat_stream(vec![SessionEvent::Agent {
         session_id: session.id.clone(),
         event: AgentEvent::AgentStart,
     }]));
     assert_eq!(state.session_attention(&session), SessionAttention::Working);
 
     runtime.finish_generation(Some("provider failed".into()));
-    assert!(state.drain_chat_stream(vec![ChatStreamEvent::Agent {
+    assert!(state.drain_chat_stream(vec![SessionEvent::Agent {
         session_id: session.id.clone(),
         event: AgentEvent::AgentError {
             error: "provider failed".into(),
@@ -1161,7 +1162,7 @@ fn removed_session_clears_live_and_deferred_attention() {
         .insert(session.id.clone(), permission_request("permission-1"));
     state.deferred_stream_events.insert(
         session.id.clone(),
-        vec![ChatStreamEvent::Finished {
+        vec![SessionEvent::Finished {
             session_id: session.id.clone(),
             session_file,
         }],
@@ -1855,7 +1856,7 @@ fn issue_work_failure_never_selects_or_runs_in_canonical_checkout() {
     assert!(!error.is_empty());
     assert!(state.active_session_id.is_none());
     assert!(state.projects[0].sessions.is_empty());
-    assert!(state.session_runtimes.is_empty());
+    assert!(state.daemon_core.runtimes().is_empty());
     assert!(!work_dir.join(".threadlane/sessions").exists());
 }
 
@@ -2311,7 +2312,7 @@ async fn durable_projections_and_hydration_are_scoped_by_session_file() {
     let projection_a = compute_full_session_projection(&file_a).unwrap();
     let projection_b = compute_full_session_projection(&file_b).unwrap();
     let expected_b_billed = projection_b.metrics.billed_input_tokens();
-    let expected_b_processed = projection_b.token_efficiency.usage.processed_tokens();
+    let expected_b_processed = projection_b.token_efficiency.as_ref().unwrap().usage.processed_tokens();
     let mut state = AppState::load_from_registry(Vec::new());
     activate_test_session(&mut state, "same-session", &file_a);
     state.apply_session_hydration("same-session", &file_a, projection_a);
@@ -2700,7 +2701,7 @@ fn startup_restores_the_most_recent_project_and_its_sessions() {
         Some(recent_project.as_path())
     );
     assert_eq!(state.active_session_id.as_deref(), Some("recent-session"));
-    assert!(state.session_runtimes.is_empty());
+    assert!(state.daemon_core.runtimes().is_empty());
     assert_eq!(
         state
             .projects
@@ -3432,7 +3433,7 @@ fn live_subagent_events_contribute_to_composer_metrics() {
     state.active_session_id = Some("session".into());
 
     state.drain_chat_stream(vec![
-        ChatStreamEvent::Agent {
+        SessionEvent::Agent {
             session_id: "session".into(),
             event: AgentEvent::SubagentStarted {
                 run_id: 1,
@@ -3445,7 +3446,7 @@ fn live_subagent_events_contribute_to_composer_metrics() {
                 isolation: None,
             },
         },
-        ChatStreamEvent::Agent {
+        SessionEvent::Agent {
             session_id: "session".into(),
             event: AgentEvent::SubagentUpdate {
                 run_id: 1,
@@ -3459,7 +3460,7 @@ fn live_subagent_events_contribute_to_composer_metrics() {
                 },
             },
         },
-        ChatStreamEvent::Agent {
+        SessionEvent::Agent {
             session_id: "session".into(),
             event: AgentEvent::SubagentUpdate {
                 run_id: 1,
@@ -3593,11 +3594,11 @@ fn session_switch_preserves_live_trajectory_and_applies_deferred_events() {
     state.deferred_stream_events.insert(
         session_id.clone(),
         vec![
-            ChatStreamEvent::Agent {
+            SessionEvent::Agent {
                 session_id: session_id.clone(),
                 event: AgentEvent::TurnStart { turn_number: 2 },
             },
-            ChatStreamEvent::Finished {
+            SessionEvent::Finished {
                 session_id: session_id.clone(),
                 session_file,
             },
@@ -3634,13 +3635,13 @@ fn selecting_attention_session_replays_deferred_events_once() {
     state.active_session_id = Some("foreground".into());
 
     assert!(state.drain_chat_stream(vec![
-        ChatStreamEvent::Agent {
+        SessionEvent::Agent {
             session_id: session.id.clone(),
             event: AgentEvent::AgentError {
                 error: "background failed".into(),
             },
         },
-        ChatStreamEvent::Finished {
+        SessionEvent::Finished {
             session_id: session.id.clone(),
             session_file: session_file.clone(),
         },
@@ -3855,7 +3856,7 @@ fn inactive_session_stream_events_replay_after_switching_back() {
     ] {
         state
             .stream_tx
-            .send(ChatStreamEvent::Agent {
+            .send(SessionEvent::Agent {
                 session_id: "background-session".into(),
                 event,
             })
@@ -3895,7 +3896,7 @@ fn stream_drain_preserves_events_beyond_one_frame_budget() {
     for index in 0..130 {
         state
             .stream_tx
-            .send(ChatStreamEvent::Agent {
+            .send(SessionEvent::Agent {
                 session_id: "session".into(),
                 event: AgentEvent::MessageUpdate {
                     text_delta: Some(format!("{index},")),
@@ -4442,7 +4443,7 @@ async fn one_time_permission_rejects_stale_and_persistent_decisions() {
     state.active_work_dir = Some(root.path().to_path_buf());
     state.active_session_id = Some(session_id.into());
     let runtime = state.ensure_session_runtime(root.path().to_path_buf(), session_file.clone());
-    assert!(state.session_runtimes.contains_key(&session_file));
+    assert!(state.daemon_core.runtime_for_file(&session_file).is_some());
     assert!(state.scheduler_results.contains_key(&session_file));
     let handle = runtime.permission_handle();
     let (events, mut rx) = tokio::sync::broadcast::channel(4);
@@ -4472,7 +4473,7 @@ async fn one_time_permission_rejects_stale_and_persistent_decisions() {
     assert_eq!(pending.await.unwrap(), Some(PermissionDecision::AllowOnce));
     assert!(!state.pending_permissions.contains_key(session_id));
     state.finish_session_removal(root.path(), session_id);
-    assert!(!state.session_runtimes.contains_key(&session_file));
+    assert!(state.daemon_core.runtime_for_file(&session_file).is_none());
     assert!(!state.scheduler_results.contains_key(&session_file));
 }
 
@@ -4707,7 +4708,7 @@ fn pr_review_actions_reject_missing_checkout_without_dispatch_or_tracking() {
     }
     assert!(state.active_session_id.is_none());
     assert!(state.pr_review_tracking.is_empty());
-    assert!(state.session_runtimes.is_empty());
+    assert!(state.daemon_core.runtimes().is_empty());
 }
 
 #[test]
@@ -4803,7 +4804,7 @@ fn worktree_setup_failure_and_cancellation_are_scoped_to_the_session() {
     assert!(state.pending_hydrations.is_empty());
     assert!(state.is_generating);
     assert!(state.session_is_generating(&file));
-    state.drain_chat_stream(vec![ChatStreamEvent::WorktreeProgress {
+    state.drain_chat_stream(vec![SessionEvent::WorktreeProgress {
         session_id: id.clone(),
         stage: SetupStage::Creating,
         branch: Some("worktree/fix-login".into()),
@@ -4818,7 +4819,7 @@ fn worktree_setup_failure_and_cancellation_are_scoped_to_the_session() {
         state.active_worktree_setup().unwrap().error.as_deref(),
         Some("invalid base")
     );
-    assert!(state.session_runtimes.is_empty());
+    assert!(state.daemon_core.runtimes().is_empty());
     state.cancel_generation().unwrap();
     assert!(setup.cancelled.load(std::sync::atomic::Ordering::Relaxed));
     assert_eq!(
@@ -4881,7 +4882,7 @@ fn worktree_setup_failure_and_cancellation_are_scoped_to_the_session() {
     assert!(!state.worktree_setups.contains_key(&id));
     assert!(state.active_session_id.is_none());
     assert!(state.session_status.is_none());
-    assert!(state.session_runtimes.is_empty());
+    assert!(state.daemon_core.runtimes().is_empty());
 }
 
 #[test]

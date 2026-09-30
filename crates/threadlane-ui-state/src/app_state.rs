@@ -130,8 +130,8 @@ pub struct AppState {
     pub requested_composer_prompt: Option<String>,
     pub requested_terminal_command: Option<String>,
     pub requested_terminal_work_dir: Option<PathBuf>,
-    stream_tx: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
-    pub stream_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ChatStreamEvent>>,
+    stream_tx: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
+    pub stream_rx: Option<tokio::sync::mpsc::UnboundedReceiver<SessionEvent>>,
     session_refresh_tx: Sender<(u64, PathBuf)>,
     pub session_refresh_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<(u64, PathBuf, Vec<SessionInfo>)>>,
@@ -139,11 +139,26 @@ pub struct AppState {
     /// `recreate_active_worktree` replaces a checkout so late results captured
     /// before the recreation cannot overwrite the fresh sessions.
     session_refresh_generation: u64,
-    pub session_runtimes: HashMap<PathBuf, Arc<SessionRuntime>>,
+    /// Daemon-owned session state (runtimes, identities, setup tracking,
+    /// event journal) embedded in-process via `LocalDaemon`. In remote mode
+    /// it stays empty — sessions live in the attached daemon process.
+    pub daemon_core: Arc<threadlane_daemon::core::DaemonCore>,
+    /// The `SessionCommand`/`SessionEvent` boundary the UI talks through:
+    /// `LocalDaemon` in-process by default, `RemoteDaemon` over WebSocket
+    /// when `THREADLANE_DAEMON_URL` is set.
+    pub daemon_client: Arc<dyn threadlane_client::DaemonClient>,
+    /// True when `daemon_client` is remote: runtime handles are then
+    /// process-remote and only the command/event surface can reach them.
+    pub daemon_remote: bool,
+    /// Remote deletes awaiting the daemon's `SessionRemoved` ack:
+    /// `session_id` → project dir. Persisted cleanup (seen watermark,
+    /// pins, pending prompts) runs only on the ack — a rejected delete
+    /// must leave that data intact when the session row returns.
+    pending_remote_deletes: HashMap<String, PathBuf>,
     scheduler_handles: HashMap<PathBuf, SchedulerSupervisorHandle>,
     scheduler_results:
         HashMap<PathBuf, tokio::sync::mpsc::UnboundedReceiver<SchedulerSupervisorEvent>>,
-    deferred_stream_events: HashMap<String, Vec<ChatStreamEvent>>,
+    deferred_stream_events: HashMap<String, Vec<SessionEvent>>,
     /// Bridge to the embedded browser panel. The channel is created with the
     /// app; the first constructed right panel claims the receiver and pumps
     /// agent browser commands into the live view.
@@ -549,7 +564,49 @@ impl AppState {
                 .unwrap_or_default();
 
         let model_roles = threadlane_runtime::ModelRoles::default();
-        let session_runtimes = HashMap::new();
+        let reasoning_effort = ReasoningEffort::default();
+        let browser_bridge = threadlane_protocol::browser::BrowserBridge::channel();
+        let daemon_core = threadlane_daemon::core::DaemonCore::new()
+            .unwrap_or_else(|error| panic!("could not start daemon core: {error}"));
+        daemon_core.set_browser_bridge(browser_bridge.clone());
+        daemon_core.seed_config(
+            selected_model.clone(),
+            model_roles.clone(),
+            reasoning_effort,
+        );
+        // `THREADLANE_DAEMON_URL` points the app at a running
+        // threadlane-daemon instead of the embedded in-process core —
+        // the same DaemonClient surface either way.
+        let (daemon_client, daemon_remote): (
+            Arc<dyn threadlane_client::DaemonClient>,
+            bool,
+        ) = match std::env::var("THREADLANE_DAEMON_URL") {
+            Ok(url) => (
+                threadlane_client::RemoteDaemon::connect(
+                    url,
+                    std::env::var("THREADLANE_DAEMON_TOKEN").ok(),
+                ),
+                true,
+            ),
+            Err(_) => (
+                threadlane_client::LocalDaemon::new(daemon_core.clone()),
+                false,
+            ),
+        };
+        // Daemon events flow into the UI stream: in local mode this is one
+        // extra hop through the core's journal/broadcast, in remote mode it
+        // is the whole event path. The view drains stream_rx unchanged.
+        if let Ok(executor) = crate::chat::executor() {
+            let mut daemon_events = daemon_client.subscribe();
+            let stream_tx = stream_tx.clone();
+            executor.spawn(async move {
+                while let Some(event) = daemon_events.recv().await {
+                    if stream_tx.send(event).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
         let session_status = active_session_id
             .as_ref()
             .map(|_| "Loading session…".to_string());
@@ -604,7 +661,7 @@ impl AppState {
             stashed_prompts: HashMap::new(),
             selected_model,
             model_roles,
-            reasoning_effort: ReasoningEffort::default(),
+            reasoning_effort,
             orchestrator_mode,
             workspace_page: WorkspacePage::Chat,
             github_tab: GitHubTab::default(),
@@ -624,11 +681,14 @@ impl AppState {
             session_refresh_tx,
             session_refresh_rx: Some(session_refresh_rx),
             session_refresh_generation: 0,
-            session_runtimes,
+            daemon_core,
+            daemon_client,
+            daemon_remote,
+            pending_remote_deletes: HashMap::new(),
             scheduler_handles: HashMap::new(),
             scheduler_results: HashMap::new(),
             deferred_stream_events: HashMap::new(),
-            browser_bridge: threadlane_protocol::browser::BrowserBridge::channel(),
+            browser_bridge,
             mirror_open: false,
             mirror_seen: HashSet::new(),
             session_seen: HashMap::new(),
@@ -664,12 +724,11 @@ impl AppState {
                 session_file: session_file.to_path_buf(),
                 reload_messages: true,
                 runtime_options: active_runtime_work_dir.map(|work_dir| {
-                    (
+                    HydrationRuntimeOptions {
                         work_dir,
-                        state.selected_model.clone(),
-                        state.model_roles.clone(),
-                        state.browser_bridge.clone(),
-                    )
+                        model: state.selected_model.clone(),
+                        model_roles: state.model_roles.clone(),
+                    }
                 }),
             });
         }
@@ -699,7 +758,7 @@ impl AppState {
             });
         }
         let mut session_files = HashSet::new();
-        for (session_file, runtime) in &self.session_runtimes {
+        for (session_file, runtime) in self.daemon_core.runtimes() {
             let active = runtime.is_generating()
                 || runtime.scheduled_work_active()
                 || matches!(
@@ -774,7 +833,14 @@ impl AppState {
         }
         if let Some(runtime) = &projection.active_runtime {
             let path = runtime.session_file().to_path_buf();
-            if !self.session_runtimes.contains_key(&path) { self.register_session_runtime(path, runtime.clone()); }
+            if self.daemon_core.runtime_for_file(&path).is_none() {
+                let work_dir = path
+                    .ancestors()
+                    .nth(3)
+                    .map(|root| root.to_path_buf())
+                    .unwrap_or_default();
+                self.register_session_runtime(work_dir, path, runtime.clone());
+            }
         }
         let previous: HashMap<_, _> = self.automations.snapshot.runs.iter()
             .map(|run| (&run.id, run)).collect();
@@ -883,7 +949,8 @@ impl AppState {
 
     fn invalidate_idle_runtimes(&mut self) {
         let idle = self
-            .session_runtimes
+            .daemon_core
+            .runtimes()
             .iter()
             .filter(|(_, runtime)| !runtime.is_generating())
             .map(|(session_file, _)| session_file.clone())
@@ -896,7 +963,7 @@ impl AppState {
     fn drop_session_runtime(&mut self, session_file: &Path) {
         self.scheduler_handles.remove(session_file);
         self.scheduler_results.remove(session_file);
-        self.session_runtimes.remove(session_file);
+        self.daemon_core.drop_runtime(session_file);
     }
 
     pub fn invalidate_capability_runtimes(&mut self) {
@@ -972,6 +1039,14 @@ impl AppState {
         if !self.available_models.iter().any(|m| m.id == model) {
             return;
         }
+        if self.daemon_remote {
+            self.selected_model = model.clone();
+            self.dispatch_command(SessionCommand::SetModel {
+                session_id: self.active_session_id.clone().unwrap_or_default(),
+                model,
+            });
+            return;
+        }
         if let Some((runtime, _)) = self.active_session_runtime() {
             if runtime.model() == model && self.selected_model == model {
                 return;
@@ -1026,6 +1101,14 @@ impl AppState {
             effort,
             self.active_work_dir.as_deref(),
         );
+        if self.daemon_remote {
+            self.reasoning_effort = effort;
+            self.dispatch_command(SessionCommand::SetReasoningEffort {
+                session_id: self.active_session_id.clone().unwrap_or_default(),
+                effort,
+            });
+            return;
+        }
         if let Some((runtime, _)) = self.active_session_runtime() {
             if runtime.is_generating() {
                 if self.reasoning_effort != effort {
@@ -1071,6 +1154,20 @@ impl AppState {
         if self.orchestrator_mode == mode {
             return;
         }
+        if self.daemon_remote {
+            self.orchestrator_mode = mode;
+            // With a live session the daemon persists the setting and
+            // rebuilds the runtime; without one it stays as the draft
+            // default and is saved with the next write.
+            if let Some(session_id) = self.active_session_id.clone() {
+                self.dispatch_command(SessionCommand::SetOrchestratorMode { session_id, mode });
+            } else {
+                let mut settings = threadlane_project::subagent_settings::load(&work_dir);
+                settings.orchestrator_mode = mode;
+                let _ = threadlane_project::subagent_settings::save(&work_dir, &settings);
+            }
+            return;
+        }
         let mut settings = threadlane_project::subagent_settings::load(&work_dir);
         settings.orchestrator_mode = mode;
         if let Err(error) = threadlane_project::subagent_settings::save(&work_dir, &settings) {
@@ -1084,7 +1181,7 @@ impl AppState {
             return;
         };
         let session_file = self.session_file(&work_dir, &session_id);
-        let Some(runtime) = self.session_runtimes.get(&session_file).cloned() else {
+        let Some(runtime) = self.daemon_core.runtime_for_file(&session_file) else {
             return;
         };
         if runtime.is_generating() {
@@ -1262,8 +1359,8 @@ impl AppState {
         ) {
             let session_file = self.session_file(work_dir, session_id);
             let is_generating = self
-                .session_runtimes
-                .get(&session_file)
+                .daemon_core
+                .runtime_for_file(&session_file)
                 .is_some_and(|runtime| runtime.is_generating());
             if !is_generating {
                 self.pending_hydrations.push(SessionHydrationRequest {
@@ -1320,7 +1417,7 @@ impl AppState {
                     runtime.spawn_blocking(move || {
                         let result =
                             threadlane_git::worktree_bases(&project).map_err(|e| e.to_string());
-                        let _ = tx.send(ChatStreamEvent::WorktreeBases { project, result });
+                        let _ = tx.send(SessionEvent::WorktreeBases { project, result });
                     });
                 }
                 Err(error) => self.session_status = Some(error),
@@ -1468,8 +1565,8 @@ impl AppState {
         // generating state: hydration preserves in-flight streaming rows only
         // while it is set, and the composer stays gated on it.
         self.is_generating = self
-            .session_runtimes
-            .get(&session_file)
+            .daemon_core
+            .runtime_for_file(&session_file)
             .is_some_and(|runtime| runtime.is_generating());
         self.session_status = Some("Loading session…".into());
         if !self.worktree_setups.contains_key(&session_id) {
@@ -1500,12 +1597,11 @@ impl AppState {
             session_id,
             session_file,
             reload_messages: true,
-            runtime_options: Some((
-                runtime_work_dir,
-                self.selected_model.clone(),
-                self.model_roles.clone(),
-                self.browser_bridge.clone(),
-            )),
+            runtime_options: Some(HydrationRuntimeOptions {
+                work_dir: runtime_work_dir,
+                model: self.selected_model.clone(),
+                model_roles: self.model_roles.clone(),
+            }),
         };
         self.drain_chat_stream(Vec::new());
         self.pending_hydrations.retain(|pending| {
@@ -1539,8 +1635,8 @@ impl AppState {
             return Err("Finish or cancel worktree setup before forking this session".into());
         }
         if self
-            .session_runtimes
-            .get(&source.session_file)
+            .daemon_core
+            .runtime_for_file(&source.session_file)
             .is_some_and(|runtime| runtime.is_generating())
         {
             return Err("Stop the running generation before forking this session".into());
@@ -1664,9 +1760,24 @@ impl AppState {
             return Err("Cancel worktree setup before archiving or deleting this session".into());
         }
         let session_file = self.session_file(&work_dir, &session_id);
+        if self.daemon_remote {
+            // The daemon archives the transcript, applies the shared-worktree
+            // and dirtiness guards, and drops the runtime. Persisted cleanup
+            // waits for `SessionRemoved`: a rejected delete arrives as
+            // DaemonError and the session row must come back with its pin
+            // and seen watermark intact.
+            self.pending_remote_deletes
+                .insert(session_id.clone(), work_dir);
+            self.dispatch_command(SessionCommand::DeleteSession {
+                session_id,
+                session_file,
+                delete_worktree,
+            });
+            return Ok(());
+        }
         if self
-            .session_runtimes
-            .get(&session_file)
+            .daemon_core
+            .runtime_for_file(&session_file)
             .is_some_and(|runtime| runtime.is_generating())
         {
             return Err("Stop the running generation before archiving this session".into());
@@ -1755,9 +1866,21 @@ impl AppState {
             return Err("Cancel worktree setup before archiving or deleting this session".into());
         }
         let session_file = self.session_file(&work_dir, &session_id);
+        if self.daemon_remote {
+            // As in settle_session: the session's persisted cleanup waits
+            // for the daemon's `SessionRemoved` ack.
+            self.pending_remote_deletes
+                .insert(session_id.clone(), work_dir);
+            self.dispatch_command(SessionCommand::DeleteSession {
+                session_id,
+                session_file,
+                delete_worktree,
+            });
+            return Ok(());
+        }
         if self
-            .session_runtimes
-            .get(&session_file)
+            .daemon_core
+            .runtime_for_file(&session_file)
             .is_some_and(|runtime| runtime.is_generating())
         {
             return Err("Stop the running generation before deleting this session".into());
@@ -1814,8 +1937,8 @@ impl AppState {
         work_dir: PathBuf,
         session_file: PathBuf,
     ) -> Arc<SessionRuntime> {
-        if let Some(runtime) = self.session_runtimes.get(&session_file) {
-            return runtime.clone();
+        if let Some(runtime) = self.daemon_core.runtime_for_file(&session_file) {
+            return runtime;
         }
         // Build on a dedicated thread with a large stack: CodingAgent loads
         // WASI extensions through wasmi, which needs more than GPUI's 512
@@ -1824,7 +1947,7 @@ impl AppState {
         // inside async context; the hydrated path in
         // threadlane-ui-workspace awaits the same constructor asynchronously.
         let options = coding_agent_options(
-            work_dir,
+            work_dir.clone(),
             session_file.clone(),
             self.selected_model.clone(),
             self.model_roles.clone(),
@@ -1837,22 +1960,26 @@ impl AppState {
             .expect("failed to spawn session runtime constructor")
             .join()
             .expect("session runtime construction panicked");
-        self.register_session_runtime(session_file, runtime)
+        self.register_session_runtime(work_dir.clone(), session_file, runtime)
     }
 
     pub fn register_session_runtime(
         &mut self,
+        work_dir: PathBuf,
         session_file: PathBuf,
         runtime: Arc<SessionRuntime>,
     ) -> Arc<SessionRuntime> {
-        if let Some(existing) = self.session_runtimes.get(&session_file) {
-            return existing.clone();
+        if let Some(existing) = self.daemon_core.runtime_for_file(&session_file) {
+            return existing;
         }
         if let Ok((handle, results)) = runtime.start_scheduler_supervisor_with_results() {
             self.scheduler_handles.insert(session_file.clone(), handle);
             self.scheduler_results.insert(session_file.clone(), results);
         }
-        self.session_runtimes.insert(session_file, runtime.clone());
+        let session_id = threadlane_daemon::core::DaemonCore::session_id_for_file(&session_file)
+            .unwrap_or_default();
+        self.daemon_core
+            .register_runtime(&session_id, work_dir, session_file, runtime.clone());
         runtime
     }
 
@@ -1883,10 +2010,20 @@ impl AppState {
             return false;
         };
         let session_file = self.session_file(&work_dir, &session_id);
-        let resolved = self
-            .session_runtimes
-            .get(&session_file)
-            .is_some_and(|runtime| runtime.resolve_permission(request_id, decision));
+        let resolved = if self.daemon_remote {
+            self.dispatch_command(SessionCommand::AnswerPermission {
+                session_id: session_id.clone(),
+                request_id: request_id.to_string(),
+                decision,
+            });
+            // Dispatch is fire-and-forget; the daemon reports a stale
+            // request as DaemonError, so clearing optimistically is safe.
+            true
+        } else {
+            self.daemon_core
+                .runtime_for_file(&session_file)
+                .is_some_and(|runtime| runtime.resolve_permission(request_id, decision))
+        };
         if resolved {
             self.pending_permissions.remove(&session_id);
             if let Some(service) = &self.automation_service { service.resolved(session_id.clone(), request_id.into()); }
@@ -1908,10 +2045,17 @@ impl AppState {
         };
         let session_file = self.session_file(&work_dir, &session_id);
         let answer = threadlane_protocol::QuestionAnswer::dismissed(request_id);
-        let resolved = self
-            .session_runtimes
-            .get(&session_file)
-            .is_some_and(|runtime| runtime.resolve_question(request_id, answer));
+        let resolved = if self.daemon_remote {
+            self.dispatch_command(SessionCommand::AnswerQuestion {
+                session_id: session_id.clone(),
+                answer,
+            });
+            true
+        } else {
+            self.daemon_core
+                .runtime_for_file(&session_file)
+                .is_some_and(|runtime| runtime.resolve_question(request_id, answer))
+        };
         if resolved {
             self.pending_questions.remove(&session_id);
             if let Some(service) = &self.automation_service { service.resolved(session_id.clone(), request_id.into()); }
@@ -1933,10 +2077,17 @@ impl AppState {
             return false;
         };
         let session_file = self.session_file(&work_dir, &session_id);
-        let resolved = self
-            .session_runtimes
-            .get(&session_file)
-            .is_some_and(|runtime| runtime.resolve_question(request_id, answer));
+        let resolved = if self.daemon_remote {
+            self.dispatch_command(SessionCommand::AnswerQuestion {
+                session_id: session_id.clone(),
+                answer,
+            });
+            true
+        } else {
+            self.daemon_core
+                .runtime_for_file(&session_file)
+                .is_some_and(|runtime| runtime.resolve_question(request_id, answer))
+        };
         if resolved {
             self.pending_questions.remove(&session_id);
             if let Some(service) = &self.automation_service { service.resolved(session_id.clone(), request_id.into()); }
@@ -2175,8 +2326,8 @@ impl AppState {
         {
             return true;
         }
-        self.session_runtimes
-            .get(session_file)
+        self.daemon_core
+            .runtime_for_file(session_file)
             .is_some_and(|runtime| runtime.is_generating())
     }
 
@@ -2372,8 +2523,8 @@ impl AppState {
                 SessionAttention::Working
             };
         }
-        let runtime = self.session_runtimes.get(&session.session_file);
-        let runtime_status = runtime.map(|runtime| runtime.status());
+        let runtime = self.daemon_core.runtime_for_file(&session.session_file);
+        let runtime_status = runtime.as_ref().map(|runtime| runtime.status());
         let is_active = self.active_work_dir.as_ref() == Some(&session.work_dir)
             && self.active_session_id.as_deref() == Some(session.id.as_str());
         let git_status = self
@@ -2418,7 +2569,7 @@ impl AppState {
             .is_some_and(|events| {
                 events
                     .iter()
-                    .any(|event| matches!(event, ChatStreamEvent::Scheduled { .. }))
+                    .any(|event| matches!(event, SessionEvent::Scheduled { .. }))
             });
         let ready_work =
             deferred_work || branch_is_actionable || (linked_pr.is_none() && actionable_git_work);
@@ -2429,7 +2580,7 @@ impl AppState {
                 events.iter().any(|event| {
                     matches!(
                         event,
-                        ChatStreamEvent::Scheduled {
+                        SessionEvent::Scheduled {
                             result: Some(Err(_)),
                             ..
                         }
@@ -2582,15 +2733,21 @@ impl AppState {
                 .map(|agent| self.take_pending_acp_config(agent))
                 .unwrap_or_default(),
         };
-        crate::worktree_setup::persist_request(&setup)?;
-        let options = coding_agent_options(
-            project.clone(),
-            setup.session_file.clone(),
-            model,
-            self.model_roles.clone(),
-            self.browser_bridge.clone(),
-        );
-        crate::worktree_setup::start(setup.clone(), options, self.stream_tx.clone())?;
+        if self.daemon_remote {
+            self.dispatch_command(SessionCommand::PrepareWorktree {
+                setup: setup.clone(),
+            });
+        } else {
+            crate::worktree_setup::persist_request(&setup)?;
+            let options = coding_agent_options(
+                project.clone(),
+                setup.session_file.clone(),
+                model,
+                self.model_roles.clone(),
+                self.browser_bridge.clone(),
+            );
+            crate::worktree_setup::start(setup.clone(), options, self.stream_tx.clone())?;
+        }
         if let Some(info) = self.projects.iter_mut().find(|p| p.work_dir == project) {
             info.sessions.insert(
                 0,
@@ -2630,6 +2787,14 @@ impl AppState {
         };
         setup.error = None;
         setup.stage = crate::worktree_setup::SetupStage::Naming;
+        if self.daemon_remote {
+            self.dispatch_command(SessionCommand::PrepareWorktree {
+                setup: setup.clone(),
+            });
+            self.worktree_setups.insert(setup.session_id.clone(), setup);
+            self.is_generating = true;
+            return;
+        }
         let options = coding_agent_options(
             setup.project.clone(),
             setup.session_file.clone(),
@@ -2669,7 +2834,7 @@ impl AppState {
     fn finish_worktree_setup(
         &mut self,
         id: &str,
-        result: Result<crate::worktree_setup::PreparedWorktree, String>,
+        result: Result<SessionInfo, String>,
     ) {
         let Some(setup) = self.worktree_setups.get(id).cloned() else {
             return;
@@ -2677,6 +2842,8 @@ impl AppState {
         let active = self.active_session_id.as_deref() == Some(id);
         if setup.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             drop(result);
+            // Free the runtime parked by the producer before it was claimed.
+            let _ = crate::runtimes::take_prepared_runtime(id);
             if active {
                 self.is_generating = false;
                 self.session_status = Some("Worktree setup cancelled".into());
@@ -2684,8 +2851,7 @@ impl AppState {
             self.cleanup_cancelled_worktree(&setup);
             return;
         }
-        let result = result.and_then(|prepared| {
-            let session = prepared.session;
+        let result = result.and_then(|session| {
             if let Some(project) = self
                 .projects
                 .iter_mut()
@@ -2694,7 +2860,28 @@ impl AppState {
                 project.sessions.retain(|s| s.id != id);
                 project.sessions.insert(0, session.clone());
             }
-            let runtime = self.register_session_runtime(session.session_file, prepared.runtime);
+            if self.daemon_remote {
+                // The daemon parked the prepared runtime under the session id
+                // and owns the worktree checkout; the first prompt resolves it.
+                self.dispatch_command(SessionCommand::SubmitPrompt {
+                    session_id: id.to_string(),
+                    work_dir: setup.worktree.clone(),
+                    text: setup.text.clone(),
+                    images: setup.images.clone(),
+                    effort: setup.effort,
+                    acp_config: setup.acp_config.clone(),
+                    model: Some(setup.model.clone()),
+                });
+                return Ok(());
+            }
+            let prepared = crate::runtimes::take_prepared_runtime(id).ok_or_else(|| {
+                "Prepared session runtime was already claimed".to_string()
+            })?;
+            let runtime = self.register_session_runtime(
+                setup.worktree.clone(),
+                session.session_file,
+                prepared,
+            );
             crate::chat::execute_prompt(
                 runtime,
                 setup.worktree.clone(),
@@ -3002,9 +3189,10 @@ impl AppState {
         let result = compute_full_session_projection(session_file)?;
         let key = Self::projection_key(session_id, session_file);
         self.apply_run_timing(&key, result.run_timing);
-        self.diagnostics_by_session
-            .insert(key.clone(), result.diagnostics);
-        self.diagnostics_revision = self.diagnostics_revision.wrapping_add(1);
+        if let Some(diagnostics) = result.diagnostics {
+            self.diagnostics_by_session.insert(key.clone(), diagnostics);
+            self.diagnostics_revision = self.diagnostics_revision.wrapping_add(1);
+        }
         self.trajectory_by_session
             .insert(key.clone(), result.trajectory);
         self.trajectory_epoch = self.trajectory_epoch.wrapping_add(1);
@@ -3012,8 +3200,10 @@ impl AppState {
             .insert(key.clone(), result.subagents);
         self.trajectory_revision = self.trajectory_revision.wrapping_add(1);
         self.session_metrics.insert(key.clone(), result.metrics);
-        self.token_efficiency_by_session
-            .insert(key.clone(), result.token_efficiency);
+        if let Some(token_efficiency) = result.token_efficiency {
+            self.token_efficiency_by_session
+                .insert(key.clone(), token_efficiency);
+        }
         if let Some(context_window) = result.context_window {
             self.context_windows.insert(key.clone(), context_window);
         } else {
@@ -3025,7 +3215,7 @@ impl AppState {
 
     /// Applies a completed background projection if its session remains active.
     pub fn session_status_for_file(&self, session_file: &Path) -> Option<String> {
-        self.session_runtimes.get(session_file).and_then(|runtime| {
+        self.daemon_core.runtime_for_file(session_file).and_then(|runtime| {
             threadlane_coding_agent::controller::runtime_status_text(runtime.status())
         })
     }
@@ -3154,8 +3344,8 @@ impl AppState {
         // While the runtime is still generating, a wholesale replace would
         // drop that live activity, so merge it back over the fresh snapshot.
         let generating = self
-            .session_runtimes
-            .get(session_file)
+            .daemon_core
+            .runtime_for_file(session_file)
             .is_some_and(|runtime| runtime.is_generating());
         if generating {
             let live_trajectory = self.trajectory_by_session.remove(&key).unwrap_or_default();
@@ -3176,18 +3366,85 @@ impl AppState {
         }
         self.trajectory_epoch = self.trajectory_epoch.wrapping_add(1);
         self.trajectory_revision = self.trajectory_revision.wrapping_add(1);
-        self.diagnostics_by_session
-            .insert(key.clone(), result.diagnostics);
-        self.diagnostics_revision = self.diagnostics_revision.wrapping_add(1);
+        if let Some(diagnostics) = result.diagnostics {
+            self.diagnostics_by_session.insert(key.clone(), diagnostics);
+            self.diagnostics_revision = self.diagnostics_revision.wrapping_add(1);
+        }
         self.session_metrics.insert(key.clone(), result.metrics);
-        self.token_efficiency_by_session
-            .insert(key.clone(), result.token_efficiency);
+        if let Some(token_efficiency) = result.token_efficiency {
+            self.token_efficiency_by_session
+                .insert(key.clone(), token_efficiency);
+        }
         if let Some(context_window) = result.context_window {
             self.context_windows.insert(key.clone(), context_window);
         } else {
             self.context_windows.remove(&key);
         }
         self.session_token_usage.insert(key, result.token_usage);
+    }
+
+    /// Applies a daemon wire snapshot (attach mid-run: snapshot first, live
+    /// tail after). Wire snapshots cannot carry the daemon-local diagnostics
+    /// and token-efficiency panels, so whatever the UI already computed is
+    /// preserved rather than blanked.
+    fn apply_session_snapshot(
+        &mut self,
+        session_id: &str,
+        snapshot: threadlane_protocol::daemon::SessionSnapshot,
+    ) -> bool {
+        let session_file = snapshot.session.session_file.clone();
+        self.finish_session_hydration(session_id, &session_file);
+        if !self.active_session_matches(session_id, &session_file) {
+            return false;
+        }
+        // The "new result" watermark is local bookkeeping; a remote daemon's
+        // transcript may not exist on this filesystem at all.
+        let presented_completion = compute_latest_run_completion(&session_file)
+            .ok()
+            .flatten();
+        self.apply_session_messages(
+            session_id,
+            &session_file,
+            snapshot.messages,
+            presented_completion,
+        );
+        self.apply_session_hydration(
+            session_id,
+            &session_file,
+            crate::types::SessionProjectionResult {
+                run_timing: snapshot.run_timing,
+                plan: snapshot.plan,
+                trajectory: snapshot.trajectory,
+                subagents: snapshot.subagents,
+                diagnostics: None,
+                metrics: snapshot.metrics,
+                token_efficiency: None,
+                token_usage: snapshot.token_usage,
+                context_window: snapshot.context_window,
+            },
+        );
+        true
+    }
+
+    /// Sends a `SessionCommand` through the attached `DaemonClient` —
+    /// fire-and-forget; failures arrive as `SessionEvent::DaemonError`.
+    /// A command the client rejects outright (e.g. disconnected remote)
+    /// also surfaces through the event stream rather than vanishing into
+    /// a log line, since callers optimistically enter generating state.
+    pub fn dispatch_command(&self, command: SessionCommand) {
+        let client = self.daemon_client.clone();
+        let stream_tx = self.stream_tx.clone();
+        if let Ok(executor) = crate::chat::executor() {
+            executor.spawn(async move {
+                if let Err(error) = client.command(command).await {
+                    tracing::warn!("daemon command failed: {error}");
+                    let _ = stream_tx.send(SessionEvent::DaemonError {
+                        session_id: None,
+                        message: error,
+                    });
+                }
+            });
+        }
     }
 
     fn record_subagent_activity(&mut self, event: &AgentEvent) {
@@ -3693,6 +3950,12 @@ impl AppState {
         if !threadlane_acp_engine::is_acp_model(&self.selected_model) {
             return;
         }
+        if self.daemon_remote {
+            if let Some(session_id) = self.active_session_id.clone() {
+                self.dispatch_command(SessionCommand::LoadAcpConfigOptions { session_id });
+            }
+            return;
+        }
         let Some((runtime, session_id)) = self.active_session_runtime() else {
             return;
         };
@@ -3711,6 +3974,16 @@ impl AppState {
             self.session_status =
                 Some("Cancel worktree setup before changing agent settings".into());
             return;
+        }
+        if self.daemon_remote {
+            if let Some(session_id) = self.active_session_id.clone() {
+                self.dispatch_command(SessionCommand::SetAcpConfigOption {
+                    session_id,
+                    config_id,
+                    value,
+                });
+                return;
+            }
         }
         let Some((runtime, session_id)) = self.active_session_runtime() else {
             // No session yet (New task): remember the choice, show it
@@ -3875,12 +4148,12 @@ impl AppState {
     pub fn apply_durable_event(&mut self, session_id: &str, event: HarnessEvent) -> bool {
         match event.payload() {
             EventPayload::Agent(agent_event) => {
-                self.drain_chat_stream(vec![ChatStreamEvent::Agent {
+                self.drain_chat_stream(vec![SessionEvent::Agent {
                     session_id: session_id.to_owned(),
                     event: agent_event.clone(),
                 }])
             }
-            EventPayload::Fault(error) => self.drain_chat_stream(vec![ChatStreamEvent::Agent {
+            EventPayload::Fault(error) => self.drain_chat_stream(vec![SessionEvent::Agent {
                 session_id: session_id.to_owned(),
                 event: AgentEvent::AgentError {
                     error: error.clone(),
@@ -3952,7 +4225,7 @@ impl AppState {
         changed
     }
 
-    pub fn drain_chat_stream(&mut self, mut events: Vec<ChatStreamEvent>) -> bool {
+    pub fn drain_chat_stream(&mut self, mut events: Vec<SessionEvent>) -> bool {
         let seen_changed = self.drain_session_seen_write_results();
         let scheduler_files: Vec<PathBuf> = self.scheduler_results.keys().cloned().collect();
         for session_file in scheduler_files {
@@ -3973,9 +4246,9 @@ impl AppState {
                         .unwrap_or_else(|| session_file.to_string_lossy().into_owned());
                     events.push(match update {
                         SchedulerSupervisorEvent::Agent(event) => {
-                            ChatStreamEvent::Agent { session_id, event }
+                            SessionEvent::Agent { session_id, event }
                         }
-                        SchedulerSupervisorEvent::Completed(result) => ChatStreamEvent::Scheduled {
+                        SchedulerSupervisorEvent::Completed(result) => SessionEvent::Scheduled {
                             session_id,
                             session_file: session_file.clone(),
                             result,
@@ -3994,7 +4267,7 @@ impl AppState {
 
         for event in deferred.chain(events) {
             match event {
-                ChatStreamEvent::WorktreeBases { project, result } => {
+                SessionEvent::WorktreeBases { project, result } => {
                     if self.is_new_task && self.active_work_dir.as_ref() == Some(&project) {
                         match result {
                             Ok((default, branches)) => {
@@ -4015,7 +4288,7 @@ impl AppState {
                         changed = true;
                     }
                 }
-                ChatStreamEvent::WorktreeProgress {
+                SessionEvent::WorktreeProgress {
                     session_id,
                     stage,
                     branch,
@@ -4028,11 +4301,11 @@ impl AppState {
                         changed = true;
                     }
                 }
-                ChatStreamEvent::WorktreePrepared { session_id, result } => {
+                SessionEvent::WorktreePrepared { session_id, result } => {
                     self.finish_worktree_setup(&session_id, result);
                     changed = true;
                 }
-                ChatStreamEvent::Agent { session_id, event }
+                SessionEvent::Agent { session_id, event }
                     if self.active_session_id.as_deref() == Some(&session_id) =>
                 {
                     if matches!(&event, AgentEvent::AgentStart) {
@@ -4271,7 +4544,7 @@ impl AppState {
                         ChatAgentUpdate::Ignore => {}
                     }
                 }
-                ChatStreamEvent::Scheduled {
+                SessionEvent::Scheduled {
                     session_id,
                     session_file,
                     result,
@@ -4290,7 +4563,7 @@ impl AppState {
                         self.deferred_stream_events
                             .entry(session_id.clone())
                             .or_default()
-                            .push(ChatStreamEvent::Scheduled {
+                            .push(SessionEvent::Scheduled {
                                 session_id,
                                 session_file,
                                 result,
@@ -4336,7 +4609,7 @@ impl AppState {
                         self.request_session_refresh(&work_dir);
                     }
                 }
-                ChatStreamEvent::Finished {
+                SessionEvent::Finished {
                     session_id,
                     session_file,
                 } => {
@@ -4353,7 +4626,7 @@ impl AppState {
                         self.deferred_stream_events
                             .entry(session_id.clone())
                             .or_default()
-                            .push(ChatStreamEvent::Finished {
+                            .push(SessionEvent::Finished {
                                 session_id,
                                 session_file,
                             });
@@ -4386,8 +4659,8 @@ impl AppState {
                         runtime_options: None,
                     });
                     let runtime_is_stale =
-                        self.session_runtimes
-                            .get(&session_file)
+                        self.daemon_core
+                            .runtime_for_file(&session_file)
                             .is_some_and(|runtime| {
                                 !runtime.is_generating()
                                     && (runtime.selected_model != self.selected_model
@@ -4400,24 +4673,32 @@ impl AppState {
                         self.request_session_refresh(&work_dir);
                     }
                 }
-                ChatStreamEvent::AcpConfigOptions {
+                SessionEvent::AcpConfigOptions {
                     session_id,
-                    source,
+                    session_file,
+                    runtime_instance,
                     options,
                     error,
                     failed_config,
                 } => {
-                    let Some(runtime) = source.upgrade() else {
-                        continue;
-                    };
-                    if !self
-                        .session_runtimes
-                        .get(&runtime.session_file)
-                        .is_some_and(|current| Arc::ptr_eq(current, &runtime))
-                    {
-                        continue;
+                    // Apply options only while the producing runtime instance
+                    // is still the registered one — the wire-clean stand-in
+                    // for the old `Weak<SessionRuntime>` identity check.
+                    // Remote mode keeps no local runtimes to compare against;
+                    // the daemon's own ordering is the staleness guard there.
+                    if !self.daemon_remote {
+                        let Some(current_instance) = self
+                            .daemon_core
+                            .runtime_for_file(&session_file)
+                            .map(|runtime| runtime.instance_id())
+                        else {
+                            continue;
+                        };
+                        if current_instance != runtime_instance {
+                            continue;
+                        }
                     }
-                    let is_active = self.active_session_matches(&session_id, &runtime.session_file);
+                    let is_active = self.active_session_matches(&session_id, &session_file);
                     if let Some(error) = error {
                         if let (Some((config_id, value)), Some(agent_id)) = (
                             failed_config,
@@ -4434,7 +4715,7 @@ impl AppState {
                         }
                         continue;
                     }
-                    let key = Self::projection_key(&session_id, &runtime.session_file);
+                    let key = Self::projection_key(&session_id, &session_file);
                     if options.is_empty() {
                         if self.acp_config_options.remove(&key).is_some() && is_active {
                             changed = true;
@@ -4446,7 +4727,7 @@ impl AppState {
                         }
                     }
                 }
-                ChatStreamEvent::TitleGenerated {
+                SessionEvent::TitleGenerated {
                     session_id,
                     session_file,
                 } => {
@@ -4462,7 +4743,7 @@ impl AppState {
                         self.refresh_active_session();
                     }
                 }
-                ChatStreamEvent::Agent { session_id, event } => {
+                SessionEvent::Agent { session_id, event } => {
                     match &event {
                         AgentEvent::PermissionRequested { request } => {
                             self.pending_permissions
@@ -4475,7 +4756,43 @@ impl AppState {
                     self.deferred_stream_events
                         .entry(session_id.clone())
                         .or_default()
-                        .push(ChatStreamEvent::Agent { session_id, event });
+                        .push(SessionEvent::Agent { session_id, event });
+                }
+                // Wire variants with no in-process producer yet: PTY output
+                // stays desktop-local, snapshots are a remote-daemon attach
+                // affordance, and project deltas arrive via the file watcher.
+                // PTY output stays client-local and project deltas arrive
+                // via the file watcher.
+                SessionEvent::TerminalEvent { .. } | SessionEvent::ProjectChanged { .. } => {}
+                SessionEvent::SessionSnapshot {
+                    session_id,
+                    snapshot,
+                } => {
+                    if self.apply_session_snapshot(&session_id, *snapshot) {
+                        changed = true;
+                    }
+                }
+                SessionEvent::DaemonError { message, .. } => {
+                    tracing::warn!("daemon error: {message}");
+                    // Dispatch failures surface here — the command path has
+                    // no return channel on the wire.
+                    self.session_status = Some(format!("Daemon: {message}"));
+                    changed = true;
+                }
+                SessionEvent::SessionRemoved {
+                    session_id,
+                    session_file,
+                } => {
+                    // The daemon confirmed the delete — only now is the
+                    // session's persisted data safe to drop.
+                    let work_dir = self
+                        .pending_remote_deletes
+                        .remove(&session_id)
+                        .or_else(|| self.session_work_dir_for_file(&session_file));
+                    if let Some(work_dir) = work_dir {
+                        self.finish_session_removal(&work_dir, &session_id);
+                        changed = true;
+                    }
                 }
             }
         }
@@ -4551,6 +4868,35 @@ impl AppState {
     }
 
     pub(crate) fn queue_pending_message(&mut self) -> Result<(), String> {
+        if self.daemon_remote {
+            let (text, images, session_id) = {
+                let session_id = self
+                    .active_session_id
+                    .clone()
+                    .ok_or_else(|| "No active session".to_string())?;
+                let pending = self
+                    .pending_composer_messages
+                    .get(&session_id)
+                    .cloned()
+                    .ok_or_else(|| "No pending composer message".to_string())?;
+                (pending.text, pending.images, session_id)
+            };
+            self.pending_composer_messages.remove(&session_id);
+            // The daemon queues a follow-up itself when the session is still
+            // generating (SubmitPrompt's generating branch).
+            self.dispatch_command(SessionCommand::SubmitPrompt {
+                session_id: session_id.clone(),
+                work_dir: self.active_work_dir.clone().unwrap_or_default(),
+                text: text.clone(),
+                images,
+                effort: self.reasoning_effort,
+                acp_config: Vec::new(),
+                model: Some(self.selected_model.clone()),
+            });
+            self.push_optimistic_follow_up(&session_id, text, format!("queued-user-{session_id}"));
+            self.session_status = Some("Message queued…".into());
+            return Ok(());
+        }
         let (runtime, session_id, text, images) = self.pending_runtime_message()?;
         let entry_id = runtime
             .work_handle
@@ -4563,6 +4909,11 @@ impl AppState {
     }
 
     pub(crate) fn steer_pending_message(&mut self) -> Result<(), String> {
+        if self.daemon_remote {
+            // No wire-level steer yet; the daemon-side follow-up queue is the
+            // closest equivalent and preserves the message.
+            return self.queue_pending_message();
+        }
         let (runtime, session_id, text, images) = self.pending_runtime_message()?;
         runtime
             .work_handle
@@ -4624,9 +4975,8 @@ impl AppState {
             .ok_or_else(|| "No active project".to_string())?;
         let session_file = self.session_file(work_dir, &session_id);
         let runtime = self
-            .session_runtimes
-            .get(&session_file)
-            .cloned()
+            .daemon_core
+            .runtime_for_file(&session_file)
             .ok_or_else(|| "Session runtime is unavailable".to_string())?;
         Ok((runtime, session_id))
     }
@@ -4689,8 +5039,8 @@ impl AppState {
         let session_file = self.session_file(&work_dir, &session_id);
         let runtime_work_dir = self.session_runtime_work_dir(&work_dir, &session_id);
         if self
-            .session_runtimes
-            .get(&session_file)
+            .daemon_core
+            .runtime_for_file(&session_file)
             .is_some_and(|runtime| runtime.is_generating())
         {
             return Err("A generation is already running for this session".into());
@@ -4719,23 +5069,36 @@ impl AppState {
             return Ok(());
         }
 
-        let runtime = self.ensure_session_runtime(runtime_work_dir.clone(), session_file.clone());
         // New-task ACP picks have no session to apply to yet; they wait here
         // and are applied inside the turn task before generation starts, so
         // the first turn runs the model the picker shows.
         let pending_acp = threadlane_acp_engine::acp_agent_id(&model)
             .map(|agent_id| self.take_pending_acp_config(agent_id))
             .unwrap_or_default();
-        crate::chat::execute_prompt(
-            runtime,
-            runtime_work_dir,
-            session_id.clone(),
-            text.clone(),
-            images.clone(),
-            self.reasoning_effort,
-            self.stream_tx.clone(),
-            pending_acp,
-        )?;
+        if self.daemon_remote {
+            self.dispatch_command(SessionCommand::SubmitPrompt {
+                session_id: session_id.clone(),
+                work_dir: runtime_work_dir.clone(),
+                text: text.clone(),
+                images: images.clone(),
+                effort: self.reasoning_effort,
+                acp_config: pending_acp,
+                model: Some(self.selected_model.clone()),
+            });
+        } else {
+            let runtime =
+                self.ensure_session_runtime(runtime_work_dir.clone(), session_file.clone());
+            crate::chat::execute_prompt(
+                runtime,
+                runtime_work_dir,
+                session_id.clone(),
+                text.clone(),
+                images.clone(),
+                self.reasoning_effort,
+                self.stream_tx.clone(),
+                pending_acp,
+            )?;
+        }
         let prompt_detail = if images.is_empty() {
             text.clone()
         } else if text.is_empty() {
@@ -4803,6 +5166,11 @@ impl AppState {
     pub(crate) fn cancel_generation(&mut self) -> Result<(), String> {
         if let Some(id) = self.active_session_id.clone() {
             if let Some(setup) = self.worktree_setups.remove(&id) {
+                if self.daemon_remote {
+                    self.dispatch_command(SessionCommand::CancelWorktreeSetup {
+                        session_id: id.clone(),
+                    });
+                }
                 crate::worktree_setup::clear_request(&setup);
                 setup
                     .cancelled
@@ -4833,8 +5201,16 @@ impl AppState {
         ) else {
             return Ok(());
         };
+        if self.daemon_remote {
+            self.dispatch_command(SessionCommand::CancelRun {
+                session_id: session_id.clone(),
+            });
+            self.is_generating = false;
+            self.session_status = Some("Generation cancelled".into());
+            return Ok(());
+        }
         let session_file = self.session_file(work_dir, session_id);
-        let Some(runtime) = self.session_runtimes.get(&session_file).cloned() else {
+        let Some(runtime) = self.daemon_core.runtime_for_file(&session_file) else {
             return Ok(());
         };
         crate::chat::cancel_prompt(runtime, session_id.clone(), self.stream_tx.clone())?;

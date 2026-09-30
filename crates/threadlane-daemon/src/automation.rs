@@ -1,5 +1,5 @@
 //! Application-owned automation service. One actor serializes storage and dispatch.
-use crate::ChatStreamEvent;
+use crate::SessionEvent;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -42,7 +42,7 @@ type Request = (Command, oneshot::Sender<Result<(), String>>);
 pub struct AutomationService {
     commands: mpsc::UnboundedSender<Request>,
     pub projection: watch::Receiver<Projection>,
-    events: broadcast::Sender<ChatStreamEvent>,
+    events: broadcast::Sender<SessionEvent>,
     chat_commands: mpsc::UnboundedSender<CreationRequest>,
 }
 impl AutomationService {
@@ -86,7 +86,7 @@ impl AutomationService {
         });
         service
     }
-    pub fn subscribe(&self) -> broadcast::Receiver<ChatStreamEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
         self.events.subscribe()
     }
     pub async fn command(&self, command: Command) -> Result<(), String> {
@@ -125,7 +125,7 @@ struct Actor {
     store: Store,
     projection: Projection,
     updates: watch::Sender<Projection>,
-    events: broadcast::Sender<ChatStreamEvent>,
+    events: broadcast::Sender<SessionEvent>,
     tx: mpsc::UnboundedSender<Event>,
     rx: mpsc::UnboundedReceiver<Event>,
     active: Option<Active>,
@@ -134,7 +134,7 @@ impl Actor {
     fn new(
         store: Store,
         updates: watch::Sender<Projection>,
-        events: broadcast::Sender<ChatStreamEvent>,
+        events: broadcast::Sender<SessionEvent>,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         Self {
@@ -496,11 +496,11 @@ impl Actor {
                 }
                 let _ = self
                     .events
-                    .send(ChatStreamEvent::Agent { session_id, event });
+                    .send(SessionEvent::Agent { session_id, event });
             }
             Event::Output(id, text) => {
                 if let Some(active) = self.active.as_ref().filter(|a| a.run.id == id) {
-                    let _ = self.events.send(ChatStreamEvent::Agent {
+                    let _ = self.events.send(SessionEvent::Agent {
                         session_id: active.run.session_id.clone(),
                         event: AgentEvent::MessageUpdate {
                             text_delta: Some(text),
@@ -564,7 +564,7 @@ impl Actor {
         }
         self.store.update_run(id, status, error, None, now())?;
         if let Some(runtime) = &active.runtime {
-            let _ = self.events.send(ChatStreamEvent::Finished {
+            let _ = self.events.send(SessionEvent::Finished {
                 session_id: active.run.session_id.clone(),
                 session_file: runtime.session_file().into(),
             });

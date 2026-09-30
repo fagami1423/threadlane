@@ -7,7 +7,7 @@ use threadlane_coding_agent::credentials::provider_client_for;
 use threadlane_protocol::{AgentEvent, ImageAttachment, ReasoningEffort};
 
 use threadlane_coding_agent::controller::SessionRuntime;
-use crate::ChatStreamEvent;
+use crate::SessionEvent;
 
 pub fn executor() -> Result<&'static tokio::runtime::Runtime, String> {
     threadlane_provider::exec::try_get_runtime()
@@ -20,7 +20,7 @@ pub fn execute_prompt(
     text: String,
     images: Vec<ImageAttachment>,
     reasoning_effort: ReasoningEffort,
-    stream_tx: Sender<ChatStreamEvent>,
+    stream_tx: Sender<SessionEvent>,
     pending_acp: Vec<(String, String)>,
 ) -> Result<(), String> {
     // Turn-driving policy lives on the controller; this adapter only maps the
@@ -28,7 +28,7 @@ pub fn execute_prompt(
     let event_session_id = session_id.clone();
     let event_tx = stream_tx.clone();
     let on_agent_event = move |event| {
-        let _ = event_tx.send(ChatStreamEvent::Agent {
+        let _ = event_tx.send(SessionEvent::Agent {
             session_id: event_session_id.clone(),
             event,
         });
@@ -36,7 +36,7 @@ pub fn execute_prompt(
     let output_session_id = session_id.clone();
     let output_tx = stream_tx.clone();
     let on_output_text = move |output: String| {
-        let _ = output_tx.send(ChatStreamEvent::Agent {
+        let _ = output_tx.send(SessionEvent::Agent {
             session_id: output_session_id.clone(),
             event: AgentEvent::MessageUpdate {
                 text_delta: Some(output),
@@ -47,11 +47,13 @@ pub fn execute_prompt(
     };
     let acp_session_id = session_id.clone();
     let acp_tx = stream_tx.clone();
-    let acp_source = Arc::downgrade(&runtime);
+    let acp_session_file = runtime.session_file.clone();
+    let acp_runtime_instance = runtime.instance_id();
     let on_acp_options = move |options, error, failed_config| {
-        let _ = acp_tx.send(ChatStreamEvent::AcpConfigOptions {
+        let _ = acp_tx.send(SessionEvent::AcpConfigOptions {
             session_id: acp_session_id.clone(),
-            source: acp_source.clone(),
+            session_file: acp_session_file.clone(),
+            runtime_instance: acp_runtime_instance,
             options,
             error,
             failed_config,
@@ -59,7 +61,7 @@ pub fn execute_prompt(
     };
     let finished_file = runtime.session_file.clone();
     let on_finished = move || {
-        let _ = stream_tx.send(ChatStreamEvent::Finished {
+        let _ = stream_tx.send(SessionEvent::Finished {
             session_id: session_id.clone(),
             session_file: finished_file.clone(),
         });
@@ -85,7 +87,7 @@ pub fn execute_prompt(
 pub fn load_acp_config_options(
     runtime: Arc<SessionRuntime>,
     session_id: String,
-    stream_tx: Sender<ChatStreamEvent>,
+    stream_tx: Sender<SessionEvent>,
 ) -> Result<(), String> {
     spawn_acp_config_task(runtime, session_id, stream_tx, |runtime| async move {
         runtime.acp_config_options().await
@@ -98,7 +100,7 @@ pub fn set_acp_config_option(
     session_id: String,
     config_id: String,
     value: String,
-    stream_tx: Sender<ChatStreamEvent>,
+    stream_tx: Sender<SessionEvent>,
 ) -> Result<(), String> {
     spawn_acp_config_task(runtime, session_id, stream_tx, move |runtime| async move {
         runtime.set_acp_config_option(&config_id, &value).await
@@ -113,7 +115,7 @@ pub fn set_acp_config_option(
 fn spawn_acp_config_task<F, Fut>(
     runtime: Arc<SessionRuntime>,
     session_id: String,
-    stream_tx: Sender<ChatStreamEvent>,
+    stream_tx: Sender<SessionEvent>,
     operation: F,
 ) -> Result<(), String>
 where
@@ -125,14 +127,16 @@ where
         return Err("Stop the current turn before changing the agent's settings".into());
     }
     executor()?.spawn(async move {
-        let source = Arc::downgrade(&runtime);
+        let session_file = runtime.session_file.clone();
+        let runtime_instance = runtime.instance_id();
         let (options, error) = match operation(runtime).await {
             Ok(options) => (options, None),
             Err(error) => (Vec::new(), Some(error)),
         };
-        let _ = stream_tx.send(ChatStreamEvent::AcpConfigOptions {
+        let _ = stream_tx.send(SessionEvent::AcpConfigOptions {
             session_id,
-            source,
+            session_file,
+            runtime_instance,
             options,
             error,
             failed_config: None,
@@ -150,7 +154,7 @@ pub fn maybe_generate_session_title(
     account_id: Option<String>,
     model: String,
     work_dir: PathBuf,
-    stream_tx: Sender<ChatStreamEvent>,
+    stream_tx: Sender<SessionEvent>,
 ) {
     let mut store = match JsonlStore::open(&session_file) {
         Ok(store) => store,
@@ -227,7 +231,7 @@ pub fn maybe_generate_session_title(
             );
             return;
         }
-        let _ = stream_tx.send(ChatStreamEvent::TitleGenerated {
+        let _ = stream_tx.send(SessionEvent::TitleGenerated {
             session_id,
             session_file,
         });
@@ -239,17 +243,17 @@ pub fn maybe_generate_session_title(
 pub fn cancel_prompt(
     runtime: Arc<SessionRuntime>,
     session_id: String,
-    stream_tx: Sender<ChatStreamEvent>,
+    stream_tx: Sender<SessionEvent>,
 ) -> Result<(), String> {
     runtime.cancel()?;
     runtime.finish_generation(None);
-    let _ = stream_tx.send(ChatStreamEvent::Agent {
+    let _ = stream_tx.send(SessionEvent::Agent {
         session_id: session_id.clone(),
         event: AgentEvent::AgentError {
             error: "Generation cancelled".into(),
         },
     });
-    let _ = stream_tx.send(ChatStreamEvent::Finished {
+    let _ = stream_tx.send(SessionEvent::Finished {
         session_id,
         session_file: runtime.session_file.clone(),
     });

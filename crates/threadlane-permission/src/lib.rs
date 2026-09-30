@@ -25,14 +25,9 @@ use tokio::sync::oneshot;
 
 const PERMISSIONS_FILE: &str = ".threadlane/permissions.json";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PermissionDecision {
-    AllowOnce,
-    /// In-memory grant for the rest of the session (never persisted).
-    AllowSession,
-    AllowAlways,
-    Deny,
-}
+// Canonical in `threadlane_protocol::daemon` so the daemon command surface
+// carries the same type the manager resolves with.
+pub use threadlane_protocol::daemon::PermissionDecision;
 
 #[derive(Clone)]
 pub struct PermissionHandle {

@@ -46,3 +46,39 @@ impl OrchestratorMode {
         matches!(self, Self::Fusion)
     }
 }
+
+/// Model-routing roles shared by the agent config, the daemon hydration
+/// contract, and UI state. Canonical home is here — it is a serialized
+/// session/config contract type, not execution logic; `threadlane-runtime`
+/// re-exports it so `threadlane_runtime::ModelRoles` paths keep working.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ModelRoles {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast: Option<String>,
+    /// Ordered alternate models attempted after a pre-output quota/rate-limit failure.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_chain: Vec<String>,
+    /// Persisted cooldown markers for temporarily exhausted provider/model routes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cooldown_models: Vec<String>,
+}
+
+impl ModelRoles {
+    pub fn resolve_fast<'a>(&'a self, fallback: &'a str) -> &'a str {
+        self.fast.as_deref().unwrap_or(fallback)
+    }
+
+    /// Next fallback candidate: skips the current route and models in cooldown.
+    pub fn fallback_after<'a>(&'a self, current: &str) -> Option<&'a str> {
+        self.fallback_chain
+            .iter()
+            .map(String::as_str)
+            .find(|candidate| {
+                *candidate != current
+                    && !self
+                        .cooldown_models
+                        .iter()
+                        .any(|cooldown| cooldown == candidate)
+            })
+    }
+}

@@ -29,7 +29,7 @@ use threadlane_ui_editor::EditorView;
 use threadlane_ui_mirror::MirrorView;
 use threadlane_ui_state::{actions::AppAction, controller};
 use threadlane_ui_state::{
-    AppState, ChatMessageInfo, ChatStreamEvent, MessageRole, SessionAttention,
+    AppState, ChatMessageInfo, SessionEvent, MessageRole, SessionAttention,
     SubagentActivityStatus, ToolActivityInfo, WorkMode, WorkspacePage,
 };
 
@@ -534,8 +534,8 @@ const CHAT_STREAM_BATCH_LIMIT: usize = 128;
 const COPIED_FEEDBACK_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
 async fn next_chat_stream_batch(
-    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ChatStreamEvent>,
-) -> Option<Vec<ChatStreamEvent>> {
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
+) -> Option<Vec<SessionEvent>> {
     threadlane_ui_state::next_event_batch_capped(receiver, CHAT_STREAM_BATCH_LIMIT).await
 }
 
