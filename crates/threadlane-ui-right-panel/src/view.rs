@@ -2123,7 +2123,12 @@ impl RightPanelView {
 
         div()
             .id(row_id)
+            .debug_selector(|| "review-file-row".into())
             .h_8()
+            .min_h_8()
+            .max_h_8()
+            .flex_shrink_0()
+            .overflow_hidden()
             .mx_2()
             .px_2()
             .rounded_md()
@@ -2182,6 +2187,8 @@ impl RightPanelView {
                                 div()
                                     .debug_selector(|| "review-filename".into())
                                     .min_w(px(40.0))
+                                    .max_w_full()
+                                    .flex_shrink_0()
                                     .truncate()
                                     .child(filename),
                             )
@@ -5989,6 +5996,8 @@ mod review_layout_tests {
                     cx.notify();
                 });
                 cx.update(|window, cx| window.draw(cx).clear(cx));
+                let row = cx.debug_bounds("review-file-row").expect("row rendered");
+                assert_eq!(row.size.height, px(32.0), "row height changed at {width}");
                 let filename = cx
                     .debug_bounds("review-filename")
                     .expect("filename rendered");
@@ -5998,6 +6007,10 @@ mod review_layout_tests {
                 let stats = cx
                     .debug_bounds("review-file-stats")
                     .expect("stats rendered");
+                assert!(
+                    filename.size.height <= row.size.height,
+                    "filename wraps beyond row height at {width}: {filename:?}"
+                );
                 assert!(
                     filename.size.width >= px(40.0),
                     "filename collapsed at {width}: {filename:?}"

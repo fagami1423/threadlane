@@ -1466,10 +1466,41 @@ impl ChatListView {
                 .into()
             });
         let changes = environment_changes_label(status);
-        let model = self.model.clone();
         let theme = cx.theme();
+        let changes_content = status.map(|status| {
+            let (added, removed) = status
+                .files
+                .iter()
+                .fold((0_u64, 0_u64), |(added, removed), file| {
+                    (
+                        added + u64::from(file.additions),
+                        removed + u64::from(file.deletions),
+                    )
+                });
+            let summary = changes.split(" · ").next().unwrap_or(&changes).to_owned();
+            let mut content = div().flex().items_center().min_w_0().child(summary);
+            if added > 0 || removed > 0 {
+                content = content.child(" · ");
+                content = content.child(
+                    div()
+                        .debug_selector(|| "environment-changes-additions".into())
+                        .text_color(theme.success)
+                        .child(format!("+{added}")),
+                );
+                content = content.child(" ");
+                content = content.child(
+                    div()
+                        .debug_selector(|| "environment-changes-deletions".into())
+                        .text_color(theme.danger)
+                        .child(format!("−{removed}")),
+                );
+            }
+            content.into_any_element()
+        });
+        let changes_content = changes_content.unwrap_or_else(|| changes.clone().into_any_element());
+        let model = self.model.clone();
         // Button's built-in icon/label wrapper centers its contents independently.
-        let action_content = |icon: Icon, label: String| {
+        let action_content = |icon: Icon, label: AnyElement| {
             div()
                 .w_full()
                 .min_w_0()
@@ -1532,7 +1563,7 @@ impl ChatListView {
                     .accessibility_label(format!("Manage branches: {branch}"))
                     .child(action_content(
                         Icon::default().path("icons/git/branch.svg"),
-                        branch.clone(),
+                        div().child(branch.clone()).into_any_element(),
                     ))
                     .tooltip(format!("Manage branches: {branch}"))
                     .disabled(status.is_none())
@@ -1548,7 +1579,7 @@ impl ChatListView {
                     .w_full()
                     .justify_start()
                     .accessibility_label(changes.clone())
-                    .child(action_content(Icon::new(IconName::File), changes))
+                    .child(action_content(Icon::new(IconName::File), changes_content))
                     .disabled(checkout.is_none())
                     .tooltip("Review workspace changes")
                     .on_click(|_, window, cx| {
@@ -1579,7 +1610,7 @@ impl ChatListView {
                             .tooltip("Commit, pull, push, create a pull request or branch")
                             .child(action_content(
                                 Icon::default().path("icons/git/actions.svg"),
-                                "Git actions".into(),
+                                div().child("Git actions").into_any_element(),
                             ))
                             .dropdown_menu({
                                 let model = self.model.clone();
@@ -1651,7 +1682,7 @@ impl ChatListView {
                             .tooltip(format!("Open GitHub workspace for {repository}"))
                             .child(action_content(
                                 Icon::new(IconName::Github),
-                                repository.to_owned().into(),
+                                div().child(repository.to_owned()).into_any_element(),
                             ))
                             .on_click(move |_, _, cx| {
                                 model.update(cx, |state, cx| {
@@ -1712,7 +1743,10 @@ impl ChatListView {
                             .w_full()
                             .justify_start()
                             .accessibility_label("Files")
-                            .child(action_content(Icon::new(IconName::Folder), "Files".into()))
+                            .child(action_content(
+                                Icon::new(IconName::Folder),
+                                div().child("Files").into_any_element(),
+                            ))
                             .disabled(checkout.is_none())
                             .on_click(|_, window, cx| {
                                 window.dispatch_action(Box::new(crate::OpenWorkspaceFiles), cx)
@@ -1729,7 +1763,7 @@ impl ChatListView {
                     .accessibility_label("Terminal")
                     .child(action_content(
                         Icon::new(IconName::SquareTerminal),
-                        "Terminal".into(),
+                        div().child("Terminal").into_any_element(),
                     ))
                     .disabled(checkout.is_none())
                     .on_click(move |_, _, cx| {
