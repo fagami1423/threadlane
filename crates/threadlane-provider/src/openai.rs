@@ -2019,10 +2019,25 @@ mod tests {
     }
 
     #[test]
+    fn gpt61_sol_subscription_inventory_preserves_discovered_capabilities() {
+        let models = parse_subscription_models(&json!({"models": [
+            {"slug": "gpt-6.1-sol", "display_name": "GPT-6.1 Sol", "visibility": "list",
+             "default_reasoning_level": "high",
+             "supported_reasoning_levels": [{"effort": "medium"}, {"effort": "high"}]}
+        ]}));
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gpt-6.1-sol");
+        assert_eq!(models[0].label, "GPT-6.1 Sol");
+        assert_eq!(models[0].supported_efforts, ["medium", "high"]);
+        assert_eq!(models[0].default_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
     fn chat_model_filter_accepts_new_models_without_code_changes() {
         use super::is_chat_capable_model;
         assert!(is_chat_capable_model("gpt-5.6-luna"));
         assert!(is_chat_capable_model("gpt-6-sol"));
+        assert!(is_chat_capable_model("gpt-6.1-sol"));
         assert!(is_chat_capable_model("gpt-99-new"));
         assert!(is_chat_capable_model("o4-mini"));
         assert!(!is_chat_capable_model("text-embedding-3-small"));
