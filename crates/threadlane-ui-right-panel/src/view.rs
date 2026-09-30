@@ -1446,6 +1446,35 @@ impl RightPanelView {
         browser
     }
 
+    /// Human terminal navigation uses a new tab, never the address/search resolver.
+    pub fn open_terminal_url(
+        &mut self,
+        url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.is_dirty {
+            return Err("Save or discard the editor's changes, then retry Open link…".into());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let browser = self.ensure_browser(window, cx);
+            browser.update(cx, |browser, cx| browser.try_open_tab(url, window, cx))?;
+            self.visible = true;
+            self.open_surface(Surface::Browser, cx);
+            browser.update(cx, |browser, cx| browser.focus_address(window, cx));
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (url, window, cx);
+            Err(
+                "Threadlane browser is available on macOS only. Choose Open in default browser."
+                    .into(),
+            )
+        }
+    }
+
     /// Native browser views must be hidden explicitly when the panel leaves the layout.
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.visible = visible;
@@ -6414,6 +6443,12 @@ mod browser_editor_safety_tests {
                 panel.sync_pending_document(window, cx);
                 panel.is_dirty = true;
                 let editor = panel.editor_state.clone().expect("editor");
+                let error = panel.open_terminal_url("http://localhost:3000/", window, cx).unwrap_err();
+                assert!(error.contains("Save or discard"));
+                assert_eq!(panel.active_surface, Some(surface));
+                assert!(panel.is_dirty);
+                assert_eq!(panel.editor_state.as_ref(), Some(&editor));
+                assert!(panel.browser.is_none());
                 for command in [
                     BrowserCommand::Tabs { action: BrowserTabAction::Open { url: "example.com".into() } },
                     BrowserCommand::Tabs { action: BrowserTabAction::Select { tab_id: 1 } },

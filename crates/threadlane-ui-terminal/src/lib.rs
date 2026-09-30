@@ -5,12 +5,17 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod search;
+mod links;
+#[cfg(test)]
+mod links_tests;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
+use gpui_component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
+use links::{visible_links, TerminalLink};
+pub use links::is_web_url;
 use gpui_component::ThemeMode;
 use gpui_component::{ActiveTheme, Disableable, ElementExt, Icon, IconName, Sizable, WindowExt};
 
@@ -186,6 +191,7 @@ async fn next_terminal_wake(
 }
 
 enum ParserCommand {
+    LinkEpoch(u64),
     Clear,
     Resize(u16, u16),
     SetScrollback(usize),
@@ -253,6 +259,8 @@ fn emit_find_results(
 }
 
 struct TerminalFrame {
+    link_epoch: u64,
+    links: Vec<TerminalLink>,
     screen: vt100::Screen,
     scrollback: usize,
     /// Total retained scrollback rows; `scrollback` (the view offset) can
@@ -270,13 +278,34 @@ fn visible_terminal_frame(parser: &mut vt100::Parser, rows: u16, cols: u16) -> T
     parser.screen_mut().set_scrollback(usize::MAX);
     let scrollback_len = parser.screen().scrollback();
     parser.screen_mut().set_scrollback(saved_offset);
+    // Look back exactly one row to establish whether the viewport starts mid-token.
+    parser
+        .screen_mut()
+        .set_scrollback(saved_offset.saturating_add(1));
+    let first_continues = if parser.screen().scrollback() > saved_offset {
+        parser.screen().row_wrapped(0)
+    } else {
+        // At the retained-history boundary a clipped first token is ambiguous.
+        scrollback_len > 0
+    };
+    parser.screen_mut().set_scrollback(saved_offset);
+    let links = visible_links(parser.screen(), first_continues);
     let mut visible = vt100::Parser::new(rows, cols, 0);
     visible.process(&parser.screen().state_formatted());
     TerminalFrame {
+        link_epoch: 0,
+        links,
         screen: visible.screen().clone(),
         scrollback: parser.screen().scrollback(),
         scrollback_len,
         alt_screen: parser.screen().alternate_screen(),
+    }
+}
+
+impl TerminalFrame {
+    fn with_link_epoch(mut self, epoch: u64) -> Self {
+        self.link_epoch = epoch;
+        self
     }
 }
 
@@ -308,6 +337,7 @@ fn start_parser_worker(
             // the worker keeps servicing commands until the view drops the
             // channel instead of exiting with the shell.
             let mut output_disconnected = false;
+            let mut link_epoch = 0;
 
             loop {
                 let mut commands_open = true;
@@ -321,6 +351,7 @@ fn start_parser_worker(
                         }
                     };
                     match command {
+                        ParserCommand::LinkEpoch(epoch) => link_epoch = epoch,
                         ParserCommand::Clear => {
                             parser = vt100::Parser::new(rows, cols, SCROLLBACK_ROWS);
                             if find.is_some() {
@@ -426,7 +457,10 @@ fn start_parser_worker(
                 if now >= next_frame {
                     if dirty {
                         if event_tx
-                            .send(PtyEvent::Frame(visible_terminal_frame(&mut parser, rows, cols)))
+                            .send(PtyEvent::Frame(
+                                visible_terminal_frame(&mut parser, rows, cols)
+                                    .with_link_epoch(link_epoch),
+                            ))
                             .is_err()
                         {
                             break;
@@ -489,11 +523,10 @@ fn start_parser_worker(
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         if dirty {
                             if event_tx
-                                .send(PtyEvent::Frame(visible_terminal_frame(
-                                    &mut parser,
-                                    rows,
-                                    cols,
-                                )))
+                                .send(PtyEvent::Frame(
+                                    visible_terminal_frame(&mut parser, rows, cols)
+                                        .with_link_epoch(link_epoch),
+                                ))
                                 .is_err()
                             {
                                 break;
@@ -604,11 +637,36 @@ pub struct SelectionStatus {
     pub excerpt_len: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkDestination {
+    Threadlane,
+    DefaultBrowser,
+}
+
+#[derive(Clone, Debug)]
+pub struct OpenTerminalLink {
+    pub url: String,
+    pub destination: LinkDestination,
+}
+
+impl EventEmitter<OpenTerminalLink> for TerminalView {}
+
 /// A persistent, focusable project shell backed by a real pseudo-terminal.
 ///
 /// Construct it with `cx.new(|cx| TerminalView::new(project, cx))` and
 /// render the resulting `Entity<TerminalView>` directly from its parent view.
 pub struct TerminalView {
+    links: Vec<TerminalLink>,
+    link_press: Option<(TerminalLink, Point<Pixels>)>,
+    link_menu: Option<Entity<PopupMenu>>,
+    link_menu_focus: Option<FocusHandle>,
+    link_menu_subscription: Option<Subscription>,
+    link_epoch: u64,
+    retry_url: Option<String>,
+    // Worker echo rejects frames queued before clear/restart/geometry changes.
+    frame_epoch: u64,
+    dismissed_link_focus: Option<FocusHandle>,
+    context_link: Option<(String, u64)>,
     project: PathBuf,
     focus_handle: FocusHandle,
     screen: vt100::Screen,
@@ -683,6 +741,16 @@ impl TerminalView {
         .detach();
 
         let mut terminal = Self {
+            links: Vec::new(),
+            link_press: None,
+            link_menu: None,
+            link_menu_focus: None,
+            link_menu_subscription: None,
+            link_epoch: 0,
+            retry_url: None,
+            frame_epoch: 0,
+            dismissed_link_focus: None,
+            context_link: None,
             project,
             focus_handle: cx.focus_handle(),
             screen: vt100::Parser::new(DEFAULT_ROWS, DEFAULT_COLS, 0)
@@ -732,6 +800,7 @@ impl TerminalView {
 
     /// Terminates the current shell and starts a fresh login-capable interactive shell.
     pub fn restart(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_links();
         self.session.take();
         self.parser_command_tx = None;
         self.screen = vt100::Parser::new(self.rows, self.cols, 0).screen().clone();
@@ -748,9 +817,11 @@ impl TerminalView {
 
     /// Clears both the emulator scrollback and the visible screen.
     pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_links();
         self.screen = vt100::Parser::new(self.rows, self.cols, 0).screen().clone();
         if let Some(parser) = &self.parser_command_tx {
             let _ = parser.send(ParserCommand::Clear);
+            self.sync_link_frame();
         }
         self.scrollback_offset = 0;
         self.scroll_accumulator = 0.0;
@@ -761,6 +832,7 @@ impl TerminalView {
 
     /// Scrolls the terminal view by a number of lines (positive = into scrollback history, negative = towards bottom).
     fn scroll_by(&mut self, lines: f32, cx: &mut Context<Self>) {
+        self.link_press = None;
         self.scroll_accumulator += lines;
         let whole_lines = self.scroll_accumulator.trunc() as isize;
         if whole_lines != 0 {
@@ -806,11 +878,13 @@ impl TerminalView {
         if (rows, cols) == (self.rows, self.cols) {
             return;
         }
+        self.invalidate_links();
         self.rows = rows;
         self.cols = cols;
         self.clear_selection();
         if let Some(parser) = &self.parser_command_tx {
             let _ = parser.send(ParserCommand::Resize(rows, cols));
+            self.sync_link_frame();
         }
         if let Some(session) = &self.session {
             session.resize(rows, cols);
@@ -845,6 +919,7 @@ impl TerminalView {
         match result {
             Ok((session, command_tx)) => {
                 self.session = Some(session);
+                let _ = command_tx.send(ParserCommand::LinkEpoch(self.frame_epoch));
                 self.parser_command_tx = Some(command_tx);
             }
             Err(error) => {
@@ -858,6 +933,16 @@ impl TerminalView {
     fn apply_event(&mut self, event: PtyEvent) {
         match event {
             PtyEvent::Frame(frame) => {
+                if frame.link_epoch != self.frame_epoch {
+                    return;
+                }
+                self.link_press = None;
+                if self.alt_screen != frame.alt_screen || self.scrollback_offset != frame.scrollback
+                {
+                    self.invalidate_links();
+                    self.sync_link_frame();
+                }
+                self.links = frame.links;
                 self.screen = frame.screen;
                 self.scrollback_offset = frame.scrollback;
                 self.scrollback_len = frame.scrollback_len;
@@ -872,6 +957,15 @@ impl TerminalView {
                 alt_screen,
                 revealed,
             } => {
+                if self
+                    .find
+                    .as_ref()
+                    .is_some_and(|find| find.generation == generation)
+                    && self.alt_screen != alt_screen
+                {
+                    self.invalidate_links();
+                    self.sync_link_frame();
+                }
                 // Replies for an older query generation never land; the
                 // generation moves on every query edit and on close.
                 let Some(find) = &mut self.find else {
@@ -916,9 +1010,11 @@ impl TerminalView {
     // retained length itself; the view clamps against its last-known length
     // so wheel scrolling can reach any retained row.
     fn set_scrollback(&mut self, offset: usize) {
+        self.invalidate_links();
         self.scrollback_offset = offset.min(self.scrollback_len);
         if let Some(parser) = &self.parser_command_tx {
             let _ = parser.send(ParserCommand::SetScrollback(self.scrollback_offset));
+            self.sync_link_frame();
         }
     }
 
@@ -939,6 +1035,9 @@ impl TerminalView {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus_handle.is_focused(window) {
+            return;
+        }
         if let Some(find) = &self.find {
             if find.input.read(cx).focus_handle(cx).is_focused(window) {
                 // Keystrokes inside the find input belong to the input: they
@@ -1090,6 +1189,153 @@ impl TerminalView {
         }
     }
 
+    /// Dismiss transient destinations when the owner changes the displayed terminal.
+    pub fn dismiss_links(&mut self, cx: &mut Context<Self>) {
+        self.context_link = None;
+        self.retry_url = None;
+        self.link_press = None;
+        self.dismissed_link_focus = self.link_menu_focus.take();
+        self.link_menu = None;
+        self.link_menu_subscription = None;
+        self.link_epoch = self.link_epoch.wrapping_add(1);
+        cx.notify();
+    }
+
+    fn invalidate_links(&mut self) {
+        self.frame_epoch = self.frame_epoch.wrapping_add(1);
+        self.context_link = None;
+        self.retry_url = None;
+        self.link_press = None;
+        self.links.clear();
+        self.dismissed_link_focus = self.link_menu_focus.take();
+        self.link_menu = None;
+        self.link_menu_subscription = None;
+        self.link_epoch = self.link_epoch.wrapping_add(1);
+    }
+
+    fn sync_link_frame(&self) {
+        if let Some(parser) = &self.parser_command_tx {
+            let _ = parser.send(ParserCommand::LinkEpoch(self.frame_epoch));
+        }
+    }
+
+    fn link_at(&self, position: Point<Pixels>) -> Option<&TerminalLink> {
+        let bounds = self.screen_bounds?;
+        let x = (position.x - bounds.left()).as_f32() - TERMINAL_CONTENT_INSET;
+        let y = (position.y - bounds.top()).as_f32() - TERMINAL_CONTENT_INSET;
+        // Unlike selection drags, links must not clamp padding to a nearby cell.
+        if !bounds.contains(&position) || x < 0.0 || y < 0.0
+            || x >= f32::from(self.cols) * self.cell_width
+            || y >= f32::from(self.rows) * self.row_height()
+        {
+            return None;
+        }
+        let cell = self.cell_at(position)?;
+        self.links.iter().find(|link| link.cells.contains(&cell))
+    }
+
+    fn activate_link(
+        &mut self,
+        url: String,
+        destination: LinkDestination,
+        epoch: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if epoch == self.link_epoch && !self.alt_screen && is_web_url(&url) {
+            cx.emit(OpenTerminalLink { url, destination });
+        }
+    }
+
+    fn link_commands(
+        menu: PopupMenu,
+        url: String,
+        terminal: WeakEntity<Self>,
+        epoch: u64,
+    ) -> PopupMenu {
+        let mut menu = menu;
+        if cfg!(target_os = "macos") {
+            let url = url.clone();
+            let terminal = terminal.clone();
+            menu = menu.item(
+                PopupMenuItem::new(format!("Open in Threadlane browser — {url}")).on_click(
+                    move |_, _, cx| {
+                        let _ = terminal.update(cx, |terminal, cx| {
+                            terminal.activate_link(
+                                url.clone(),
+                                LinkDestination::Threadlane,
+                                epoch,
+                                cx,
+                            );
+                        });
+                    },
+                ),
+            );
+        }
+        menu.item(
+            PopupMenuItem::new(format!("Open in default browser — {url}")).on_click(
+                move |_, _, cx| {
+                    let _ = terminal.update(cx, |terminal, cx| {
+                        terminal.activate_link(
+                            url.clone(),
+                            LinkDestination::DefaultBrowser,
+                            epoch,
+                            cx,
+                        );
+                    });
+                },
+            ),
+        )
+    }
+
+    pub fn retry_link(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.retry_url = Some(url);
+        self.open_links(window, cx);
+    }
+
+    /// A standard menu owns keyboard navigation and a frozen, deduplicated viewport snapshot.
+    pub fn open_links(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_handle.focus(window, cx);
+        let terminal = cx.weak_entity();
+        let epoch = self.link_epoch;
+        let menu = PopupMenu::build(window, cx, |menu, _, _| {
+            let mut menu = menu
+                .label("Links in visible output")
+                .action_context(self.focus_handle.clone())
+                .scrollable(true);
+            if self.alt_screen {
+                return menu.label("Links unavailable in full-screen terminal applications");
+            }
+            if !cfg!(target_os = "macos") {
+                menu = menu.label("Threadlane browser is available on macOS only");
+            }
+            if let Some(url) = &self.retry_url {
+                menu = menu.label("Navigation could not start — retry or open externally");
+                menu = Self::link_commands(menu, url.clone(), terminal.clone(), epoch).separator();
+            }
+            if self.links.is_empty() && self.retry_url.is_none() {
+                return menu
+                    .label("No web links in visible output")
+                    .label("Scroll older output into view to find links");
+            }
+            let mut seen = std::collections::HashSet::new();
+            for link in &self.links {
+                if seen.insert(&link.url) {
+                    menu = Self::link_commands(menu, link.url.clone(), terminal.clone(), epoch);
+                }
+            }
+            menu
+        });
+        self.link_menu_subscription = Some(cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.link_menu_focus = None;
+            this.link_menu = None;
+            cx.notify();
+        }));
+        self.link_menu_focus = Some(menu.read(cx).focus_handle(cx));
+        menu.read(cx).focus_handle(cx).focus(window, cx);
+        self.link_menu = Some(menu);
+        cx.notify();
+    }
+
     fn screen_text(&self) -> String {
         let mut text = self.screen.contents();
         if let Some(status) = &self.status {
@@ -1188,6 +1434,7 @@ impl TerminalView {
     }
 
     fn clear_selection(&mut self) {
+        self.link_press = None;
         self.selection_anchor = None;
         self.selection_head = None;
     }
@@ -1198,6 +1445,18 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.link_press = None;
+        let modifier = if cfg!(target_os = "macos") {
+            event.modifiers.platform
+        } else {
+            event.modifiers.control
+        };
+        if modifier && event.click_count == 1 {
+            self.link_press = self
+                .link_at(event.position)
+                .cloned()
+                .map(|link| (link, event.position));
+        }
         self.selection_anchor = self.cell_at(event.position);
         self.selection_head = self.selection_anchor;
         self.focus_handle.focus(window, cx);
@@ -1210,6 +1469,12 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.link_press.as_ref().is_some_and(|(_, start)| {
+            (event.position.x - start.x).abs() > px(3.)
+                || (event.position.y - start.y).abs() > px(3.)
+        }) {
+            self.link_press = None;
+        }
         if event.dragging() && self.selection_anchor.is_some() {
             self.selection_head = self.cell_at(event.position);
             cx.notify();
@@ -1222,6 +1487,27 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some((link, start)) = self.link_press.take() {
+            let modifier = if cfg!(target_os = "macos") {
+                event.modifiers.platform
+            } else {
+                event.modifiers.control
+            };
+            if modifier
+                && (event.position.x - start.x).abs() <= px(3.)
+                && (event.position.y - start.y).abs() <= px(3.)
+                && self.link_at(event.position) == Some(&link)
+            {
+                let destination = if cfg!(target_os = "macos") {
+                    LinkDestination::Threadlane
+                } else {
+                    LinkDestination::DefaultBrowser
+                };
+                self.activate_link(link.url, destination, self.link_epoch, cx);
+                self.clear_selection();
+                return;
+            }
+        }
         self.selection_head = self.cell_at(event.position).or(self.selection_head);
         cx.notify();
     }
@@ -1696,6 +1982,11 @@ impl Focusable for TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(focus) = self.dismissed_link_focus.take() {
+            if focus.contains_focused(window, cx) {
+                self.focus_handle.focus(window, cx);
+            }
+        }
         let theme = cx.theme().colors;
         let is_light_theme = cx.theme().mode == ThemeMode::Light;
         let terminal_resize = cx.entity().clone();
@@ -1727,10 +2018,17 @@ impl Render for TerminalView {
         });
 
         let mut screen_lines = Vec::with_capacity(self.rows as usize);
+        let link_cells: std::collections::HashMap<_, _> = self
+            .links
+            .iter()
+            .enumerate()
+            .flat_map(|(index, link)| link.cells.iter().map(move |cell| (*cell, index)))
+            .collect();
         for row in 0..self.rows {
             let mut row_spans = Vec::new();
             let mut current_span_text = String::new();
-            let mut current_style: Option<(Option<Hsla>, Option<Hsla>, bool, bool)> = None;
+            let mut current_style: Option<(Option<Hsla>, Option<Hsla>, bool, bool, Option<usize>)> =
+                None;
 
             // Find the rightmost non-empty column or cursor column
             let mut max_col = 0;
@@ -1782,12 +2080,13 @@ impl Render for TerminalView {
                         }
                     };
 
-                    let style = (fg, bg, cell.bold(), is_cursor);
+                    let link = link_cells.get(&(row, col)).copied();
+                    let style = (fg, bg, cell.bold(), is_cursor, link);
 
                     if current_style == Some(style) {
                         current_span_text.push_str(char_str);
                     } else {
-                        if let Some((cfg, cbg, bold, _cur)) = current_style {
+                        if let Some((cfg, cbg, bold, _cur, link)) = current_style {
                             if !current_span_text.is_empty() {
                                 let mut span = div().child(current_span_text.clone());
                                 if let Some(c) = cfg {
@@ -1799,7 +2098,28 @@ impl Render for TerminalView {
                                 if bold {
                                     span = span.font_weight(FontWeight::BOLD);
                                 }
-                                row_spans.push(span);
+                                if let Some(index) = link {
+                                    let gesture = if cfg!(target_os = "macos") {
+                                        "Cmd-click to open in Threadlane browser"
+                                    } else {
+                                        "Ctrl-click to open in default browser"
+                                    };
+                                    let tooltip = format!("{} — {gesture}", self.links[index].url);
+                                    span = span.underline().cursor_pointer();
+                                    row_spans.push(
+                                        span.id((
+                                            "terminal-link",
+                                            row as usize * self.cols as usize + col as usize,
+                                        ))
+                                        .tooltip(move |window, cx| {
+                                            gpui_component::tooltip::Tooltip::new(tooltip.clone())
+                                                .build(window, cx)
+                                        })
+                                        .into_any_element(),
+                                    );
+                                } else {
+                                    row_spans.push(span.into_any_element());
+                                }
                             }
                         }
                         current_span_text.clear();
@@ -1809,7 +2129,7 @@ impl Render for TerminalView {
                 }
             }
 
-            if let Some((cfg, cbg, bold, _cur)) = current_style {
+            if let Some((cfg, cbg, bold, _cur, link)) = current_style {
                 if !current_span_text.is_empty() {
                     let mut span = div().child(current_span_text);
                     if let Some(c) = cfg {
@@ -1821,12 +2141,30 @@ impl Render for TerminalView {
                     if bold {
                         span = span.font_weight(FontWeight::BOLD);
                     }
-                    row_spans.push(span);
+                    if let Some(index) = link {
+                        let gesture = if cfg!(target_os = "macos") {
+                            "Cmd-click to open in Threadlane browser"
+                        } else {
+                            "Ctrl-click to open in default browser"
+                        };
+                        let tooltip = format!("{} — {gesture}", self.links[index].url);
+                        span = span.underline().cursor_pointer();
+                        row_spans.push(
+                            span.id(("terminal-link-end", row as usize))
+                                .tooltip(move |window, cx| {
+                                    gpui_component::tooltip::Tooltip::new(tooltip.clone())
+                                        .build(window, cx)
+                                })
+                                .into_any_element(),
+                        );
+                    } else {
+                        row_spans.push(span.into_any_element());
+                    }
                 }
             }
 
             if row_spans.is_empty() {
-                row_spans.push(div().child(" "));
+                row_spans.push(div().child(" ").into_any_element());
             }
 
             let find_cue = find_cue_row == Some(row);
@@ -1954,9 +2292,14 @@ impl Render for TerminalView {
             .role(Role::Terminal)
             .on_key_down(cx.listener(Self::key_down))
             .children(find_strip)
+            .children(
+                self.link_menu
+                    .as_ref()
+                    .map(|menu| deferred(anchored().child(menu.clone())).with_priority(1)),
+            )
             .child(
                 div()
-                    .id("pty-terminal-screen")
+                    .id(("pty-terminal-screen", self.link_epoch as usize))
                     .relative()
                     .flex_1()
                     .min_h_0()
@@ -1986,10 +2329,21 @@ impl Render for TerminalView {
                             / cell_width)
                             .floor() as u16;
                         terminal_resize.update(cx, |terminal, cx| {
+                            if terminal.screen_bounds != Some(bounds) {
+                                terminal.link_press = None;
+                            }
                             terminal.screen_bounds = Some(bounds);
                             terminal.resize(rows, cols, cx);
                         });
                     })
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseDownEvent, _, _| {
+                            this.context_link = this
+                                .link_at(event.position)
+                                .map(|link| (link.url.clone(), this.link_epoch));
+                        }),
+                    )
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_selection))
                     .on_mouse_move(cx.listener(Self::extend_selection))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::end_selection))
@@ -2004,6 +2358,10 @@ impl Render for TerminalView {
                                 (terminal.screen_text(), terminal.selected_text())
                             };
                             let mut menu = menu;
+                            if let Some((url, epoch)) = terminal.read(cx).context_link.clone() {
+                                menu = Self::link_commands(menu, url, terminal.downgrade(), epoch)
+                                    .separator();
+                            }
                             if let Some(selection) = &selection {
                                 let selection = selection.clone();
                                 menu = menu.item(PopupMenuItem::new("Copy Selection").on_click(
@@ -2031,6 +2389,8 @@ impl Render for TerminalView {
                                         .checked(font_size == size)
                                         .on_click(move |_, _, cx| {
                                             target.update(cx, |view, cx| {
+                                                view.invalidate_links();
+                                                view.sync_link_frame();
                                                 view.font_size = size;
                                                 cx.notify();
                                             });
@@ -2043,6 +2403,8 @@ impl Render for TerminalView {
                                     .checked(compact)
                                     .on_click(move |_, _, cx| {
                                         compact_target.update(cx, |view, cx| {
+                                            view.invalidate_links();
+                                            view.sync_link_frame();
                                             view.compact = !view.compact;
                                             cx.notify();
                                         });
@@ -2256,6 +2618,8 @@ mod tests {
             let mut parser = vt100::Parser::new(4, 20, 0);
             parser.process(b"select me");
             terminal.apply_event(super::PtyEvent::Frame(super::TerminalFrame {
+                link_epoch: 0,
+                links: Vec::new(),
                 screen: parser.screen().clone(),
                 scrollback: 0,
                 scrollback_len: 0,
@@ -2319,6 +2683,8 @@ mod tests {
         parser.process(b"old");
         event_tx
             .send(PtyEvent::Frame(super::TerminalFrame {
+                link_epoch: 0,
+                links: Vec::new(),
                 screen: parser.screen().clone(),
                 scrollback: 0,
                 scrollback_len: 0,
@@ -2328,6 +2694,8 @@ mod tests {
         parser.process(b"\rnew");
         event_tx
             .send(PtyEvent::Frame(super::TerminalFrame {
+                link_epoch: 0,
+                links: Vec::new(),
                 screen: parser.screen().clone(),
                 scrollback: 0,
                 scrollback_len: 0,

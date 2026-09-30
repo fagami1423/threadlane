@@ -8804,6 +8804,7 @@ dependencies = [
  "portable-pty",
  "tokio",
  "tracing",
+ "url",
  "vt100",
 ]
 
