@@ -678,22 +678,10 @@ impl BrowserView {
             .get("comment")
             .and_then(|value| value.as_str())
             .unwrap_or("");
-        let mut note = format!("[Browser annotation — {page_title}]({page_url})");
-        if !comment.is_empty() {
-            note.push_str(&format!("\nComment: {comment}"));
-        }
-        let elements: Vec<&serde_json::Value> = pick
-            .get("elements")
-            .and_then(|value| value.as_array())
-            .map(|elements| elements.iter().collect())
-            .unwrap_or_default();
-        let numbered = elements.len() > 1;
-        for (index, element) in elements.iter().enumerate() {
-            let label = if numbered {
-                format!("Element {}", index + 1)
-            } else {
-                "Element".to_string()
-            };
+        // Devin-style compact note: the cropped image carries the visual
+        // context, so text only needs enough to locate the element —
+        // tag + selector, an identifying name or link, and the comment.
+        let element_line = |element: &serde_json::Value| {
             let tag = element
                 .get("tag")
                 .and_then(|value| value.as_str())
@@ -702,49 +690,41 @@ impl BrowserView {
                 .get("selector")
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
-            let geometry = element
-                .get("rect")
-                .map(|rect| {
-                    format!(
-                        "{}x{} at ({},{})",
-                        rect.get("w").and_then(|value| value.as_u64()).unwrap_or(0),
-                        rect.get("h").and_then(|value| value.as_u64()).unwrap_or(0),
-                        rect.get("x").and_then(|value| value.as_i64()).unwrap_or(0),
-                        rect.get("y").and_then(|value| value.as_i64()).unwrap_or(0),
-                    )
-                })
-                .unwrap_or_else(|| "unknown geometry".to_string());
-            note.push_str(&format!("\n{label}: <{tag}> `{selector}` {geometry}"));
-            for (key, prefix) in [
-                ("role", "Role: "),
-                ("name", "Name: \""),
-                ("text", "Text: \""),
-            ] {
-                let Some(value) = element.get(key).and_then(|value| value.as_str()) else {
-                    continue;
-                };
-                if value.is_empty() {
-                    continue;
-                }
-                if prefix.ends_with('"') {
-                    note.push_str(&format!("\n  {prefix}{value}\""));
-                } else {
-                    note.push_str(&format!("\n  {prefix}{value}"));
-                }
+            let mut line = format!("<{tag}>");
+            if !selector.is_empty() {
+                line.push_str(&format!(" `{selector}`"));
+            }
+            if let Some(name) = ["name", "text"].iter().find_map(|key| {
+                element
+                    .get(key)
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty())
+            }) {
+                line.push_str(&format!(" \"{name}\""));
             }
             if let Some(href) = element
                 .get("href")
                 .and_then(|value| value.as_str())
                 .filter(|href| !href.is_empty())
             {
-                note.push_str(&format!("\n  Link: {href}"));
+                line.push_str(&format!(" → {href}"));
             }
-            if let Some(html) = element
-                .get("html")
-                .and_then(|value| value.as_str())
-                .filter(|html| !html.is_empty())
-            {
-                note.push_str(&format!("\n  HTML: `{html}`"));
+            line
+        };
+        let elements: Vec<&serde_json::Value> = pick
+            .get("elements")
+            .and_then(|value| value.as_array())
+            .map(|elements| elements.iter().collect())
+            .unwrap_or_default();
+        let mut note = format!("[Browser annotation — {page_title}]({page_url})");
+        if !comment.is_empty() {
+            note.push_str(&format!(": {comment}"));
+        }
+        if elements.len() == 1 {
+            note.push_str(&format!(" — {}", element_line(elements[0])));
+        } else {
+            for element in &elements {
+                note.push_str(&format!("\n• {}", element_line(element)));
             }
         }
         // Snapshot cropped to the annotated element union so the attachment

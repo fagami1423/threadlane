@@ -347,8 +347,8 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
   const Z = 2147483646;
   const HOVER_BORDER = "#f59e0b";
   const HOVER_FILL = "rgba(245, 158, 11, 0.10)";
-  const PICK_BORDER = "#22c55e";
-  const PICK_FILL = "rgba(34, 197, 94, 0.12)";
+  const PICK_BORDER = "#3b82f6";
+  const PICK_FILL = "rgba(59, 130, 246, 0.16)";
   const COMMENT_MAX = 1000;
   const TEXT_MAX = 240;
   const NAME_MAX = 120;
@@ -524,13 +524,11 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
   style.textContent = [
     ".box{position:fixed;pointer-events:none;border:2px solid;border-radius:3px;box-sizing:border-box;display:none}",
     ".tag{position:fixed;pointer-events:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:280px;background:#111827;color:#f9fafb;font:11px/1.4 ui-monospace,monospace;padding:1px 6px;border-radius:4px;display:none}",
-    ".card{position:fixed;pointer-events:auto;min-width:260px;max-width:340px;background:rgba(17,24,39,0.97);border:1px solid rgba(255,255,255,0.16);border-radius:10px;padding:8px;box-shadow:0 10px 30px rgba(0,0,0,0.4);color:#f9fafb;font:12px/1.4 -apple-system,system-ui,sans-serif;display:none}",
-    ".card textarea{width:100%;box-sizing:border-box;min-height:34px;max-height:96px;resize:none;background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.2);border-radius:6px;color:#f9fafb;padding:6px 8px;font:12px/1.4 -apple-system,system-ui,sans-serif;outline:none}",
-    ".card textarea:focus{border-color:" + PICK_BORDER + "}",
-    ".row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:6px}",
-    ".hint{opacity:0.6;font-size:11px}",
-    ".attach{background:" + PICK_BORDER + ";color:#052e16;border:0;border-radius:6px;padding:4px 10px;font:600 12px/1.4 -apple-system,system-ui,sans-serif;cursor:pointer}",
-    ".count{font-size:11px;opacity:0.7;margin-bottom:4px}",
+    ".card{position:fixed;pointer-events:auto;display:none;align-items:center;gap:6px;background:#15181f;border:1px solid rgba(255,255,255,0.15);border-radius:999px;padding:5px 6px 5px 12px;box-shadow:0 8px 24px rgba(0,0,0,0.45);color:#f9fafb;font:12px/1.4 -apple-system,system-ui,sans-serif;white-space:nowrap}",
+    ".card input{width:190px;max-width:45vw;background:transparent;border:0;outline:none;color:#f9fafb;font:12px/1.4 -apple-system,system-ui,sans-serif;padding:0}",
+    ".card input::placeholder{color:rgba(249,250,251,0.45)}",
+    ".attach{flex:none;width:22px;height:22px;border-radius:50%;border:0;background:" + PICK_BORDER + ";color:#fff;font:600 12px/1 -apple-system,system-ui,sans-serif;cursor:pointer;padding:0}",
+    ".count{font-size:11px;opacity:0.65;flex:none;max-width:160px;overflow:hidden;text-overflow:ellipsis}",
   ].join("\n");
   shadow.appendChild(style);
   const root = document.createElement("div");
@@ -544,25 +542,21 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
 
   const card = document.createElement("div");
   card.className = "card";
-  const countLabel = document.createElement("div");
+  const countLabel = document.createElement("span");
   countLabel.className = "count";
-  const comment = document.createElement("textarea");
-  comment.placeholder = "Describe the change…";
+  const comment = document.createElement("input");
+  comment.type = "text";
+  comment.placeholder = "Add a comment…";
   comment.setAttribute("aria-label", "Annotation comment");
-  const row = document.createElement("div");
-  row.className = "row";
-  const hint = document.createElement("span");
-  hint.className = "hint";
-  hint.textContent = "Enter attaches · Shift-click adds · Esc cancels";
   const attach = document.createElement("button");
   attach.type = "button";
   attach.className = "attach";
-  attach.textContent = "Attach";
-  row.appendChild(hint);
-  row.appendChild(attach);
+  attach.textContent = "\u21b5";
+  attach.title = "Attach";
+  attach.setAttribute("aria-label", "Attach annotation");
   card.appendChild(countLabel);
   card.appendChild(comment);
-  card.appendChild(row);
+  card.appendChild(attach);
   root.appendChild(card);
 
   const selected = new Map();
@@ -612,7 +606,7 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
   };
 
   const positionCard = (bounds) => {
-    card.style.display = "block";
+    card.style.display = "flex";
     const w = card.offsetWidth;
     const h = card.offsetHeight;
     const gap = 8;
@@ -631,7 +625,7 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
       return;
     }
     countLabel.textContent =
-      selected.size === 1 ? shortLabel(selected.keys().next().value) : selected.size + " elements selected";
+      selected.size === 1 ? shortLabel(selected.keys().next().value) : selected.size + " selected";
     positionCard(bounds);
   };
 
@@ -812,10 +806,6 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
       event.preventDefault();
       commit();
     }
-  });
-  comment.addEventListener("input", () => {
-    comment.style.height = "0px";
-    comment.style.height = Math.min(comment.scrollHeight, 96) + "px";
   });
   attach.addEventListener("click", (event) => {
     event.stopPropagation();
