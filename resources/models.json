@@ -1,6 +1,11 @@
 {
   "models": [
     {
+      "id": "gpt-6.1-sol",
+      "label": "GPT-6.1 Sol",
+      "provider": "openai"
+    },
+    {
       "id": "opencode-go/minimax-m2.7",
       "label": "MiniMax M2.7",
       "provider": "opencode",

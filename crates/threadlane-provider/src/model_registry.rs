@@ -412,6 +412,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gpt61_sol_bundled_metadata_leaves_unverified_capabilities_to_discovery() {
+        let sol = bundled_models()
+            .into_iter()
+            .find(|model| model.id == "gpt-6.1-sol")
+            .expect("GPT-6.1 Sol bundled entry");
+        assert_eq!(sol.label, "GPT-6.1 Sol");
+        assert_eq!(sol.provider.as_deref(), Some("openai"));
+        assert_eq!(sol.context_window, None);
+        assert!(sol.supported_efforts.is_empty());
+        assert_eq!(sol.default_effort, None);
+    }
+
+    #[test]
     fn custom_effort_round_trips_through_serde() {
         let effort = ReasoningEffort::from_label("ultra").unwrap();
         assert!(effort.is_custom());
