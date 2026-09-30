@@ -70,6 +70,29 @@ mod project_memory_tests {
             Some(1)
         );
         assert_eq!(sent.len(), 2);
+        // Compaction can leave only continuation prompts plus a checkpoint.
+        for prompts in [vec!["Continue"], vec!["Continue", "CONTINUE"], vec![""]] {
+            let mut continued = vec![AgentMessage::Custom {
+                custom_type: "compaction_summary".into(),
+                payload: serde_json::json!({"summary":"Inspect parser"}),
+            }];
+            continued.extend(prompts.into_iter().map(|content| AgentMessage::User {
+                content: content.into(),
+            }));
+            let position = continued.len();
+            assert_eq!(
+                append_project_memory(
+                    &mut continued,
+                    Some(dir.path().into()),
+                    "test",
+                    &config,
+                    None,
+                    Some(100_000)
+                )
+                .await,
+                Some(position)
+            );
+        }
         for schema in [None, Some("large tool schema")] {
             let mut limited = original.clone();
             assert_eq!(
@@ -149,14 +172,19 @@ async fn append_project_memory(
         .map(|content| content.chars().take(300).collect::<String>())
         .collect::<Vec<_>>()
         .join(" ");
-    if query.trim().is_empty() {
-        query = messages
+    if query.trim().is_empty()
+        || query
+            .split_whitespace()
+            .all(|word| word.eq_ignore_ascii_case("continue"))
+    {
+        if let Some(summary) = messages
             .iter()
             .rev()
-            .find_map(threadlane_compaction::compaction_summary_text)?
-            .chars()
-            .take(1_000)
-            .collect();
+            .find_map(threadlane_compaction::compaction_summary_text)
+        {
+            query.push(' ');
+            query.extend(summary.chars().take(1_000));
+        }
     }
     let recalled = tokio::task::spawn_blocking(move || {
         threadlane_tools::memory::recall_project_memory(&root, &query)

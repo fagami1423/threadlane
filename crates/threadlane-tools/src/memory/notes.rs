@@ -1,7 +1,7 @@
 //! Small checkout-scoped findings store. Raw reads stay in the existing harness.
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::path::{Component, Path};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,6 +16,8 @@ const MAX_NOTES: usize = 512;
 const MAX_STORE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_RECALL_CHARS: usize = 3_000;
+const MAX_RECALL_CANDIDATES: usize = 32;
+const MAX_RECALL_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -198,6 +200,14 @@ fn write_store(root: &Path, store: &Store) -> Result<(), String> {
 }
 
 fn source_digest(root: &Path, source: &Source) -> Result<String, String> {
+    source_digest_with_budget(root, source, &mut (MAX_SOURCE_BYTES + 1))
+}
+
+fn source_digest_with_budget(
+    root: &Path,
+    source: &Source,
+    remaining_bytes: &mut u64,
+) -> Result<String, String> {
     validate_source(source)?;
     let path = validate_path_in_workspace(&source.path, root)?;
     let metadata =
@@ -216,9 +226,25 @@ fn source_digest(root: &Path, source: &Source) -> Result<String, String> {
     {
         return Err("Memory source must be a regular file".into());
     }
-    let mut reader = BufReader::new(file.take(MAX_SOURCE_BYTES + 1));
+    let mut reader = file.take(MAX_SOURCE_BYTES + 1);
     let mut digest = Sha256::new();
-    let count = std::io::copy(&mut reader, &mut digest).map_err(|error| error.to_string())?;
+    let mut count = 0;
+    let mut buffer = [0; 8 * 1024];
+    loop {
+        if *remaining_bytes == 0 {
+            return Err("Memory evidence scan byte budget exhausted".into());
+        }
+        let allowed = (*remaining_bytes).min(buffer.len() as u64) as usize;
+        let read = reader
+            .read(&mut buffer[..allowed])
+            .map_err(|error| error.to_string())?;
+        *remaining_bytes -= read as u64;
+        count += read as u64;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
     if count > MAX_SOURCE_BYTES {
         return Err("Memory source exceeds the 8 MiB hashing limit".into());
     }
@@ -226,10 +252,20 @@ fn source_digest(root: &Path, source: &Source) -> Result<String, String> {
 }
 
 fn fresh(root: &Path, note: &Note, digests: &mut HashMap<String, Option<String>>) -> bool {
+    let mut remaining_bytes = u64::MAX;
+    fresh_with_budget(root, note, digests, &mut remaining_bytes)
+}
+
+fn fresh_with_budget(
+    root: &Path,
+    note: &Note,
+    digests: &mut HashMap<String, Option<String>>,
+    remaining_bytes: &mut u64,
+) -> bool {
     note.sources.iter().all(|source| {
         digests
             .entry(source.path.clone())
-            .or_insert_with(|| source_digest(root, source).ok())
+            .or_insert_with(|| source_digest_with_budget(root, source, remaining_bytes).ok())
             .as_deref()
             == Some(source.sha256.as_str())
     })
@@ -295,11 +331,25 @@ fn recall(root: &Path, query: &str, limit: usize, include_stale: bool) -> Result
     let mut digests = HashMap::new();
     let mut result = json!({"results": [], "skipped_stale": 0, "omitted_for_budget": 0});
     let mut skipped = 0;
-    for (_, note) in ranked {
+    let mut remaining_bytes = MAX_RECALL_SOURCE_BYTES;
+    let candidate_count = ranked.len();
+    for (index, (_, note)) in ranked.into_iter().enumerate() {
         if result["results"].as_array().unwrap().len() == limit {
             break;
         }
-        let is_fresh = fresh(root, note, &mut digests);
+        if index == MAX_RECALL_CANDIDATES || remaining_bytes == 0 {
+            result["omitted_for_budget"] = json!(
+                result["omitted_for_budget"].as_u64().unwrap() + (candidate_count - index) as u64
+            );
+            break;
+        }
+        let is_fresh = fresh_with_budget(root, note, &mut digests, &mut remaining_bytes);
+        if remaining_bytes == 0 {
+            result["omitted_for_budget"] = json!(
+                result["omitted_for_budget"].as_u64().unwrap() + (candidate_count - index) as u64
+            );
+            break;
+        }
         if !is_fresh && !include_stale {
             skipped += 1;
             continue;
@@ -641,6 +691,76 @@ mod tests {
         ] {
             assert!(tool(root, request).is_err());
         }
+    }
+
+    #[test]
+    fn recall_bounds_stale_candidates_and_aggregate_evidence_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("src.rs"), "source").unwrap();
+        let valid_source = Source {
+            path: "src.rs".into(),
+            sha256: format!("{:x}", Sha256::digest(b"source")),
+        };
+        let note = |key: String, source: Source| Note {
+            key,
+            content: "parser".into(),
+            kind: Kind::Fact,
+            sources: vec![source],
+            revision: 1,
+            updated_at: 1,
+        };
+        let mut stale_source = valid_source.clone();
+        stale_source.sha256 = "0".repeat(64);
+        let mut notes: Vec<_> = (0..MAX_RECALL_CANDIDATES)
+            .map(|index| note(format!("parser-{index:02}"), stale_source.clone()))
+            .collect();
+        notes.push(note("parser-99".into(), valid_source.clone()));
+        with_memory_writer(root, || write_store(root, &Store { version: 1, notes })).unwrap();
+        let result = recall(root, "parser", 5, false).unwrap();
+        assert!(result["results"].as_array().unwrap().is_empty());
+        assert_eq!(result["skipped_stale"], MAX_RECALL_CANDIDATES);
+        assert_eq!(result["omitted_for_budget"], 1);
+        assert!(recall_project_memory(root, "parser").unwrap().is_empty());
+
+        let mut remaining = 3;
+        assert!(source_digest_with_budget(root, &valid_source, &mut remaining).is_err());
+        assert_eq!(remaining, 0);
+        let mut remaining = 7;
+        assert_eq!(
+            source_digest_with_budget(root, &valid_source, &mut remaining).unwrap(),
+            valid_source.sha256
+        );
+        assert_eq!(remaining, 1);
+
+        let mut notes = vec![note("parser-00".into(), valid_source)];
+        for index in 1..=3 {
+            let path = format!("large-{index}.rs");
+            File::create(root.join(&path))
+                .unwrap()
+                .set_len(MAX_SOURCE_BYTES)
+                .unwrap();
+            notes.push(note(
+                format!("parser-{index:02}"),
+                Source {
+                    path,
+                    sha256: "0".repeat(64),
+                },
+            ));
+        }
+        with_memory_writer(root, || write_store(root, &Store { version: 1, notes })).unwrap();
+        let result = recall(root, "parser", 5, false).unwrap();
+        assert_eq!(result["results"].as_array().unwrap().len(), 1);
+        assert_eq!(result["results"][0]["key"], "parser-00");
+        assert_eq!(result["skipped_stale"], 1);
+        assert_eq!(result["omitted_for_budget"], 2);
+    }
+
+    #[test]
+    fn missing_memory_action_points_to_working_dyn_help() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = try_execute_tool_in_workspace("manage_memory", "{}", dir.path()).unwrap_err();
+        assert!(error.contains("dyn manage_memory --help"));
     }
 
     #[test]

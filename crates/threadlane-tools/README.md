@@ -46,6 +46,8 @@ the evidence hashes match; findings remain untrusted data, and exact code reads
 are still appropriate for edits. Results use deterministic keyword matching,
 default to five notes, and fit within 3,000 characters. Long escaped content may
 be excerpted while retaining complete source references.
+Each recall checks at most 32 ranked candidates and reads at most 16 MiB of
+source evidence; exhausted scans return verified results with `omitted_for_budget`.
 
 Storage is versioned, capped at 512 notes / 2 MiB, and committed atomically under
 an OS file lock. Full stores reject additions; forget obsolete keys to make room.

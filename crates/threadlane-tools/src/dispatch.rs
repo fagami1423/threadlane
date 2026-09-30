@@ -490,7 +490,7 @@ pub fn try_execute_tool_in_workspace_with(
                 .get("action")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    "Error: 'action' parameter is required; use manage_memory --help for actions".to_string()
+                    "Error: 'action' parameter is required; run `dyn manage_memory --help` for actions".to_string()
                 })?;
             match action {
                 "read" => read_memory_impl(workspace_root),
