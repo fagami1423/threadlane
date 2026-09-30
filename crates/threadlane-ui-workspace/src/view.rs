@@ -38,7 +38,7 @@ use gpui_component::WindowExt;
 use threadlane_ui_right_panel::RightPanelView;
 use threadlane_ui_settings::SettingsView;
 use threadlane_ui_sidebar::SidebarView;
-use threadlane_ui_terminal::{FindInTerminalOutput, TerminalSelection, TerminalView};
+use threadlane_ui_terminal::{FindInTerminalOutput, SelectionStatus, TerminalView};
 use threadlane_coding_agent::controller::spawn_session_runtime_construction;
 use threadlane_ui_state::updater::{self, UpdaterEvent};
 use threadlane_coding_agent::controller::runtime_status_text;
@@ -174,16 +174,16 @@ struct TerminalGroup {
 /// UTF-8 bytes. Matches the "Select less terminal output" notice.
 const TERMINAL_EXCERPT_LIMIT: usize = 32 * 1024;
 
-/// `None` when a selection snapshot can be handed to the chat draft;
-/// otherwise the user-facing reason the command is disabled or a stale
-/// activation is rejected. Textual, never color-only.
-fn terminal_excerpt_block_reason(snapshot: Option<&TerminalSelection>) -> Option<&'static str> {
-    match snapshot {
+/// `None` when the selection can be handed to the chat draft; otherwise
+/// the user-facing reason the command is disabled or a stale activation
+/// is rejected. Textual, never color-only.
+fn terminal_excerpt_block_reason(status: Option<SelectionStatus>) -> Option<&'static str> {
+    match status {
         None => Some("Select terminal output first"),
-        Some(selection) if selection.text.trim().is_empty() => {
+        Some(status) if !status.has_text => {
             Some("The terminal selection is empty — select output text first")
         }
-        Some(selection) if selection.text.len() > TERMINAL_EXCERPT_LIMIT => {
+        Some(status) if status.excerpt_len > TERMINAL_EXCERPT_LIMIT => {
             Some("Select less terminal output (maximum 32 KiB)")
         }
         Some(_) => None,
@@ -762,20 +762,25 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    /// Creates a project terminal and tracks its selection presence so
-    /// the "Add selection to chat" affordance refreshes on selection
-    /// transitions only — the terminal still notifies per PTY frame, but
-    /// the workspace re-renders only when presence actually changes.
+    /// Creates a project terminal and tracks its selection validity so
+    /// the "Add selection to chat" affordance refreshes when the
+    /// available/rejected state could flip — not on every PTY frame.
+    /// The signal covers presence, non-whitespace content, and the size
+    /// cap, so extending a whitespace drag into real text or output
+    /// scrolling under a static selection still re-renders.
     fn new_terminal_with_tracking(
         cwd: PathBuf,
         cx: &mut Context<Self>,
     ) -> (Entity<TerminalView>, Subscription) {
         let terminal = cx.new(|cx| TerminalView::new(cwd, cx));
-        let mut had_selection = false;
+        let mut last_availability = None;
         let subscription = cx.observe(&terminal, move |_, terminal, cx| {
-            let has_selection = terminal.read(cx).has_selection();
-            if has_selection != had_selection {
-                had_selection = has_selection;
+            let availability = terminal
+                .read(cx)
+                .selection_status()
+                .map(|status| (status.has_text, status.excerpt_len > TERMINAL_EXCERPT_LIMIT));
+            if availability != last_availability {
+                last_availability = availability;
                 cx.notify();
             }
         });
@@ -848,12 +853,16 @@ impl WorkspaceView {
             );
             return;
         }
-        let snapshot = terminal.read(cx).selection_snapshot();
-        if let Some(reason) = terminal_excerpt_block_reason(snapshot.as_ref()) {
+        if let Some(reason) =
+            terminal_excerpt_block_reason(terminal.read(cx).selection_status())
+        {
             window.push_notification(reason, cx);
             return;
         }
-        let snapshot = snapshot.expect("block reason proves a snapshot exists");
+        let snapshot = terminal
+            .read(cx)
+            .selection_snapshot()
+            .expect("block reason proves a snapshot exists");
         let shell = group_key
             .as_ref()
             .and_then(|key| self.terminal_groups.get(key))
@@ -1576,9 +1585,9 @@ impl WorkspaceView {
             .displayed_terminal(cx)
             .map(|(_group, terminal)| terminal);
         let excerpt_block = match &handoff_terminal {
-            Some(terminal) => terminal_excerpt_block_reason(
-                terminal.read(cx).selection_snapshot().as_ref(),
-            ),
+            Some(terminal) => {
+                terminal_excerpt_block_reason(terminal.read(cx).selection_status())
+            }
             None => Some("No terminal is visible"),
         };
 
@@ -2529,7 +2538,7 @@ impl Render for WorkspaceView {
                 let active_terminal_restart = active_terminal.clone();
                 let active_terminal_find = active_terminal.clone();
                 let excerpt_block = terminal_excerpt_block_reason(
-                    active_terminal.read(cx).selection_snapshot().as_ref(),
+                    active_terminal.read(cx).selection_status(),
                 );
                 let handoff_hint = excerpt_block.map(str::to_owned).unwrap_or_else(|| {
                     format!("Add the selected terminal text to {composer_target} — nothing is sent")
@@ -2924,7 +2933,7 @@ mod tests {
         session_pr_target_is_active, terminal_excerpt_block_reason, GitEvent,
         WorkspacePumpEvent, TERMINAL_EXCERPT_LIMIT,
     };
-    use threadlane_ui_terminal::TerminalSelection;
+    use threadlane_ui_terminal::SelectionStatus;
     use threadlane_ui_state::updater::UpdaterEvent;
     use threadlane_ui_state::{AppState, SessionInfo, WorkspacePage};
     use std::cell::Cell;
@@ -3084,9 +3093,9 @@ mod tests {
 
     #[test]
     fn terminal_excerpt_block_reason_reports_disabled_states() {
-        let snapshot = |text: String| TerminalSelection {
-            text,
-            launched_in: PathBuf::from("/projects/one"),
+        let status = |has_text, excerpt_len| SelectionStatus {
+            has_text,
+            excerpt_len,
         };
 
         assert_eq!(
@@ -3094,17 +3103,15 @@ mod tests {
             Some("Select terminal output first")
         );
         assert_eq!(
-            terminal_excerpt_block_reason(Some(&snapshot("  \n ".into()))),
+            terminal_excerpt_block_reason(Some(status(false, 4))),
             Some("The terminal selection is empty — select output text first")
         );
         assert_eq!(
-            terminal_excerpt_block_reason(Some(&snapshot(
-                "x".repeat(TERMINAL_EXCERPT_LIMIT + 1)
-            ))),
+            terminal_excerpt_block_reason(Some(status(true, TERMINAL_EXCERPT_LIMIT + 1))),
             Some("Select less terminal output (maximum 32 KiB)")
         );
         assert_eq!(
-            terminal_excerpt_block_reason(Some(&snapshot("cargo test failed".into()))),
+            terminal_excerpt_block_reason(Some(status(true, 17))),
             None
         );
     }

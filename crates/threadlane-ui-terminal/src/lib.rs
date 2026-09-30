@@ -590,6 +590,20 @@ pub struct TerminalSelection {
     pub launched_in: PathBuf,
 }
 
+/// Block-relevant selection state without the excerpt payload: whether
+/// the covered cells hold any non-whitespace text, and the UTF-8 byte
+/// length [`selection_snapshot`](TerminalView::selection_snapshot)
+/// would produce. Cheap to poll per frame — it walks cells rather than
+/// copying text out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectionStatus {
+    /// At least one covered cell holds non-whitespace content.
+    pub has_text: bool,
+    /// UTF-8 bytes of the snapshot excerpt: cell contents plus one line
+    /// break per covered row that is not a soft wrap.
+    pub excerpt_len: usize,
+}
+
 /// A persistent, focusable project shell backed by a real pseudo-terminal.
 ///
 /// Construct it with `cx.new(|cx| TerminalView::new(project, cx))` and
@@ -727,6 +741,7 @@ impl TerminalView {
         self.alt_screen = false;
         self.find = None;
         self.status = None;
+        self.clear_selection();
         self.start();
         cx.notify();
     }
@@ -740,6 +755,7 @@ impl TerminalView {
         self.scrollback_offset = 0;
         self.scroll_accumulator = 0.0;
         self.status = None;
+        self.clear_selection();
         cx.notify();
     }
 
@@ -1138,6 +1154,36 @@ impl TerminalView {
         Some(TerminalSelection {
             text,
             launched_in: self.project.clone(),
+        })
+    }
+
+    /// Availability facts about the current selection, derived by
+    /// walking the covered cells instead of copying the excerpt —
+    /// affordances that refresh on selection changes can evaluate it on
+    /// every notify without paying for a string copy. Mirrors the
+    /// accounting `contents_between` performs.
+    pub fn selection_status(&self) -> Option<SelectionStatus> {
+        let (anchor, head) = (self.selection_anchor?, self.selection_head?);
+        let (start, end) = selection_bounds(anchor, head, self.cols)?;
+        let mut has_text = false;
+        let mut excerpt_len = 0usize;
+        for row in start.0..=end.0 {
+            let from = if row == start.0 { start.1 } else { 0 };
+            let to = if row == end.0 { end.1 } else { self.cols };
+            for col in from..to {
+                if let Some(cell) = self.screen.cell(row, col) {
+                    let contents = cell.contents();
+                    excerpt_len += contents.len();
+                    has_text |= !contents.trim().is_empty();
+                }
+            }
+            if row != end.0 && !self.screen.row_wrapped(row) {
+                excerpt_len += 1;
+            }
+        }
+        Some(SelectionStatus {
+            has_text,
+            excerpt_len,
         })
     }
 
@@ -2199,7 +2245,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn terminal_resize_invalidates_a_selection_instead_of_reinterpreting_it(
+    fn screen_resets_invalidate_a_selection_instead_of_reinterpreting_it(
         cx: &mut gpui::TestAppContext,
     ) {
         use gpui::AppContext as _;
@@ -2221,9 +2267,24 @@ mod tests {
             let snapshot = terminal.selection_snapshot().expect("selection snapshot");
             assert_eq!(snapshot.text, "select me");
             assert_eq!(snapshot.launched_in, std::path::PathBuf::from("/tmp"));
-            // A geometry change clears the selection rather than re-mapping
+            let status = terminal.selection_status().expect("selection status");
+            assert!(status.has_text);
+            assert_eq!(status.excerpt_len, 9);
+            // Geometry changes clear the selection rather than re-mapping
             // the old cell coordinates onto the resized screen.
             terminal.resize(8, 40, cx);
+            assert!(!terminal.has_selection());
+            assert!(terminal.selection_snapshot().is_none());
+            assert!(terminal.selection_status().is_none());
+        });
+        terminal.update(cx, |terminal, cx| {
+            // Clearing the screen invalidates the selection the same way:
+            // the retained coordinates must not be re-read against a
+            // blank or restarted screen.
+            terminal.selection_anchor = Some((0, 0));
+            terminal.selection_head = Some((0, 9));
+            assert!(terminal.has_selection());
+            terminal.clear(cx);
             assert!(!terminal.has_selection());
             assert!(terminal.selection_snapshot().is_none());
         });
