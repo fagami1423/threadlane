@@ -44,7 +44,9 @@ use crate::events::{AgentEvent, SubagentIsolation};
 pub enum SessionCommand {
     /// Submit a user prompt. `work_dir` is the effective execution directory
     /// (the worktree for worktree sessions); `acp_config` holds pending ACP
-    /// agent settings to apply before the first turn.
+    /// agent settings to apply before the first turn. `model` re-seeds the
+    /// daemon's current selection before the runtime is built — required on
+    /// the first prompt of a daemon that has not seen a `SetModel` yet.
     SubmitPrompt {
         session_id: String,
         work_dir: PathBuf,
@@ -54,6 +56,8 @@ pub enum SessionCommand {
         effort: ReasoningEffort,
         #[serde(default)]
         acp_config: Vec<(String, String)>,
+        #[serde(default)]
+        model: Option<String>,
     },
     /// Cancel the session's in-flight turn.
     CancelRun { session_id: String },
@@ -635,6 +639,7 @@ mod tests {
                 }],
                 effort: ReasoningEffort::High,
                 acp_config: vec![("model".into(), "auto".into())],
+                model: Some("gpt-5".into()),
             },
             SessionCommand::CancelRun {
                 session_id: "sess_1".into(),

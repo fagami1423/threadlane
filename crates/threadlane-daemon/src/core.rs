@@ -296,7 +296,7 @@ impl DaemonCore {
             .map_err(|error| format!("session runtime construction failed: {error}"))?;
         Ok(self.register_runtime(
             session_id,
-            work_dir.to_path_buf(),
+            Self::project_dir_for(work_dir),
             session_file,
             runtime,
         ))
@@ -313,7 +313,7 @@ impl DaemonCore {
         };
         self.register_identity(
             &request.session_id,
-            options.work_dir.clone(),
+            Self::project_dir_for(&options.work_dir),
             request.session_file.clone(),
         );
         if let Some(runtime) = self.runtime_for_file(&request.session_file) {
@@ -333,7 +333,7 @@ impl DaemonCore {
         .map_err(|error| format!("session runtime construction failed: {error}"))?;
         Ok(Some(self.register_runtime(
             &request.session_id,
-            options.work_dir.clone(),
+            Self::project_dir_for(&options.work_dir),
             request.session_file.clone(),
             runtime,
         )))
@@ -364,7 +364,11 @@ impl DaemonCore {
                 images,
                 effort,
                 acp_config,
+                model,
             } => {
+                if let Some(model) = model {
+                    *self.model.write().expect("model poisoned") = model;
+                }
                 let runtime = self.ensure_runtime(&session_id, &work_dir).await?;
                 *self.effort.write().expect("effort poisoned") = effort;
                 if runtime.is_generating() {
@@ -593,6 +597,30 @@ impl DaemonCore {
 
     /// `set_fact` on the session's live agent, then drop the runtime so the
     /// next access rebuilds it (credentials and providers re-resolve).
+    /// The owning *project* directory for a runtime's working directory.
+    ///
+    /// Commands carry the effective checkout (`SubmitPrompt.work_dir`,
+    /// `HydrationRuntimeOptions.work_dir`) which is the worktree for
+    /// worktree sessions; `SessionIdentity.work_dir` is the project root,
+    /// which stub discovery and session deletion search. Worktrees live
+    /// canonically at `<project>/.threadlane/worktrees/<name>`.
+    fn project_dir_for(work_dir: &Path) -> PathBuf {
+        let mut segments = work_dir.components().collect::<Vec<_>>();
+        // Walk up to a `.threadlane/worktrees` parent, if any.
+        while let Some(last) = segments.last() {
+            if last.as_os_str() == "worktrees" {
+                segments.pop();
+                if segments.last().is_some_and(|seg| seg.as_os_str() == ".threadlane") {
+                    segments.pop();
+                    return segments.iter().collect();
+                }
+                break;
+            }
+            segments.pop();
+        }
+        work_dir.to_path_buf()
+    }
+
     fn switch_runtime_fact(
         &self,
         session_id: &str,
@@ -683,7 +711,7 @@ impl DaemonCore {
         let work_dir = request
             .runtime_options
             .as_ref()
-            .map(|options| options.work_dir.clone())
+            .map(|options| Self::project_dir_for(&options.work_dir))
             .or_else(|| identity.as_ref().map(|identity| identity.work_dir.clone()))
             // The canonical layout puts the transcript inside the project's
             // `.threadlane/sessions/`; fall back to its owning root.
@@ -711,9 +739,10 @@ impl DaemonCore {
             session_file: request.session_file.clone(),
             work_dir,
         };
-        let snapshot = self
-            .build_snapshot(&request.session_id, &resolved)
-            .unwrap_or_default();
+        // A projection failure must surface as DaemonError rather than an
+        // empty snapshot — a client cannot match a default snapshot to the
+        // session it asked for and would hang on the loading row.
+        let snapshot = self.build_snapshot(&request.session_id, &resolved)?;
         let _ = self.ingest_tx.send(SessionEvent::SessionSnapshot {
             session_id: request.session_id,
             snapshot: Box::new(snapshot),

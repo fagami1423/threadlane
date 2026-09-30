@@ -31,10 +31,14 @@ async fn main() {
         .unwrap_or_else(|_| "127.0.0.1:4747".to_string());
     let token = std::env::var("THREADLANE_DAEMON_TOKEN").ok();
     if !addr.starts_with("127.0.0.1") && !addr.starts_with("localhost") && token.is_none() {
-        tracing::warn!(
-            "listening on a non-loopback address without THREADLANE_DAEMON_TOKEN; \
-             clients are unauthenticated"
+        // The command surface includes prompt submission and session
+        // deletion; serving it unauthenticated on a routable interface is
+        // remote code execution for anyone who can reach the port.
+        eprintln!(
+            "refusing to bind {addr}: non-loopback addresses require \
+             THREADLANE_DAEMON_TOKEN"
         );
+        std::process::exit(2);
     }
 
     let core = DaemonCore::new().expect("could not start daemon core");

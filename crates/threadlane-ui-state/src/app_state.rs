@@ -2859,6 +2859,7 @@ impl AppState {
                     images: setup.images.clone(),
                     effort: setup.effort,
                     acp_config: setup.acp_config.clone(),
+                    model: Some(setup.model.clone()),
                 });
                 return Ok(());
             }
@@ -3416,12 +3417,20 @@ impl AppState {
 
     /// Sends a `SessionCommand` through the attached `DaemonClient` —
     /// fire-and-forget; failures arrive as `SessionEvent::DaemonError`.
+    /// A command the client rejects outright (e.g. disconnected remote)
+    /// also surfaces through the event stream rather than vanishing into
+    /// a log line, since callers optimistically enter generating state.
     pub fn dispatch_command(&self, command: SessionCommand) {
         let client = self.daemon_client.clone();
+        let stream_tx = self.stream_tx.clone();
         if let Ok(executor) = crate::chat::executor() {
             executor.spawn(async move {
                 if let Err(error) = client.command(command).await {
                     tracing::warn!("daemon command failed: {error}");
+                    let _ = stream_tx.send(SessionEvent::DaemonError {
+                        session_id: None,
+                        message: error,
+                    });
                 }
             });
         }
@@ -4664,15 +4673,19 @@ impl AppState {
                     // Apply options only while the producing runtime instance
                     // is still the registered one — the wire-clean stand-in
                     // for the old `Weak<SessionRuntime>` identity check.
-                    let Some(current_instance) = self
-                        .daemon_core
-                        .runtime_for_file(&session_file)
-                        .map(|runtime| runtime.instance_id())
-                    else {
-                        continue;
-                    };
-                    if current_instance != runtime_instance {
-                        continue;
+                    // Remote mode keeps no local runtimes to compare against;
+                    // the daemon's own ordering is the staleness guard there.
+                    if !self.daemon_remote {
+                        let Some(current_instance) = self
+                            .daemon_core
+                            .runtime_for_file(&session_file)
+                            .map(|runtime| runtime.instance_id())
+                        else {
+                            continue;
+                        };
+                        if current_instance != runtime_instance {
+                            continue;
+                        }
                     }
                     let is_active = self.active_session_matches(&session_id, &session_file);
                     if let Some(error) = error {
@@ -4852,6 +4865,7 @@ impl AppState {
                 images,
                 effort: self.reasoning_effort,
                 acp_config: Vec::new(),
+                model: Some(self.selected_model.clone()),
             });
             self.push_optimistic_follow_up(&session_id, text, format!("queued-user-{session_id}"));
             self.session_status = Some("Message queued…".into());
@@ -5043,6 +5057,7 @@ impl AppState {
                 images: images.clone(),
                 effort: self.reasoning_effort,
                 acp_config: pending_acp,
+                model: Some(self.selected_model.clone()),
             });
         } else {
             let runtime =
