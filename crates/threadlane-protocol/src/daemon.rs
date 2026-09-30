@@ -220,9 +220,8 @@ pub enum SessionEvent {
 
 /// A permission decision the client sends back to the daemon.
 ///
-/// Mirrors `threadlane_permission::PermissionDecision` (which owns the
-/// in-process enum); kept here so the wire contract does not reach across
-/// crate boundaries for a four-variant vocabulary.
+/// Canonical definition; `threadlane_permission` re-exports it so the
+/// command surface and the permission manager share one type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionDecision {
