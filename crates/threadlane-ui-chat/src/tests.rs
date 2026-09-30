@@ -4418,6 +4418,17 @@ fn conversation_outline_focuses_and_jumps_to_prompts(cx: &mut gpui::TestAppConte
         assert_eq!(chat.outline_selected_id.as_deref(), Some("u1"), "cancel keeps the last jump");
     });
 
+    // A second pointer click on the trigger closes the outline instead of
+    // reopening it.
+    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, _| assert!(chat.outline_open));
+    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, _| {
+        assert!(!chat.outline_open, "trigger toggles the outline closed");
+    });
+
     // Opening Find clears the outline selection.
     chat.update_in(cx, |chat, window, cx| {
         chat.open_conversation_find(&super::FindInConversation, window, cx)

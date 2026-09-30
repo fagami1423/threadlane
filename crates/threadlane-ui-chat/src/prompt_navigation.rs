@@ -380,7 +380,9 @@ impl ChatListView {
         // Outline supersedes Find without moving the viewport.
         self.clear_conversation_find();
         self.prompt_recall = None;
-        self.outline_previous_focus = window.focused(cx);
+        // Focus restoration on close is owned by the kit Popover: it
+        // captures the previously focused handle (the trigger, via
+        // pointer auto-focus or keyboard focus) before moving focus here.
         self.outline_open = true;
         self.refresh_conversation_outline(cx);
         // Prefer the last jumped-to prompt when it is still listed,
@@ -417,23 +419,13 @@ impl ChatListView {
         cx.notify();
     }
 
-    fn close_conversation_outline(
-        &mut self,
-        restore_focus: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// Closes the popover; the kit Popover restores the focus it captured
+    /// before opening once `.open(false)` syncs on the next render.
+    fn close_conversation_outline(&mut self, cx: &mut Context<Self>) {
         if !self.outline_open {
             return;
         }
         self.outline_open = false;
-        if restore_focus {
-            if let Some(focus) = self.outline_previous_focus.take() {
-                window.focus(&focus, cx);
-            }
-        } else {
-            self.outline_previous_focus = None;
-        }
         cx.notify();
     }
 
@@ -449,7 +441,7 @@ impl ChatListView {
         let key = event.keystroke.key.as_str();
         match key {
             "escape" => {
-                self.close_conversation_outline(true, window, cx);
+                self.close_conversation_outline(cx);
                 cx.stop_propagation();
             }
             "up" | "down" | "home" | "end" if !event.keystroke.modifiers.modified() => {
@@ -523,7 +515,7 @@ impl ChatListView {
             item_ix: row,
             offset_in_item: px(0.),
         });
-        self.close_conversation_outline(true, window, cx);
+        self.close_conversation_outline(cx);
     }
 
     fn render_outline_row(
@@ -554,6 +546,7 @@ impl ChatListView {
             .px_3()
             .py_1p5()
             .cursor_pointer()
+            .role(Role::ListBoxOption)
             .aria_label(label.clone())
             .when(focused, |el| el.bg(theme.secondary))
             .when(!focused, |el| {
@@ -605,16 +598,22 @@ impl ChatListView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let outline_chat = cx.entity();
-        let outline_chat_close = cx.entity();
+        let outline_chat_content = cx.entity();
+        // The popover toggles itself on pointer mousedown and on the
+        // Enter/Space Confirm binding it registers under its "Popover"
+        // context; `on_open_change` is the single driver of view state so
+        // no click handler can double-toggle it.
         Popover::new("conversation-outline")
             .anchor(Anchor::TopLeft)
             .appearance(false)
             .open(self.outline_open)
             .track_focus(&self.outline_focus)
             .on_open_change(move |open, window, cx| {
-                outline_chat_close.update(cx, |this, cx| {
-                    if !*open {
-                        this.close_conversation_outline(true, window, cx);
+                outline_chat.update(cx, |this, cx| {
+                    if *open {
+                        this.open_conversation_outline(window, cx);
+                    } else {
+                        this.close_conversation_outline(cx);
                     }
                 });
             })
@@ -625,17 +624,10 @@ impl ChatListView {
                     .ghost()
                     .small()
                     .accessibility_label("Conversation outline")
-                    .tooltip("Conversation outline — jump to an earlier prompt")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        if this.outline_open {
-                            this.close_conversation_outline(true, window, cx);
-                        } else {
-                            this.open_conversation_outline(window, cx);
-                        }
-                    })),
+                    .tooltip("Conversation outline — jump to an earlier prompt"),
             )
             .content(move |_, _window, cx| {
-                outline_chat.update(cx, |this, cx| this.render_outline_content(cx))
+                outline_chat_content.update(cx, |this, cx| this.render_outline_content(cx))
             })
     }
 
@@ -659,6 +651,8 @@ impl ChatListView {
             .id("conversation-outline-content")
             .flex()
             .flex_col()
+            .role(Role::ListBox)
+            .aria_label("Conversation outline prompts")
             .track_focus(&self.outline_focus)
             .key_context("ConversationOutline")
             .on_key_down(cx.listener(Self::handle_outline_key_down))

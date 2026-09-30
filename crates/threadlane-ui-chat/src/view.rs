@@ -453,7 +453,6 @@ pub struct ChatListView {
 
     prompt_recall: Option<PromptRecallState>,
     outline_open: bool,
-    outline_previous_focus: Option<FocusHandle>,
     outline_focus: FocusHandle,
     outline_list_state: ListState,
     outline_landmarks: Vec<PromptLandmark>,
@@ -801,7 +800,6 @@ impl ChatListView {
             find_task: None,
             prompt_recall: None,
             outline_open: false,
-            outline_previous_focus: None,
             outline_focus: cx.focus_handle(),
             outline_list_state: ListState::new(0, ListAlignment::Top, window.rem_size() * 20.0),
             outline_landmarks: Vec::new(),
@@ -6503,7 +6501,6 @@ impl Render for ChatListView {
             self.clear_conversation_find();
             self.prompt_recall = None;
             self.outline_open = false;
-            self.outline_previous_focus = None;
             self.outline_landmarks.clear();
             self.outline_focus_id = None;
             self.outline_selected_id = None;
