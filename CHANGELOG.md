@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.1.32](https://github.com/wheregmis/threadlane/compare/v0.1.31...v0.1.32) (2026-09-30)
+
+
+### Features
+
+* **chat:** add safe preview for staged images ([5853d73](https://github.com/wheregmis/threadlane/commit/5853d7337da2b87c14dbdf90f9d70ca8131d2d5a))
+* **chat:** add safe preview for staged images ([6f69e82](https://github.com/wheregmis/threadlane/commit/6f69e8298856f35268a0380e9156cba51bd581e3))
+* move trajectory into the right panel ([6167fea](https://github.com/wheregmis/threadlane/commit/6167fea7c88274e148bd56ba572a11e43941d5ba))
+* **sidebar:** move title regeneration to session context menus ([ca0d7bc](https://github.com/wheregmis/threadlane/commit/ca0d7bc6b1685563617649cb9684402d4bbe1866))
+* **ui:** Refine task, issue, and workspace UI ([7e5fe9b](https://github.com/wheregmis/threadlane/commit/7e5fe9bee26b193873241a9a44491755b6297801))
+* **ui:** Refine task, issue, and workspace UI ([e3fd1fc](https://github.com/wheregmis/threadlane/commit/e3fd1fc846f13711b61866f8920185c7dfac8ed2))
+
+
+### Bug Fixes
+
+* **chat:** compile image preview against image 0.25 reader API ([b1cc53e](https://github.com/wheregmis/threadlane/commit/b1cc53e109118777e917918ef733958364588d06))
+* **chat:** prevent disclosure header content clipping ([3d1e430](https://github.com/wheregmis/threadlane/commit/3d1e4303614e52e92453ab42439153c11acdfc54))
+* **chat:** prevent thought-process and tool header clipping ([1eb386f](https://github.com/wheregmis/threadlane/commit/1eb386f1452a8ba576af5d80669252154318accb))
+* **runtime:** recover torn trailing journal lines on read ([5ee47f7](https://github.com/wheregmis/threadlane/commit/5ee47f79bd27b266a0fb13d4131d701a6a29e9ca))
+* **tools,state,coding-agent,right-panel:** clean up worktree cargo target cache on teardown ([61407e9](https://github.com/wheregmis/threadlane/commit/61407e9135cdf2f328cf46c0d80ecaca761bcbba))
+
+
+### Maintenance
+
+* **cargo:** disable debug symbols in dev profile to reduce build size ([82ec55c](https://github.com/wheregmis/threadlane/commit/82ec55c9914061a5877cb71b80aa2426fcdf025c))
+* only working ([44bd33a](https://github.com/wheregmis/threadlane/commit/44bd33a340aada4fabbb8c7dce85a80e532c8d97))
+* only working ([cda8ba6](https://github.com/wheregmis/threadlane/commit/cda8ba684c87fe8108c4ff5b5b439bc7c763315a))
+
 ## [0.1.31](https://github.com/wheregmis/threadlane/compare/v0.1.30...v0.1.31) (2026-09-29)
 
 
