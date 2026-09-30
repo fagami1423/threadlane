@@ -483,6 +483,7 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
     el.tagName === "OPTION" ||
     (el instanceof HTMLElement && el.isContentEditable) ||
     (el.matches && el.matches("[autocomplete*='password' i], [autocomplete*='cc-' i], [type='password' i]")) ||
+    !!(el.querySelector && Array.from(el.querySelectorAll("[contenteditable]")).some((descendant) => descendant instanceof HTMLElement && descendant.isContentEditable)) ||
     !!(el.querySelector && el.querySelector("input[type='password'], [autocomplete*='cc-' i]"));
 
   const describe = (el) => {

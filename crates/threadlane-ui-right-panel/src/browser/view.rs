@@ -433,6 +433,10 @@ impl BrowserView {
                 takeSnapshotWithConfiguration: config,
                 completionHandler: &*block
             ];
+            // `new` returned a +1 object; WebKit retains it for the call.
+            if !config.is_null() {
+                let _: () = objc2::msg_send![config, release];
+            }
         }
 
         Ok(rx)
