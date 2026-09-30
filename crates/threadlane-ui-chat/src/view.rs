@@ -21,6 +21,7 @@ use gpui_component::tag::{Tag, TagVariant};
 use gpui_component::text::{TextView, TextViewState};
 use gpui_component::theme::ActiveTheme;
 use gpui_component::{Disableable, Icon, IconName, Selectable, Sizable, WindowExt};
+use crate::image_preview::decode_staged_image;
 
 use threadlane_ui_editor::EditorView;
 use threadlane_ui_mirror::MirrorView;
@@ -383,6 +384,25 @@ pub fn init(cx: &mut App) {
     init_conversation_find(cx);
 }
 
+type ComposerKey = (Option<PathBuf>, Option<String>);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImagePreviewMode {
+    Fit,
+    ActualSize,
+}
+
+struct ImagePreviewState {
+    generation: u64,
+    composer_key: ComposerKey,
+    image_index: usize,
+    display_name: String,
+    data_url: String,
+    decoded: Option<Result<Arc<RenderImage>, String>>,
+    mode: ImagePreviewMode,
+    initiating_focus: FocusHandle,
+}
+
 pub struct ChatListView {
     model: Entity<AppState>,
     #[cfg(test)]
@@ -412,7 +432,9 @@ pub struct ChatListView {
     markdown_states: HashMap<(SharedString, String), MarkdownRenderState>,
     markdown_cache_namespace: SharedString,
     pasted_images: Vec<ImageAttachment>,
-    composer_key: (Option<PathBuf>, Option<String>),
+    image_preview: Option<ImagePreviewState>,
+    image_preview_generation: u64,
+    composer_key: ComposerKey,
     composer_drafts: HashMap<(Option<PathBuf>, Option<String>), ComposerDraft>,
     last_session_key: Option<(std::path::PathBuf, String)>,
     initial_scroll_frames: u8,
@@ -743,6 +765,8 @@ impl ChatListView {
             markdown_states: HashMap::new(),
             markdown_cache_namespace: SharedString::from(""),
             pasted_images: Vec::new(),
+            image_preview: None,
+            image_preview_generation: 0,
             composer_key,
             composer_drafts: HashMap::new(),
             last_session_key: None,
@@ -777,6 +801,7 @@ impl ChatListView {
         if key == self.composer_key {
             return;
         }
+        self.invalidate_image_preview(window, cx);
 
         // An explicit stash is separate from the unsent text and attachments in each task.
         let draft = ComposerDraft {
@@ -795,6 +820,293 @@ impl ChatListView {
         self.input_state.update(cx, |input, cx| {
             input.set_value(draft.text, window, cx);
         });
+    }
+
+    fn preview_attachment_is_current(&self, preview: &ImagePreviewState) -> bool {
+        self.current_tab == CentralTab::Chat
+            && self.composer_key == preview.composer_key
+            && self
+                .pasted_images
+                .get(preview.image_index)
+                .is_some_and(|image| {
+                    image.display_name == preview.display_name && image.data_url == preview.data_url
+                })
+    }
+
+    fn invalidate_image_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.image_preview.take().is_some() {
+            self.image_preview_generation = self.image_preview_generation.wrapping_add(1);
+            window.close_dialog(cx);
+        }
+    }
+
+    fn open_image_preview(
+        &mut self,
+        image_index: usize,
+        initiating_focus: FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.current_tab != CentralTab::Chat
+            || self.image_preview.is_some()
+            || window.has_active_dialog(cx)
+        {
+            return;
+        }
+        let Some(attachment) = self.pasted_images.get(image_index).cloned() else {
+            return;
+        };
+
+        self.image_preview_generation = self.image_preview_generation.wrapping_add(1);
+        let generation = self.image_preview_generation;
+        let composer_key = self.composer_key.clone();
+        self.image_preview = Some(ImagePreviewState {
+            generation,
+            composer_key: composer_key.clone(),
+            image_index,
+            display_name: attachment.display_name.clone(),
+            data_url: attachment.data_url.clone(),
+            decoded: None,
+            mode: ImagePreviewMode::Fit,
+            initiating_focus: initiating_focus.clone(),
+        });
+
+        let decode_attachment = attachment.clone();
+        let decode_task = cx.background_spawn(async move { decode_staged_image(&decode_attachment) });
+        let completion_chat = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let decoded = decode_task.await;
+            let _ = completion_chat.update(cx, |this, cx| {
+                let current = this.image_preview.as_ref().is_some_and(|preview| {
+                    preview.generation == generation && this.preview_attachment_is_current(preview)
+                });
+                if current {
+                    if let Some(preview) = this.image_preview.as_mut() {
+                        preview.decoded = Some(decoded);
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+
+        let content_chat = cx.entity().downgrade();
+        let close_chat = content_chat.clone();
+        window.open_dialog(cx, move |dialog, window, _cx| {
+            let content_chat = content_chat.clone();
+            let close_chat = close_chat.clone();
+            dialog
+                .title("Image preview")
+                .w(window.rem_size() * 40.0)
+                .max_w(window.viewport_size().width - window.rem_size() * 2.0)
+                .button_props(
+                    gpui_component::dialog::DialogButtonProps::default().ok_text("Close"),
+                )
+                .content(move |content, window, cx| {
+                    let preview = content_chat
+                        .update(cx, |this, cx| {
+                            this.render_image_preview_content(generation, window, cx)
+                        })
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| {
+                            div()
+                                .child("This image preview is no longer available.")
+                                .into_any_element()
+                        });
+                    content.child(preview)
+                })
+                .on_close(move |_, window, cx| {
+                    let _ = close_chat.update(cx, |this, cx| {
+                        this.finish_image_preview(generation, window, cx);
+                    });
+                })
+        });
+        cx.notify();
+    }
+
+    fn finish_image_preview(
+        &mut self,
+        generation: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(preview) = self
+            .image_preview
+            .as_ref()
+            .filter(|preview| preview.generation == generation)
+        else {
+            return;
+        };
+        let attachment_is_current = self.preview_attachment_is_current(preview);
+        let initiating_focus = preview.initiating_focus.clone();
+        self.image_preview = None;
+        self.image_preview_generation = self.image_preview_generation.wrapping_add(1);
+        if attachment_is_current {
+            window.focus(&initiating_focus, cx);
+        } else if self.current_tab == CentralTab::Chat {
+            self.input_state.update(cx, |input, cx| input.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    fn render_image_preview_content(
+        &mut self,
+        generation: u64,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let preview = self
+            .image_preview
+            .as_ref()
+            .filter(|preview| {
+                preview.generation == generation && self.preview_attachment_is_current(preview)
+            })?;
+        let display_name = preview.display_name.clone();
+        let decoded = preview.decoded.as_ref().map(|result| match result {
+            Ok(image) => Ok(image.clone()),
+            Err(error) => Err(error.clone()),
+        });
+        let mode = preview.mode;
+        let theme = cx.theme().colors;
+        let (image, dimensions, error) = match decoded {
+            Some(Ok(image)) => {
+                let size = image.size(0);
+                (Some(image), Some((size.width.0 as u32, size.height.0 as u32)), None)
+            }
+            Some(Err(error)) => (None, None, Some(error)),
+            None => (None, None, None),
+        };
+
+        let mode_controls = dimensions.map(|(width, height)| {
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    Button::new(("image-preview-fit", generation))
+                        .label("Fit")
+                        .xsmall()
+                        .ghost()
+                        .selected(mode == ImagePreviewMode::Fit)
+                        .accessibility_label("Fit image to preview")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(preview) = this
+                                .image_preview
+                                .as_mut()
+                                .filter(|preview| preview.generation == generation)
+                            {
+                                preview.mode = ImagePreviewMode::Fit;
+                                cx.notify();
+                            }
+                        })),
+                )
+                .child(
+                    Button::new(("image-preview-actual-size", generation))
+                        .label("Actual size")
+                        .xsmall()
+                        .ghost()
+                        .selected(mode == ImagePreviewMode::ActualSize)
+                        .accessibility_label(format!(
+                            "Show image at actual size, {width} by {height} pixels"
+                        ))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(preview) = this
+                                .image_preview
+                                .as_mut()
+                                .filter(|preview| preview.generation == generation)
+                            {
+                                preview.mode = ImagePreviewMode::ActualSize;
+                                cx.notify();
+                            }
+                        })),
+                )
+        });
+        let image_area_height = (window.viewport_size().height - window.rem_size() * 12.0)
+            .max(window.rem_size() * 8.0);
+        let image_area: AnyElement = if let Some(image) = image {
+            match mode {
+                ImagePreviewMode::Fit => div()
+                    .w_full()
+                    .h(image_area_height)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .overflow_hidden()
+                    .child(img(image).size_full().object_fit(ObjectFit::Contain))
+                    .into_any_element(),
+                ImagePreviewMode::ActualSize => {
+                    let size = image.size(0);
+                    let scale = window.scale_factor();
+                    div()
+                        .w_full()
+                        .max_h(image_area_height)
+                        .min_h_0()
+                        .overflow_scrollbar()
+                        .child(
+                            div()
+                                .w(px(size.width.0 as f32 / scale))
+                                .h(px(size.height.0 as f32 / scale))
+                                .child(img(image).size_full().object_fit(ObjectFit::None)),
+                        )
+                        .into_any_element()
+                }
+            }
+        } else if let Some(error) = error {
+            div()
+                .w_full()
+                .h(image_area_height)
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_4()
+                .text_color(theme.danger)
+                .child(error)
+                .into_any_element()
+        } else {
+            div()
+                .w_full()
+                .h(image_area_height)
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(Spinner::new().small())
+                .child("Preparing image preview…")
+                .into_any_element()
+        };
+
+        let metadata = dimensions.map(|(width, height)| format!("{width} × {height} px"));
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .text_color(theme.muted_foreground)
+                                .child(display_name),
+                        )
+                        .children(mode_controls)
+                        .children(metadata.map(|metadata| {
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(metadata)
+                        })),
+                )
+                .child(image_area)
+                .into_any_element(),
+        )
     }
 
     fn paste_composer_clipboard(
@@ -840,6 +1152,10 @@ impl ChatListView {
     }
 
     pub fn set_tab(&mut self, tab: CentralTab, cx: &mut Context<Self>) {
+        if tab != self.current_tab && self.image_preview.is_some() {
+            self.image_preview = None;
+            self.image_preview_generation = self.image_preview_generation.wrapping_add(1);
+        }
         if tab != CentralTab::Chat {
             self.clear_conversation_find();
         }
@@ -3890,7 +4206,7 @@ impl ChatListView {
         )
     }
 
-    fn render_composer(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().colors;
         let (
             selected_model,
@@ -3996,13 +4312,20 @@ impl ChatListView {
         let send_model = self.model.clone();
         let send_input = self.input_state.clone();
 
+        let image_count = self.pasted_images.len();
         let image_chips = self
             .pasted_images
             .iter()
             .enumerate()
             .map(|(index, image)| {
                 let name = image.display_name.clone();
+                let preview_label = format!("Preview {name}, image {} of {image_count}", index + 1);
                 let remove_label = format!("Remove {name}");
+                let preview_button_id = ("preview-pasted-image", index);
+                let preview_focus = window
+                    .use_keyed_state(preview_button_id.clone(), cx, |_, cx| cx.focus_handle())
+                    .read(cx)
+                    .clone();
                 div()
                     .flex()
                     .items_center()
@@ -4028,7 +4351,18 @@ impl ChatListView {
                                         .build(window, cx)
                                 }
                             })
-                            .child(name),
+                            .child(name.clone()),
+                    )
+                    .child(
+                        Button::new(preview_button_id)
+                            .label("Preview…")
+                            .xsmall()
+                            .ghost()
+                            .accessibility_label(preview_label.clone())
+                            .tooltip(preview_label)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_image_preview(index, preview_focus.clone(), window, cx);
+                            })),
                     )
                     .child(
                         Button::new(("remove-pasted-image", index))
@@ -4037,9 +4371,10 @@ impl ChatListView {
                             .xsmall()
                             .ghost()
                             .tooltip(remove_label)
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                            .on_click(cx.listener(move |this, _event, window, cx| {
                                 if index < this.pasted_images.len() {
                                     this.pasted_images.remove(index);
+                                    this.invalidate_image_preview(window, cx);
                                     cx.notify();
                                 }
                             })),
@@ -6223,7 +6558,7 @@ impl Render for ChatListView {
                             )
                             .children(
                                 (self.current_tab == CentralTab::Chat)
-                                    .then(|| self.render_composer(cx)),
+                                    .then(|| self.render_composer(window, cx)),
                             ),
                     )
                     .children(show_environment.then(|| self.render_environment(cx))),
