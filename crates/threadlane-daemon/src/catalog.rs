@@ -814,6 +814,10 @@ mod tests {
 
     #[test]
     fn antigravity_capabilities_follow_live_variants_and_disable_non_thinking() {
+        // Writes the shared discovery registry; serialize against the
+        // antigravity-cache fixtures so a marker refresh cannot drop the
+        // seeded entry between write and assert.
+        let _fixture_lock = ANTIGRAVITY_CACHE_TEST_LOCK.lock().unwrap();
         use threadlane_provider::antigravity::AntigravityModelInfo;
         let models = vec![
             ModelOption {
@@ -878,9 +882,31 @@ mod tests {
         ));
     }
 
+    /// Serializes tests that seed the process-global Antigravity cache or the
+    /// shared provider-discovery registry the availability gate consults.
+    static ANTIGRAVITY_CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Seeds the process-global Antigravity cache, restoring it afterwards
     /// so parallel tests never observe the fixture.
     fn with_antigravity_cache(stub: Option<HashSet<String>>, run: impl FnOnce()) {
+        let _fixture_lock = ANTIGRAVITY_CACHE_TEST_LOCK.lock().unwrap();
+        if stub.is_some() {
+            // Availability pruning only trusts live ids while provider
+            // discovery is fresh; publish a benign entry mirroring the builtin
+            // seed so the gate is deterministic instead of depending on which
+            // sibling test populated the registry first.
+            threadlane_provider::model_registry::update_discovered_models(
+                "antigravity",
+                vec![threadlane_provider::model_registry::ModelInfo {
+                    id: "antigravity/gemini-3.7-flash".into(),
+                    label: "Gemini 3.7 Flash".into(),
+                    provider: Some("antigravity".into()),
+                    context_window: None,
+                    supported_efforts: Vec::new(),
+                    default_effort: None,
+                }],
+            );
+        }
         let saved = DISCOVERED_ANTIGRAVITY
             .get_or_init(|| std::sync::Mutex::new((std::time::Instant::now(), None)))
             .lock()

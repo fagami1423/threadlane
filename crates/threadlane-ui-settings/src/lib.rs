@@ -18,7 +18,7 @@ pub async fn refresh_discovered_models_and_update(
     model: gpui::Entity<threadlane_ui_state::AppState>,
     cx: &mut gpui::AsyncApp,
 ) {
-    threadlane_ui_catalog::refresh_discovered_models().await;
+    threadlane_daemon::catalog::refresh_discovered_models().await;
     refresh_models(model, cx);
 }
 
@@ -26,7 +26,7 @@ pub async fn refresh_openai_models_and_update(
     model: gpui::Entity<threadlane_ui_state::AppState>,
     cx: &mut gpui::AsyncApp,
 ) {
-    threadlane_ui_catalog::refresh_openai_models().await;
+    threadlane_daemon::catalog::refresh_openai_models().await;
     refresh_models(model, cx);
 }
 
@@ -34,7 +34,7 @@ pub async fn refresh_antigravity_models_and_update(
     model: gpui::Entity<threadlane_ui_state::AppState>,
     cx: &mut gpui::AsyncApp,
 ) {
-    threadlane_ui_catalog::refresh_antigravity_models().await;
+    threadlane_daemon::catalog::refresh_antigravity_models().await;
     refresh_models(model, cx);
 }
 
@@ -43,7 +43,7 @@ pub async fn refresh_acp_models_and_update(
     cx: &mut gpui::AsyncApp,
     project_root: Option<std::path::PathBuf>,
 ) {
-    threadlane_ui_catalog::refresh_acp_models(project_root).await;
+    threadlane_daemon::catalog::refresh_acp_models(project_root).await;
     refresh_models(model, cx);
 }
 

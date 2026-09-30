@@ -389,11 +389,11 @@ impl Actor {
                         // Await discovery before the first provider turn (also populates live
                         // runtime mappings). A failed/empty refresh is not proof of removal.
                         if model.starts_with("opencode-go/") {
-                            threadlane_ui_catalog::refresh_discovered_models().await;
+                            crate::catalog::refresh_discovered_models().await;
                         } else if model.starts_with("antigravity/") {
-                            threadlane_ui_catalog::refresh_antigravity_models().await;
+                            crate::catalog::refresh_antigravity_models().await;
                         } else {
-                            threadlane_ui_catalog::refresh_openai_models().await;
+                            crate::catalog::refresh_openai_models().await;
                         }
                     }
                     let _ = tx.send(Event::Prepared(id, result));
@@ -850,46 +850,5 @@ mod tests {
         assert_eq!(error, "Attach this automation's project before running it");
         assert_eq!(actor.store.snapshot().runs[0].status, RunStatus::Starting);
         assert_eq!(actor.store.snapshot().definitions[0].failures, 0);
-    }
-    #[test]
-    fn automation_navigation_preserves_chat_and_project_scope() {
-        let mut state = crate::AppState::load_from_registry(vec![]);
-        state.active_session_id = Some("original".into());
-        state.active_work_dir = Some(PathBuf::from("/project"));
-        state.sidebar_project_filter = Some(PathBuf::from("/filter"));
-        crate::controller::dispatch(&mut state, crate::actions::AppAction::OpenAutomations);
-        assert_eq!(state.workspace_page, crate::WorkspacePage::Automations);
-        assert_eq!(state.active_session_id.as_deref(), Some("original"));
-        assert_eq!(state.active_work_dir, Some(PathBuf::from("/project")));
-        assert_eq!(state.sidebar_project_filter, Some(PathBuf::from("/filter")));
-    }
-
-    #[test]
-    fn completed_run_refresh_preserves_questions_from_a_later_chat_turn() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut actor = make_actor(temp.path());
-        actor.store.save(definition(temp.path()), 0).unwrap();
-        let id = actor.store.enqueue("automation-test", false, 1).unwrap();
-        actor
-            .store
-            .update_run(&id, RunStatus::Succeeded, None, None, 2)
-            .unwrap();
-        let session_id = actor.store.snapshot().runs[0].session_id.clone();
-        let mut state = crate::AppState::load_from_registry(vec![]);
-        state.pending_questions.insert(
-            session_id.clone(),
-            QuestionRequest {
-                id: "later-turn-question".into(),
-                questions: vec![],
-            },
-        );
-        state.apply_automation_projection(Projection {
-            snapshot: actor.store.snapshot().clone(),
-            ..Default::default()
-        });
-        assert_eq!(
-            state.pending_questions[&session_id].id,
-            "later-turn-question"
-        );
     }
 }

@@ -37,18 +37,18 @@ pub struct WorktreeSetup {
     pub branch: Option<String>,
     pub error: Option<String>,
     #[serde(skip)]
-    pub(crate) cancelled: Arc<std::sync::atomic::AtomicBool>,
-    pub(crate) text: String,
-    pub(crate) images: Vec<ImageAttachment>,
-    pub(crate) model: String,
-    pub(crate) effort: ReasoningEffort,
-    pub(crate) acp_config: Vec<(String, String)>,
+    pub cancelled: Arc<std::sync::atomic::AtomicBool>,
+    pub text: String,
+    pub images: Vec<ImageAttachment>,
+    pub model: String,
+    pub effort: ReasoningEffort,
+    pub acp_config: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
 pub struct PreparedWorktree {
-    pub(crate) session: SessionInfo,
-    pub(crate) runtime: Arc<SessionRuntime>,
+    pub session: SessionInfo,
+    pub runtime: Arc<SessionRuntime>,
 }
 
 impl std::fmt::Debug for PreparedWorktree {
@@ -60,7 +60,7 @@ impl std::fmt::Debug for PreparedWorktree {
 }
 
 /// Model output is untrusted: allow only a bounded ASCII slug and add a unique suffix.
-pub(crate) fn branch_name(raw: &str, session_id: &str) -> String {
+pub fn branch_name(raw: &str, session_id: &str) -> String {
     let slug = raw
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|s| !s.is_empty())
@@ -78,7 +78,7 @@ pub(crate) fn branch_name(raw: &str, session_id: &str) -> String {
     )
 }
 
-pub(crate) fn start(
+pub fn start(
     setup: WorktreeSetup,
     mut options: threadlane_coding_agent::CodingAgentOptions,
     tx: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
@@ -200,7 +200,7 @@ pub(crate) fn start(
 }
 
 /// Save the unsent request with the session so an interrupted setup retains the user's input.
-pub(crate) fn persist_request(setup: &WorktreeSetup) -> Result<(), String> {
+pub fn persist_request(setup: &WorktreeSetup) -> Result<(), String> {
     for (key, value) in [
         ("is_worktree", "true".to_string()),
         (
@@ -235,7 +235,7 @@ pub(crate) fn persist_request(setup: &WorktreeSetup) -> Result<(), String> {
 }
 
 /// Recover an interrupted first-send without automatically replaying any accepted turn.
-pub(crate) fn recover(session: &SessionInfo) -> Option<WorktreeSetup> {
+pub fn recover(session: &SessionInfo) -> Option<WorktreeSetup> {
     let store = JsonlStore::open_read_only(&session.session_file).ok()?;
     if !store.entries().is_empty() {
         return None;
@@ -262,7 +262,7 @@ pub(crate) fn recover(session: &SessionInfo) -> Option<WorktreeSetup> {
 }
 
 /// Only discard an unstarted session and the unchanged checkout recorded by its creator.
-pub(crate) fn cleanup_cancelled(setup: &WorktreeSetup) -> Result<(), String> {
+pub fn cleanup_cancelled(setup: &WorktreeSetup) -> Result<(), String> {
     let store = JsonlStore::open_read_only(&setup.session_file).map_err(|e| e.to_string())?;
     if !store.entries().is_empty() {
         return Err("The session has recorded work; keep it for manual cleanup".into());
@@ -299,7 +299,7 @@ pub(crate) fn cleanup_cancelled(setup: &WorktreeSetup) -> Result<(), String> {
     std::fs::remove_file(&setup.session_file).map_err(|e| e.to_string())
 }
 
-pub(crate) fn clear_request(setup: &WorktreeSetup) {
+pub fn clear_request(setup: &WorktreeSetup) {
     if let Err(error) = threadlane_coding_agent::harness::CodingSessionHarness::append_fact_to_path(
         &setup.session_file,
         "main",
