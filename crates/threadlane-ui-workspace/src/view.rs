@@ -46,7 +46,8 @@ use threadlane_ui_state::{
     AppState, SessionHydrationRequest, SessionInfo, WorkspacePage,
 };
 use threadlane_ui_state::projection::{
-    coding_agent_options, compute_full_session_projection, compute_session_messages,
+    coding_agent_options, compute_full_session_projection, compute_latest_run_completion,
+    compute_session_messages,
 };
 use threadlane_updater::UpdateStatus;
 
@@ -255,6 +256,17 @@ impl WorkspaceView {
                         )
                     });
             if request.reload_messages {
+                // The completion token is captured strictly before the
+                // transcript load so an acknowledged result can never claim
+                // content the presented transcript did not contain; a failed
+                // capture carries `None` and simply cannot acknowledge.
+                let capture_file = request.session_file.clone();
+                let presented_completion = cx
+                    .background_executor()
+                    .spawn(async move {
+                        compute_latest_run_completion(&capture_file).ok().flatten()
+                    })
+                    .await;
                 let history_file = request.session_file.clone();
                 let history = cx
                     .background_executor()
@@ -270,6 +282,7 @@ impl WorkspaceView {
                             &request.session_id,
                             &request.session_file,
                             messages,
+                            presented_completion,
                         ),
                         Err(error) => {
                             state.session_status = Some(format!("Could not load session: {error}"))

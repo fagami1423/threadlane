@@ -522,7 +522,11 @@ pub struct SidebarView {
     _subscriptions: Vec<Subscription>,
 }
 
-fn sidebar_session_fingerprint(session: &SessionInfo, attention: SessionAttention) -> u64 {
+fn sidebar_session_fingerprint(
+    session: &SessionInfo,
+    attention: SessionAttention,
+    has_unseen_result: bool,
+) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -530,6 +534,7 @@ fn sidebar_session_fingerprint(session: &SessionInfo, attention: SessionAttentio
     session.work_dir.hash(&mut hasher);
     session.session_file.hash(&mut hasher);
     session.updated_at.hash(&mut hasher);
+    has_unseen_result.hash(&mut hasher);
     match session.github_issue.as_ref() {
         Some(issue) => {
             true.hash(&mut hasher);
@@ -605,8 +610,12 @@ fn sidebar_fingerprint(state: &AppState, now: u64) -> u64 {
         project.name.hash(&mut hasher);
         project.work_dir.hash(&mut hasher);
         for session in &project.sessions {
-            sidebar_session_fingerprint(session, state.session_attention(session))
-                .hash(&mut hasher);
+            sidebar_session_fingerprint(
+                session,
+                state.session_attention(session),
+                state.session_has_unseen_result(session),
+            )
+            .hash(&mut hasher);
         }
     }
     // Hash-map iteration is stable between notifications unless the map changes;
@@ -1242,6 +1251,7 @@ impl SidebarView {
         } else {
             "local checkout"
         };
+        let has_unseen_result = self.model.read(cx).session_has_unseen_result(session);
         let session_tooltip = format!(
             "{}\n{} · {}\nBranch: {branch_display} ({worktree_display})\n{} · {}",
             session_identity.tooltip,
@@ -1250,6 +1260,11 @@ impl SidebarView {
             time_ago,
             attention.label(),
         );
+        let session_tooltip = if has_unseen_result {
+            format!("{session_tooltip}\nNew result: a finished run has output you have not seen yet")
+        } else {
+            session_tooltip
+        };
 
         let work_dir = session.work_dir.clone();
         let session_id = session.id.clone();
@@ -1301,13 +1316,19 @@ impl SidebarView {
             .map(|branch| format!(", branch {branch}"))
             .unwrap_or_default();
         let pinned_prefix = if is_pinned { "Pinned, " } else { "" };
+        let unseen_suffix = if has_unseen_result {
+            ", new result"
+        } else {
+            ""
+        };
         let session_row_label = format!(
-            "{pinned_prefix}{}, project {}, {}, {}{}",
+            "{pinned_prefix}{}, project {}, {}, {}{}{}",
             session_title,
             project,
             attention.label(),
             time_ago,
             branch_suffix,
+            unseen_suffix,
         );
 
         let pr_info = session_pr_info(session, &self.model.read(cx).git_prs).cloned();
@@ -1383,6 +1404,27 @@ impl SidebarView {
         // quiet sessions collapse back to two rows.
         let mut context_items = Vec::new();
         let mut signal_items = Vec::new();
+        if has_unseen_result {
+            signal_items.push(
+                div()
+                    .id(SharedString::from(format!(
+                        "session-new-result-{}",
+                        session.id
+                    )))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .px_1p5()
+                    .py(rems(0.125))
+                    .rounded_full()
+                    .bg(theme.muted.opacity(0.2))
+                    .text_xs()
+                    .font_medium()
+                    .text_color(theme.muted_foreground)
+                    .child("New result")
+                    .into_any_element(),
+            );
+        }
         context_items.push(
             div()
                 .flex()
@@ -1628,7 +1670,11 @@ impl SidebarView {
                                     let id = session.id.clone();
                                     move || format!("session-title-{id}")
                                 })
-                                .accessibility_label(session_title.clone())
+                                .accessibility_label(if has_unseen_result {
+                                    format!("{session_title} — New result")
+                                } else {
+                                    session_title.clone()
+                                })
                                 .ghost()
                                 .xsmall()
                                 .compact()
@@ -2756,7 +2802,9 @@ mod tests {
     };
     use std::collections::HashMap;
     use threadlane_git::GitHubPrInfo;
-    use threadlane_ui_state::{SessionAttention, SessionHealth, SessionInfo};
+    use threadlane_ui_state::{
+        SessionAttention, SessionCompletionSummary, SessionHealth, SessionInfo,
+    };
 
     #[gpui::test]
     fn update_control_stays_beside_settings_and_tracks_progress(cx: &mut gpui::TestAppContext) {
@@ -2887,6 +2935,7 @@ mod tests {
             github_issue: None,
             is_worktree: false,
             worktree_available: true,
+            completion_summary: SessionCompletionSummary::Unknown,
         }
     }
 
@@ -3219,13 +3268,13 @@ mod tests {
     fn changing_a_session_branch_changes_the_sidebar_fingerprint() {
         let mut item = session("session");
         item.git_branch = Some("feature/one".into());
-        let first = sidebar_session_fingerprint(&item, SessionAttention::Idle);
+        let first = sidebar_session_fingerprint(&item, SessionAttention::Idle, false);
 
         item.git_branch = Some("feature/two".into());
 
         assert_ne!(
             first,
-            sidebar_session_fingerprint(&item, SessionAttention::Idle)
+            sidebar_session_fingerprint(&item, SessionAttention::Idle, false)
         );
     }
 
@@ -3234,8 +3283,18 @@ mod tests {
         let item = session("session");
 
         assert_ne!(
-            sidebar_session_fingerprint(&item, SessionAttention::Idle),
-            sidebar_session_fingerprint(&item, SessionAttention::NeedsYou)
+            sidebar_session_fingerprint(&item, SessionAttention::Idle, false),
+            sidebar_session_fingerprint(&item, SessionAttention::NeedsYou, false)
+        );
+    }
+
+    #[test]
+    fn unseen_result_changes_the_sidebar_fingerprint() {
+        let item = session("session");
+
+        assert_ne!(
+            sidebar_session_fingerprint(&item, SessionAttention::Idle, false),
+            sidebar_session_fingerprint(&item, SessionAttention::Idle, true)
         );
     }
 
@@ -3251,7 +3310,7 @@ mod tests {
             url: "https://github.com/threadlane/app/issues/42".into(),
         });
 
-        let before = sidebar_session_fingerprint(&item, SessionAttention::Idle);
+        let before = sidebar_session_fingerprint(&item, SessionAttention::Idle, false);
         let identity = sidebar_session_identity(&item);
         assert_eq!(identity.title, "#42 Fix linked task browser");
         assert!(identity.tooltip.contains("threadlane/app"));
@@ -3272,7 +3331,7 @@ mod tests {
         });
         assert_ne!(
             before,
-            sidebar_session_fingerprint(&item, SessionAttention::Idle)
+            sidebar_session_fingerprint(&item, SessionAttention::Idle, false)
         );
     }
 }

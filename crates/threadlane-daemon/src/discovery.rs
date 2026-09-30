@@ -2,7 +2,11 @@ use std::path::{Path, PathBuf};
 use threadlane_runtime::harness::{JsonlStore, SessionStore};
 
 use threadlane_runtime::titles::extract_session_title;
-use crate::types::{SessionDiscoveryCache, SessionDiscoveryCacheEntry, SessionHealth, SessionInfo};
+use crate::projection::project_latest_run_completion;
+use crate::types::{
+    SessionCompletionSummary, SessionDiscoveryCache, SessionDiscoveryCacheEntry, SessionHealth,
+    SessionInfo,
+};
 
 pub fn file_mtime(path: &Path) -> u64 {
     std::fs::metadata(path)
@@ -138,6 +142,9 @@ pub fn discover_session_stubs_in_project(work_dir: &Path) -> Vec<SessionInfo> {
                 github_issue,
                 is_worktree,
                 worktree_available,
+                // The stub pass never parses the transcript: completions stay
+                // Unknown until the background discovery refresh parses it.
+                completion_summary: SessionCompletionSummary::Unknown,
             })
         })
         .collect::<Vec<_>>();
@@ -237,17 +244,22 @@ pub fn discover_sessions_in_project_cached(
                     };
                 let session_file =
                     resolve_session_transcript_file(&path, &runtime_work_dir, &id, is_worktree);
-                let (title, health, recorded_branch) =
+                let (title, health, recorded_branch, completion_summary) =
                     match JsonlStore::open_read_only(&session_file) {
                         Ok(store) => (
                             extract_session_title(&store, &id),
                             SessionHealth::Healthy,
                             store.facts().get("git_branch").cloned().or(stub_branch),
+                            match project_latest_run_completion(&store) {
+                                Some(token) => SessionCompletionSummary::Latest(token),
+                                None => SessionCompletionSummary::None,
+                            },
                         ),
                         Err(_) => (
                             "Unreadable session".to_string(),
                             SessionHealth::Warning,
                             stub_branch,
+                            SessionCompletionSummary::Unknown,
                         ),
                     };
                 let git_branch =
@@ -268,6 +280,7 @@ pub fn discover_sessions_in_project_cached(
                     github_issue,
                     is_worktree,
                     worktree_available,
+                    completion_summary,
                 };
                 cache.entries.insert(
                     path.clone(),

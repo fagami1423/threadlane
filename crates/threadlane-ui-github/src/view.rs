@@ -4457,7 +4457,9 @@ mod tests {
         PrViewedStates, PrViewedTransport, PrWorkspaceKey, PrWorkspaceSelections, ScopedIssue,
         ScopedPr,
     };
-    use threadlane_ui_state::{AppState, SessionHealth, SessionInfo};
+    use threadlane_ui_state::{
+        AppState, SessionCompletionSummary, SessionHealth, SessionInfo,
+    };
     use gpui::{AppContext as _, Focusable as _};
     use std::path::PathBuf;
     use std::sync::mpsc::{channel, Receiver, Sender};
@@ -4501,6 +4503,7 @@ mod tests {
             github_issue,
             is_worktree: false,
             worktree_available: true,
+            completion_summary: SessionCompletionSummary::Unknown,
         }
     }
 

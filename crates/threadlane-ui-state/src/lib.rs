@@ -11,12 +11,14 @@
 pub mod actions;
 pub mod controller;
 mod app_state;
+pub mod session_seen;
 pub mod types;
 
 #[cfg(any(test, feature = "test-support"))]
 mod test_support;
 
 pub use app_state::{close_work_needs_refresh, ActiveCloseWork, AppState};
+pub use session_seen::{SessionSeenStore, SessionSeenWriter};
 pub use threadlane_daemon::{
     agent_events, automation, chat, discovery, events, projection, provider_auth, settings,
     updater, worktree_setup,
@@ -24,10 +26,11 @@ pub use threadlane_daemon::{
 pub use threadlane_daemon::{
     derive_session_attention, hash_session_identity, next_event_batch, next_event_batch_capped,
     AttachedProject, ChatMessageInfo, ChatStreamEvent, ContextWindowInfo, MessageRole,
-    PendingComposerMessage, ProjectInfo, RunTiming, SessionAttention, SessionDiscoveryCache,
-    SessionDiscoveryCacheEntry, SessionHealth, SessionHydrationRequest, SessionInfo,
-    SessionMetricsInfo, SessionProjectionKey, SessionProjectionResult, SubagentActivityInfo,
-    SubagentActivityStatus, ToolActivityInfo, TrajectoryEntry, WorkMode,
+    PendingComposerMessage, ProjectInfo, RunCompletionToken, RunTiming, SessionAttention,
+    SessionCompletionSummary, SessionDiscoveryCache, SessionDiscoveryCacheEntry, SessionHealth,
+    SessionHydrationRequest, SessionInfo, SessionMetricsInfo, SessionProjectionKey,
+    SessionProjectionResult, SubagentActivityInfo, SubagentActivityStatus, ToolActivityInfo,
+    TrajectoryEntry, WorkMode,
 };
 pub use types::{
     GitHubTab, IssueWorkSelection, RequestedComposerInsert, RequestedEditorTarget, WorkspacePage,

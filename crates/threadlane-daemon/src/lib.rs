@@ -26,9 +26,10 @@ pub mod worktree_setup;
 pub use events::{next_event_batch, next_event_batch_capped};
 pub use types::{
     derive_session_attention, hash_session_identity, AttachedProject, ChatMessageInfo,
-    ChatStreamEvent, ContextWindowInfo, MessageRole, PendingComposerMessage, ProjectInfo, RunTiming,
-    SessionAttention, SessionDiscoveryCache, SessionDiscoveryCacheEntry, SessionHealth,
-    SessionHydrationRequest, SessionInfo, SessionMetricsInfo, SessionProjectionKey,
-    SessionProjectionResult, SubagentActivityInfo, SubagentActivityStatus, ToolActivityInfo,
-    TrajectoryDiagnostics, TrajectoryEntry, WorkMode,
+    ChatStreamEvent, ContextWindowInfo, MessageRole, PendingComposerMessage, ProjectInfo,
+    RunCompletionToken, RunTiming, SessionAttention, SessionCompletionSummary,
+    SessionDiscoveryCache, SessionDiscoveryCacheEntry, SessionHealth, SessionHydrationRequest,
+    SessionInfo, SessionMetricsInfo, SessionProjectionKey, SessionProjectionResult,
+    SubagentActivityInfo, SubagentActivityStatus, ToolActivityInfo, TrajectoryDiagnostics,
+    TrajectoryEntry, WorkMode,
 };

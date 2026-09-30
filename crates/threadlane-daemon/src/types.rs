@@ -77,6 +77,29 @@ impl WorkMode {
     }
 }
 
+/// Identity of one successful main-lane Run completion in a session journal:
+/// the `OperationFinished` record id, the run it closed, and its journal seq.
+/// Persisted inside `session_seen.json`, so the shape and field names are a
+/// stable on-disk contract.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct RunCompletionToken {
+    pub record_id: String,
+    pub run_id: String,
+    pub seq: u64,
+}
+
+/// What discovery could prove about a session's latest successful main-lane
+/// Run completion. `Unknown` deliberately stays distinct from `None`: an
+/// unreadable stub must never be baselined as acknowledged, while a parsed
+/// transcript with no qualifying completion confirms there is nothing to mark.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SessionCompletionSummary {
+    #[default]
+    Unknown,
+    None,
+    Latest(RunCompletionToken),
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionInfo {
     pub id: String,
@@ -92,6 +115,7 @@ pub struct SessionInfo {
     pub github_issue: Option<threadlane_git::GitHubIssueRef>,
     pub is_worktree: bool,
     pub worktree_available: bool,
+    pub completion_summary: SessionCompletionSummary,
 }
 
 /// Hash of the session-identity fields every session list renders (id, title,

@@ -30,7 +30,7 @@ use threadlane_ui_mirror::MirrorView;
 use threadlane_ui_state::{actions::AppAction, controller};
 use threadlane_ui_state::{
     AppState, ChatMessageInfo, ChatStreamEvent, MessageRole, SessionAttention,
-    SubagentActivityStatus, ToolActivityInfo, WorkMode,
+    SubagentActivityStatus, ToolActivityInfo, WorkMode, WorkspacePage,
 };
 
 use super::composer::*;
@@ -6550,7 +6550,7 @@ impl ChatListView {
 
 impl Render for ChatListView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (messages, is_new_task, active_plan, session_key, is_generating, active_permission_id) = {
+        let (messages, is_new_task, active_plan, session_key, is_generating, active_permission_id, on_chat_page) = {
             let state = self.model.read(cx);
             let active_permission_id = state
                 .active_session_id
@@ -6572,6 +6572,7 @@ impl Render for ChatListView {
                     .zip(state.active_session_id.clone()),
                 state.is_generating,
                 active_permission_id,
+                state.workspace_page == WorkspacePage::Chat,
             )
         };
         let session_changed = session_key != self.last_session_key;
@@ -6608,6 +6609,23 @@ impl Render for ChatListView {
             window.defer(cx, |window, cx| window.close_dialog(cx));
         }
         self.sync_transcript_rows(messages.clone(), is_generating, session_changed);
+        // Acknowledge a presented run completion only once the completed
+        // transcript is actually visible at the tail in a foreground window
+        // on the Chat page/tab. Loading states, Editor/GitHub/Settings, and
+        // a background or unfocused window never clear a New result marker.
+        if on_chat_page
+            && self.current_tab == CentralTab::Chat
+            && !is_new_task
+            && !messages.is_empty()
+            && self.transcript_list_state.is_following_tail()
+            && window.is_window_active()
+        {
+            self.model.update(cx, |state, cx| {
+                if state.acknowledge_presented_completion() {
+                    cx.notify();
+                }
+            });
+        }
         self.refresh_conversation_outline(cx);
         self.retain_prompt_recall(cx);
         if let Some(prompt) = self

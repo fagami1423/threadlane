@@ -4,7 +4,7 @@ use std::sync::{
     Arc, Mutex,
 };
 
-use crate::types::{ProjectInfo, SessionHealth, SessionInfo};
+use crate::types::{ProjectInfo, SessionCompletionSummary, SessionHealth, SessionInfo};
 use crate::{projection::compute_full_session_projection, AppState};
 
 struct ReportedShapeProvider {
@@ -174,6 +174,7 @@ pub fn activate_test_session(state: &mut AppState, session_id: &str, session_fil
             github_issue: None,
             is_worktree: false,
             worktree_available: true,
+            completion_summary: SessionCompletionSummary::Unknown,
         }],
         is_expanded: true,
     });

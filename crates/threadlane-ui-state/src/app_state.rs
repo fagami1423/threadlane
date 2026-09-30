@@ -152,6 +152,18 @@ pub struct AppState {
     /// Seen computer trigger ids (permission requests and tool activities)
     /// so the mirror opens once per new activity, not per pump tick.
     mirror_seen: HashSet<String>,
+    /// Per-project `session_seen.json` stores — the acknowledged newest-run
+    /// watermarks behind the sidebar "New result" marker. Keyed by canonical
+    /// project dir so a worktree transcript's relocation never loses it.
+    session_seen: HashMap<PathBuf, crate::session_seen::SessionSeenStore>,
+    /// Single serialized background writer for every session_seen file.
+    session_seen_writer: crate::session_seen::SessionSeenWriter,
+    /// Completion token captured before the active session's latest
+    /// transcript load. Cleared when acknowledged by the chat surface and
+    /// replaced by each applied load; never populated by a failed load.
+    presented_completion: Option<(SessionProjectionKey, RunCompletionToken)>,
+    /// One-shot flag so a failed session_seen write surfaces exactly once.
+    session_seen_save_failed: bool,
 }
 
 impl Default for AppState {
@@ -223,6 +235,132 @@ impl AppState {
         self.pinned_sessions
             .contains(&(work_dir.to_path_buf(), session_id.to_string()))
     }
+
+    /// Store key for `session_seen` maps: the canonical project dir so a
+    /// worktree session and its stub share one acknowledgment watermark.
+    fn session_seen_key(work_dir: &Path) -> PathBuf {
+        std::fs::canonicalize(work_dir).unwrap_or_else(|_| work_dir.to_path_buf())
+    }
+
+    fn session_seen_store_for(
+        &mut self,
+        work_dir: &Path,
+    ) -> &mut crate::session_seen::SessionSeenStore {
+        let key = Self::session_seen_key(work_dir);
+        self.session_seen
+            .entry(key)
+            .or_insert_with(|| crate::session_seen::SessionSeenStore::load(work_dir))
+    }
+
+    /// Hands any dirty store for `work_dir` to the serialized writer. A
+    /// dead writer re-marks the store so the next mutation retries instead
+    /// of spinning per frame.
+    fn flush_session_seen(&mut self, work_dir: &Path) {
+        let key = Self::session_seen_key(work_dir);
+        let Some(store) = self.session_seen.get_mut(&key) else {
+            return;
+        };
+        let Some(json) = store.take_dirty_json() else {
+            return;
+        };
+        let path = store.path().to_path_buf();
+        if !self.session_seen_writer.submit(key.clone(), path, json) {
+            tracing::warn!("session_seen writer is gone; keeping {} dirty", key.display());
+            if let Some(store) = self.session_seen.get_mut(&key) {
+                store.mark_dirty();
+            }
+        }
+    }
+
+    /// True while a session carries a confirmed successful main-lane Run
+    /// completion newer than its acknowledged watermark — the sidebar "New
+    /// result" marker.
+    pub fn session_has_unseen_result(&self, session: &SessionInfo) -> bool {
+        self.session_seen
+            .get(&Self::session_seen_key(&session.work_dir))
+            .is_none_or(|store| store.has_unseen(session))
+    }
+
+    /// Registers a session created in-app (before its first prompt runs) so
+    /// discovery's baseline cannot retroactively mark its first result seen.
+    pub fn register_session_seen(&mut self, work_dir: &Path, session_id: &str) {
+        self.session_seen_store_for(work_dir).register(session_id);
+        self.flush_session_seen(work_dir);
+    }
+
+    /// First-confirmed-discovery baseline: sessions the store has no record
+    /// of inherit their current completion as already seen. `Unknown`
+    /// summaries and already-tracked sessions are left alone, so a transient
+    /// discovery failure or stub parse never resets a watermark.
+    fn baseline_session_seen(&mut self, sessions: &[SessionInfo]) {
+        let mut dirty_dirs = Vec::new();
+        for session in sessions {
+            if session.completion_summary == SessionCompletionSummary::Unknown {
+                continue;
+            }
+            let store = self.session_seen_store_for(&session.work_dir);
+            if store.is_tracked(&session.id) {
+                continue;
+            }
+            store.baseline(session);
+            dirty_dirs.push(session.work_dir.clone());
+        }
+        for work_dir in dirty_dirs {
+            self.flush_session_seen(&work_dir);
+        }
+    }
+
+    /// Acknowledges the completion token the active session's last applied
+    /// transcript load captured — invoked by the chat surface only once the
+    /// transcript is presented at its tail in the foreground window.
+    /// Session-id + session-file guards keep a stale presentation from
+    /// acknowledging a different session's token; the write is journal-seq
+    /// monotonic, so a completion newer than the presented one can never be
+    /// acknowledged by it.
+    pub fn acknowledge_presented_completion(&mut self) -> bool {
+        let Some((key, token)) = self.presented_completion.clone() else {
+            return false;
+        };
+        if self.active_session_id.as_deref() != Some(key.session_id.as_str()) {
+            return false;
+        }
+        let Some(session) = self.active_session_info() else {
+            return false;
+        };
+        if session.session_file != key.session_file {
+            return false;
+        }
+        let work_dir = session.work_dir.clone();
+        let advanced = self
+            .session_seen_store_for(&work_dir)
+            .acknowledge(&key.session_id, &token);
+        if advanced {
+            self.flush_session_seen(&work_dir);
+        }
+        // The presented token is consumed whether it advanced the watermark
+        // or was already covered by a newer one; a later applied load
+        // replaces it.
+        self.presented_completion = None;
+        advanced
+    }
+
+    /// Canonical project dir owning `session_file` — the sessions list when
+    /// known, else the `.threadlane/sessions/<file>` parent chain.
+    fn session_work_dir_for_file(&self, session_file: &Path) -> Option<PathBuf> {
+        self.projects
+            .iter()
+            .flat_map(|project| project.sessions.iter())
+            .find(|session| session.session_file == session_file)
+            .map(|session| session.work_dir.clone())
+            .or_else(|| {
+                session_file
+                    .parent()
+                    .and_then(Path::parent)
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf)
+            })
+    }
+
     pub fn issue_branch_name(number: u64, title: &str, suffix: &str) -> String {
         let slug = title
             .chars()
@@ -484,6 +622,10 @@ impl AppState {
             browser_bridge: threadlane_protocol::browser::BrowserBridge::channel(),
             mirror_open: false,
             mirror_seen: HashSet::new(),
+            session_seen: HashMap::new(),
+            session_seen_writer: crate::session_seen::SessionSeenWriter::spawn(),
+            presented_completion: None,
+            session_seen_save_failed: false,
             pending_permissions: HashMap::new(),
             pending_questions: HashMap::new(),
             pending_hydrations: Vec::new(),
@@ -493,6 +635,16 @@ impl AppState {
             auto_address_pr_reviews_enabled: threadlane_git::load_auto_address_pr_reviews_enabled(),
             pr_review_tracking: HashMap::new(),
         };
+        // Load each project's seen-store once so discovery refreshes can
+        // baseline against persisted watermarks instead of the empty map.
+        let store_dirs: Vec<PathBuf> = state
+            .projects
+            .iter()
+            .map(|project| project.work_dir.clone())
+            .collect();
+        for work_dir in store_dirs {
+            state.session_seen_store_for(&work_dir);
+        }
         if let (Some(session_id), Some(session_file)) = (
             state.active_session_id.clone(),
             active_session_file.as_deref(),
@@ -963,6 +1115,10 @@ impl AppState {
         if generation != self.session_refresh_generation {
             return false;
         }
+        // Sessions first confirmed by this discovery pass inherit their
+        // current completion as seen — history predating the marker is never
+        // reported as a new result.
+        self.baseline_session_seen(&sessions);
         self.load_pinned_sessions(&work_dir);
         for session in &sessions {
             if session.work_dir != work_dir {
@@ -1909,6 +2065,16 @@ impl AppState {
         self.pending_questions.remove(session_id);
         self.deferred_stream_events.remove(session_id);
         self.pending_composer_messages.remove(session_id);
+        if self.presented_completion
+            .as_ref()
+            .is_some_and(|(key, _)| key.session_id == session_id)
+        {
+            self.presented_completion = None;
+        }
+        // Deleted sessions may drop their seen watermark; sessions that only
+        // disappear from discovery keep it.
+        self.session_seen_store_for(work_dir).prune(session_id);
+        self.flush_session_seen(work_dir);
         let pin_key = (work_dir.to_path_buf(), session_id.to_string());
         let was_pinned = self.pinned_sessions.contains(&pin_key);
         let mut pin_error = None;
@@ -1928,12 +2094,14 @@ impl AppState {
         }
         self.acp_config_options
             .remove(&Self::projection_key(session_id, &session_file));
+        let sessions = discover_sessions_in_project(work_dir);
+        self.baseline_session_seen(&sessions);
         if let Some(project) = self
             .projects
             .iter_mut()
             .find(|project| project.work_dir == work_dir)
         {
-            project.sessions = discover_sessions_in_project(work_dir);
+            project.sessions = sessions;
             self.load_pinned_sessions(work_dir);
         }
 
@@ -2405,9 +2573,11 @@ impl AppState {
                     github_issue: None,
                     is_worktree: true,
                     worktree_available: false,
+                    completion_summary: SessionCompletionSummary::Unknown,
                 },
             );
         }
+        self.register_session_seen(&project, &id);
         self.worktree_setups.insert(id.clone(), setup);
         self.select_session(project, id);
         self.composer_text.clear();
@@ -2536,6 +2706,8 @@ impl AppState {
         let session_id = format!("session_{now_nanos}");
         let session_file = sessions_dir.join(format!("{session_id}.jsonl"));
 
+        self.register_session_seen(&work_dir, &session_id);
+
         threadlane_coding_agent::harness::CodingSessionHarness::append_fact_to_path(
             &session_file,
             "main",
@@ -2545,12 +2717,14 @@ impl AppState {
         )
         .map_err(|error| format!("failed to persist reasoning effort: {error}"))?;
 
+        let sessions = discover_sessions_in_project(&work_dir);
+        self.baseline_session_seen(&sessions);
         if let Some(project) = self
             .projects
             .iter_mut()
             .find(|project| project.work_dir == work_dir)
         {
-            project.sessions = discover_sessions_in_project(&work_dir);
+            project.sessions = sessions;
             self.load_pinned_sessions(&work_dir);
         }
         let _ = self.select_session(work_dir, session_id.clone());
@@ -2654,6 +2828,7 @@ impl AppState {
         if worktree_dir.exists() || session_file.exists() {
             return Err("Generated issue session path already exists".into());
         }
+        self.register_session_seen(&work_dir, &session_id);
 
         let cleanup = |work_dir: &Path, worktree_dir: &Path, session_file: &Path| {
             // Best-effort rollback of exactly what this setup created
@@ -2719,12 +2894,14 @@ impl AppState {
             }
         }
 
+        let sessions = discover_sessions_in_project(&work_dir);
+        self.baseline_session_seen(&sessions);
         if let Some(project) = self
             .projects
             .iter_mut()
             .find(|project| project.work_dir == work_dir)
         {
-            project.sessions = discover_sessions_in_project(&work_dir);
+            project.sessions = sessions;
         }
         let selection = IssueWorkSelection::capture(self);
         self.selected_model = model.clone();
@@ -2763,12 +2940,14 @@ impl AppState {
                 settings.orchestrator_mode = previous_mode;
                 let _ = threadlane_project::subagent_settings::save(&work_dir, &settings);
             }
+            let sessions = discover_sessions_in_project(&work_dir);
+            self.baseline_session_seen(&sessions);
             if let Some(project) = self
                 .projects
                 .iter_mut()
                 .find(|project| project.work_dir == work_dir)
             {
-                project.sessions = discover_sessions_in_project(&work_dir);
+                project.sessions = sessions;
             }
             selection.restore(self);
             return Err(error);
@@ -2818,6 +2997,7 @@ impl AppState {
         session_id: &str,
         session_file: &Path,
         mut messages: Vec<ChatMessageInfo>,
+        presented_completion: Option<RunCompletionToken>,
     ) {
         if self.active_session_matches(session_id, session_file) {
             // Session creation queues hydration before the first prompt is
@@ -2841,6 +3021,12 @@ impl AppState {
                 .collect();
             messages.extend(optimistic_messages);
             self.messages = Arc::new(messages);
+            // Only a successfully applied load may carry its captured token —
+            // failed loads retain the marker, and the later full projection
+            // can never acknowledge a newer token it observed afterward.
+            self.presented_completion = presented_completion.map(|token| {
+                (Self::projection_key(session_id, session_file), token)
+            });
         }
     }
 }
@@ -3683,6 +3869,28 @@ impl AppState {
         Ok(changed)
     }
     pub fn drain_chat_stream(&mut self, mut events: Vec<ChatStreamEvent>) -> bool {
+        while let Some(result) = self.session_seen_writer.try_recv_result() {
+            match result.error {
+                Some(error) => {
+                    tracing::warn!(
+                        "session_seen write failed for {}: {error}",
+                        result.work_dir.display()
+                    );
+                    let key = Self::session_seen_key(&result.work_dir);
+                    if let Some(store) = self.session_seen.get_mut(&key) {
+                        store.mark_dirty();
+                    }
+                    if !self.session_seen_save_failed {
+                        self.session_seen_save_failed = true;
+                        self.session_status = Some(
+                            "Could not save read state — the New result marker may return after restart."
+                                .into(),
+                        );
+                    }
+                }
+                None => self.session_seen_save_failed = false,
+            }
+        }
         let scheduler_files: Vec<PathBuf> = self.scheduler_results.keys().cloned().collect();
         for session_file in scheduler_files {
             if let Some(receiver) = self.scheduler_results.get_mut(&session_file) {
@@ -4010,6 +4218,12 @@ impl AppState {
                         .map(|key| key.session_file);
                     if active_file.as_ref() != Some(&session_file) {
                         changed = true;
+                        // A background completion must still reach the
+                        // sidebar's New result marker; the deferred event
+                        // only replays when the session is opened.
+                        if let Some(work_dir) = self.session_work_dir_for_file(&session_file) {
+                            self.request_session_refresh(&work_dir);
+                        }
                         self.deferred_stream_events
                             .entry(session_id.clone())
                             .or_default()
@@ -4043,6 +4257,9 @@ impl AppState {
                         reasoning_expanded: false,
                     });
                     self.session_status = Some(status);
+                    if let Some(work_dir) = self.session_work_dir_for_file(&session_file) {
+                        self.request_session_refresh(&work_dir);
+                    }
                 }
                 ChatStreamEvent::Finished {
                     session_id,
@@ -4052,6 +4269,12 @@ impl AppState {
                     self.pending_questions.remove(&session_id);
                     if self.active_session_id.as_deref() != Some(&session_id) {
                         changed = true;
+                        // A background completion must still reach the
+                        // sidebar's New result marker; the deferred event
+                        // only replays when the session is opened.
+                        if let Some(work_dir) = self.session_work_dir_for_file(&session_file) {
+                            self.request_session_refresh(&work_dir);
+                        }
                         self.deferred_stream_events
                             .entry(session_id.clone())
                             .or_default()
@@ -4098,12 +4321,8 @@ impl AppState {
                     if runtime_is_stale {
                         self.drop_session_runtime(&session_file);
                     }
-                    if let Some(work_dir) = session_file
-                        .parent()
-                        .and_then(Path::parent)
-                        .and_then(Path::parent)
-                    {
-                        self.request_session_refresh(work_dir);
+                    if let Some(work_dir) = self.session_work_dir_for_file(&session_file) {
+                        self.request_session_refresh(&work_dir);
                     }
                 }
                 ChatStreamEvent::AcpConfigOptions {
