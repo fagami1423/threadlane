@@ -1,14 +1,10 @@
 //! Embedded browser surface for the right panel (macOS only).
 //!
-//! Thin wrapper over `gpui-wry` (same git checkout as `gpui-kit`, same
-//! `gpui-pre`): real `WKWebView` child views with a Safari-style address
-//! bar, multiple tabs, and a click-to-annotate picker whose picks land in
-//! the chat composer.
-//!
-//! Known limitation (matches upstream `gpui-kit/examples/webview`): our
-//! `gpui-pre` has no overlay plane (`GPUIOverlayView` exists only in Waku's
-//! pinned fork), so the native view paints above GPUI menus/tooltips that
-//! overlap its rect. The tab hides the view when inactive to bound this.
+//! Thin wrapper over `wry`: real `WKWebView`s reparented into GPUI window
+//! composition surfaces (see `webview.rs`), so deferred overlays — dialogs,
+//! sheets, menus, tooltips, notifications — paint above the page. Safari-style
+//! address bar, multiple tabs, and a click-to-annotate picker whose picks land
+//! in the chat composer.
 
 use base64::Engine as _;
 use gpui::prelude::FluentBuilder;
@@ -32,7 +28,7 @@ struct BrowserTab {
     /// address bar shows it instead of the live URL, which still reports the
     /// previous page during provisional navigation.
     pending_url: Option<String>,
-    webview: Option<Entity<gpui_wry::WebView>>,
+    webview: Option<Entity<super::webview::ComposedWebView>>,
 }
 
 pub struct BrowserView {
@@ -119,7 +115,7 @@ impl BrowserView {
         cx.notify();
     }
 
-    fn active_webview(&self) -> Option<Entity<gpui_wry::WebView>> {
+    fn active_webview(&self) -> Option<Entity<super::webview::ComposedWebView>> {
         self.tabs
             .get(self.active_tab)
             .and_then(|tab| tab.webview.clone())
@@ -130,7 +126,7 @@ impl BrowserView {
         url: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Entity<gpui_wry::WebView> {
+    ) -> Entity<super::webview::ComposedWebView> {
         use raw_window_handle::HasWindowHandle;
 
         let window_handle = window.window_handle().expect("window handle");
@@ -141,10 +137,13 @@ impl BrowserView {
         let wry_webview = builder
             .build_as_child(&window_handle)
             .expect("wry child webview");
-        let webview = cx.new(|cx| gpui_wry::WebView::new(wry_webview, window, cx));
+        let webview = cx.new(|cx| super::webview::ComposedWebView::new(wry_webview, window, cx));
         webview.update(cx, |view, _| view.load_url(url));
         // Inactive tabs stay hidden until selected.
-        webview.update(cx, |view, _| view.hide());
+        webview.update(cx, |view, cx| {
+            view.hide();
+            cx.notify();
+        });
         webview
     }
 
@@ -181,7 +180,10 @@ impl BrowserView {
         if let Some(position) = self.tabs.iter().position(|tab| tab.id == id) {
             let removed = self.tabs.remove(position);
             if let Some(webview) = removed.webview {
-                webview.update(cx, |view, _| view.hide());
+                webview.update(cx, |view, cx| {
+                    view.hide();
+                    cx.notify();
+                });
             }
             if self.active_tab >= self.tabs.len() {
                 self.active_tab = self.tabs.len() - 1;
@@ -233,12 +235,13 @@ impl BrowserView {
     fn sync_active_visibility(&self, cx: &mut Context<Self>) {
         for (index, tab) in self.tabs.iter().enumerate() {
             if let Some(webview) = tab.webview.clone() {
-                webview.update(cx, |view, _| {
+                webview.update(cx, |view, cx| {
                     if self.visible && index == self.active_tab {
                         view.show();
                     } else {
                         view.hide();
                     }
+                    cx.notify();
                 });
             }
         }

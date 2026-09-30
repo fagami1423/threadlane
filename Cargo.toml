@@ -87,13 +87,14 @@ vt100 = "0.16"
 wasmi = "2.0"
 
 # GPUI Kit's snapshot facades must all resolve to the same gpui-fast runtime.
-# Pinned to the compatibility support merged in longbridge/gpui-fast#23.
+# Pinned to c22243e: window composition (longbridge/gpui-fast#30), which lets
+# the embedded browser's WKWebView sit under GPUI's overlay layer.
 [patch.crates-io]
-gpui-pre = { git = "https://github.com/longbridge/gpui-fast", rev = "1b381adb68a6e5a4550f73b0cd29a231ce6c7281" }
-gpui-pre-platform = { git = "https://github.com/longbridge/gpui-fast", rev = "1b381adb68a6e5a4550f73b0cd29a231ce6c7281" }
-gpui-pre-macros = { git = "https://github.com/longbridge/gpui-fast", rev = "1b381adb68a6e5a4550f73b0cd29a231ce6c7281" }
-gpui-pre-sum-tree = { git = "https://github.com/longbridge/gpui-fast", rev = "1b381adb68a6e5a4550f73b0cd29a231ce6c7281" }
-gpui-pre-web = { git = "https://github.com/longbridge/gpui-fast", rev = "1b381adb68a6e5a4550f73b0cd29a231ce6c7281" }
+gpui-pre = { git = "https://github.com/longbridge/gpui-fast", rev = "c22243e1ddc97ac4ea81ddb18408e0074a78d820" }
+gpui-pre-platform = { git = "https://github.com/longbridge/gpui-fast", rev = "c22243e1ddc97ac4ea81ddb18408e0074a78d820" }
+gpui-pre-macros = { git = "https://github.com/longbridge/gpui-fast", rev = "c22243e1ddc97ac4ea81ddb18408e0074a78d820" }
+gpui-pre-sum-tree = { git = "https://github.com/longbridge/gpui-fast", rev = "c22243e1ddc97ac4ea81ddb18408e0074a78d820" }
+gpui-pre-web = { git = "https://github.com/longbridge/gpui-fast", rev = "c22243e1ddc97ac4ea81ddb18408e0074a78d820" }
 
 [profile.dev]
 opt-level = 0

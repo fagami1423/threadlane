@@ -23,7 +23,6 @@ tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-gpui-wry = { git = "https://github.com/longbridge/gpui-kit" }
 wry = { version = "0.53.3", package = "lb-wry" }
 raw-window-handle = "0.6"
 objc2 = { version = "0.6", features = ["std"] }
