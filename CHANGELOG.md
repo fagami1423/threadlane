@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.1.33](https://github.com/wheregmis/threadlane/compare/v0.1.32...v0.1.33) (2026-09-30)
+
+
+### Features
+
+* **git:** add branch context menu with safe deletion ([beb1e86](https://github.com/wheregmis/threadlane/commit/beb1e86d8466d447b1d2f2dd04f8899bb032fc1d))
+* **git:** add safe branch deletion context menu ([4421157](https://github.com/wheregmis/threadlane/commit/4421157b3f7fe2b4077178f1bd9872d61c66f2a0))
+* **models:** add GPT-6.1 Sol for OpenAI and Codex ([20b736e](https://github.com/wheregmis/threadlane/commit/20b736e48c8f4600c1b49149ddfe77569ae6fc26))
+* **models:** register GPT-6.1 Sol for OpenAI and Codex ([7cc3a82](https://github.com/wheregmis/threadlane/commit/7cc3a8228210ec5c32b7792fa566125e0abd8b0c))
+* **terminal:** find in terminal output ([e2134a8](https://github.com/wheregmis/threadlane/commit/e2134a8f20050f39c1d2a72b09f4bad3851bedc3))
+* **terminal:** find in terminal output ([716433e](https://github.com/wheregmis/threadlane/commit/716433ea2b595f726e00e3058cb67567908c9108)), closes [#293](https://github.com/wheregmis/threadlane/issues/293)
+
+
+### Bug Fixes
+
+* **git:** disable local deletion for remote branch rows ([c0a1157](https://github.com/wheregmis/threadlane/commit/c0a11577af1a3d366f08888c20b4da40e4c30966))
+* **openai:** reject unsupported GPT-6.1 Sol API-key tools ([d5ba294](https://github.com/wheregmis/threadlane/commit/d5ba294817679aab0e24d8708a766ace434dbcab))
+
+
+### Maintenance
+
+* better review ([6fa541f](https://github.com/wheregmis/threadlane/commit/6fa541fc7d923f81ea8a15255312d8b0f2bda7df))
+
 ## [0.1.32](https://github.com/wheregmis/threadlane/compare/v0.1.31...v0.1.32) (2026-09-30)
 
 
