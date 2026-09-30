@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -28,7 +28,7 @@ type TimedCache<T> = HashMap<PathBuf, (Instant, T)>;
 
 static REPOSITORY_METADATA_CACHE: OnceLock<Mutex<TimedCache<RepositoryMetadata>>> = OnceLock::new();
 
-pub(crate) fn command(work_dir: &Path, args: &[&str]) -> Result<String, GitError> {
+pub(crate) fn command_bytes(work_dir: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
     let mut attempts = 0;
     loop {
         attempts += 1;
@@ -42,7 +42,7 @@ pub(crate) fn command(work_dir: &Path, args: &[&str]) -> Result<String, GitError
             .map_err(|error| GitError::new(work_dir, format!("could not start git: {error}")))?;
 
         if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+            return Ok(output.stdout);
         }
 
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -61,6 +61,10 @@ pub(crate) fn command(work_dir: &Path, args: &[&str]) -> Result<String, GitError
             },
         ));
     }
+}
+
+pub(crate) fn command(work_dir: &Path, args: &[&str]) -> Result<String, GitError> {
+    command_bytes(work_dir, args).map(|stdout| String::from_utf8_lossy(&stdout).into_owned())
 }
 
 pub(crate) fn parse_status(_work_dir: &Path, porcelain: &str) -> GitStatus {
@@ -1357,6 +1361,85 @@ pub fn is_git_repo(work_dir: &Path) -> bool {
     command(work_dir, &["rev-parse", "--is-inside-work-tree"])
         .map(|out| out.trim() == "true")
         .unwrap_or(false)
+}
+
+/// Maximum paths [`list_project_files`] returns before marking the inventory
+/// truncated.
+pub const FILE_INVENTORY_LIMIT: usize = 20_000;
+
+/// The files `git ls-files` reports for a repository, de-duplicated.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GitFileInventory {
+    /// Repository-relative file paths (`/` separated), sorted.
+    pub paths: Vec<String>,
+    /// Output exceeded [`FILE_INVENTORY_LIMIT`]; `paths` is a bounded prefix.
+    pub truncated: bool,
+    /// Names that were not valid UTF-8 and were skipped rather than mangled.
+    pub non_utf8_skipped: usize,
+}
+
+/// Why a file inventory could not be produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileInventoryError {
+    /// `work_dir` is not inside a Git work tree.
+    NotARepository,
+    /// Git ran but failed, so the result is unknown (not "empty").
+    Failed(GitError),
+}
+
+/// Lists files selectable for `@` completion under `work_dir`.
+///
+/// Runs `git ls-files -z --cached --others --exclude-standard`, so results are
+/// tracked files plus non-ignored untracked files; names ignored by
+/// `.gitignore`/`.git/info/exclude`/global excludes are never enumerated.
+/// `.git` and `.threadlane` entries are excluded on top of that, duplicate
+/// names (tracked + untracked) are removed, and non-UTF-8 names are counted
+/// and skipped instead of being lossy-decoded into replacement characters.
+///
+/// Only names are handled: no file content is read and no symlink is
+/// traversed. The inventory is purely Git's index/worktree name list.
+pub fn list_project_files(work_dir: &Path) -> Result<GitFileInventory, FileInventoryError> {
+    if !is_git_repo(work_dir) {
+        return Err(FileInventoryError::NotARepository);
+    }
+    let output = command_bytes(
+        work_dir,
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+    )
+    .map_err(FileInventoryError::Failed)?;
+
+    let mut inventory = GitFileInventory::default();
+    let mut seen = HashSet::new();
+    for raw in output.split(|byte| *byte == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(path) = std::str::from_utf8(raw) else {
+            inventory.non_utf8_skipped += 1;
+            continue;
+        };
+        if path == ".git"
+            || path == ".threadlane"
+            || path.starts_with(".git/")
+            || path.starts_with(".threadlane/")
+            || path.split('/').any(|component| component == "..")
+        {
+            continue;
+        }
+        if seen.insert(path) {
+            inventory.paths.push(path.to_owned());
+        }
+    }
+    inventory.paths.sort();
+    inventory.truncated = inventory.paths.len() > FILE_INVENTORY_LIMIT;
+    inventory.paths.truncate(FILE_INVENTORY_LIMIT);
+    Ok(inventory)
 }
 
 /// Returns the primary checkout root even when `work_dir` is itself a worktree.

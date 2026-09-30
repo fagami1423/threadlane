@@ -1466,3 +1466,176 @@ fn worktree_bases_refreshes_refs_and_selects_only_existing_defaults() {
     );
     assert_eq!(worktree_bases(local.path()).unwrap(), (default, branches));
 }
+
+#[test]
+fn list_project_files_reports_tracked_and_nonignored_untracked() {
+    let dir = tempdir().unwrap();
+    init_repo(dir.path());
+    fs::write(dir.path().join("tracked.rs"), "fn main() {}\n").unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+    fs::write(dir.path().join(".gitignore"), "ignored/\nsecret.env\n").unwrap();
+    run_git(dir.path(), &["add", "."]);
+    run_git(dir.path(), &["commit", "-qm", "initial"]);
+
+    fs::write(dir.path().join("untracked.rs"), "x\n").unwrap();
+    fs::create_dir_all(dir.path().join("ignored")).unwrap();
+    fs::write(dir.path().join("ignored/hidden.rs"), "x\n").unwrap();
+    fs::write(dir.path().join("secret.env"), "TOKEN=1\n").unwrap();
+    fs::create_dir_all(dir.path().join(".threadlane")).unwrap();
+    fs::write(dir.path().join(".threadlane/state.json"), "{}\n").unwrap();
+
+    let inventory = list_project_files(dir.path()).unwrap();
+    assert!(!inventory.truncated);
+    assert_eq!(inventory.non_utf8_skipped, 0);
+    assert!(inventory.paths.contains(&"tracked.rs".to_string()));
+    assert!(inventory.paths.contains(&"src/lib.rs".to_string()));
+    assert!(inventory.paths.contains(&"untracked.rs".to_string()));
+    assert!(inventory.paths.contains(&".gitignore".to_string()));
+    // Ignored names and Threadlane state are never enumerated.
+    assert!(!inventory
+        .paths
+        .iter()
+        .any(|path| path.contains("ignored") || path.contains("secret.env")));
+    assert!(!inventory
+        .paths
+        .iter()
+        .any(|path| path == ".threadlane" || path.starts_with(".threadlane/")
+            || path == ".git" || path.starts_with(".git/")));
+}
+
+#[test]
+fn list_project_files_rejects_non_repositories() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("file.rs"), "x\n").unwrap();
+    assert_eq!(
+        list_project_files(dir.path()),
+        Err(FileInventoryError::NotARepository)
+    );
+}
+
+#[test]
+fn list_project_files_works_inside_linked_worktrees() {
+    let main = tempdir().unwrap();
+    init_repo(main.path());
+    fs::write(main.path().join("base.rs"), "x\n").unwrap();
+    run_git(main.path(), &["add", "base.rs"]);
+    run_git(main.path(), &["commit", "-qm", "initial"]);
+
+    let linked = main.path().join("linked-worktree");
+    run_git(
+        main.path(),
+        &[
+            "worktree",
+            "add",
+            linked.to_str().unwrap(),
+            "-b",
+            "linked-branch",
+        ],
+    );
+    fs::write(linked.join("new.rs"), "x\n").unwrap();
+
+    // A linked worktree has a `.git` FILE, not a directory — it must not leak.
+    assert!(linked.join(".git").is_file());
+    let inventory = list_project_files(&linked).unwrap();
+    assert_eq!(
+        inventory.paths,
+        vec!["README.md".to_string(), "base.rs".to_string(), "new.rs".to_string()]
+    );
+}
+
+#[test]
+fn list_project_files_round_trips_unusual_names() {
+    let dir = tempdir().unwrap();
+    init_repo(dir.path());
+    for name in [
+        "a file.rs",
+        "tick`name.rs",
+        "日本語のファイル.rs",
+        " leading space.rs",
+        "trailing space .rs",
+    ] {
+        fs::write(dir.path().join(name), "x\n").unwrap();
+    }
+    run_git(dir.path(), &["add", "."]);
+    run_git(dir.path(), &["commit", "-qm", "initial"]);
+
+    let inventory = list_project_files(dir.path()).unwrap();
+    for name in [
+        "a file.rs",
+        "tick`name.rs",
+        "日本語のファイル.rs",
+        " leading space.rs",
+        "trailing space .rs",
+    ] {
+        assert!(
+            inventory.paths.contains(&name.to_string()),
+            "missing {name:?} in {:?}",
+            inventory.paths
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn list_project_files_skips_non_utf8_names() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = tempdir().unwrap();
+    init_repo(dir.path());
+    fs::write(dir.path().join("normal.rs"), "x\n").unwrap();
+    run_git(dir.path(), &["add", "normal.rs"]);
+
+    // A filename that is not valid UTF-8 must be skipped, not lossy-decoded.
+    // APFS refuses to create such a name at all, so stage it straight into
+    // the index by reusing normal.rs's blob.
+    let sha = Command::new("git")
+        .args(["rev-parse", ":normal.rs"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(sha.status.success());
+    let mut spec = b"100644,".to_vec();
+    spec.extend_from_slice(&sha.stdout);
+    spec.extend_from_slice(b",bad-\xFFname.rs");
+    spec.retain(|byte| *byte != b'\n');
+    let output = Command::new("git")
+        .arg("update-index")
+        .arg("--add")
+        .arg("--cacheinfo")
+        .arg(OsString::from_vec(spec))
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "update-index failed: {output:?}");
+
+    let inventory = list_project_files(dir.path()).unwrap();
+    assert_eq!(inventory.non_utf8_skipped, 1);
+    assert_eq!(
+        inventory.paths,
+        vec!["README.md".to_string(), "normal.rs".to_string()]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn list_project_files_does_not_traverse_external_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    init_repo(dir.path());
+    let outside = tempdir().unwrap();
+    fs::write(outside.path().join("outside.rs"), "x\n").unwrap();
+    fs::write(dir.path().join("inside.rs"), "x\n").unwrap();
+    symlink(outside.path(), dir.path().join("link-out")).unwrap();
+
+    let inventory = list_project_files(dir.path()).unwrap();
+    // The symlink itself is a valid name; nothing under it is enumerated.
+    assert!(inventory.paths.contains(&"link-out".to_string()));
+    assert!(inventory.paths.contains(&"inside.rs".to_string()));
+    assert!(!inventory
+        .paths
+        .iter()
+        .any(|path| path.contains("outside") || path.starts_with("link-out/")));
+}
