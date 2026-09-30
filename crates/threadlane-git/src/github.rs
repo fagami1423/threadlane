@@ -11,8 +11,9 @@ use crate::error::GitError;
 use crate::git::{command, current_branch, push};
 use crate::types::{
     GitHubIssueComment, GitHubIssueDetail, GitHubIssueRef, GitHubIssueSummary, GitHubLabel,
-    GitHubPrCommit, GitHubPrFile, GitHubPrInfo, GitHubPullRequestSummary, GitHubRepository,
-    PrCheckStatus, PrConversationComment, PrReview, PrReviewComment, PullRequestReviewCommentDraft,
+    GitHubPrCommit, GitHubPrFile, GitHubPrFileViewed, GitHubPrInfo, GitHubPrViewedState,
+    GitHubPullRequestSummary, GitHubRepository, PrCheckStatus, PrConversationComment,
+    PrFileViewedStatus, PrReview, PrReviewComment, PullRequestReviewCommentDraft,
     PullRequestReviewVerdict,
 };
 
@@ -1404,4 +1405,238 @@ pub fn submit_pull_request_review(
         execute_gh_json(work_dir, &args, &payload)?;
     }
     Ok(review)
+}
+
+/// Bound on GraphQL pagination so one read stays within a fixed request budget.
+const PR_VIEWED_MAX_PAGES: usize = 20;
+
+const PR_VIEWED_STATE_QUERY: &str = "query($owner: String!, $repo: String!, $number: Int!, $cursor: String) { \
+    repository(owner: $owner, name: $repo) { \
+        pullRequest(number: $number) { \
+            id headRefOid \
+            files(first: 100, after: $cursor) { \
+                pageInfo { hasNextPage endCursor } \
+                nodes { path viewerViewedState } \
+            } \
+        } \
+    } \
+    viewer { login } \
+}";
+
+const PR_MARK_FILE_VIEWED_MUTATION: &str = "mutation($pullRequestId: ID!, $path: String!) { \
+    markFileAsViewed(input: {pullRequestId: $pullRequestId, path: $path}) { clientMutationId } \
+}";
+
+const PR_UNMARK_FILE_VIEWED_MUTATION: &str = "mutation($pullRequestId: ID!, $path: String!) { \
+    unmarkFileAsViewed(input: {pullRequestId: $pullRequestId, path: $path}) { clientMutationId } \
+}";
+
+fn github_graphql_args(host: &str) -> Vec<String> {
+    github_api_args(host, &["graphql", "--input", "-"])
+}
+
+/// GraphQL responses can carry HTTP-200 success with a populated `errors`
+/// array; treat that as a failure rather than trusting an empty `data`.
+pub(crate) fn graphql_errors(value: &serde_json::Value) -> Option<String> {
+    let errors = value["errors"].as_array()?;
+    (!errors.is_empty()).then(|| {
+        errors
+            .iter()
+            .map(|error| {
+                error["message"]
+                    .as_str()
+                    .or_else(|| error.as_str())
+                    .unwrap_or("unknown GraphQL error")
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
+}
+
+pub(crate) fn pr_viewed_state_payload(
+    owner: &str,
+    repo: &str,
+    number: u64,
+    cursor: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "query": PR_VIEWED_STATE_QUERY,
+        "variables": {
+            "owner": owner,
+            "repo": repo,
+            "number": number,
+            "cursor": cursor,
+        },
+    })
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ParsedViewedPage {
+    pub pull_request_id: String,
+    pub head_oid: String,
+    pub viewer: String,
+    pub files: Vec<GitHubPrFileViewed>,
+    pub has_next_page: bool,
+    pub end_cursor: Option<String>,
+}
+
+pub(crate) fn parse_pr_viewed_state_page(json_str: &str) -> Result<ParsedViewedPage, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json_str).map_err(|error| error.to_string())?;
+    if let Some(message) = graphql_errors(&value) {
+        return Err(message);
+    }
+    let pull_request = &value["data"]["repository"]["pullRequest"];
+    if pull_request.is_null() {
+        return Err("GitHub did not return the pull request".to_owned());
+    }
+    let pull_request_id = pull_request["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "GitHub did not return the pull request identity".to_owned())?
+        .to_owned();
+    let page_info = &pull_request["files"]["pageInfo"];
+    let files = pull_request["files"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|node| GitHubPrFileViewed {
+            path: node["path"].as_str().unwrap_or("").to_owned(),
+            status: match node["viewerViewedState"].as_str() {
+                Some("VIEWED") => PrFileViewedStatus::Viewed,
+                Some("UNVIEWED") => PrFileViewedStatus::Unviewed,
+                Some("DISMISSED") => PrFileViewedStatus::ChangedSinceViewed,
+                _ => PrFileViewedStatus::Unknown,
+            },
+        })
+        .filter(|file| !file.path.is_empty())
+        .collect();
+    Ok(ParsedViewedPage {
+        pull_request_id,
+        head_oid: pull_request["headRefOid"].as_str().unwrap_or("").to_owned(),
+        viewer: github_login(&value["data"]["viewer"]),
+        files,
+        has_next_page: page_info["hasNextPage"].as_bool().unwrap_or(false),
+        end_cursor: page_info["endCursor"].as_str().map(str::to_owned),
+    })
+}
+
+pub(crate) fn collect_pr_viewed_state(
+    work_dir: &Path,
+    repository: &GitHubRepository,
+    number: u64,
+    mut fetch_page: impl FnMut(&serde_json::Value) -> Result<String, GitError>,
+) -> Result<GitHubPrViewedState, GitError> {
+    let mut state = GitHubPrViewedState::default();
+    let mut cursor: Option<String> = None;
+    let mut complete = false;
+    for _ in 0..PR_VIEWED_MAX_PAGES {
+        let payload =
+            pr_viewed_state_payload(&repository.owner, &repository.repo, number, cursor.as_deref());
+        let output = fetch_page(&payload)?;
+        let page = parse_pr_viewed_state_page(&output).map_err(|message| {
+            GitError::new(
+                work_dir,
+                format!("could not parse pull request viewed state: {message}"),
+            )
+        })?;
+        if !state.pull_request_id.is_empty()
+            && (state.pull_request_id != page.pull_request_id || state.viewer != page.viewer)
+        {
+            return Err(GitError::new(
+                work_dir,
+                "GitHub returned inconsistent pull request viewed state pages".to_owned(),
+            ));
+        }
+        state.pull_request_id = page.pull_request_id;
+        state.head_oid = page.head_oid;
+        state.viewer = page.viewer;
+        state.files.extend(page.files);
+        if !page.has_next_page {
+            complete = true;
+            break;
+        }
+        let Some(next_cursor) = page.end_cursor.filter(|cursor| !cursor.is_empty()) else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+    state.complete = complete;
+    if state.pull_request_id.is_empty() {
+        return Err(GitError::new(
+            work_dir,
+            "GitHub did not return the pull request identity".to_owned(),
+        ));
+    }
+    Ok(state)
+}
+
+/// Reads the signed-in viewer's per-file Viewed markers for a pull request.
+/// Personal state is deliberately not cached in the shared PR-detail caches:
+/// it is viewer-scoped and changes with every mark/unmark write.
+pub fn pull_request_viewed_state(
+    work_dir: &Path,
+    pull_request_url: &str,
+) -> Result<GitHubPrViewedState, GitError> {
+    let (repository, number) = parse_pull_request_url(pull_request_url)
+        .map_err(|message| GitError::new(work_dir, message))?;
+    let args = github_graphql_args(&repository.host);
+    collect_pr_viewed_state(work_dir, &repository, number, |payload| {
+        execute_gh_json(work_dir, &args, payload)
+    })
+}
+
+pub(crate) fn pr_file_viewed_mutation_payload(
+    pull_request_id: &str,
+    path: &str,
+    viewed: bool,
+) -> Result<serde_json::Value, String> {
+    let pull_request_id = validated_text(pull_request_id, "pull request identity")?;
+    let path = validate_review_path(path)?;
+    let query = if viewed {
+        PR_MARK_FILE_VIEWED_MUTATION
+    } else {
+        PR_UNMARK_FILE_VIEWED_MUTATION
+    };
+    Ok(serde_json::json!({
+        "query": query,
+        "variables": {
+            "pullRequestId": pull_request_id,
+            "path": path,
+        },
+    }))
+}
+
+/// Marks one pull request file as viewed/unviewed for the signed-in account.
+/// The pull request node ID must come from a current viewed-state read so the
+/// write lands on the same PR the UI displayed.
+pub fn set_pull_request_file_viewed(
+    work_dir: &Path,
+    pull_request_url: &str,
+    pull_request_id: &str,
+    path: &str,
+    viewed: bool,
+) -> Result<(), GitError> {
+    let (repository, _number) = parse_pull_request_url(pull_request_url)
+        .map_err(|message| GitError::new(work_dir, message))?;
+    let payload = pr_file_viewed_mutation_payload(pull_request_id, path, viewed)
+        .map_err(|message| GitError::new(work_dir, message))?;
+    let args = github_graphql_args(&repository.host);
+    let output = execute_gh_json(work_dir, &args, &payload)?;
+    let value: serde_json::Value = serde_json::from_str(&output).map_err(|error| {
+        GitError::new(
+            work_dir,
+            format!("could not parse viewed marker response: {error}"),
+        )
+    })?;
+    if let Some(message) = graphql_errors(&value) {
+        return Err(GitError::new(work_dir, message));
+    }
+    if value["data"].is_null() {
+        return Err(GitError::new(
+            work_dir,
+            "GitHub did not confirm the viewed marker".to_owned(),
+        ));
+    }
+    Ok(())
 }
