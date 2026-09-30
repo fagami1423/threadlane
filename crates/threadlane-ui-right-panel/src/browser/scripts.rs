@@ -547,6 +547,7 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
   countLabel.className = "count";
   const comment = document.createElement("textarea");
   comment.placeholder = "Describe the change…";
+  comment.setAttribute("aria-label", "Annotation comment");
   const row = document.createElement("div");
   row.className = "row";
   const hint = document.createElement("span");
@@ -614,7 +615,7 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
     const w = card.offsetWidth;
     const h = card.offsetHeight;
     const gap = 8;
-    let left = bounds.left + bounds.width / 2 - w / 2;
+    let left = bounds.left + (bounds.right - bounds.left) / 2 - w / 2;
     let top = bounds.bottom + gap;
     if (top + h > window.innerHeight - gap) top = bounds.top - h - gap;
     left = Math.max(gap, Math.min(left, window.innerWidth - w - gap));

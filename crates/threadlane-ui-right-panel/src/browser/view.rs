@@ -28,6 +28,10 @@ const DEFAULT_URL: &str = "https://github.com/wheregmis/threadlane";
 struct BrowserTab {
     id: usize,
     url: String,
+    /// URL requested but not yet committed by the webview. While set, the
+    /// address bar shows it instead of the live URL, which still reports the
+    /// previous page during provisional navigation.
+    pending_url: Option<String>,
     webview: Option<Entity<gpui_wry::WebView>>,
 }
 
@@ -106,6 +110,7 @@ impl BrowserView {
         };
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             tab.url = url.clone();
+            tab.pending_url = Some(url.clone());
             if let Some(webview) = tab.webview.clone() {
                 webview.update(cx, |view, _| view.load_url(&url));
             }
@@ -152,6 +157,7 @@ impl BrowserView {
         self.tabs.push(BrowserTab {
             id,
             url: url.to_string(),
+            pending_url: Some(url.to_string()),
             webview: Some(webview),
         });
         self.switch_tab(id, window, cx);
@@ -164,6 +170,7 @@ impl BrowserView {
             let url = DEFAULT_URL.to_string();
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                 tab.url = url.clone();
+                tab.pending_url = Some(url.clone());
                 if let Some(webview) = tab.webview.clone() {
                     webview.update(cx, |view, _| view.load_url(&url));
                 }
@@ -197,6 +204,7 @@ impl BrowserView {
         let url = self.tabs[position].url.clone();
         if self.tabs[position].webview.is_none() {
             let webview = self.spawn_webview(&url, window, cx);
+            self.tabs[position].pending_url = Some(url.clone());
             self.tabs[position].webview = Some(webview);
         }
         self.sync_active_visibility(cx);
@@ -239,18 +247,35 @@ impl BrowserView {
     /// Mirrors the active tab URL into the address bar. Render-owned
     /// (it needs the window) and guarded: never clobbers focused typing,
     /// and no-ops once in sync so it cannot loop renders.
-    fn sync_address_bar(&self, window: &mut Window, cx: &mut Context<Self>) {
+    fn sync_address_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Prefer the live URL: in-page navigation (SPA pushes, redirects,
-        // link clicks) never updates `tab.url`, so the bar went stale.
+        // link clicks) never updates `tab.url`, so the bar went stale. While
+        // a requested navigation is still provisional WKWebView reports the
+        // old page, so keep showing the pending URL until the live one
+        // commits to it or diverges (redirect / in-page nav wins the race).
         let url = self
             .tabs
-            .get(self.active_tab)
+            .get_mut(self.active_tab)
             .map(|tab| {
-                tab.webview
+                let live = tab
+                    .webview
                     .as_ref()
                     .and_then(|webview| webview.read(cx).raw().url().ok())
-                    .filter(|url| !url.is_empty())
-                    .unwrap_or_else(|| tab.url.clone())
+                    .filter(|url| !url.is_empty());
+                match (tab.pending_url.clone(), live) {
+                    (Some(pending), Some(live)) if live == pending => {
+                        tab.pending_url = None;
+                        live
+                    }
+                    (Some(_), Some(live)) if live != tab.url => {
+                        tab.pending_url = None;
+                        tab.url = live.clone();
+                        live
+                    }
+                    (Some(pending), _) => pending,
+                    (None, Some(live)) => live,
+                    (None, None) => tab.url.clone(),
+                }
             })
             .unwrap_or_default();
         let focused = self
@@ -271,6 +296,7 @@ impl BrowserView {
     pub fn load_url(&mut self, url: &str, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             tab.url = url.to_string();
+            tab.pending_url = Some(url.to_string());
             if let Some(webview) = tab.webview.clone() {
                 webview.update(cx, |view, _| view.load_url(url));
             }
@@ -1066,6 +1092,7 @@ mod browser_tabs_tests {
                     .map(|id| BrowserTab {
                         id,
                         url: format!("https://long-subdomain-{id}.example.com"),
+                        pending_url: None,
                         webview: None,
                     })
                     .collect();
