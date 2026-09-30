@@ -414,6 +414,59 @@ fn unsent_composer_drafts_and_images_follow_their_task(cx: &mut gpui::TestAppCon
     });
 }
 
+#[gpui::test]
+fn terminal_excerpt_append_targets_the_current_draft_only(cx: &mut gpui::TestAppContext) {
+    use gpui::{AppContext as _, Focusable};
+
+    cx.update(gpui_component::init);
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::default();
+        state.active_work_dir = Some("/projects/one".into());
+        state.active_session_id = Some("task".into());
+        state
+    });
+    let retained_model = model.clone();
+    let (chat, cx) =
+        cx.add_window_view(move |window, cx| super::ChatListView::new(model, window, cx));
+    chat.update_in(cx, |chat, window, cx| {
+        chat.input_state.update(cx, |input, cx| {
+            input.set_value("Question:", window, cx);
+        });
+        chat.pasted_images.push(super::ImageAttachment {
+            display_name: "shot.png".into(),
+            data_url: "data:image/png;base64,x".into(),
+        });
+        chat.set_tab(super::CentralTab::Editor, cx);
+
+        // A stale destination is rejected and leaves the draft untouched.
+        let stale = (Some("/projects/other".into()), Some("task".into()));
+        assert!(!chat.append_draft_text_for(stale, "excerpt", window, cx));
+        assert_eq!(chat.input_state.read(cx).value().as_ref(), "Question:");
+
+        let destination = (Some("/projects/one".into()), Some("task".into()));
+        let excerpt = "Terminal · Shell 1 · launched in /projects/one\n```\nbuild failed\n```";
+        assert!(chat.append_draft_text_for(destination, excerpt, window, cx));
+        assert_eq!(
+            chat.input_state.read(cx).value().as_ref(),
+            "Question:\nTerminal · Shell 1 · launched in /projects/one\n```\nbuild failed\n```"
+        );
+        assert_eq!(
+            chat.pasted_images.len(),
+            1,
+            "staged images survive the append"
+        );
+        assert_eq!(chat.current_tab, super::CentralTab::Chat);
+        assert!(chat
+            .input_state
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window));
+    });
+    retained_model.read_with(cx, |state, _| {
+        assert!(state.messages.is_empty(), "the handoff never sends");
+    });
+}
+
 use super::{
     active_slash_command_query, build_trajectory_rows, build_transcript_rows, classify_chat_link,
     classify_markdown_update, contains_case_insensitive, context_meter_view_model,
