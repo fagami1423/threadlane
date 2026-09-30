@@ -237,8 +237,26 @@ impl SessionSeenWriter {
 fn write_session_seen(path: &Path, json: &str) -> Result<(), String> {
     let dir = path.parent().ok_or("session_seen path has no parent")?;
     std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
-    let temporary = dir.join(format!("session_seen.{}.tmp", std::process::id()));
-    std::fs::write(&temporary, json).map_err(|error| error.to_string())?;
+    // Unique name + create_new: a pre-planted file or symlink at the
+    // temporary path can never be opened and truncated.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let temporary = dir.join(format!(
+        "session_seen.{}.{nonce}.tmp",
+        std::process::id()
+    ));
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        file.write_all(json.as_bytes())
+            .map_err(|error| error.to_string())?;
+    }
     std::fs::rename(&temporary, path).map_err(|error| error.to_string())
 }
 
