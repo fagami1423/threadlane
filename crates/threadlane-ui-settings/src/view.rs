@@ -1320,7 +1320,7 @@ impl SettingsView {
                 vec![
                     ("⌘ F / Ctrl ⇧ F", "Find in terminal output (terminal focused)"),
                     ("Enter / ⇧ Enter", "Next / previous matching line (find focused)"),
-                    ("Escape", "Close terminal find"),
+                    ("Escape", "Close terminal find (find focused)"),
                     ("⇧ Page Up / Page Down", "Scroll retained output"),
                 ],
             ),

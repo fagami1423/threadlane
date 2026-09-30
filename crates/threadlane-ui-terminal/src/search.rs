@@ -19,6 +19,11 @@ pub(crate) struct TerminalSearchHit {
 /// Bounded outcome of a full retained-buffer scan.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TerminalSearchOutcome {
+    /// The NEWEST matching logical lines, capped at
+    /// [`TERMINAL_SEARCH_MAX_HITS`]. Keeping the tail rather than the head
+    /// means "reveal newest" and backward navigation always cover the most
+    /// recent output; older matches beyond the cap are counted by `total`
+    /// but not navigable.
     pub hits: Vec<TerminalSearchHit>,
     /// Total matching logical lines, including any beyond `hits` when the
     /// descriptor list was truncated.
@@ -29,8 +34,9 @@ pub(crate) struct TerminalSearchOutcome {
     pub truncated: bool,
 }
 
-/// Maximum retained match descriptors per scan. Navigation happens inside
-/// this list; `total` still counts every matching line.
+/// Maximum retained match descriptors per scan (the newest ones).
+/// Navigation happens inside this list; `total` still counts every matching
+/// line.
 pub(crate) const TERMINAL_SEARCH_MAX_HITS: usize = 512;
 /// Excerpts are capped so a match inside a huge line stays displayable.
 const TERMINAL_SEARCH_EXCERPT_CHARS: usize = 160;
@@ -138,13 +144,17 @@ pub(crate) fn scan_retained_output(
     for line in logical_lines(&texts, &wraps) {
         if line_matches(&line.text, query) {
             total += 1;
-            if hits.len() < TERMINAL_SEARCH_MAX_HITS {
-                hits.push(TerminalSearchHit {
-                    absolute_row: line.row,
-                    excerpt: line_excerpt(&line.text, query),
-                });
-            }
+            hits.push(TerminalSearchHit {
+                absolute_row: line.row,
+                excerpt: line_excerpt(&line.text, query),
+            });
         }
+    }
+    // Keep the newest descriptors: a settled query reveals the newest match,
+    // and backward navigation then covers the tail of the result set.
+    let overflow = hits.len().saturating_sub(TERMINAL_SEARCH_MAX_HITS);
+    if overflow > 0 {
+        hits.drain(..overflow);
     }
 
     TerminalSearchOutcome {
@@ -166,28 +176,21 @@ pub(crate) fn reveal_offset(hit: &TerminalSearchHit, scrollback_len: usize) -> u
 /// Visible row index a hit cue should paint on, given the current scrollback
 /// length and view offset. Returns `None` when the hit is not on screen.
 ///
-/// `hit_scrollback_len` is the retained length the hit's `absolute_row` was
-/// computed against; scrollback hits compare against the *current* length
-/// (appends do not shift retained indexes), while live hits re-derive their
-/// row index from the scan-time length (live indexes are scrollback-relative).
+/// Scrollback and live rows share one linear buffer `0..len + rows`: at
+/// offset `o` the view shows buffer rows `len - o .. len - o + rows`, so any
+/// hit — retained or live at scan time — paints at
+/// `absolute_row - len_now + offset`. Comparing against the CURRENT length
+/// stays correct when appends push a previously-live hit into scrollback.
 pub(crate) fn cue_row(
     hit: &TerminalSearchHit,
-    hit_scrollback_len: usize,
     scrollback_len: usize,
     offset: usize,
     rows: u16,
 ) -> Option<u16> {
-    let visible = if hit.absolute_row < hit_scrollback_len {
-        // Retained index s is painted at s - len + offset.
-        hit.absolute_row
-            .checked_add(offset)?
-            .checked_sub(scrollback_len)?
-    } else {
-        // Live row r is painted at offset + r.
-        hit.absolute_row
-            .checked_sub(hit_scrollback_len)?
-            .checked_add(offset)?
-    };
+    let visible = hit
+        .absolute_row
+        .checked_add(offset)?
+        .checked_sub(scrollback_len)?;
     (visible < usize::from(rows)).then_some(visible as u16)
 }
 
@@ -353,16 +356,23 @@ mod tests {
     }
 
     #[test]
-    fn hit_descriptors_never_exceed_the_cap() {
+    fn hit_descriptors_keep_the_newest_matches_past_the_cap() {
         let mut input = String::new();
-        for _ in 0..(TERMINAL_SEARCH_MAX_HITS + 10) {
-            input.push_str("hit line\r\n");
+        for line in 0..(TERMINAL_SEARCH_MAX_HITS + 10) {
+            input.push_str(&format!("hit {line}\r\n"));
         }
         let mut parser = feed(input.as_bytes(), 4, 16);
         let outcome = scan_retained_output(parser.screen_mut(), 4, 16, "hit");
         assert_eq!(outcome.hits.len(), TERMINAL_SEARCH_MAX_HITS);
         assert!(outcome.truncated);
-        assert!(outcome.total > TERMINAL_SEARCH_MAX_HITS);
+        assert_eq!(outcome.total, TERMINAL_SEARCH_MAX_HITS + 10);
+        // The kept descriptors are the newest: the first kept hit is 10
+        // matches in and the last hit is the final line.
+        assert_eq!(outcome.hits.first().unwrap().absolute_row, 10);
+        assert_eq!(
+            outcome.hits.last().unwrap().absolute_row,
+            TERMINAL_SEARCH_MAX_HITS + 10 - 1
+        );
     }
 
     #[test]
@@ -372,16 +382,25 @@ mod tests {
             excerpt: String::new(),
         };
         // scrollback hit: painted at absolute_row - len + offset.
-        assert_eq!(cue_row(&hit, 10, 10, 8, 4), Some(1));
-        assert_eq!(cue_row(&hit, 10, 10, 5, 4), None);
-        // live hit: painted at offset + (row - len).
+        assert_eq!(cue_row(&hit, 10, 8, 4), Some(1));
+        assert_eq!(cue_row(&hit, 10, 5, 4), None);
+        // live hit: painted at absolute_row - len + offset as well.
         let live = TerminalSearchHit {
             absolute_row: 11,
             excerpt: String::new(),
         };
-        assert_eq!(cue_row(&live, 10, 12, 0, 4), Some(1));
-        assert_eq!(cue_row(&live, 10, 12, 2, 4), Some(3));
-        assert_eq!(cue_row(&live, 10, 12, 3, 4), None);
+        assert_eq!(cue_row(&live, 10, 0, 4), Some(1));
+        assert_eq!(cue_row(&live, 10, 2, 4), Some(3));
+        assert_eq!(cue_row(&live, 10, 3, 4), None);
+        // When appends push a previously-live hit into scrollback, the same
+        // absolute row maps against the grown length — not a stale scan-time
+        // length — so it goes offscreen instead of cueing unrelated output.
+        let hit_at_11 = TerminalSearchHit {
+            absolute_row: 11,
+            excerpt: String::new(),
+        };
+        assert_eq!(cue_row(&hit_at_11, 12, 0, 4), None);
+        assert_eq!(cue_row(&hit_at_11, 12, 2, 4), Some(1));
     }
 
     #[test]

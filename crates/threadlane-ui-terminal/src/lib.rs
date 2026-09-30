@@ -57,7 +57,7 @@ pub fn init(cx: &mut App) {
     };
     cx.bind_keys([
         KeyBinding::new(find_shortcut, FindInTerminalOutput, Some("Terminal")),
-        KeyBinding::new("escape", CloseTerminalFind, Some("TerminalFindActive")),
+        KeyBinding::new("escape", CloseTerminalFind, Some("TerminalFind")),
         KeyBinding::new("enter", NextTerminalMatch, Some("TerminalFind > Input")),
         KeyBinding::new(
             "shift-enter",
@@ -195,13 +195,16 @@ enum ParserCommand {
         generation: u64,
         query: Option<String>,
     },
-    /// Worker-validated navigation: the worker rescans against the current
-    /// buffer, clamps `index` into the fresh result set, and scrolls the
-    /// viewport to reveal it — a stale index can never reveal unrelated
-    /// output because the row is recomputed, never trusted.
+    /// Worker-validated navigation: the worker rescans the buffer and
+    /// resolves the hit by identity (`row` + `excerpt`) in the fresh result
+    /// set — never trusting the index the view navigated from — then scrolls
+    /// the viewport to it. When the identity no longer exists the viewport
+    /// stays put and `revealed` comes back `None`, so a stale location can
+    /// never reveal unrelated output.
     RevealMatch {
         generation: u64,
-        index: usize,
+        row: usize,
+        excerpt: String,
     },
 }
 
@@ -372,7 +375,11 @@ fn start_parser_worker(
                                 find_rescan_at = None;
                             }
                         },
-                        ParserCommand::RevealMatch { generation, index } => {
+                        ParserCommand::RevealMatch {
+                            generation,
+                            row,
+                            excerpt,
+                        } => {
                             if find
                                 .as_ref()
                                 .is_some_and(|state| state.generation == generation)
@@ -380,10 +387,12 @@ fn start_parser_worker(
                                 let find_state = find.as_ref().unwrap();
                                 let (outcome, alt_screen) =
                                     worker_find_scan(&mut parser, rows, cols, &find_state.query);
-                                // Clamp into the fresh result set so a stale
-                                // index lands on a real current match.
-                                let revealed = (!outcome.hits.is_empty())
-                                    .then(|| index.min(outcome.hits.len() - 1));
+                                // Resolve the target by identity: a rescan
+                                // can renumber matches, and only the same
+                                // row + text is the same line.
+                                let revealed = outcome.hits.iter().position(|hit| {
+                                    hit.absolute_row == row && hit.excerpt == excerpt
+                                });
                                 if let Some(index) = revealed {
                                     parser.screen_mut().set_scrollback(reveal_offset(
                                         &outcome.hits[index],
@@ -1277,8 +1286,15 @@ impl TerminalView {
         find.selected = Some(index);
         find.selected_hit = find.hits.get(index).cloned();
         let generation = find.generation;
-        if let Some(parser) = &self.parser_command_tx {
-            let _ = parser.send(ParserCommand::RevealMatch { generation, index });
+        // Navigation asks the worker to reveal by hit identity; the worker
+        // resolves it in a fresh scan so output churn cannot reveal a
+        // different line.
+        if let (Some(hit), Some(parser)) = (&find.selected_hit, &self.parser_command_tx) {
+            let _ = parser.send(ParserCommand::RevealMatch {
+                generation,
+                row: hit.absolute_row,
+                excerpt: hit.excerpt.clone(),
+            });
         }
         cx.notify();
     }
@@ -1318,7 +1334,10 @@ impl TerminalView {
         } else if find.hits.is_empty() {
             "No matching lines in retained output".to_owned()
         } else if let Some(index) = find.selected {
-            format!("{} of {} matching lines", index + 1, find.total)
+            // `hits` holds the newest descriptors when truncated, so a
+            // visible index maps to a global match position.
+            let position = find.total - find.hits.len() + index + 1;
+            format!("{position} of {} matching lines", find.total)
         } else {
             format!("{} matching lines · Choose Previous or Next", find.total)
         }
@@ -1572,13 +1591,7 @@ impl Render for TerminalView {
         // text, so a selection cannot change what Copy produces.
         let find_cue_row = self.find.as_ref().and_then(|find| {
             let hit = find.selected.and_then(|index| find.hits.get(index))?;
-            cue_row(
-                hit,
-                find.scrollback_len,
-                self.scrollback_len,
-                self.scrollback_offset,
-                self.rows,
-            )
+            cue_row(hit, self.scrollback_len, self.scrollback_offset, self.rows)
         });
 
         let mut screen_lines = Vec::with_capacity(self.rows as usize);
@@ -1787,11 +1800,7 @@ impl Render for TerminalView {
 
         div()
             .id("pty-terminal-root")
-            .key_context(if self.find.is_some() {
-                "Terminal TerminalFindActive"
-            } else {
-                "Terminal"
-            })
+            .key_context("Terminal")
             .size_full()
             .min_h_0()
             .flex()
@@ -2208,10 +2217,13 @@ mod tests {
             .unwrap();
         let _ = next_search_results(&mut event_rx).await;
 
-        // A stale index clamps into the fresh result set — never onto an
-        // unrelated row of the buffer.
+        // The worker resolves the hit by identity in a fresh scan.
         command_tx
-            .send(ParserCommand::RevealMatch { generation: 1, index: 9_999 })
+            .send(ParserCommand::RevealMatch {
+                generation: 1,
+                row: 0,
+                excerpt: "needle deep".to_string(),
+            })
             .unwrap();
         let PtyEvent::SearchResults { revealed, .. } = next_search_results(&mut event_rx).await
         else {
@@ -2250,7 +2262,11 @@ mod tests {
         let _ = next_search_results(&mut event_rx).await;
 
         command_tx
-            .send(ParserCommand::RevealMatch { generation: 999, index: 0 })
+            .send(ParserCommand::RevealMatch {
+                generation: 999,
+                row: 0,
+                excerpt: "needle".to_string(),
+            })
             .unwrap();
         // No rescan is scheduled for a mismatched generation: draining the
         // channel for a while must not surface another SearchResults.
@@ -2264,6 +2280,40 @@ mod tests {
         })
         .await;
         assert!(saw_results.is_err(), "stale generation produced results");
+    }
+
+    #[tokio::test]
+    async fn parser_worker_reveal_refuses_a_stale_hit_identity() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (output_tx, command_tx) = start_parser_worker(4, 16, event_tx).unwrap();
+
+        output_tx.send(b"needle one\r\n".to_vec()).unwrap();
+        next_frame(&mut event_rx).await;
+        command_tx
+            .send(ParserCommand::Find { generation: 8, query: Some("needle".to_string()) })
+            .unwrap();
+        let _ = next_search_results(&mut event_rx).await;
+
+        // A clear + rewrite removes the hit the view navigated to. The
+        // identity can no longer be confirmed, so the worker must NOT reveal
+        // a different line in its place.
+        command_tx.send(ParserCommand::Clear).unwrap();
+        let _ = next_search_results(&mut event_rx).await;
+        output_tx.send(b"needle other\r\n".to_vec()).unwrap();
+        let _ = next_search_results(&mut event_rx).await;
+
+        command_tx
+            .send(ParserCommand::RevealMatch {
+                generation: 8,
+                row: 0,
+                excerpt: "needle one".to_string(),
+            })
+            .unwrap();
+        let PtyEvent::SearchResults { revealed, .. } = next_search_results(&mut event_rx).await
+        else {
+            panic!("expected search results");
+        };
+        assert_eq!(revealed, None);
     }
 
     #[tokio::test]
