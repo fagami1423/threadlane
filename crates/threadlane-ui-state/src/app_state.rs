@@ -1491,7 +1491,8 @@ impl AppState {
                     setup.images.len()
                 )
             };
-            self.push_optimistic_follow_up(&session_id, text, "pending-user");
+            let pending_id = format!("pending-user-{session_id}-{}", self.messages.len());
+            self.push_optimistic_follow_up(&session_id, text, pending_id);
             self.session_status = None;
             return;
         }
@@ -2306,7 +2307,8 @@ impl AppState {
                 tracing::warn!("failed to persist PR review tracking: {error}");
             }
         }
-        self.push_optimistic_follow_up(&session_id, prompt.clone(), "pr-review");
+        let echo_id = format!("pr-review-{session_id}-{}", self.messages.len());
+        self.push_optimistic_follow_up(&session_id, prompt.clone(), echo_id);
         Some(prompt)
     }
 
@@ -4550,11 +4552,12 @@ impl AppState {
 
     pub(crate) fn queue_pending_message(&mut self) -> Result<(), String> {
         let (runtime, session_id, text, images) = self.pending_runtime_message()?;
-        runtime
+        let entry_id = runtime
             .work_handle
             .try_queue_follow_up_with_images(text.clone(), images)?;
         self.pending_composer_messages.remove(&session_id);
-        self.push_optimistic_follow_up(&session_id, text, "queued-user");
+        let echo_id = format!("queued-user-{session_id}-{entry_id}");
+        self.push_optimistic_follow_up(&session_id, text, echo_id);
         self.session_status = Some("Message queued…".into());
         Ok(())
     }
@@ -4565,7 +4568,41 @@ impl AppState {
             .work_handle
             .queue_steer_with_images(text.clone(), images)?;
         self.pending_composer_messages.remove(&session_id);
-        self.push_optimistic_follow_up(&session_id, text, "steered-user");
+        let echo_id = format!("steered-user-{session_id}-{}", self.messages.len());
+        self.push_optimistic_follow_up(&session_id, text, echo_id);
+        self.session_status = Some("Steering current turn…".into());
+        Ok(())
+    }
+
+    /// Drop a still-pending queued follow-up, returning its staged content and
+    /// images so the caller can restore them to the composer or discard them.
+    pub fn cancel_queued_message(
+        &mut self,
+        entry_id: &str,
+    ) -> Result<(String, Vec<ImageAttachment>), String> {
+        let (runtime, session_id) = self.active_runtime()?;
+        let staged = runtime.work_handle.cancel_queued_entry(entry_id)?;
+        let echo_id = format!("queued-user-{session_id}-{entry_id}");
+        let mut messages = (*self.messages).clone();
+        if messages.iter().any(|message| message.id == echo_id) {
+            messages.retain(|message| message.id != echo_id);
+            self.messages = messages.into();
+        }
+        self.session_status = Some("Queued message removed".into());
+        Ok(staged)
+    }
+
+    /// Re-route a still-pending queued follow-up into the live steer queue so
+    /// it reaches the model during the current turn instead of after it.
+    pub fn steer_queued_message(&mut self, entry_id: &str) -> Result<(), String> {
+        let (runtime, session_id) = self.active_runtime()?;
+        runtime.work_handle.steer_queued_entry(entry_id)?;
+        let queued_id = format!("queued-user-{session_id}-{entry_id}");
+        let mut messages = (*self.messages).clone();
+        if let Some(message) = messages.iter_mut().find(|message| message.id == queued_id) {
+            message.id = format!("steered-user-{session_id}-{entry_id}");
+            self.messages = messages.into();
+        }
         self.session_status = Some("Steering current turn…".into());
         Ok(())
     }
@@ -4576,9 +4613,7 @@ impl AppState {
         }
     }
 
-    fn pending_runtime_message(
-        &self,
-    ) -> Result<(Arc<SessionRuntime>, String, String, Vec<ImageAttachment>), String> {
+    fn active_runtime(&self) -> Result<(Arc<SessionRuntime>, String), String> {
         let session_id = self
             .active_session_id
             .clone()
@@ -4593,6 +4628,13 @@ impl AppState {
             .get(&session_file)
             .cloned()
             .ok_or_else(|| "Session runtime is unavailable".to_string())?;
+        Ok((runtime, session_id))
+    }
+
+    fn pending_runtime_message(
+        &self,
+    ) -> Result<(Arc<SessionRuntime>, String, String, Vec<ImageAttachment>), String> {
+        let (runtime, session_id) = self.active_runtime()?;
         let pending = self
             .pending_composer_messages
             .get(&session_id)
@@ -4601,11 +4643,10 @@ impl AppState {
         Ok((runtime, session_id, pending.text, pending.images))
     }
 
-    fn push_optimistic_follow_up(&mut self, session_id: &str, text: String, prefix: &str) {
+    fn push_optimistic_follow_up(&mut self, session_id: &str, text: String, id: String) {
         if self.active_session_id.as_deref() == Some(session_id) {
-            let new_len = self.messages.len();
             self.messages_mut().push(ChatMessageInfo {
-                id: format!("{prefix}-{session_id}-{new_len}"),
+                id,
                 role: MessageRole::User,
                 content: text,
                 tool_activities: Vec::new(),

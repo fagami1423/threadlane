@@ -47,6 +47,14 @@ pub enum AppAction {
     QueuePendingMessage,
     SteerPendingMessage,
     DismissPendingMessage,
+    /// Drop a still-pending queued follow-up by its queue entry id.
+    RemoveQueuedMessage {
+        entry_id: String,
+    },
+    /// Re-route a still-pending queued follow-up into the live steer queue.
+    SteerQueuedMessage {
+        entry_id: String,
+    },
     ToggleToolActivity(String),
     CancelGeneration,
     SelectModel(String),

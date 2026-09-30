@@ -140,6 +140,16 @@ fn has_sendable_prompt(text: &str, image_count: usize) -> bool {
     !text.trim().is_empty() || image_count > 0
 }
 
+/// Queue entry id embedded in an optimistic `queued-user-{session}-{entry}`
+/// echo; `None` for echoes that carry no durable entry to act on.
+fn queued_entry_id(message_id: &str, session_id: Option<&str>) -> Option<String> {
+    let prefix = format!("queued-user-{}-", session_id?);
+    message_id
+        .strip_prefix(&prefix)
+        .filter(|entry_id| !entry_id.is_empty())
+        .map(str::to_owned)
+}
+
 fn truncate_preview_text(text: &str, max_chars: usize) -> String {
     let text = text.trim();
     if text.chars().count() <= max_chars {
@@ -4571,10 +4581,6 @@ impl ChatListView {
         let dismiss_model = self.model.clone();
         let dismiss_input = self.input_state.clone();
         let cancel_model = self.model.clone();
-        let queue_prompt_model = self.model.clone();
-        let queue_prompt_input = self.input_state.clone();
-        let steer_prompt_model = self.model.clone();
-        let steer_prompt_input = self.input_state.clone();
         let send_model = self.model.clone();
         let send_input = self.input_state.clone();
 
@@ -5003,14 +5009,15 @@ impl ChatListView {
                     .child(branch)
             }));
 
-        let queued_messages: Vec<_> = self
+        let queued_messages: Vec<(String, String)> = self
             .model
             .read(cx)
             .messages
             .iter()
             .filter(|message| crate::transcript::is_queued_message(message, is_generating))
-            .map(|message| message.content.clone())
+            .map(|message| (message.id.clone(), message.content.clone()))
             .collect();
+        let queued_session_id = active_session_id.clone();
         let queued_preview = (!queued_messages.is_empty()).then(|| {
             div()
                 .debug_selector(|| "queued-messages-panel".into())
@@ -5049,8 +5056,9 @@ impl ChatListView {
                         .id("queued-messages-list")
                         .max_h(rems(10.0))
                         .overflow_y_scrollbar()
-                        .children(queued_messages.into_iter().map(|text| {
-                            div()
+                        .children(queued_messages.into_iter().map(|(message_id, text)| {
+                            let entry_id = queued_entry_id(&message_id, queued_session_id.as_deref());
+                            let mut row = div()
                                 .debug_selector(|| "queued-message-row".into())
                                 .w_full()
                                 .min_w_0()
@@ -5058,9 +5066,117 @@ impl ChatListView {
                                 .py_2()
                                 .border_t_1()
                                 .border_color(theme.border)
-                                .text_sm()
-                                .text_color(theme.foreground)
-                                .child(text)
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_sm()
+                                        .text_color(theme.foreground)
+                                        .child(text),
+                                );
+                            if let Some(entry_id) = entry_id {
+                                let queued_steer_model = self.model.clone();
+                                let queued_edit_model = self.model.clone();
+                                let queued_remove_model = self.model.clone();
+                                let queued_edit_input = self.input_state.clone();
+                                let steer_entry_id = entry_id.clone();
+                                let remove_entry_id = entry_id.clone();
+                                row = row.child(
+                                    div()
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            Button::new(format!("queued-steer-{message_id}"))
+                                                .debug_selector(|| "queued-steer".into())
+                                                .icon(IconName::ArrowRight)
+                                                .accessibility_label(
+                                                    "Steer current turn with this message",
+                                                )
+                                                .xsmall()
+                                                .ghost()
+                                                .disabled(!supports_live_steering)
+                                                .tooltip(steer_tooltip)
+                                                .on_click(move |_event, _window, cx| {
+                                                    queued_steer_model.update(cx, |state, cx| {
+                                                        controller::dispatch(
+                                                            state,
+                                                            AppAction::SteerQueuedMessage {
+                                                                entry_id: steer_entry_id.clone(),
+                                                            },
+                                                        );
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new(format!("queued-edit-{message_id}"))
+                                                .debug_selector(|| "queued-edit".into())
+                                                .icon(IconName::Undo2)
+                                                .accessibility_label("Edit queued message")
+                                                .xsmall()
+                                                .ghost()
+                                                .tooltip("Edit message in the composer")
+                                                .on_click(cx.listener(
+                                                    move |this, _event, window, cx| {
+                                                        let restored = queued_edit_model.update(
+                                                            cx,
+                                                            |state, cx| {
+                                                                let restored = state
+                                                                    .cancel_queued_message(
+                                                                        &entry_id,
+                                                                    )
+                                                                    .map_err(|error| {
+                                                                        state.session_status =
+                                                                            Some(error);
+                                                                    })
+                                                                    .ok();
+                                                                cx.notify();
+                                                                restored
+                                                            },
+                                                        );
+                                                        if let Some((text, images)) = restored {
+                                                            this.prompt_recall = None;
+                                                            this.pasted_images.extend(images);
+                                                            queued_edit_input.update(
+                                                                cx,
+                                                                |input, cx| {
+                                                                    input.set_value(
+                                                                        text, window, cx,
+                                                                    );
+                                                                },
+                                                            );
+                                                        }
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            Button::new(format!("queued-remove-{message_id}"))
+                                                .debug_selector(|| "queued-remove".into())
+                                                .icon(IconName::Close)
+                                                .accessibility_label("Remove queued message")
+                                                .xsmall()
+                                                .ghost()
+                                                .tooltip("Remove from queue")
+                                                .on_click(move |_event, _window, cx| {
+                                                    queued_remove_model.update(cx, |state, cx| {
+                                                        controller::dispatch(
+                                                            state,
+                                                            AppAction::RemoveQueuedMessage {
+                                                                entry_id: remove_entry_id.clone(),
+                                                            },
+                                                        );
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        ),
+                                );
+                            }
+                            row
                         })),
                 )
         });
@@ -6270,63 +6386,53 @@ impl ChatListView {
                                             .child(label)
                                     }))
                                     .child(context_meter)
-                            .                            children(if is_generating {
-                                    vec![
-                                        Button::new("composer-queue-btn")
-                                            .icon(IconName::Plus)
-                                            .label("Queue")
-                                            .small()
+                                    .child({
+                                        let send_hint = if needs_provider {
+                                            "Connect a model provider in Settings before sending"
+                                        } else if !has_prompt {
+                                            "Type a message to send"
+                                        } else if is_generating {
+                                            "Queue for next turn (Enter)"
+                                        } else {
+                                            "Send message (Enter)"
+                                        };
+                                        Button::new("send-btn")
+                                            .debug_selector(|| "send-btn".into())
+                                            .size_8()
                                             .rounded_full()
-                                            .secondary()
-                                            .disabled(!has_prompt)
-                                            .accessibility_label("Queue message for next turn")
-                                            .tooltip("Queue for next turn (Enter)")
+                                            .icon(IconName::ArrowUp)
+                                            .accessibility_label(send_hint)
+                                            .tooltip(send_hint)
+                                            .when(has_prompt && !needs_provider, |b| b.primary())
+                                            .when(!has_prompt || needs_provider || self.model.read(cx).active_worktree_setup().is_some(), |b| b.ghost().disabled(true))
                                             .on_click(cx.listener(move |this, _event, window, cx| {
-                                                let text = queue_prompt_input.read(cx).value().to_string();
-                                                if has_sendable_prompt(&text, this.pasted_images.len()) {
+                                                let text = send_input.read(cx).value().to_string();
+                                                if !text.trim().is_empty() || !this.pasted_images.is_empty() {
                                                     this.prompt_recall = None;
-                                                    queue_prompt_model.update(cx, |state, cx| {
-                                                        let images = std::mem::take(&mut this.pasted_images);
-                                                        controller::dispatch(state, AppAction::StageBusyMessage { text, images });
-                                                        controller::dispatch(state, AppAction::QueuePendingMessage);
+                                                    let images = std::mem::take(&mut this.pasted_images);
+                                                    send_model.update(cx, |state, cx| {
+                                                        if is_generating {
+                                                            // Sending while a turn runs queues by
+                                                            // default; steer lives on the queued
+                                                            // message rows above the composer.
+                                                            controller::dispatch(state, AppAction::StageBusyMessage { text, images });
+                                                            controller::dispatch(state, AppAction::QueuePendingMessage);
+                                                        } else {
+                                                            controller::dispatch(state, AppAction::SendPromptWithImages { text, images });
+                                                        }
                                                         cx.notify();
                                                     });
-                                                    queue_prompt_input.update(cx, |state, cx| {
+                                                    send_input.update(cx, |state, cx| {
                                                         state.set_value("", window, cx);
                                                     });
                                                     this.transcript_list_state.scroll_to_end();
                                                     cx.notify();
                                                 }
                                             }))
-                                            .into_any_element(),
-                                        Button::new("composer-steer-btn")
-                                            .icon(IconName::ArrowRight)
-                                            .label("Steer")
-                                            .small()
-                                            .rounded_full()
-                                            .primary()
-                                            .disabled(!has_prompt || !supports_live_steering)
-                                            .accessibility_label("Steer current turn with message")
-                                            .tooltip(steer_tooltip)
-                                            .on_click(cx.listener(move |this, _event, window, cx| {
-                                                let text = steer_prompt_input.read(cx).value().to_string();
-                                                if has_sendable_prompt(&text, this.pasted_images.len()) {
-                                                    this.prompt_recall = None;
-                                                    steer_prompt_model.update(cx, |state, cx| {
-                                                        let images = std::mem::take(&mut this.pasted_images);
-                                                        controller::dispatch(state, AppAction::StageBusyMessage { text, images });
-                                                        controller::dispatch(state, AppAction::SteerPendingMessage);
-                                                        cx.notify();
-                                                    });
-                                                    steer_prompt_input.update(cx, |state, cx| {
-                                                        state.set_value("", window, cx);
-                                                    });
-                                                    this.transcript_list_state.scroll_to_end();
-                                                    cx.notify();
-                                                }
-                                            }))
-                                            .into_any_element(),
+                                    })
+                                    .children(is_generating.then(|| {
                                         Button::new("composer-stop-btn")
+                                            .debug_selector(|| "composer-stop-btn".into())
                                             .icon(IconName::CircleX)
                                             .accessibility_label("Stop generation")
                                             .small()
@@ -6342,55 +6448,7 @@ impl ChatListView {
                                                     cx.notify();
                                                 });
                                             }))
-                                            .into_any_element(),
-                                    ]
-                            } else {
-                                vec![
-                                    Button::new("send-btn")
-                                        .size_8()
-                                        .rounded_full()
-                                        .icon(IconName::ArrowUp)
-                                        .accessibility_label(if needs_provider {
-                                            "Connect a model provider in Settings before sending"
-                                        } else if has_prompt {
-                                            "Send message (Enter)"
-                                        } else {
-                                            "Type a message to send"
-                                        })
-                                        .tooltip(if needs_provider {
-                                            "Connect a model provider in Settings before sending"
-                                        } else if has_prompt {
-                                            "Send message (Enter)"
-                                        } else {
-                                            "Type a message to send"
-                                        })
-                                        .when(has_prompt && !needs_provider, |b| b.primary())
-                                        .when(!has_prompt || needs_provider || self.model.read(cx).active_worktree_setup().is_some(), |b| b.ghost().disabled(true))
-                                        .on_click(cx.listener(move |this, _event, window, cx| {
-                                            let text = send_input.read(cx).value().to_string();
-                                            if !text.trim().is_empty() || !this.pasted_images.is_empty() {
-                                                this.prompt_recall = None;
-                                                let images = std::mem::take(&mut this.pasted_images);
-                                                send_model.update(cx, |state, cx| {
-                                                    controller::dispatch(
-                                                        state,
-                                                        AppAction::SendPromptWithImages {
-                                                            text,
-                                                            images,
-                                                        },
-                                                    );
-                                                    cx.notify();
-                                                });
-                                                send_input.update(cx, |state, cx| {
-                                                    state.set_value("", window, cx);
-                                                });
-                                                this.transcript_list_state.scroll_to_end();
-                                                cx.notify();
-                                            }
-                                        }))
-                                        .into_any_element(),
-                                ]
-                            }),
+                                    })),
                             ),
                     ),
             )

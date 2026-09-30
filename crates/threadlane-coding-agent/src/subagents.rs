@@ -1282,11 +1282,13 @@ pub(crate) async fn run_subagent_task(
         scheduler.set_test_observer(observer.clone());
         scheduler.schedule(if is_recovery {
             AgentWork::QueueMessage {
+                entry_id: "recovery".into(),
                 content: SUBAGENT_RECOVERY_PROMPT.into(),
                 images: Vec::new(),
             }
         } else {
             AgentWork::QueueMessage {
+                entry_id: "follow-up".into(),
                 content: "test subagent follow-up".into(),
                 images: Vec::new(),
             }

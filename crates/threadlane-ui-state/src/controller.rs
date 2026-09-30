@@ -91,6 +91,16 @@ pub fn dispatch(state: &mut AppState, action: AppAction) {
             let _ = state.steer_pending_message();
         }
         AppAction::DismissPendingMessage => state.dismiss_pending_message(),
+        AppAction::RemoveQueuedMessage { entry_id } => {
+            if let Err(error) = state.cancel_queued_message(&entry_id) {
+                state.session_status = Some(error);
+            }
+        }
+        AppAction::SteerQueuedMessage { entry_id } => {
+            if let Err(error) = state.steer_queued_message(&entry_id) {
+                state.session_status = Some(error);
+            }
+        }
         AppAction::ToggleToolActivity(tool_call_id) => state.toggle_tool_activity(&tool_call_id),
         AppAction::CancelGeneration => {
             if let Err(error) = state.cancel_generation() {

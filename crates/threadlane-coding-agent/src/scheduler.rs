@@ -30,13 +30,25 @@ pub enum AgentWork {
         entry_id: String,
     },
     SteerMessage {
+        entry_id: String,
         content: String,
         images: Vec<ImageAttachment>,
     },
     QueueMessage {
+        entry_id: String,
         content: String,
         images: Vec<ImageAttachment>,
     },
+}
+
+impl AgentWork {
+    fn entry_id(&self) -> &str {
+        match self {
+            Self::DurableQueueWake { entry_id, .. }
+            | Self::SteerMessage { entry_id, .. }
+            | Self::QueueMessage { entry_id, .. } => entry_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +132,16 @@ impl AgentWorkScheduler {
             .unwrap_or_default()
     }
 
+    /// Remove the oldest pending work item for `entry_id`, returning it so
+    /// the caller can requeue or drop it. A durable entry's wake is removed
+    /// here too — the durable record is the source of truth and has already
+    /// been cancelled or requeued by the caller.
+    fn take_pending(&self, entry_id: &str) -> Option<AgentWork> {
+        let mut pending = self.pending.lock().ok()?;
+        let index = pending.iter().position(|work| work.entry_id() == entry_id)?;
+        pending.remove(index)
+    }
+
     pub(crate) fn set_acp_model(&self, is_acp: bool) {
         self.acp_model.store(is_acp, Ordering::SeqCst);
     }
@@ -174,11 +196,11 @@ impl AgentWorkScheduler {
                         }
                     }
                 }
-                AgentWork::SteerMessage { content, images } => {
+                AgentWork::SteerMessage { content, images, .. } => {
                     agent.steer(AgentMessage::user(content, images));
                     agent.run_steer().await;
                 }
-                AgentWork::QueueMessage { content, images } => {
+                AgentWork::QueueMessage { content, images, .. } => {
                     agent.follow_up(AgentMessage::user(content, images));
                     agent.run_follow_up().await;
                 }
@@ -239,7 +261,7 @@ impl CodingAgentWorkHandle {
         &self,
         content: impl Into<String>,
         images: Vec<ImageAttachment>,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         if self.scheduler.acp_model.load(Ordering::SeqCst) {
             return Err("This agent does not support live steering; use Queue.".into());
         }
@@ -248,20 +270,25 @@ impl CodingAgentWorkHandle {
             let entry_id = enqueue_harness_queue(path, QueueKind::Steer, content, images)?;
             self.scheduler.schedule(AgentWork::DurableQueueWake {
                 queue: QueueKind::Steer,
-                entry_id,
+                entry_id: entry_id.clone(),
             });
+            Ok(entry_id)
         } else {
-            self.scheduler
-                .schedule(AgentWork::SteerMessage { content, images });
+            let entry_id = new_queue_entry_id();
+            self.scheduler.schedule(AgentWork::SteerMessage {
+                entry_id: entry_id.clone(),
+                content,
+                images,
+            });
+            Ok(entry_id)
         }
-        Ok(())
     }
 
     pub fn try_queue_follow_up_with_images(
         &self,
         content: impl Into<String>,
         images: Vec<ImageAttachment>,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         let content = content.into();
         if let Some(path) = self.session_file.as_deref() {
             // ACP accepts the next prompt only after its current turn ends.
@@ -272,13 +299,113 @@ impl CodingAgentWorkHandle {
                 QueueKind::FollowUp
             };
             let entry_id = enqueue_harness_queue(path, queue.clone(), content, images)?;
-            self.scheduler
-                .schedule(AgentWork::DurableQueueWake { queue, entry_id });
+            self.scheduler.schedule(AgentWork::DurableQueueWake {
+                queue,
+                entry_id: entry_id.clone(),
+            });
+            Ok(entry_id)
         } else {
-            self.scheduler
-                .schedule(AgentWork::QueueMessage { content, images });
+            let entry_id = new_queue_entry_id();
+            self.scheduler.schedule(AgentWork::QueueMessage {
+                entry_id: entry_id.clone(),
+                content,
+                images,
+            });
+            Ok(entry_id)
         }
-        Ok(())
+    }
+
+    /// Drop a still-pending queued input, returning its staged content and
+    /// images so the caller can restore them to the composer or discard them.
+    pub fn cancel_queued_entry(
+        &self,
+        entry_id: &str,
+    ) -> Result<(String, Vec<ImageAttachment>), String> {
+        if let Some(path) = self.session_file.as_deref() {
+            let mut harness = CodingSessionHarness::open(path)?;
+            let Some((_queue, message)) = harness.unbound_queue_entry(entry_id)? else {
+                return Err("Queued message is no longer pending".into());
+            };
+            harness.cancel_unbound_entry(entry_id)?;
+            self.scheduler.take_pending(entry_id);
+            queued_message_parts(message)
+        } else {
+            match self.scheduler.take_pending(entry_id) {
+                Some(
+                    AgentWork::QueueMessage { content, images, .. }
+                    | AgentWork::SteerMessage { content, images, .. },
+                ) => Ok((content, images)),
+                Some(work) => {
+                    self.scheduler.schedule(work);
+                    Err("Queued message is no longer pending".into())
+                }
+                None => Err("Queued message is no longer pending".into()),
+            }
+        }
+    }
+
+    /// Re-route a still-pending queued input into the live steer queue so it
+    /// reaches the model during the current turn instead of after it.
+    pub fn steer_queued_entry(&self, entry_id: &str) -> Result<(), String> {
+        if self.scheduler.acp_model.load(Ordering::SeqCst) {
+            return Err("This agent does not support live steering; use Queue.".into());
+        }
+        if let Some(path) = self.session_file.as_deref() {
+            let mut harness = CodingSessionHarness::open(path)?;
+            let Some((_queue, message)) = harness.unbound_queue_entry(entry_id)? else {
+                return Err("Queued message is no longer pending".into());
+            };
+            let (content, images) = queued_message_parts(message)?;
+            harness.cancel_unbound_entry(entry_id)?;
+            let steer_entry_id =
+                harness.enqueue_unbound_with_images(QueueKind::Steer, content, images)?;
+            self.scheduler.take_pending(entry_id);
+            self.scheduler.schedule(AgentWork::DurableQueueWake {
+                queue: QueueKind::Steer,
+                entry_id: steer_entry_id,
+            });
+            Ok(())
+        } else {
+            match self.scheduler.take_pending(entry_id) {
+                Some(AgentWork::QueueMessage {
+                    entry_id,
+                    content,
+                    images,
+                }) => {
+                    self.scheduler.schedule(AgentWork::SteerMessage {
+                        entry_id,
+                        content,
+                        images,
+                    });
+                    Ok(())
+                }
+                Some(work) => {
+                    self.scheduler.schedule(work);
+                    Err("Queued message is no longer pending".into())
+                }
+                None => Err("Queued message is no longer pending".into()),
+            }
+        }
+    }
+}
+
+fn new_queue_entry_id() -> String {
+    format!(
+        "entry-queue-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    )
+}
+
+fn queued_message_parts(
+    message: AgentMessage,
+) -> Result<(String, Vec<ImageAttachment>), String> {
+    match message {
+        AgentMessage::User { content } => Ok((content, Vec::new())),
+        AgentMessage::UserWithImages { content, images } => Ok((content, images)),
+        _ => Err("Queued entry is not a user message".into()),
     }
 }
 
@@ -321,6 +448,7 @@ mod execution_owner_tests {
         let waiting = tokio::spawn(async move { waiter.wait_for_work().await });
 
         scheduler.schedule(AgentWork::QueueMessage {
+            entry_id: "entry-1".into(),
             content: "wake".into(),
             images: Vec::new(),
         });
