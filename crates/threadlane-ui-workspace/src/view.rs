@@ -38,7 +38,9 @@ use gpui_component::WindowExt;
 use threadlane_ui_right_panel::RightPanelView;
 use threadlane_ui_settings::SettingsView;
 use threadlane_ui_sidebar::SidebarView;
-use threadlane_ui_terminal::{FindInTerminalOutput, SelectionStatus, TerminalView};
+use threadlane_ui_terminal::{
+    FindInTerminalOutput, LinkDestination, OpenTerminalLink, SelectionStatus, TerminalView,
+};
 use threadlane_coding_agent::controller::spawn_session_runtime_construction;
 use threadlane_ui_state::updater::{self, UpdaterEvent};
 use threadlane_coding_agent::controller::runtime_status_text;
@@ -165,6 +167,17 @@ async fn next_workspace_event(
     }
 }
 
+fn terminal_link_is_current(
+    displayed: Option<EntityId>,
+    source: EntityId,
+    visible: bool,
+    page: WorkspacePage,
+    url: &str,
+) -> bool {
+    visible && page == WorkspacePage::Chat && displayed == Some(source)
+        && threadlane_ui_terminal::is_web_url(url)
+}
+
 struct TerminalGroup {
     tabs: Vec<Entity<TerminalView>>,
     active_tab: usize,
@@ -238,6 +251,8 @@ fn session_pr_refresh_delay(succeeded: bool, active: bool, open: bool) -> std::t
 }
 
 pub struct WorkspaceView {
+    window_handle: AnyWindowHandle,
+    last_link_terminal: Option<Entity<TerminalView>>,
     focus_handle: FocusHandle,
     rendered_page: WorkspacePage,
     model: Entity<AppState>,
@@ -556,6 +571,8 @@ impl WorkspaceView {
                 });
 
             Self {
+                window_handle: window.window_handle(),
+                last_link_terminal: None,
                 focus_handle,
                 rendered_page: model.read(cx).workspace_page,
                 model,
@@ -771,7 +788,7 @@ impl WorkspaceView {
     fn new_terminal_with_tracking(
         cwd: PathBuf,
         cx: &mut Context<Self>,
-    ) -> (Entity<TerminalView>, Subscription) {
+    ) -> (Entity<TerminalView>, Vec<Subscription>) {
         let terminal = cx.new(|cx| TerminalView::new(cwd, cx));
         let mut last_availability = None;
         let subscription = cx.observe(&terminal, move |_, terminal, cx| {
@@ -784,7 +801,19 @@ impl WorkspaceView {
                 cx.notify();
             }
         });
-        (terminal, subscription)
+        let links = cx.subscribe(&terminal, |this, terminal, request: &OpenTerminalLink, cx| {
+            let owner = cx.weak_entity();
+            let window = this.window_handle;
+            let request = request.clone();
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |_, window, cx| {
+                    let _ = owner.update(cx, |this, cx| {
+                        this.open_terminal_link(terminal, request, window, cx)
+                    });
+                });
+            });
+        });
+        (terminal, vec![subscription, links])
     }
 
     /// The terminal shown in the bottom panel at this moment, with the
@@ -806,6 +835,44 @@ impl WorkspaceView {
                 .fallback_terminal
                 .clone()
                 .map(|terminal| (None, terminal)),
+        }
+    }
+
+    fn open_terminal_link(
+        &mut self,
+        terminal: Entity<TerminalView>,
+        request: OpenTerminalLink,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !terminal_link_is_current(
+            self.displayed_terminal(cx).map(|(_, active)| active.entity_id()),
+            terminal.entity_id(),
+            self.bottom_panel_visible,
+            self.model.read(cx).workspace_page,
+            &request.url,
+        ) {
+            return;
+        }
+        match request.destination {
+            LinkDestination::DefaultBrowser => cx.open_url(&request.url),
+            LinkDestination::Threadlane => {
+                let result = self.right_panel.update(cx, |panel, cx| {
+                    panel.open_terminal_url(&request.url, window, cx)
+                });
+                match result {
+                    Ok(()) => {
+                        self.right_panel_visible = true;
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        window.push_notification(error, cx);
+                        terminal.update(cx, |terminal, cx| {
+                            terminal.retry_link(request.url, window, cx)
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -916,7 +983,7 @@ impl WorkspaceView {
             .is_none_or(|group| group.tabs.is_empty())
         {
             let (terminal, subscription) = Self::new_terminal_with_tracking(cwd.clone(), cx);
-            self.terminal_subscriptions.push(subscription);
+            self.terminal_subscriptions.extend(subscription);
             let group = self
                 .terminal_groups
                 .entry(group_key.clone())
@@ -943,7 +1010,7 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         let (terminal, subscription) = Self::new_terminal_with_tracking(cwd, cx);
-        self.terminal_subscriptions.push(subscription);
+        self.terminal_subscriptions.extend(subscription);
         terminal.read(cx).focus_handle(cx).focus(window, cx);
         let group = self
             .terminal_groups
@@ -964,7 +1031,7 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         let (terminal, subscription) = Self::new_terminal_with_tracking(work_dir, cx);
-        self.terminal_subscriptions.push(subscription);
+        self.terminal_subscriptions.extend(subscription);
         let group = self.get_or_create_terminal_group(&project, cx);
         group.tabs.push(terminal);
         group.active_tab = group.tabs.len() - 1;
@@ -976,7 +1043,7 @@ impl WorkspaceView {
             let project =
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let (terminal, subscription) = Self::new_terminal_with_tracking(project, cx);
-            self.terminal_subscriptions.push(subscription);
+            self.terminal_subscriptions.extend(subscription);
             self.fallback_terminal = Some(terminal);
         }
         self.fallback_terminal
@@ -1038,7 +1105,7 @@ impl WorkspaceView {
             } else {
                 let (terminal, subscription) =
                     Self::new_terminal_with_tracking(replacement_cwd.clone(), cx);
-                self.terminal_subscriptions.push(subscription);
+                self.terminal_subscriptions.extend(subscription);
                 group.tabs = vec![terminal];
                 group.active_tab = 0;
                 self.bottom_panel_visible = false;
@@ -1165,6 +1232,16 @@ impl WorkspaceView {
             }
             "run_terminal" => {
                 self.toggle_terminal_action(&ToggleTerminal, window, cx);
+            }
+            "open_terminal_link" => {
+                self.command_palette_open = false;
+                self.command_palette_previous_focus = None;
+                if let Some((_, terminal)) = self.displayed_terminal(cx) {
+                    self.bottom_panel_visible = true;
+                    terminal.update(cx, |terminal, cx| terminal.open_links(window, cx));
+                } else {
+                    window.push_notification("Open a terminal first", cx);
+                }
             }
             "add_terminal_selection" => {
                 match self.displayed_terminal(cx) {
@@ -1394,7 +1471,7 @@ impl WorkspaceView {
         let model = self.model.clone();
         let state = model.read(cx);
 
-        let commands: [(&str, &str, &str, Icon, &[&str], &str); 23] = [
+        let commands: [(&str, &str, &str, Icon, &[&str], &str); 24] = [
             (
                 "New Task",
                 "Start a fresh session",
@@ -1426,6 +1503,14 @@ impl WorkspaceView {
                 Icon::from(IconName::SquareTerminal),
                 &["run", "terminal", "command", "shell", "exec"],
                 "⌘J",
+            ),
+            (
+                "Terminal: Open link…",
+                "Links in visible output",
+                "open_terminal_link",
+                Icon::from(IconName::ExternalLink),
+                &["terminal", "link", "url", "browser", "open"],
+                "",
             ),
             (
                 "Add Selection to Chat",
@@ -2156,6 +2241,17 @@ impl Render for WorkspaceView {
             });
         }
         let workspace_page = self.model.read(cx).workspace_page;
+        let link_terminal = if self.bottom_panel_visible && workspace_page == WorkspacePage::Chat {
+            self.displayed_terminal(cx).map(|(_, terminal)| terminal)
+        } else {
+            None
+        };
+        if self.last_link_terminal != link_terminal {
+            if let Some(previous) = self.last_link_terminal.take() {
+                previous.update(cx, |terminal, cx| terminal.dismiss_links(cx));
+            }
+            self.last_link_terminal = link_terminal;
+        }
         if self.rendered_page != workspace_page {
             let settings_transition = self.rendered_page == WorkspacePage::Settings
                 || workspace_page == WorkspacePage::Settings;
@@ -2543,6 +2639,7 @@ impl Render for WorkspaceView {
                 let handoff_hint = excerpt_block.map(str::to_owned).unwrap_or_else(|| {
                     format!("Add the selected terminal text to {composer_target} — nothing is sent")
                 });
+                let links_terminal = active_terminal.clone();
                 let handoff_terminal = active_terminal.clone();
                 let handoff_group = terminal_project.clone();
                 let handoff_view = cx.entity().clone();
@@ -2634,6 +2731,18 @@ impl Render for WorkspaceView {
                             .on_click(move |_event, window, cx| {
                                 active_terminal_find.update(cx, |t, cx| {
                                     t.open_find(&FindInTerminalOutput, window, cx)
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("terminal-open-link")
+                            .label("Open link…")
+                            .tooltip("Links in visible output")
+                            .ghost()
+                            .small()
+                            .on_click(move |_, window, cx| {
+                                links_terminal.update(cx, |terminal, cx| {
+                                    terminal.open_links(window, cx)
                                 });
                             }),
                     )
@@ -3031,6 +3140,25 @@ mod tests {
         assert!(!stopped.get(), "menu dismissal must not stop the underlying turn");
         cx.simulate_keystrokes("escape");
         assert!(stopped.get(), "Escape still stops a turn after focus returns to the workspace");
+    }
+
+    #[gpui::test]
+    fn terminal_links_reject_hidden_switched_and_unsafe_sources(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        use threadlane_ui_state::WorkspacePage;
+        let first = cx.new(|_| 1u8);
+        let second = cx.new(|_| 2u8);
+        let accepts = |displayed, visible, page, url| super::terminal_link_is_current(
+            displayed, first.entity_id(), visible, page, url,
+        );
+        assert!(accepts(Some(first.entity_id()), true, WorkspacePage::Chat, "http://0.0.0.0:3000/"));
+        assert!(!accepts(Some(second.entity_id()), true, WorkspacePage::Chat, "http://host/"));
+        assert!(!accepts(None, true, WorkspacePage::Chat, "http://host/"));
+        assert!(!accepts(Some(first.entity_id()), false, WorkspacePage::Chat, "http://host/"));
+        assert!(!accepts(Some(first.entity_id()), true, WorkspacePage::Settings, "http://host/"));
+        for url in ["file:///tmp/a", "localhost:3000", "http://user@host/", "https://host/\n"] {
+            assert!(!accepts(Some(first.entity_id()), true, WorkspacePage::Chat, url));
+        }
     }
 
     #[test]
