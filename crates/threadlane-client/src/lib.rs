@@ -29,9 +29,10 @@ use threadlane_protocol::daemon::{SessionCommand, SessionEvent};
 /// The session contract a daemon serves and clients consume.
 #[async_trait]
 pub trait DaemonClient: Send + Sync {
-    /// Dispatch one command. `Err` is also surfaced to subscribers as
-    /// `SessionEvent::DaemonError` by every transport, so UI error handling
-    /// lives in the event drain alone.
+    /// Dispatch one command. Callers must handle the returned `Err`;
+    /// `SessionEvent::DaemonError` delivery is transport-specific
+    /// (`AppState::dispatch_command` also converts `Err` into the event
+    /// stream for its callers).
     async fn command(&self, command: SessionCommand) -> Result<(), String>;
 
     /// Attach to the daemon's event stream. Each call returns an

@@ -220,6 +220,14 @@ pub enum SessionEvent {
         session_id: Option<String>,
         message: String,
     },
+    /// Acknowledgement that `DeleteSession` completed: the transcript is
+    /// archived or removed and the runtime dropped. Clients drop their
+    /// local bookkeeping for the session only now — a rejected delete
+    /// arrives as `DaemonError` instead, and the session row returns.
+    SessionRemoved {
+        session_id: String,
+        session_file: PathBuf,
+    },
 }
 
 /// A permission decision the client sends back to the daemon.
@@ -817,6 +825,10 @@ mod tests {
             SessionEvent::DaemonError {
                 session_id: None,
                 message: "boom".into(),
+            },
+            SessionEvent::SessionRemoved {
+                session_id: "sess_1".into(),
+                session_file: PathBuf::from("/repo/.threadlane/sessions/sess_1.jsonl"),
             },
         ];
         for event in events {

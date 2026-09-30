@@ -37,19 +37,22 @@ impl DaemonClient for LocalDaemon {
     }
 
     fn subscribe(&self) -> mpsc::UnboundedReceiver<SessionEvent> {
-        let (tail, mut broadcast_rx) = self.core.subscribe_with_tail();
+        // An in-process attach starts an empty cursor — the whole journal
+        // tail replays (this client never reconnects, so dedupe by seq
+        // is not needed).
+        let (tail, mut broadcast_rx) = self.core.subscribe_with_tail(0);
         let (tx, rx) = mpsc::unbounded_channel();
         match threadlane_daemon::chat::executor() {
             Ok(executor) => {
                 executor.spawn(async move {
-                    for event in tail {
+                    for (_, event) in tail {
                         if tx.send(event).is_err() {
                             return;
                         }
                     }
                     loop {
                         match broadcast_rx.recv().await {
-                            Ok(event) => {
+                            Ok((_, event)) => {
                                 if tx.send(event).is_err() {
                                     return;
                                 }

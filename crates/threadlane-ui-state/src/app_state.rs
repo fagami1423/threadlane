@@ -150,6 +150,11 @@ pub struct AppState {
     /// True when `daemon_client` is remote: runtime handles are then
     /// process-remote and only the command/event surface can reach them.
     pub daemon_remote: bool,
+    /// Remote deletes awaiting the daemon's `SessionRemoved` ack:
+    /// `session_id` → project dir. Persisted cleanup (seen watermark,
+    /// pins, pending prompts) runs only on the ack — a rejected delete
+    /// must leave that data intact when the session row returns.
+    pending_remote_deletes: HashMap<String, PathBuf>,
     scheduler_handles: HashMap<PathBuf, SchedulerSupervisorHandle>,
     scheduler_results:
         HashMap<PathBuf, tokio::sync::mpsc::UnboundedReceiver<SchedulerSupervisorEvent>>,
@@ -679,6 +684,7 @@ impl AppState {
             daemon_core,
             daemon_client,
             daemon_remote,
+            pending_remote_deletes: HashMap::new(),
             scheduler_handles: HashMap::new(),
             scheduler_results: HashMap::new(),
             deferred_stream_events: HashMap::new(),
@@ -1756,15 +1762,17 @@ impl AppState {
         let session_file = self.session_file(&work_dir, &session_id);
         if self.daemon_remote {
             // The daemon archives the transcript, applies the shared-worktree
-            // and dirtiness guards, and drops the runtime. A rejected delete
-            // arrives as DaemonError after the local bookkeeping below; the
-            // next refresh restores the session row when the file survives.
+            // and dirtiness guards, and drops the runtime. Persisted cleanup
+            // waits for `SessionRemoved`: a rejected delete arrives as
+            // DaemonError and the session row must come back with its pin
+            // and seen watermark intact.
+            self.pending_remote_deletes
+                .insert(session_id.clone(), work_dir);
             self.dispatch_command(SessionCommand::DeleteSession {
-                session_id: session_id.clone(),
+                session_id,
                 session_file,
                 delete_worktree,
             });
-            self.finish_session_removal(&work_dir, &session_id);
             return Ok(());
         }
         if self
@@ -1859,12 +1867,15 @@ impl AppState {
         }
         let session_file = self.session_file(&work_dir, &session_id);
         if self.daemon_remote {
+            // As in settle_session: the session's persisted cleanup waits
+            // for the daemon's `SessionRemoved` ack.
+            self.pending_remote_deletes
+                .insert(session_id.clone(), work_dir);
             self.dispatch_command(SessionCommand::DeleteSession {
-                session_id: session_id.clone(),
+                session_id,
                 session_file,
                 delete_worktree,
             });
-            self.finish_session_removal(&work_dir, &session_id);
             return Ok(());
         }
         if self
@@ -4767,6 +4778,21 @@ impl AppState {
                     // no return channel on the wire.
                     self.session_status = Some(format!("Daemon: {message}"));
                     changed = true;
+                }
+                SessionEvent::SessionRemoved {
+                    session_id,
+                    session_file,
+                } => {
+                    // The daemon confirmed the delete — only now is the
+                    // session's persisted data safe to drop.
+                    let work_dir = self
+                        .pending_remote_deletes
+                        .remove(&session_id)
+                        .or_else(|| self.session_work_dir_for_file(&session_file));
+                    if let Some(work_dir) = work_dir {
+                        self.finish_session_removal(&work_dir, &session_id);
+                        changed = true;
+                    }
                 }
             }
         }

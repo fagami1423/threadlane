@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::sync::{broadcast, mpsc};
@@ -63,8 +64,11 @@ pub struct DaemonCore {
     worktree_setups: Mutex<HashMap<String, WorktreeSetup>>,
     /// Events producers write into; pumped onto the journal + broadcast.
     ingest_tx: mpsc::UnboundedSender<SessionEvent>,
-    broadcast_tx: broadcast::Sender<SessionEvent>,
-    journal: Arc<Mutex<VecDeque<SessionEvent>>>,
+    /// `(seq, event)` pairs: the pump assigns a monotonic journal sequence
+    /// so transports can offer cursor-based replay (`?since=` on attach).
+    broadcast_tx: broadcast::Sender<(u64, SessionEvent)>,
+    journal: Arc<Mutex<VecDeque<(u64, SessionEvent)>>>,
+    event_seq: Arc<AtomicU64>,
     /// Host-provided browser bridge resolved at runtime construction — the
     /// desktop embeds a live bridge; a standalone daemon serves
     /// `BrowserBridge::unavailable()`.
@@ -81,21 +85,25 @@ impl DaemonCore {
     pub fn new() -> Result<Arc<Self>, String> {
         let (ingest_tx, mut ingest_rx) = mpsc::unbounded_channel::<SessionEvent>();
         let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let journal: Arc<Mutex<VecDeque<SessionEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let journal: Arc<Mutex<VecDeque<(u64, SessionEvent)>>> =
+            Arc::new(Mutex::new(VecDeque::new()));
+        let event_seq: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         {
             let broadcast_tx = broadcast_tx.clone();
             let journal = journal.clone();
+            let event_seq = event_seq.clone();
             crate::chat::executor()?.spawn(async move {
                 while let Some(event) = ingest_rx.recv().await {
+                    let seq = event_seq.fetch_add(1, Ordering::SeqCst) + 1;
                     let mut journal = journal.lock().expect("daemon journal poisoned");
-                    journal.push_back(event.clone());
+                    journal.push_back((seq, event.clone()));
                     while journal.len() > JOURNAL_CAPACITY {
                         journal.pop_front();
                     }
                     drop(journal);
                     // Slow subscribers drop via Lagged rather than blocking
                     // the whole daemon on one client's backlog.
-                    let _ = broadcast_tx.send(event);
+                    let _ = broadcast_tx.send((seq, event));
                 }
             });
         }
@@ -106,6 +114,7 @@ impl DaemonCore {
             ingest_tx,
             broadcast_tx,
             journal,
+            event_seq,
             browser_bridge: RwLock::new(BrowserBridge::unavailable()),
             model: RwLock::new(String::new()),
             model_roles: RwLock::new(ModelRoles::default()),
@@ -136,24 +145,32 @@ impl DaemonCore {
 
     /// A live event subscription (journal replay is the caller's choice —
     /// [`Self::subscribe_with_tail`] bundles both for attach flows).
-    pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<(u64, SessionEvent)> {
         self.broadcast_tx.subscribe()
     }
 
-    /// Attach semantics: replay the bounded journal tail, then tail live.
-    /// The broadcast subscription is created while the journal is locked, so
-    /// an event can never fall between the tail snapshot and the live feed —
-    /// the tail boundary is exactly-once.
-    pub fn subscribe_with_tail(&self) -> (Vec<SessionEvent>, broadcast::Receiver<SessionEvent>) {
+    /// Attach semantics: replay the bounded journal tail newer than `since`
+    /// (a client's last-seen journal sequence; `0` replays everything), then
+    /// tail live. The broadcast subscription is created while the journal is
+    /// locked, so an event can never fall between the tail snapshot and the
+    /// live feed — the tail boundary is exactly-once.
+    pub fn subscribe_with_tail(
+        &self,
+        since: u64,
+    ) -> (Vec<(u64, SessionEvent)>, broadcast::Receiver<(u64, SessionEvent)>) {
         let journal = self.journal.lock().expect("daemon journal poisoned");
         let receiver = self.broadcast_tx.subscribe();
-        let tail: Vec<SessionEvent> = journal.iter().cloned().collect();
+        let tail: Vec<(u64, SessionEvent)> = journal
+            .iter()
+            .filter(|(seq, _)| *seq > since)
+            .cloned()
+            .collect();
         (tail, receiver)
     }
 
-    /// All events since the tail snapshot — used by transports that must
-    /// bridge a `Lagged` gap into a `DaemonError` for the client.
-    pub fn journal_tail(&self) -> Vec<SessionEvent> {
+    /// All journaled events — used by transports that must bridge a `Lagged`
+    /// gap into a `DaemonError` for the client.
+    pub fn journal_tail(&self) -> Vec<(u64, SessionEvent)> {
         self.journal
             .lock()
             .expect("daemon journal poisoned")
@@ -272,7 +289,7 @@ impl DaemonCore {
         if let Some(prepared) = crate::runtimes::take_prepared_runtime(session_id) {
             return Ok(self.register_runtime(
                 session_id,
-                work_dir.to_path_buf(),
+                Self::project_dir_for(work_dir),
                 prepared.session_file.clone(),
                 prepared,
             ));
@@ -836,6 +853,13 @@ impl DaemonCore {
             .lock()
             .expect("identities poisoned")
             .remove(session_id);
+        // Acknowledge on the event stream: clients defer their persisted
+        // cleanup (seen watermark, pins) until the delete is confirmed,
+        // since a rejection above must never lose that data.
+        let _ = self.ingest_tx.send(SessionEvent::SessionRemoved {
+            session_id: session_id.to_string(),
+            session_file: session_file.to_path_buf(),
+        });
         Ok(())
     }
 

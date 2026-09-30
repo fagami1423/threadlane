@@ -2,11 +2,14 @@
 //! this, and tests drive the real protocol roundtrip through it.
 //!
 //! Framing: one bare `SessionCommand` JSON per inbound text frame;
-//! `SessionEvent` JSON frames outbound — the journal tail on attach, then
-//! live broadcast. Errors travel as `DaemonError` events, so no error
-//! frame shape exists.
+//! `{"seq": N, "event": SessionEvent}` frames outbound — the journal tail
+//! newer than the client's `?since=` cursor on attach, then live broadcast.
+//! Errors travel as `DaemonError` events, so no error frame shape exists.
+//! `seq` is the daemon's journal sequence; synthesized frames (undecodable
+//! commands, lag notices) carry `seq: 0`.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
@@ -37,6 +40,28 @@ pub async fn serve(listener: TcpListener, core: Arc<DaemonCore>, token: Option<S
     }
 }
 
+/// One outbound frame: the journal sequence (0 for frames the daemon
+/// synthesizes outside the journal, like lag notices) plus the event.
+fn wire_frame(seq: u64, event: &SessionEvent) -> Result<Message, serde_json::Error> {
+    serde_json::to_string(&serde_json::json!({ "seq": seq, "event": event }))
+        .map(|text| Message::Text(text.into()))
+}
+
+/// The client's last-seen journal sequence from `?since=` on the connect
+/// URL; absent or unparsable means a full tail replay.
+fn since_param(request: &Request) -> u64 {
+    request
+        .uri()
+        .query()
+        .and_then(|query| {
+            query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("since="))
+        })
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 /// One client: journal tail, live broadcast, command loop.
 async fn serve_connection(
     core: Arc<DaemonCore>,
@@ -44,9 +69,22 @@ async fn serve_connection(
     peer: SocketAddr,
     token: Option<String>,
 ) -> Result<(), String> {
+    let since: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let handshake_since = since.clone();
     let socket = tokio_tungstenite::accept_hdr_async(
         stream,
-        |request: &Request, response: Response| {
+        move |request: &Request, response: Response| {
+            // Browsers always send Origin; native clients do not. Refuse
+            // browser pages outright: a website could otherwise open
+            // ws://127.0.0.1 and drive the daemon (submit prompts, answer
+            // its own permission requests) — cross-site WebSocket
+            // hijacking, which CORS does not cover.
+            if request.headers().contains_key("Origin") {
+                return Err(tokio_tungstenite::tungstenite::http::Response::builder()
+                    .status(403)
+                    .body(Some("forbidden origin".to_string()))
+                    .expect("static 403 response"));
+            }
             if let Some(token) = &token {
                 let presented = request
                     .headers()
@@ -59,6 +97,7 @@ async fn serve_connection(
                         .expect("static 401 response"));
                 }
             }
+            handshake_since.store(since_param(request), Ordering::SeqCst);
             Ok(response)
         },
     )
@@ -66,31 +105,38 @@ async fn serve_connection(
     .map_err(|error| format!("websocket handshake failed: {error}"))?;
     tracing::info!(%peer, "daemon client attached");
 
-    // All outbound traffic funnels through one channel: the journal tail is
-    // seeded first, then a forwarder streams live broadcast events.
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
+    // All outbound traffic funnels through one bounded channel: the
+    // journal tail is seeded first, then a forwarder streams live
+    // broadcast events. Bounded on purpose — a slow socket backs the
+    // forwarder up into the broadcast receiver, where it surfaces as
+    // `Lagged` (client gets a dropped-events notice) instead of growing
+    // an unbounded queue per stalled client.
+    let (out_tx, mut out_rx) = mpsc::channel::<Message>(256);
     let error_tx = out_tx.clone();
-    let (tail, mut broadcast_rx) = core.subscribe_with_tail();
-    for event in tail {
-        let text = serde_json::to_string(&event).map_err(|error| error.to_string())?;
-        let _ = out_tx.send(Message::Text(text.into()));
+    let (tail, mut broadcast_rx) =
+        core.subscribe_with_tail(since.load(Ordering::SeqCst));
+    for (seq, event) in tail {
+        let frame = wire_frame(seq, &event).map_err(|error| error.to_string())?;
+        if out_tx.send(frame).await.is_err() {
+            return Ok(());
+        }
     }
     tokio::spawn(async move {
         loop {
-            let event = match broadcast_rx.recv().await {
-                Ok(event) => event,
+            let (seq, event) = match broadcast_rx.recv().await {
+                Ok(pair) => pair,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    SessionEvent::DaemonError {
+                    (0, SessionEvent::DaemonError {
                         session_id: None,
                         message: format!("dropped {skipped} daemon events; refresh the session"),
-                    }
+                    })
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             };
-            let Ok(text) = serde_json::to_string(&event) else {
+            let Ok(frame) = wire_frame(seq, &event) else {
                 continue;
             };
-            if out_tx.send(Message::Text(text.into())).is_err() {
+            if out_tx.send(frame).await.is_err() {
                 return;
             }
         }
@@ -117,14 +163,14 @@ async fn serve_connection(
                         }
                     }
                     Err(error) => {
-                        let _ = error_tx.send(Message::Text(
-                            serde_json::to_string(&SessionEvent::DaemonError {
-                                session_id: None,
-                                message: format!("undecodable command: {error}"),
-                            })
-                            .unwrap_or_default()
-                            .into(),
-                        ));
+                        // A jammed client misses the notice rather than
+                        // stalling the command loop on its backlog.
+                        if let Ok(frame) = wire_frame(0, &SessionEvent::DaemonError {
+                            session_id: None,
+                            message: format!("undecodable command: {error}"),
+                        }) {
+                            let _ = error_tx.try_send(frame);
+                        }
                     }
                 }
             }
