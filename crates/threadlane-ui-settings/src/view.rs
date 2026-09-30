@@ -1303,7 +1303,7 @@ impl SettingsView {
                     ("Enter", "Submit prompt to agent"),
                     ("⇧ Enter", "Insert newline in composer"),
                     ("/ (in empty composer)", "Open Slash Commands palette"),
-                    ("@ (in composer)", "Reference file or context in prompt"),
+                    ("@ (in composer)", "Insert a workspace file path (Git worktrees)"),
                 ],
             ),
             (

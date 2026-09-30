@@ -348,9 +348,12 @@ actions!(
 
 #[path = "conversation_find.rs"]
 mod conversation_find;
+#[path = "file_completion.rs"]
+mod file_completion;
 #[path = "prompt_navigation.rs"]
 mod prompt_navigation;
 use conversation_find::*;
+use file_completion::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum CentralTab {
@@ -398,6 +401,7 @@ pub fn init(cx: &mut App) {
         ),
     ]);
     init_conversation_find(cx);
+    init_file_completion(cx);
 }
 
 type ComposerKey = (Option<PathBuf>, Option<String>);
@@ -489,6 +493,14 @@ pub struct ChatListView {
     slash_scroll_handle: ScrollHandle,
     selected_slash_index: usize,
     dismiss_slash_menu: bool,
+    /// `@` file completion picker: transient results, the resolved Git root,
+    /// dismissal flag, and a generation guard rejecting late task results.
+    file_completion: Option<FileCompletionState>,
+    file_completion_generation: u64,
+    file_completion_task: Option<Task<()>>,
+    file_scroll_handle: ScrollHandle,
+    selected_file_index: usize,
+    dismiss_file_menu: bool,
     permission_details_request: Option<String>,
     context_meter_open: bool,
     /// Selected options per question, keyed by `request_id\0question_id`.
@@ -528,7 +540,7 @@ impl ChatListView {
         });
         let input_state = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder("Ask a question, describe a task, or type / for commands...")
+                .placeholder("Ask a question, or type / for commands, @ for files...")
                 .auto_grow(1, 8)
                 .submit_on_enter(true)
                 .soft_wrap(true)
@@ -651,12 +663,20 @@ impl ChatListView {
                         this.dismiss_slash_menu = false;
                         this.selected_slash_index = 0;
                         this.slash_scroll_handle.scroll_to_item(0);
+                        this.dismiss_file_menu = false;
+                        this.sync_file_completion(cx);
                     }
                     InputEvent::PressEnter {
                         secondary,
                         shift: false,
                     } => {
                         if model_clone.read(cx).active_worktree_setup().is_some() { return; }
+                        // An open `@` picker owns Enter in every state — apply
+                        // a valid result or swallow; never Send/Queue/Steer.
+                        if this.file_menu_open(cx) {
+                            this.apply_selected_file_completion(window, cx);
+                            return;
+                        }
                         let text = input_state.read(cx).value().to_string();
                         let is_generating = model_clone.read(cx).is_generating;
                         let project_root = model_clone.read(cx).active_work_dir.clone();
@@ -828,6 +848,12 @@ impl ChatListView {
             slash_scroll_handle: ScrollHandle::new(),
             selected_slash_index: 0,
             dismiss_slash_menu: false,
+            file_completion: None,
+            file_completion_generation: 0,
+            file_completion_task: None,
+            file_scroll_handle: ScrollHandle::new(),
+            selected_file_index: 0,
+            dismiss_file_menu: false,
             permission_details_request: None,
             context_meter_open: false,
             question_selections: std::collections::HashMap::new(),
@@ -852,6 +878,7 @@ impl ChatListView {
             return;
         }
         self.prompt_recall = None;
+        self.clear_file_completion();
         self.invalidate_image_preview(window, cx);
 
         // An explicit stash is separate from the unsent text and attachments in each task.
@@ -1210,6 +1237,7 @@ impl ChatListView {
         if tab != CentralTab::Chat {
             self.clear_conversation_find();
             self.prompt_recall = None;
+            self.clear_file_completion();
             self.outline_open = false;
             self.outline_selected_id = None;
         }
@@ -3676,6 +3704,10 @@ impl ChatListView {
         }
         let key = event.keystroke.key.as_str();
 
+        if self.handle_file_completion_key_down(key, window, cx) {
+            return;
+        }
+
         let text = self.input_state.read(cx).value().to_string();
         let project_root = self.model.read(cx).active_work_dir.clone();
         if let Some(query) = active_slash_command_query(&text) {
@@ -5407,6 +5439,36 @@ impl ChatListView {
             div().into_any_element()
         };
 
+        // `@` file completion: the trigger is recomputed from the live caret
+        // each frame (caret moves emit no events); state is refreshed on
+        // Change and cleared when the trigger disappears or the draft,
+        // session, or tab changes.
+        let file_trigger = if self.dismiss_file_menu {
+            None
+        } else {
+            self.current_file_trigger(cx)
+        };
+        // A trigger can exist without picker state (e.g. a restored draft
+        // ending in `@`, whose set_value emits no Change), and stored state
+        // can go stale without a Change event — e.g. an `Unsupported` state
+        // recorded while the session worktree was still preparing. Resync
+        // whenever the resolved root no longer matches the retained one.
+        let git_root = self.model.read(cx).active_git_work_dir();
+        let file_state_stale = self
+            .file_completion
+            .as_ref()
+            .map(|state| state.root.as_deref() != git_root.as_deref())
+            .unwrap_or(true);
+        if file_trigger.is_some() && file_state_stale {
+            cx.defer_in(window, |this, _window, cx| {
+                this.sync_file_completion(cx);
+            });
+        }
+        let file_completion_active = file_trigger.is_some();
+        let file_menu = file_trigger
+            .as_ref()
+            .map(|trigger| self.render_file_menu(trigger, cx))
+            .unwrap_or_else(|| div().into_any_element());
         let meter = context_meter_view_model(
             context_window.as_ref(),
             &ContextMeterMetrics {
@@ -5989,6 +6051,12 @@ impl ChatListView {
                         if slash_completion_active {
                             contexts.push_str(SLASH_COMMAND_KEY_CONTEXT);
                         }
+                        if file_completion_active {
+                            if !contexts.is_empty() {
+                                contexts.push(' ');
+                            }
+                            contexts.push_str(FILE_COMPLETION_KEY_CONTEXT);
+                        }
                         if prompt_recall_keys_active {
                             if !contexts.is_empty() {
                                 contexts.push(' ');
@@ -6004,6 +6072,10 @@ impl ChatListView {
                                 .on_action(cx.listener(Self::select_previous_slash_command_action))
                                 .on_action(cx.listener(Self::select_next_slash_command_action))
                                 .on_action(cx.listener(Self::dismiss_slash_command_action))
+                                .on_action(cx.listener(Self::complete_file_completion_action))
+                                .on_action(cx.listener(Self::select_previous_file_completion_action))
+                                .on_action(cx.listener(Self::select_next_file_completion_action))
+                                .on_action(cx.listener(Self::dismiss_file_completion_action))
                                 .on_action(cx.listener(Self::recall_older_prompt_action))
                                 .on_action(cx.listener(Self::recall_newer_prompt_action))
                         }
@@ -6017,6 +6089,7 @@ impl ChatListView {
                             .then(|| div().flex().flex_wrap().gap_2().children(image_chips)),
                     )
                     .child(command_menu)
+                    .child(file_menu)
                     .child(
                         div()
                             .w_full()
@@ -6524,6 +6597,7 @@ impl Render for ChatListView {
             self.initial_scroll_frames = 6;
             self.selected_slash_index = 0;
             self.dismiss_slash_menu = false;
+            self.clear_file_completion();
             self.question_selections.clear();
             self.question_inputs.clear();
         }
