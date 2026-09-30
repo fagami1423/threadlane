@@ -1,6 +1,8 @@
 use super::*;
 use std::collections::HashMap;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::tempdir;
@@ -129,6 +131,168 @@ fn diff_file_preserves_git_errors() {
     let error = diff_file(dir.path(), "file.txt").unwrap_err();
 
     assert!(!error.message.is_empty());
+}
+
+fn init_diff_repo(root: &Path) {
+    run_git(root, &["init", "-q"]);
+    run_git(root, &["config", "user.email", "test@example.com"]);
+    run_git(root, &["config", "user.name", "Threadlane"]);
+    fs::write(root.join("tracked.txt"), "one two\nold value\n").unwrap();
+    run_git(root, &["add", "tracked.txt"]);
+    run_git(root, &["commit", "-qm", "initial"]);
+}
+
+#[test]
+fn local_diff_options_filter_spacing_and_preserve_mixed_edits_without_mutations() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    init_diff_repo(root);
+    fs::write(root.join("tracked.txt"), " one   two\nnew value\n").unwrap();
+    let bytes = fs::read(root.join("tracked.txt")).unwrap();
+    let index = fs::read(root.join(".git/index")).unwrap();
+    let filtered = DiffOptions {
+        ignore_whitespace: true,
+    };
+    for diff in [
+        diff_file_with_options(root, "tracked.txt", filtered).unwrap(),
+        worktree_diff_with_options(root, filtered).unwrap(),
+    ] {
+        assert!(diff.contains("-old value\n+new value"));
+        assert!(!diff.contains("+ one   two"));
+    }
+    assert!(diff_file(root, "tracked.txt")
+        .unwrap()
+        .contains("+ one   two"));
+    assert!(worktree_diff(root).unwrap().contains("+ one   two"));
+    assert_eq!(fs::read(root.join("tracked.txt")).unwrap(), bytes);
+    assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+}
+
+#[test]
+fn local_diff_successful_empty_head_does_not_fall_back_to_staged_changes() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    init_diff_repo(root);
+    fs::write(root.join("tracked.txt"), "staged change\n").unwrap();
+    run_git(root, &["add", "tracked.txt"]);
+    fs::write(root.join("tracked.txt"), " one   two\nold value\n").unwrap();
+    let filtered = DiffOptions {
+        ignore_whitespace: true,
+    };
+    assert!(diff_file_with_options(root, "tracked.txt", filtered)
+        .unwrap()
+        .is_empty());
+    assert!(worktree_diff_with_options(root, filtered)
+        .unwrap()
+        .is_empty());
+    assert!(worktree_diff(root).unwrap().contains("+ one   two"));
+    fs::write(root.join("tracked.txt"), "one two\nold value\n").unwrap();
+    assert!(worktree_diff_with_options(root, DiffOptions::default())
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn local_diff_includes_untracked_files_alongside_tracked_changes_in_both_modes() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    init_diff_repo(root);
+    run_git(root, &["config", "core.quotePath", "false"]);
+    fs::write(root.join("tracked.txt"), " one two\nold value\n").unwrap();
+    for name in [" spaced name.txt ", "日本語.txt", "line\nbreak.txt"] {
+        fs::write(root.join(name), "new file\n").unwrap();
+    }
+    fs::write(root.join("binary.bin"), [0, 1, 0, 2]).unwrap();
+    fs::write(root.join("empty.txt"), "").unwrap();
+    for ignore_whitespace in [false, true] {
+        let options = DiffOptions { ignore_whitespace };
+        let combined = worktree_diff_with_options(root, options).unwrap();
+        assert!(combined.contains(" spaced name.txt "));
+        assert!(combined.contains("日本語.txt"));
+        assert!(combined.contains("line\\nbreak.txt"));
+        assert!(combined.contains("Binary files"));
+        assert!(combined.contains("empty.txt"));
+        assert_eq!(combined.contains("tracked.txt"), !ignore_whitespace);
+        let single = diff_file_with_options(root, " spaced name.txt ", options).unwrap();
+        assert!(single.contains("+new file"));
+        assert!(diff_file_with_options(root, "binary.bin", options)
+            .unwrap()
+            .contains("Binary files"));
+    }
+}
+
+#[test]
+fn local_diff_supports_unborn_and_detached_head() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    run_git(root, &["init", "-q"]);
+    run_git(root, &["config", "user.email", "test@example.com"]);
+    run_git(root, &["config", "user.name", "Threadlane"]);
+    fs::write(root.join("staged.txt"), "initial\n").unwrap();
+    run_git(root, &["add", "staged.txt"]);
+    fs::write(root.join("staged.txt"), "changed\n").unwrap();
+    fs::write(root.join("new.txt"), "untracked\n").unwrap();
+    for ignore_whitespace in [false, true] {
+        let options = DiffOptions { ignore_whitespace };
+        let diff = worktree_diff_with_options(root, options).unwrap();
+        assert!(diff.contains("+initial"));
+        assert!(diff.contains("+changed"));
+        assert!(diff.contains("+untracked"));
+        let single = diff_file_with_options(root, "staged.txt", options).unwrap();
+        assert!(single.contains("+initial"));
+        assert!(single.contains("+changed"));
+    }
+    run_git(root, &["commit", "-qm", "initial"]);
+    run_git(root, &["checkout", "--detach", "-q", "HEAD"]);
+    assert!(diff_file_with_options(
+        root,
+        "staged.txt",
+        DiffOptions {
+            ignore_whitespace: true
+        }
+    )
+    .unwrap()
+    .contains("+changed"));
+}
+
+#[test]
+fn local_diff_preserves_binary_rename_mode_and_deletion_metadata() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    init_diff_repo(root);
+    fs::write(root.join("binary.bin"), [0, 1, 0, 2]).unwrap();
+    fs::write(root.join("delete.txt"), "delete me\n").unwrap();
+    run_git(root, &["add", "binary.bin", "delete.txt"]);
+    run_git(root, &["commit", "-qm", "metadata fixtures"]);
+    run_git(root, &["mv", "tracked.txt", "renamed.txt"]);
+    #[cfg(unix)]
+    fs::set_permissions(root.join("renamed.txt"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(root.join("binary.bin"), [0, 3, 0, 4]).unwrap();
+    fs::remove_file(root.join("delete.txt")).unwrap();
+    let diff = worktree_diff_with_options(
+        root,
+        DiffOptions {
+            ignore_whitespace: true,
+        },
+    )
+    .unwrap();
+    assert!(diff.contains("rename to renamed.txt"));
+    #[cfg(unix)]
+    assert!(diff.contains("new mode 100755"));
+    assert!(diff.contains("Binary files"));
+    assert!(diff.contains("deleted file mode"));
+}
+
+#[test]
+fn local_diff_options_preserve_errors_and_path_validation() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("file.txt"), "file\n").unwrap();
+    for ignore_whitespace in [false, true] {
+        let options = DiffOptions { ignore_whitespace };
+        assert!(diff_file_with_options(dir.path(), "file.txt", options).is_err());
+        assert!(worktree_diff_with_options(dir.path(), options).is_err());
+        assert!(diff_file_with_options(dir.path(), "../outside.txt", options).is_err());
+    }
 }
 
 #[test]
