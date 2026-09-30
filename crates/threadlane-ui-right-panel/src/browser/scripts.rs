@@ -539,7 +539,8 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
   // The comment pill lives in a same-origin srcdoc iframe, not the page DOM:
   // events inside an iframe document never propagate to the parent document,
   // so page listeners — capture or bubble — cannot observe comment keystrokes.
-  // It talks back through postMessage keyed on the iframe's contentWindow.
+  // Bind its handlers from this host-injected script: srcdoc inherits the
+  // page's CSP, which can block inline scripts and silently disable Attach.
   const card = document.createElement("iframe");
   card.className = "card";
   card.setAttribute(
@@ -554,12 +555,7 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
       "</style>" +
       "<div class=row><span id=count class=count></span>" +
       "<input id=c type=text placeholder='Add a comment\u2026' aria-label='Annotation comment'>" +
-      "<button id=a type=button aria-label='Attach annotation' title='Attach'>\u21b5</button></div>" +
-      "<script>(function(){var i=document.getElementById('c'),a=document.getElementById('a');" +
-      "function s(m){parent.postMessage({tlane:m},'*')}" +
-      "i.addEventListener('keydown',function(e){if(e.isComposing)return;if(e.key==='Enter'){e.preventDefault();s('commit')}else if(e.key==='Escape'){e.preventDefault();s('cancel')}});" +
-      "a.addEventListener('click',function(){s('commit')});" +
-      "})();</" + "script>",
+      "<button id=a type=button aria-label='Attach annotation' title='Attach'>\u21b5</button></div>",
   );
   root.appendChild(card);
   const cardEl = (id) => card.contentDocument && card.contentDocument.getElementById(id);
@@ -791,7 +787,7 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
     window.removeEventListener("keydown", onKeyDown, true);
     window.removeEventListener("scroll", scheduleFrame, true);
     window.removeEventListener("resize", scheduleFrame);
-    window.removeEventListener("message", onMessage);
+    card.removeEventListener("load", onCardLoad);
     if (frame !== null) cancelAnimationFrame(frame);
     frame = null;
     host.remove();
@@ -808,16 +804,29 @@ const ANNOTATE_INSTALL: &str = r##"(() => {
     isolate(event, true);
   };
 
-  // Commit/cancel arrive from the pill iframe via postMessage; the source
-  // check pins them to our frame so a page cannot spoof them.
-  const onMessage = (event) => {
-    if (event.source !== card.contentWindow) return;
-    const action = event.data && event.data.tlane;
-    if (action === "commit") commit();
-    else if (action === "cancel") uninstall();
+  const onCardLoad = () => {
+    if (done) return;
+    const input = cardEl("c");
+    const attach = cardEl("a");
+    if (!input || !attach) return;
+    input.addEventListener("keydown", (event) => {
+      if (event.isComposing) return;
+      if (event.key === "Enter") {
+        event.preventDefault();
+        commit();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        uninstall();
+      }
+    });
+    attach.addEventListener("click", commit);
+    refreshCard();
+    // Selection can precede the asynchronous srcdoc load. Do not lose the
+    // initial focus request, or subsequent typing is swallowed by the picker.
+    if (selected.size > 0) input.focus({ preventScroll: true });
   };
 
-  window.addEventListener("message", onMessage);
+  card.addEventListener("load", onCardLoad);
   window.addEventListener("pointermove", onPointerMove, true);
   window.addEventListener("pointerdown", onPointerDown, true);
   window.addEventListener("pointerup", onPointerUp, true);

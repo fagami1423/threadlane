@@ -6,7 +6,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::definitions::tool_definitions;
-use crate::memory::{consolidate_memory_impl, read_memory_impl, save_memory_impl};
+use crate::memory::{consolidate_memory_impl, manage_notes, read_memory_impl, save_memory_impl};
 use crate::repo_map::get_repo_map_impl;
 use crate::search;
 use crate::transaction::{commit_text_transaction, run_post_edit_diagnostics};
@@ -490,12 +490,13 @@ pub fn try_execute_tool_in_workspace_with(
                 .get("action")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    "Error: 'action' parameter is required ('read', 'save', 'consolidate')".to_string()
+                    "Error: 'action' parameter is required; use manage_memory --help for actions".to_string()
                 })?;
             match action {
                 "read" => read_memory_impl(workspace_root),
                 "save" => save_memory_impl(workspace_root, &args),
                 "consolidate" => consolidate_memory_impl(workspace_root, &args),
+                "remember" | "recall" | "forget" | "status" => manage_notes(workspace_root, &args),
                 unknown => Err(format!("Error: Unknown action '{unknown}' for manage_memory")),
             }
         }

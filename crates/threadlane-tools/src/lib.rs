@@ -1,6 +1,6 @@
 pub mod definitions;
 pub mod dispatch;
-pub(crate) mod memory;
+pub mod memory;
 pub(crate) mod repo_map;
 pub mod search;
 pub(crate) mod transaction;

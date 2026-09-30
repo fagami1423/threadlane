@@ -35,6 +35,158 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 
 const STREAM_CHECKPOINT_BYTES: usize = 64 * 1024;
 
+#[cfg(test)]
+mod project_memory_tests {
+    use super::{append_project_memory, AgentConfig, AgentMessage};
+    use sha2::{Digest, Sha256};
+
+    #[tokio::test]
+    async fn project_memory_respects_request_budget_and_missing_or_corrupt_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("parser.rs"), "source").unwrap();
+        let args = serde_json::json!({"action":"remember", "key":"parser", "content":"Parser owns storage.",
+            "sources":[{"path":"parser.rs", "sha256":format!("{:x}", Sha256::digest(b"source"))}]});
+        threadlane_tools::try_execute_tool_in_workspace(
+            "manage_memory",
+            &args.to_string(),
+            dir.path(),
+        )
+        .unwrap();
+        let original = vec![AgentMessage::User {
+            content: "Inspect parser".into(),
+        }];
+        let mut sent = original.clone();
+        let config = AgentConfig::default();
+        assert_eq!(
+            append_project_memory(
+                &mut sent,
+                Some(dir.path().into()),
+                "test",
+                &config,
+                None,
+                Some(100_000)
+            )
+            .await,
+            Some(1)
+        );
+        assert_eq!(sent.len(), 2);
+        for schema in [None, Some("large tool schema")] {
+            let mut limited = original.clone();
+            assert_eq!(
+                append_project_memory(
+                    &mut limited,
+                    Some(dir.path().into()),
+                    "test",
+                    &config,
+                    schema,
+                    Some(1)
+                )
+                .await,
+                None
+            );
+            assert_eq!(limited, original);
+        }
+        let unrelated = tempfile::tempdir().unwrap();
+        let mut missing = original.clone();
+        assert_eq!(
+            append_project_memory(
+                &mut missing,
+                Some(unrelated.path().into()),
+                "test",
+                &config,
+                None,
+                None
+            )
+            .await,
+            None
+        );
+        assert_eq!(std::fs::read_dir(unrelated.path()).unwrap().count(), 0);
+        assert_eq!(missing, original);
+        std::fs::write(dir.path().join(".threadlane/memory.json"), b"corrupt").unwrap();
+        let mut corrupt = original.clone();
+        assert_eq!(
+            append_project_memory(
+                &mut corrupt,
+                Some(dir.path().into()),
+                "test",
+                &config,
+                None,
+                None
+            )
+            .await,
+            None
+        );
+        assert_eq!(corrupt, original);
+        assert_eq!(
+            std::fs::read(dir.path().join(".threadlane/memory.json")).unwrap(),
+            b"corrupt"
+        );
+    }
+}
+
+/// Optional background data lives only in the outgoing request. It never
+/// changes canonical messages, compaction, or the durable transcript.
+async fn append_project_memory(
+    messages: &mut Vec<AgentMessage>,
+    root: Option<std::path::PathBuf>,
+    model: &str,
+    config: &AgentConfig,
+    schema: Option<&str>,
+    effective_limit: Option<usize>,
+) -> Option<usize> {
+    let root = root?;
+    // Keep the task discoverable when the latest input is just "continue".
+    let mut query = messages
+        .iter()
+        .rev()
+        .filter_map(|message| match message {
+            AgentMessage::User { content } | AgentMessage::UserWithImages { content, .. } => {
+                Some(content)
+            }
+            _ => None,
+        })
+        .take(3)
+        .map(|content| content.chars().take(300).collect::<String>())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if query.trim().is_empty() {
+        query = messages
+            .iter()
+            .rev()
+            .find_map(threadlane_compaction::compaction_summary_text)?
+            .chars()
+            .take(1_000)
+            .collect();
+    }
+    let recalled = tokio::task::spawn_blocking(move || {
+        threadlane_tools::memory::recall_project_memory(&root, &query)
+    })
+    .await;
+    let content = match recalled {
+        Ok(Ok(content)) if !content.is_empty() => content,
+        Ok(Ok(_)) => return None,
+        error => {
+            tracing::warn!(
+                ?error,
+                "Project memory recall unavailable; continuing without findings"
+            );
+            return None;
+        }
+    };
+    let budget =
+        threadlane_context::context_budget(model, &threadlane_context::BudgetConfig::from(config));
+    let ceiling = effective_limit
+        .unwrap_or(budget.limit)
+        .min(budget.trigger_tokens);
+    let position = messages.len();
+    messages.push(AgentMessage::User { content });
+    if estimate_request_tokens(messages, schema, &CompactionParams::from(config)) >= ceiling {
+        messages.pop();
+        return None;
+    }
+    Some(position)
+}
+
 async fn persist_messages_with(
     recorder: Option<&crate::provider::AssistantMessageRecorder>,
     messages: &[AgentMessage],
@@ -291,10 +443,20 @@ impl<'a> TurnDriver<'a> {
             let (stream_tx, mut stream_rx) = mpsc::channel(100);
             let client = self.provider_client.clone();
             let payload_cache_key = self.prompt_cache_key.clone();
-            let request_messages = match boundary_result.as_ref() {
+            let mut request_messages = match boundary_result.as_ref() {
                 Some(prepared) => prepared.messages.clone(),
                 None => self.turn.lock().await.messages.clone(),
             };
+            let memory_root = self.turn.lock().await.project_root.clone();
+            let memory_position = append_project_memory(
+                &mut request_messages,
+                memory_root,
+                &model,
+                &self.config,
+                tool_schema_json.as_deref(),
+                boundary_result.as_ref().map(|prepared| prepared.context_limit),
+            )
+            .await;
             let request = {
                 let turn = self.turn.lock().await;
                 RuntimeRequest {
@@ -352,9 +514,13 @@ impl<'a> TurnDriver<'a> {
                             token_estimate,
                             status,
                             digest_sha256,
-                            label: reduced.then(|| {
-                                TraceString::new("request-only reduction").expect("static label")
-                            }),
+                            label: if memory_position == Some(idx) {
+                                Some(TraceString::new("project memory recall").expect("static label"))
+                            } else {
+                                reduced.then(|| {
+                                    TraceString::new("request-only reduction").expect("static label")
+                                })
+                            },
                         });
                     }
                 }

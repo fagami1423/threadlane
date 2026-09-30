@@ -101,7 +101,14 @@ pub fn validate_path_in_workspace(
                 canonical_root.display()
             )
         })?;
-        let resolved = canonical_ancestor.join(tail);
+        // Another writer can create the target after the first exists() probe.
+        // Joining an empty tail adds a trailing slash, turning a file into an
+        // invalid directory path. Keep the canonical target in that case.
+        let resolved = if tail.as_os_str().is_empty() {
+            canonical_ancestor
+        } else {
+            canonical_ancestor.join(tail)
+        };
         if !resolved.starts_with(&canonical_root) {
             return Err(format!(
                 "Access denied: Path '{}' escapes workspace root '{}'",
