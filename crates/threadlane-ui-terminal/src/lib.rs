@@ -583,6 +583,10 @@ pub struct TerminalView {
     scrollback_len: usize,
     alt_screen: bool,
     find: Option<TerminalFind>,
+    /// Monotonic seed for find generations so a generation is never reused
+    /// across find instances or shell restarts in this view: a delayed reply
+    /// from an older find can then never land under a newer one.
+    find_generation_seed: u64,
 }
 
 impl TerminalView {
@@ -643,6 +647,7 @@ impl TerminalView {
             scrollback_len: 0,
             alt_screen: false,
             find: None,
+            find_generation_seed: 0,
         };
         terminal.start();
         terminal
@@ -800,8 +805,8 @@ impl TerminalView {
                 total,
                 truncated,
                 scrollback_len,
+                alt_screen,
                 revealed,
-                ..
             } => {
                 // Replies for an older query generation never land; the
                 // generation moves on every query edit and on close.
@@ -811,6 +816,7 @@ impl TerminalView {
                 if find.generation != generation {
                     return;
                 }
+                self.alt_screen = alt_screen;
                 find.pending = false;
                 find.failed = false;
                 find.hits = hits;
@@ -1138,6 +1144,7 @@ impl TerminalView {
             return;
         }
         if self.find.is_none() {
+            let generation = self.next_find_generation();
             let input = cx.new(|cx| {
                 InputState::new(window, cx).placeholder("Find in retained output…")
             });
@@ -1155,7 +1162,7 @@ impl TerminalView {
                 input,
                 previous_focus: window.focused(cx),
                 query: String::new(),
-                generation: 0,
+                generation,
                 pending: false,
                 failed: false,
                 hits: Vec::new(),
@@ -1209,16 +1216,23 @@ impl TerminalView {
         cx.notify();
     }
 
+    fn next_find_generation(&mut self) -> u64 {
+        self.find_generation_seed += 1;
+        self.find_generation_seed
+    }
+
     fn update_find_query(&mut self, query: String, cx: &mut Context<Self>) {
-        let Some(find) = &mut self.find else {
-            return;
-        };
-        if find.query == query {
+        if self
+            .find
+            .as_ref()
+            .is_none_or(|find| find.query == query)
+        {
             return;
         }
+        let generation = self.next_find_generation();
+        let find = self.find.as_mut().unwrap();
         find.query = query;
-        find.generation += 1;
-        let generation = find.generation;
+        find.generation = generation;
         find.failed = false;
         find.hits.clear();
         find.total = 0;
