@@ -10,6 +10,8 @@ pub use scripts::{
 #[cfg(target_os = "macos")]
 mod view;
 #[cfg(target_os = "macos")]
+mod webview;
+#[cfg(target_os = "macos")]
 pub use view::BrowserView;
 
 #[cfg(not(target_os = "macos"))]
