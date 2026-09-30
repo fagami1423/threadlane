@@ -159,3 +159,126 @@ pub fn next_find_match(selected: Option<usize>, count: usize, previous: bool) ->
         (None, false) => 0,
     })
 }
+
+const PROMPT_EXCERPT_CHARS: usize = 96;
+
+/// One user prompt in the transcript, in chronological order. Shared by the
+/// conversation outline and composer prompt recall.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptLandmark {
+    pub message_id: String,
+    /// 1-based index among user prompts ("Prompt N").
+    pub ordinal: usize,
+    /// Transcript row index at derivation time; revalidate before scrolling.
+    pub row_index: usize,
+    /// Full message content; composer recall loads this verbatim.
+    pub text: String,
+    /// Bounded, whitespace-normalized excerpt for compact lists. Empty when
+    /// the message has no display text.
+    pub excerpt: String,
+    /// Optimistic queue/steer echo not yet confirmed by the session stream.
+    pub pending_echo: bool,
+}
+
+/// Chronological user prompts derived from the projected transcript rows, so
+/// activity-only and excluded messages never appear as landmarks.
+pub fn prompt_landmarks(messages: &[ChatMessageInfo], generating: bool) -> Vec<PromptLandmark> {
+    let mut landmarks = Vec::new();
+    for (row_index, row) in build_transcript_rows(messages, generating)
+        .iter()
+        .enumerate()
+    {
+        let TranscriptRow::Message(index) = row else {
+            continue;
+        };
+        let message = &messages[*index];
+        if message.role != MessageRole::User {
+            continue;
+        }
+        landmarks.push(PromptLandmark {
+            message_id: message.id.clone(),
+            ordinal: landmarks.len() + 1,
+            row_index,
+            text: message.content.clone(),
+            excerpt: prompt_excerpt(&message.content),
+            pending_echo: message.id.starts_with("queued-user-")
+                || message.id.starts_with("steered-user-"),
+        });
+    }
+    landmarks
+}
+
+fn prompt_excerpt(content: &str) -> String {
+    let mut normalized = String::with_capacity(content.len());
+    let mut last_was_space = true;
+    for ch in content.trim().chars() {
+        if ch.is_whitespace() {
+            if !last_was_space {
+                normalized.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            normalized.push(ch);
+            last_was_space = false;
+        }
+    }
+    let mut chars = normalized.chars();
+    let excerpt: String = chars.by_ref().take(PROMPT_EXCERPT_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{excerpt}…")
+    } else {
+        excerpt
+    }
+}
+
+/// Outcome of stepping the composer prompt-recall cursor with Up/Down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptRecallStep {
+    /// The key falls through to the default caret behavior.
+    PassThrough,
+    /// Load the entry at this index of the eligible prompt list.
+    Load(usize),
+    /// The cursor moved past the newest entry; restore the empty composer.
+    Clear,
+}
+
+/// Older/newer stepping over eligible prompt entries. `position` is the
+/// cursor's index into the entry list (`None` when the composer is not
+/// browsing). Older navigation saturates at the oldest entry; newer
+/// navigation past the newest entry clears the composer.
+pub fn prompt_recall_step(
+    position: Option<usize>,
+    count: usize,
+    older: bool,
+) -> PromptRecallStep {
+    if count == 0 {
+        return PromptRecallStep::PassThrough;
+    }
+    match (position, older) {
+        (None, true) => PromptRecallStep::Load(count - 1),
+        (None, false) => PromptRecallStep::PassThrough,
+        (Some(index), true) => PromptRecallStep::Load(index.saturating_sub(1)),
+        (Some(index), false) if index + 1 >= count => PromptRecallStep::Clear,
+        (Some(index), false) => PromptRecallStep::Load(index + 1),
+    }
+}
+
+/// Arrow/Home/End stepping over an outline list; moves focus only, no wrap.
+pub fn step_prompt_focus(focused: Option<usize>, count: usize, key: &str) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    match key {
+        "up" => Some(match focused {
+            Some(index) if index > 0 => index - 1,
+            _ => 0,
+        }),
+        "down" => Some(match focused {
+            Some(index) => (index + 1).min(count - 1),
+            None => 0,
+        }),
+        "home" => Some(0),
+        "end" => Some(count - 1),
+        _ => focused,
+    }
+}

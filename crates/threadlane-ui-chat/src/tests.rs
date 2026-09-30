@@ -423,8 +423,8 @@ use super::{
     markdown_cache_exceeded, next_chat_stream_batch, normalize_terminal_command,
     reconcile_trajectory_entries, reconcile_trajectory_entries_by_epoch, subagent_popover_counts,
     summarize_trajectory, ChatLinkTarget, ContextMeterContext, ContextMeterMetrics,
-    MarkdownSegment, MarkdownUpdate, TrajectoryCacheKey, TrajectoryInspectorTab, TrajectoryMode,
-    TrajectoryRenderCache, TrajectoryRow, TrajectorySummary,
+    MarkdownSegment, MarkdownUpdate, PromptRecallStep, TrajectoryCacheKey, TrajectoryInspectorTab,
+    TrajectoryMode, TrajectoryRenderCache, TrajectoryRow, TrajectorySummary,
     TranscriptRow, INPUT_KEY_CONTEXT, MARKDOWN_CACHE_ENTRY_LIMIT, SLASH_COMMAND_BINDING_CONTEXT,
     SLASH_COMMAND_KEY_CONTEXT,
 };
@@ -1965,6 +1965,7 @@ fn reasoning_disclosure_supports_keyboard_and_pauses_following(cx: &mut gpui::Te
     });
     cx.update(|window, cx| {
         window.blur(cx);
+        window.focus_next(cx); // Conversation outline
         window.focus_next(cx); // Find in conversation
         window.focus_next(cx); // Chat
         window.focus_next(cx); // Editor
@@ -4026,4 +4027,420 @@ fn staged_image_decoder_rejects_non_image_data_urls() {
     };
 
     assert!(super::decode_staged_image(&attachment).is_err());
+}
+
+#[test]
+fn prompt_landmarks_list_user_prompts_in_chronological_order() {
+    let msg = |id: &str, role: MessageRole, content: &str| ChatMessageInfo {
+        id: id.into(),
+        role,
+        content: content.into(),
+        tool_activities: Vec::new(),
+        streaming: false,
+        reasoning_content: None,
+        reasoning_expanded: false,
+    };
+    let messages = vec![
+        msg("u1", MessageRole::User, "first prompt\nwith newlines"),
+        msg("a1", MessageRole::Assistant, "answer"),
+        msg("u2", MessageRole::User, "second   prompt"),
+        msg("e1", MessageRole::Error, "boom"),
+        msg("u3", MessageRole::User, ""),
+        msg("queued-user-9", MessageRole::User, "not yet sent"),
+    ];
+
+    let landmarks = super::prompt_landmarks(&messages, false);
+    assert_eq!(
+        landmarks.iter().map(|l| l.message_id.as_str()).collect::<Vec<_>>(),
+        ["u1", "u2", "u3", "queued-user-9"]
+    );
+    assert_eq!(
+        landmarks.iter().map(|l| l.ordinal).collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
+    assert!(landmarks[0].row_index < landmarks[1].row_index);
+    // Excerpts collapse all whitespace runs into single spaces.
+    assert_eq!(landmarks[0].excerpt, "first prompt with newlines");
+    assert_eq!(landmarks[1].excerpt, "second prompt");
+    assert_eq!(landmarks[2].excerpt, "");
+    // Optimistic queue/steer echoes are flagged, never silently dropped here.
+    assert!(!landmarks[0].pending_echo);
+    assert!(landmarks[3].pending_echo);
+    // While generating, queued echoes are excluded like other transcript rows.
+    let live = super::prompt_landmarks(&messages, true);
+    assert_eq!(live.len(), 3);
+    assert!(live.iter().all(|l| !l.pending_echo));
+}
+
+#[test]
+fn prompt_recall_step_saturates_old_and_clears_past_newest() {
+    use super::prompt_recall_step;
+    let (old, new) = (true, false);
+    assert_eq!(prompt_recall_step(None, 0, old), PromptRecallStep::PassThrough);
+    assert_eq!(prompt_recall_step(None, 0, new), PromptRecallStep::PassThrough);
+    // Entering browses at the newest entry; Down without browsing is native.
+    assert_eq!(prompt_recall_step(None, 3, old), PromptRecallStep::Load(2));
+    assert_eq!(prompt_recall_step(None, 3, new), PromptRecallStep::PassThrough);
+    // Older saturates at the oldest entry (index 0).
+    assert_eq!(prompt_recall_step(Some(2), 3, old), PromptRecallStep::Load(1));
+    assert_eq!(prompt_recall_step(Some(0), 3, old), PromptRecallStep::Load(0));
+    // Newer past the newest restores the empty composer.
+    assert_eq!(prompt_recall_step(Some(0), 3, new), PromptRecallStep::Load(1));
+    assert_eq!(prompt_recall_step(Some(2), 3, new), PromptRecallStep::Clear);
+}
+
+#[test]
+fn step_prompt_focus_moves_without_wrapping() {
+    use super::step_prompt_focus;
+    assert_eq!(step_prompt_focus(None, 0, "up"), None);
+    assert_eq!(step_prompt_focus(None, 3, "down"), Some(0));
+    assert_eq!(step_prompt_focus(Some(0), 3, "up"), Some(0));
+    assert_eq!(step_prompt_focus(Some(0), 3, "down"), Some(1));
+    assert_eq!(step_prompt_focus(Some(2), 3, "down"), Some(2));
+    assert_eq!(step_prompt_focus(Some(1), 3, "home"), Some(0));
+    assert_eq!(step_prompt_focus(Some(0), 3, "end"), Some(2));
+    assert_eq!(step_prompt_focus(Some(1), 3, "enter"), Some(1));
+}
+
+fn prompt_test_messages() -> Vec<ChatMessageInfo> {
+    let msg = |id: &str, role: MessageRole, content: &str| ChatMessageInfo {
+        id: id.into(),
+        role,
+        content: content.into(),
+        tool_activities: Vec::new(),
+        streaming: false,
+        reasoning_content: None,
+        reasoning_expanded: false,
+    };
+    vec![
+        msg("u1", MessageRole::User, "first prompt"),
+        msg("a1", MessageRole::Assistant, "answer one"),
+        msg("u2", MessageRole::User, "second prompt"),
+        msg("u3", MessageRole::User, "third prompt"),
+    ]
+}
+
+#[gpui::test]
+fn composer_up_recalls_prompts_and_down_restores_empty(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        super::init(cx);
+    });
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::default();
+        state.is_new_task = false;
+        state.active_session_id = Some("recall-task".into());
+        state.messages = prompt_test_messages().into();
+        state
+    });
+    let holder: std::rc::Rc<
+        std::cell::RefCell<Option<gpui::Entity<super::ChatListView>>>,
+    > = Default::default();
+    let holder_clone = holder.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        holder_clone.borrow_mut().replace(chat.clone());
+        gpui_component::Root::new(chat, window, cx)
+    });
+    let chat = holder.borrow().as_ref().expect("chat mounted").clone();
+    chat.update_in(cx, |chat, window, cx| chat.focus_composer(window, cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    cx.simulate_keystrokes("up");
+    chat.read_with(cx, |chat, cx| {
+        let input = chat.input_state.read(cx);
+        assert_eq!(input.value().as_ref(), "third prompt");
+        assert_eq!(input.cursor(), 0, "older navigation leaves the caret at the start");
+        assert!(chat.prompt_recall.is_some());
+    });
+    cx.simulate_keystrokes("up up");
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(chat.input_state.read(cx).value().as_ref(), "first prompt");
+    });
+    // Older saturates at the oldest entry.
+    cx.simulate_keystrokes("up");
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(chat.input_state.read(cx).value().as_ref(), "first prompt");
+    });
+    // Down only goes newer when the caret is at the end; from the start it
+    // keeps its native caret behavior.
+    cx.simulate_keystrokes("down");
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(chat.input_state.read(cx).value().as_ref(), "first prompt");
+        assert!(chat.prompt_recall.is_some());
+    });
+    chat.update_in(cx, |chat, _, cx| {
+        let len = chat.input_state.read(cx).value().len();
+        chat.input_state
+            .update(cx, |input, cx| input.set_selected_range(len..len, cx));
+    });
+    cx.simulate_keystrokes("down down");
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(chat.input_state.read(cx).value().as_ref(), "third prompt");
+        assert_eq!(
+            chat.input_state.read(cx).cursor(),
+            "third prompt".len(),
+            "newer navigation leaves the caret at the end"
+        );
+    });
+    // Newer past the newest restores the empty composer.
+    cx.simulate_keystrokes("down");
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(chat.input_state.read(cx).value().as_ref(), "");
+        assert!(chat.prompt_recall.is_none());
+    });
+}
+
+#[gpui::test]
+fn composer_recall_ends_on_edit_and_stays_gated(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        super::init(cx);
+    });
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::default();
+        state.is_new_task = false;
+        state.active_session_id = Some("recall-task".into());
+        state.messages = prompt_test_messages().into();
+        state
+    });
+    let retained_model = model.clone();
+    let holder: std::rc::Rc<
+        std::cell::RefCell<Option<gpui::Entity<super::ChatListView>>>,
+    > = Default::default();
+    let holder_clone = holder.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        holder_clone.borrow_mut().replace(chat.clone());
+        gpui_component::Root::new(chat, window, cx)
+    });
+    let chat = holder.borrow().as_ref().expect("chat mounted").clone();
+    chat.update_in(cx, |chat, window, cx| chat.focus_composer(window, cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // Any draft text, even whitespace, keeps arrows native.
+    chat.update_in(cx, |chat, window, cx| {
+        chat.input_state
+            .update(cx, |input, cx| input.set_value("   ", window, cx));
+    });
+    cx.simulate_keystrokes("up");
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(chat.input_state.read(cx).value().as_ref(), "   ");
+        assert!(chat.prompt_recall.is_none());
+    });
+    chat.update_in(cx, |chat, window, cx| {
+        chat.input_state
+            .update(cx, |input, cx| input.set_value("", window, cx));
+    });
+
+    // Staged images keep the composer busy.
+    chat.update(cx, |chat, _| {
+        chat.pasted_images.push(super::ImageAttachment {
+            display_name: "draft.png".into(),
+            data_url: "data:image/png;base64,test".into(),
+        });
+    });
+    cx.simulate_keystrokes("up");
+    chat.read_with(cx, |chat, _| assert!(chat.prompt_recall.is_none()));
+    chat.update(cx, |chat, _| chat.pasted_images.clear());
+
+    // An active turn disables recall.
+    retained_model.update(cx, |state, cx| {
+        state.is_generating = true;
+        cx.notify();
+    });
+    cx.simulate_keystrokes("up");
+    chat.read_with(cx, |chat, _| assert!(chat.prompt_recall.is_none()));
+    retained_model.update(cx, |state, cx| {
+        state.is_generating = false;
+        cx.notify();
+    });
+
+    // Editing the recalled text ends browsing but keeps the draft.
+    cx.simulate_keystrokes("up");
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(chat.input_state.read(cx).value().as_ref(), "third prompt");
+    });
+    // The caret sits at the start after older navigation, so the typed
+    // character prepends.
+    cx.simulate_input("!");
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(chat.input_state.read(cx).value().as_ref(), "!third prompt");
+        assert!(chat.prompt_recall.is_none(), "typing ends browsing");
+    });
+    // With the composer now holding a draft, Up is native again.
+    cx.simulate_keystrokes("up");
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(chat.input_state.read(cx).value().as_ref(), "!third prompt");
+        assert!(chat.prompt_recall.is_none());
+    });
+}
+
+#[gpui::test]
+fn prompt_recall_buttons_step_and_report_position(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    cx.update(gpui_component::init);
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::default();
+        state.is_new_task = false;
+        state.active_session_id = Some("recall-task".into());
+        state.messages = prompt_test_messages().into();
+        state
+    });
+    let holder: std::rc::Rc<
+        std::cell::RefCell<Option<gpui::Entity<super::ChatListView>>>,
+    > = Default::default();
+    let holder_clone = holder.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        holder_clone.borrow_mut().replace(chat.clone());
+        gpui_component::Root::new(chat, window, cx)
+    });
+    let chat = holder.borrow().as_ref().expect("chat mounted").clone();
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // The composer-level command enters browsing like the Up arrow.
+    let recall = cx.debug_bounds("prompt-recall-btn").expect("recall command");
+    cx.simulate_click(recall.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(chat.input_state.read(cx).value().as_ref(), "third prompt");
+        assert!(chat.prompt_recall.is_some());
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("prompt-recall-strip").is_some(),
+        "browsing shows the text-only status strip"
+    );
+    let older = cx.debug_bounds("prompt-recall-older").expect("older button");
+    cx.simulate_click(older.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(chat.input_state.read(cx).value().as_ref(), "second prompt");
+    });
+    let newer = cx.debug_bounds("prompt-recall-newer").expect("newer button");
+    cx.simulate_click(newer.center(), gpui::Modifiers::default());
+    cx.simulate_click(newer.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(chat.input_state.read(cx).value().as_ref(), "");
+        assert!(chat.prompt_recall.is_none());
+    });
+}
+
+#[gpui::test]
+fn conversation_outline_focuses_and_jumps_to_prompts(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    cx.update(gpui_component::init);
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::default();
+        state.is_new_task = false;
+        state.active_session_id = Some("outline-task".into());
+        // Pad the transcript so a jump to the first prompt really leaves the
+        // tail — with everything visible, follow-tail re-engages on layout.
+        let mut messages = prompt_test_messages();
+        for ix in 0..40 {
+            messages.push(ChatMessageInfo {
+                id: format!("a-pad-{ix}"),
+                role: MessageRole::Assistant,
+                content: format!("padding answer {ix}"),
+                tool_activities: Vec::new(),
+                streaming: false,
+                reasoning_content: None,
+                reasoning_expanded: false,
+            });
+        }
+        state.messages = messages.into();
+        state
+    });
+    let retained_model = model.clone();
+    let holder: std::rc::Rc<
+        std::cell::RefCell<Option<gpui::Entity<super::ChatListView>>>,
+    > = Default::default();
+    let holder_clone = holder.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        holder_clone.borrow_mut().replace(chat.clone());
+        gpui_component::Root::new(chat, window, cx)
+    });
+    let chat = holder.borrow().as_ref().expect("chat mounted").clone();
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    chat.update(cx, |chat, _| chat.initial_scroll_frames = 0);
+
+    let trigger = cx
+        .debug_bounds("conversation-outline-open")
+        .expect("outline command in the header");
+    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    chat.read_with(cx, |chat, _| {
+        assert!(chat.outline_open);
+        assert_eq!(chat.outline_landmarks.len(), 3);
+        assert_eq!(chat.outline_focus_id.as_deref(), Some("u3"), "newest prompt focused first");
+    });
+
+    // Arrows/Home move list focus only; Enter jumps.
+    cx.simulate_keystrokes("up");
+    chat.read_with(cx, |chat, _| {
+        assert_eq!(chat.outline_focus_id.as_deref(), Some("u2"));
+        assert!(chat.transcript_list_state.is_following_tail(), "focus alone never scrolls");
+    });
+    cx.simulate_keystrokes("home");
+    chat.read_with(cx, |chat, _| {
+        assert_eq!(chat.outline_focus_id.as_deref(), Some("u1"));
+    });
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, _| {
+        assert!(!chat.outline_open, "jump closes the outline");
+        assert_eq!(chat.outline_selected_id.as_deref(), Some("u1"));
+        assert!(!chat.transcript_list_state.is_following_tail(), "the jump pauses tail following");
+    });
+
+    // Reopening prefers the last jumped-to prompt when it is still listed.
+    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, _| {
+        assert_eq!(chat.outline_focus_id.as_deref(), Some("u1"));
+    });
+    // Escape cancels without jumping.
+    cx.simulate_keystrokes("up escape");
+    chat.read_with(cx, |chat, _| {
+        assert!(!chat.outline_open);
+        assert_eq!(chat.outline_selected_id.as_deref(), Some("u1"), "cancel keeps the last jump");
+    });
+
+    // Opening Find clears the outline selection.
+    chat.update_in(cx, |chat, window, cx| {
+        chat.open_conversation_find(&super::FindInConversation, window, cx)
+    });
+    chat.read_with(cx, |chat, _| {
+        assert!(chat.find_open);
+        assert!(chat.outline_selected_id.is_none());
+    });
+    chat.update_in(cx, |chat, window, cx| {
+        chat.close_conversation_find(&super::CloseConversationFind, window, cx)
+    });
+
+    // A session switch clears the popover and the marker.
+    chat.update_in(cx, |chat, window, cx| chat.open_conversation_outline(window, cx));
+    chat.read_with(cx, |chat, _| assert!(chat.outline_open));
+    retained_model.update(cx, |state, cx| {
+        state.active_session_id = Some("other-task".into());
+        state.messages = prompt_test_messages().into();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, _| {
+        assert!(!chat.outline_open, "session switch closes the outline");
+        assert!(chat.outline_selected_id.is_none());
+    });
 }
