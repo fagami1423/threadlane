@@ -356,9 +356,14 @@ impl CodingAgentWorkHandle {
                 return Err("Queued message is no longer pending".into());
             };
             let (content, images) = queued_message_parts(message)?;
-            harness.cancel_unbound_entry(entry_id)?;
+            // Enqueue the steer first so an enqueue failure leaves the
+            // original entry intact; compensate if the old cancel fails.
             let steer_entry_id =
                 harness.enqueue_unbound_with_images(QueueKind::Steer, content, images)?;
+            if let Err(error) = harness.cancel_unbound_entry(entry_id) {
+                let _ = harness.cancel_unbound_entry(&steer_entry_id);
+                return Err(error);
+            }
             self.scheduler.take_pending(entry_id);
             self.scheduler.schedule(AgentWork::DurableQueueWake {
                 queue: QueueKind::Steer,

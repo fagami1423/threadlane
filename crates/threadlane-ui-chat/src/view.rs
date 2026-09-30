@@ -4527,8 +4527,16 @@ impl ChatListView {
             "This agent does not support live steering. Use Queue for the next turn."
         };
         let has_composer_text = !self.input_state.read(cx).value().trim().is_empty();
-        let has_prompt =
-            has_sendable_prompt(&self.input_state.read(cx).value(), self.pasted_images.len());
+        // Queued sends are text-only: an images-only draft cannot stage for
+        // the next turn, so images only count toward sendability when idle.
+        let has_prompt = has_sendable_prompt(
+            &self.input_state.read(cx).value(),
+            if is_generating {
+                0
+            } else {
+                self.pasted_images.len()
+            },
+        );
         let (model_options, selected_option, project_root) = {
             let state = self.model.read(cx);
             let options = state.available_models().to_vec();
@@ -5116,13 +5124,29 @@ impl ChatListView {
                                         .child(
                                             Button::new(format!("queued-edit-{message_id}"))
                                                 .debug_selector(|| "queued-edit".into())
-                                                .icon(IconName::Undo2)
+                                                .icon(Icon::default().path("icons/square-pen.svg"))
                                                 .accessibility_label("Edit queued message")
                                                 .xsmall()
                                                 .ghost()
                                                 .tooltip("Edit message in the composer")
                                                 .on_click(cx.listener(
                                                     move |this, _event, window, cx| {
+                                                        if !this
+                                                            .input_state
+                                                            .read(cx)
+                                                            .value()
+                                                            .is_empty()
+                                                            || !this.pasted_images.is_empty()
+                                                        {
+                                                            window.push_notification(
+                                                                Notification::info(
+                                                                    "Send or clear your draft before editing a message",
+                                                                ),
+                                                                cx,
+                                                            );
+                                                            this.focus_composer(window, cx);
+                                                            return;
+                                                        }
                                                         let restored = queued_edit_model.update(
                                                             cx,
                                                             |state, cx| {
@@ -6407,7 +6431,9 @@ impl ChatListView {
                                             .when(!has_prompt || needs_provider || self.model.read(cx).active_worktree_setup().is_some(), |b| b.ghost().disabled(true))
                                             .on_click(cx.listener(move |this, _event, window, cx| {
                                                 let text = send_input.read(cx).value().to_string();
-                                                if !text.trim().is_empty() || !this.pasted_images.is_empty() {
+                                                if !text.trim().is_empty()
+                                                    || (!is_generating && !this.pasted_images.is_empty())
+                                                {
                                                     this.prompt_recall = None;
                                                     let images = std::mem::take(&mut this.pasted_images);
                                                     send_model.update(cx, |state, cx| {
