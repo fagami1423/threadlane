@@ -1,6 +1,6 @@
 use gpui::*;
 use gpui_component::Root;
-use threadlane_coding_agent::config_dump::dump_config;
+use threadlane_coding_agent::config_dump::{dump_config, dump_token_efficiency};
 use threadlane_ui_chat::init as init_chat;
 use threadlane_ui_theme::{init as init_theme, Assets};
 use threadlane_ui_workspace::{init as init_workspace, StartupView};
@@ -12,6 +12,13 @@ mod process_environment;
 #[hotpath::main]
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "--token-efficiency") {
+        if let Err(error) = dump_token_efficiency(&args) {
+            eprintln!("--token-efficiency: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
     process_environment::initialize_child_process_path();
     if args.iter().any(|arg| arg == "--dump-config") {
         if let Err(error) = dump_config(&args) {

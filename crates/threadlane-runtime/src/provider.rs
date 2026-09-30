@@ -304,6 +304,10 @@ pub struct ProviderBoundaryRequest {
 
 #[derive(Clone, Debug)]
 pub struct ProviderBoundaryResult {
+    /// Canonical continuation state, when the provider receives a reduced
+    /// projection. Keeping it separate prevents reconciliation from persisting
+    /// request-only substitutions as transcript or compaction entries.
+    pub canonical_messages: Option<Vec<AgentMessage>>,
     pub messages: Vec<AgentMessage>,
     pub context_limit: usize,
     pub context_limit_is_estimate: bool,

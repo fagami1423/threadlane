@@ -1,6 +1,329 @@
 use super::*;
 
+const KEEP_RECENT_READS: usize = 3;
+
+/// Request-only reduction. The first visible copy of a recent read stays
+/// inline; duplicate results point to it. Older reads are evictable only while
+/// their snapshot is fresh and the request exposes manage_context.
+fn reduce_read_context_with_digests(
+    messages: &[AgentMessage],
+    snapshots: &[threadlane_runtime::harness::ContextSnapshot],
+    current_digests: &HashMap<String, String>,
+    can_load: bool,
+) -> Vec<AgentMessage> {
+    let by_call: HashMap<_, _> = snapshots
+        .iter()
+        .map(|snapshot| (snapshot.source_tool_call_id.as_str(), snapshot))
+        .collect();
+    let snapshot_for = |message: &AgentMessage| match message {
+        AgentMessage::Tool {
+            name,
+            tool_call_id,
+            content,
+            is_error: false,
+            images,
+            ..
+        } if name == "read_file" && images.is_empty() => by_call
+            .get(tool_call_id.as_str())
+            .copied()
+            .filter(|snapshot| {
+                threadlane_tools::read_file_snapshot_digest(content)
+                    == Some(snapshot.file_sha256.as_str())
+                    && threadlane_tools::read_file_snapshot_path(content).as_deref()
+                        == Some(snapshot.path.as_str())
+            }),
+        _ => None,
+    };
+    let key = |snapshot: &threadlane_runtime::harness::ContextSnapshot| {
+        (
+            snapshot.path.clone(),
+            snapshot.start_line,
+            snapshot.end_line,
+            snapshot.file_sha256.as_str().to_owned(),
+        )
+    };
+    let mut recent = std::collections::HashSet::new();
+    for snapshot in messages.iter().rev().filter_map(snapshot_for) {
+        recent.insert(key(snapshot));
+        if recent.len() == KEEP_RECENT_READS {
+            break;
+        }
+    }
+    let mut visible = HashMap::new();
+    messages.iter().map(|message| {
+        let Some(snapshot) = snapshot_for(message) else { return message.clone(); };
+        let AgentMessage::Tool { content, .. } = message else { unreachable!() };
+        let snapshot_key = key(snapshot);
+        let replacement = if let Some(first_call) = visible.get(&snapshot_key) {
+            Some(format!("[Unchanged read; full content remains in earlier tool result {first_call}. Do not repeat this read without changed arguments or file contents.]"))
+        } else if can_load && !recent.contains(&snapshot_key) {
+            let digest = current_digests.get(&snapshot.path);
+            if digest.map(String::as_str) == Some(snapshot.file_sha256.as_str()) {
+                Some(format!("[Earlier read of {} stored as context snapshot {}. Use manage_context(action=load, context_id=\"{}\") if needed.]",
+                    crate::context_snapshots::snapshot_location(snapshot), snapshot.context_id, snapshot.context_id))
+            } else { None }
+        } else { None };
+        // Small bodies cost less than a reference. Only refer to a copy that
+        // is actually inline in this request, never to an evicted result.
+        if let Some(replacement) = replacement.filter(|text| text.len() < content.len()) {
+            let mut reduced = message.clone();
+            if let AgentMessage::Tool { content, .. } = &mut reduced { *content = replacement; }
+            reduced
+        } else {
+            visible.entry(snapshot_key).or_insert_with(|| snapshot.source_tool_call_id.clone());
+            message.clone()
+        }
+    }).collect()
+}
+
+fn can_load_read_snapshots(tool_schema_json: Option<&str>) -> bool {
+    tool_schema_json
+        .and_then(|schema| serde_json::from_str::<Value>(schema).ok())
+        .and_then(|tools| {
+            tools.as_array().map(|tools| {
+                tools.iter().any(|tool| {
+                    tool.pointer("/function/name").and_then(Value::as_str) == Some("manage_context")
+                })
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn read_context_digests(paths: Vec<String>, work_dir: Option<PathBuf>) -> HashMap<String, String> {
+    // ponytail: hash each candidate once per attempt; use a watcher-invalidated
+    // digest cache if repeated I/O becomes costly.
+    let Some(work_dir) = work_dir else {
+        return HashMap::new();
+    };
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let validated = threadlane_tools::validate_path_in_workspace(&path, &work_dir).ok()?;
+            let bytes = fs::read(validated).ok()?;
+            Some((path, crate::durable::sha256_hex(&bytes)))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn reduce_read_context(
+    messages: &[AgentMessage],
+    snapshots: &[threadlane_runtime::harness::ContextSnapshot],
+    work_dir: Option<&Path>,
+    can_load: bool,
+) -> Vec<AgentMessage> {
+    let digests = read_context_digests(
+        snapshots
+            .iter()
+            .map(|snapshot| snapshot.path.clone())
+            .collect(),
+        work_dir.map(Path::to_path_buf),
+    );
+    reduce_read_context_with_digests(messages, snapshots, &digests, can_load)
+}
+
+#[cfg(test)]
+mod reduction_tests {
+    use super::{reduce_read_context, AgentMessage};
+    use threadlane_runtime::harness::{ContextSnapshot, TraceString};
+
+    #[test]
+    fn eviction_requires_fresh_recoverable_reads_and_duplicates_require_visible_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut messages = Vec::new();
+        let mut snapshots = Vec::new();
+        for index in 0..4 {
+            let path = format!("{index}.rs");
+            std::fs::write(dir.path().join(&path), "body ".repeat(1000)).unwrap();
+            let content = threadlane_tools::try_execute_tool_in_workspace(
+                "read_file",
+                &serde_json::json!({"path": path}).to_string(),
+                dir.path(),
+            )
+            .unwrap();
+            let call = format!("call-{index}");
+            snapshots.push(ContextSnapshot {
+                context_id: format!("ctx-result-{index}"),
+                source_lane: "main".into(),
+                source_run_id: "run".into(),
+                source_tool_call_id: call.clone(),
+                source_entry_id: format!("result-{index}"),
+                path,
+                start_line: None,
+                end_line: None,
+                file_sha256: TraceString::new(
+                    threadlane_tools::read_file_snapshot_digest(&content).unwrap(),
+                )
+                .unwrap(),
+                output_chars: content.chars().count(),
+                captured_at: 0,
+            });
+            messages.push(AgentMessage::Tool {
+                tool_call_id: call,
+                name: "read_file".into(),
+                content,
+                is_error: false,
+                terminate: false,
+                images: vec![],
+            });
+        }
+        let reduced = reduce_read_context(&messages, &snapshots, Some(dir.path()), true);
+        assert!(
+            matches!(&reduced[0], AgentMessage::Tool { content, .. } if content.contains("manage_context"))
+        );
+        assert_eq!(&reduced[1..], &messages[1..]);
+        assert_eq!(
+            reduce_read_context(&messages, &snapshots, Some(dir.path()), false),
+            messages
+        );
+        assert_eq!(
+            reduce_read_context(&messages, &snapshots, None, true),
+            messages
+        );
+        std::fs::write(dir.path().join("0.rs"), "changed").unwrap();
+        assert_eq!(
+            reduce_read_context(&messages, &snapshots, Some(dir.path()), true),
+            messages
+        );
+        std::fs::remove_file(dir.path().join("0.rs")).unwrap();
+        assert_eq!(
+            reduce_read_context(&messages, &snapshots, Some(dir.path()), true),
+            messages
+        );
+
+        let mut duplicate = messages[0].clone();
+        if let AgentMessage::Tool { tool_call_id, .. } = &mut duplicate {
+            *tool_call_id = "duplicate".into();
+        }
+        let mut snapshot = snapshots[0].clone();
+        snapshot.source_tool_call_id = "duplicate".into();
+        snapshots.push(snapshot);
+        messages.push(duplicate);
+        let reduced = reduce_read_context(&messages, &snapshots, Some(dir.path()), true);
+        assert_eq!(reduced[0], messages[0]);
+        assert!(
+            matches!(reduced.last(), Some(AgentMessage::Tool { content, .. }) if content.contains("Unchanged read"))
+        );
+        // Different ranges and failures must retain their own contents.
+        snapshots.last_mut().unwrap().start_line = Some(2);
+        assert_eq!(
+            reduce_read_context(&messages, &snapshots, Some(dir.path()), false),
+            messages
+        );
+        snapshots.last_mut().unwrap().start_line = None;
+        if let AgentMessage::Tool { is_error, .. } = messages.last_mut().unwrap() {
+            *is_error = true;
+        }
+        assert_eq!(
+            reduce_read_context(&messages, &snapshots, Some(dir.path()), false),
+            messages
+        );
+    }
+}
+
 impl CodingSessionHarness {
+    pub(super) fn provider_read_context(
+        &self,
+        messages: &[AgentMessage],
+        tool_schema_json: Option<&str>,
+        current_digests: &HashMap<String, String>,
+    ) -> Vec<AgentMessage> {
+        let can_load = can_load_read_snapshots(tool_schema_json);
+        reduce_read_context_with_digests(
+            messages,
+            &self.context_snapshots("main"),
+            current_digests,
+            can_load,
+        )
+    }
+
+    /// Copy the small freshness inputs while locked; workspace I/O happens later.
+    pub(super) fn provider_read_digest_inputs(
+        &mut self,
+        run_id: &str,
+    ) -> Result<(Vec<String>, Option<PathBuf>), String> {
+        self.ensure_fresh()?;
+        let work_dir = self
+            .store
+            .records()
+            .iter()
+            .rev()
+            .find_map(|record| match record {
+                HarnessRecord::RunContextCaptured {
+                    run_id: captured_run,
+                    work_dir,
+                    ..
+                } if captured_run == run_id => Some(PathBuf::from(work_dir.as_str())),
+                _ => None,
+            });
+        let snapshots = self.context_snapshots("main");
+        if snapshots.is_empty() {
+            return Ok((Vec::new(), work_dir));
+        }
+        let messages = self.model_context("main")?.messages();
+        let by_call: HashMap<_, _> = snapshots
+            .iter()
+            .map(|snapshot| (snapshot.source_tool_call_id.as_str(), snapshot))
+            .collect();
+        let mut recent = std::collections::HashSet::new();
+        let mut paths = std::collections::HashSet::new();
+        for message in messages.iter().rev() {
+            let AgentMessage::Tool {
+                name,
+                tool_call_id,
+                is_error: false,
+                images,
+                ..
+            } = message
+            else {
+                continue;
+            };
+            if name != "read_file" || !images.is_empty() {
+                continue;
+            }
+            let Some(snapshot) = by_call.get(tool_call_id.as_str()) else {
+                continue;
+            };
+            let key = (
+                &snapshot.path,
+                snapshot.start_line,
+                snapshot.end_line,
+                snapshot.file_sha256.as_str(),
+            );
+            if recent.contains(&key) {
+                continue;
+            }
+            if recent.len() < KEEP_RECENT_READS {
+                recent.insert(key);
+            } else {
+                paths.insert(snapshot.path.clone());
+            }
+        }
+        Ok((paths.into_iter().collect(), work_dir))
+    }
+
+    pub(crate) async fn prepare_shared_provider_boundary(
+        harness: Arc<tokio::sync::Mutex<Self>>,
+        run_id: String,
+        request: ProviderBoundaryRequest,
+        config: AgentConfig,
+    ) -> Result<ProviderBoundaryResult, String> {
+        let (paths, work_dir) = {
+            let mut locked = harness.lock().await;
+            if can_load_read_snapshots(request.tool_schema_json.as_deref()) {
+                locked.provider_read_digest_inputs(&run_id)?
+            } else {
+                (Vec::new(), None)
+            }
+        };
+        // Freshness I/O must neither hold the recorder mutex nor block a Tokio worker.
+        let digests = tokio::task::spawn_blocking(move || read_context_digests(paths, work_dir))
+            .await
+            .map_err(|error| format!("snapshot freshness task failed: {error}"))?;
+        let mut locked = harness.lock().await;
+        locked.prepare_provider_boundary(&run_id, request, &config, &digests)
+    }
+
     pub(crate) fn index_read_snapshot(
         &mut self,
         run_id: &str,

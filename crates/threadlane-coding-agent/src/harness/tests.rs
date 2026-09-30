@@ -362,6 +362,50 @@ fn boundary_request(overflow_recovery: bool) -> ProviderBoundaryRequest {
 }
 
 #[test]
+fn freshness_job_wait_does_not_hold_shared_harness_mutex() {
+    let (_dir, path) = temp_session();
+    let harness = Arc::new(tokio::sync::Mutex::new(open_long_run(&path)));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        // Hold the blocking pool so the production freshness job cannot finish.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        });
+        started_rx.await.unwrap();
+        let preparation = CodingSessionHarness::prepare_shared_provider_boundary(
+            harness.clone(),
+            "run-compact".into(),
+            boundary_request(false),
+            AgentConfig::default(),
+        );
+        tokio::pin!(preparation);
+        // Poll preparation into its freshness await, then allow a recorder to run.
+        tokio::select! {
+            biased;
+            result = &mut preparation => panic!("freshness unexpectedly finished: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        let mut recorder = tokio::time::timeout(std::time::Duration::from_secs(1), harness.lock())
+            .await
+            .expect("recorders must remain accessible while freshness I/O waits");
+        recorder
+            .set_fact("main", "during-freshness", "recorded".into())
+            .unwrap();
+        drop(recorder);
+        resume_tx.send(()).unwrap();
+        preparation.await.unwrap();
+        blocker.await.unwrap();
+    });
+}
+
+#[test]
 fn provider_boundary_retains_and_budgets_current_system_after_reload() {
     let config = AgentConfig::default();
     for overflow_recovery in [false, true] {
@@ -379,7 +423,7 @@ fn provider_boundary_retains_and_budgets_current_system_after_reload() {
             AgentMessage::user("stale runtime history", vec![]),
         ];
         let prepared = harness
-            .prepare_provider_boundary("run-compact", request, &config)
+            .prepare_provider_boundary("run-compact", request, &config, &HashMap::new())
             .unwrap();
         assert_eq!(prepared.messages.first(), Some(&system));
         assert!(!prepared.messages.iter().any(|message| {
@@ -403,7 +447,7 @@ fn provider_boundary_retains_and_budgets_current_system_after_reload() {
         let mut request = boundary_request(false);
         request.messages = vec![updated_system.clone()];
         let resumed = harness
-            .prepare_provider_boundary("run-compact", request, &config)
+            .prepare_provider_boundary("run-compact", request, &config, &HashMap::new())
             .unwrap();
         assert_eq!(resumed.messages.first(), Some(&updated_system));
         assert!(!resumed.messages.contains(&system));
@@ -423,6 +467,7 @@ fn provider_identity_survives_reopen_of_same_open_run() {
                 "restart-run",
                 boundary_request(false),
                 &AgentConfig::default(),
+                &HashMap::new(),
             )
             .unwrap();
         let attempt = first.provider_attempt.unwrap();
@@ -448,6 +493,7 @@ fn provider_identity_survives_reopen_of_same_open_run() {
             "restart-run",
             boundary_request(false),
             &AgentConfig::default(),
+            &HashMap::new(),
         )
         .unwrap();
     assert_eq!(second.provider_attempt, Some(2));
@@ -494,6 +540,7 @@ fn adaptive_compaction_commits_before_next_provider_attempt() {
             "run-compact",
             boundary_request(false),
             &AgentConfig::default(),
+            &HashMap::new(),
         )
         .unwrap();
     harness
@@ -543,6 +590,64 @@ fn adaptive_compaction_commits_before_next_provider_attempt() {
 }
 
 #[test]
+fn repeated_compaction_preserves_objective_and_latest_durable_plan_after_reload() {
+    let (_dir, path) = temp_session();
+    let mut harness = open_long_run(&path);
+    let config = AgentConfig::default();
+    for generation in 1..=2 {
+        let plan = serde_json::json!({"explanation": "Preserve public APIs",
+            "items": [{"step": "Verify reload", "status": if generation == 1 { "pending" } else { "completed" }}]});
+        harness
+            .set_fact("main", "session_plan", plan.to_string())
+            .unwrap();
+        let prepared = harness
+            .prepare_provider_boundary(
+                "run-compact",
+                boundary_request(true),
+                &config,
+                &HashMap::new(),
+            )
+            .unwrap();
+        assert_eq!(prepared.compaction_generation, generation);
+        let summary = prepared
+            .messages
+            .iter()
+            .find_map(threadlane_compaction::compaction_summary_text)
+            .unwrap();
+        assert!(summary.contains("Current durable plan"));
+        assert!(summary.contains("Preserve public APIs"));
+        assert!(summary.contains("Verify reload"));
+        let task = summary
+            .split_once("<task-state>\n")
+            .unwrap()
+            .1
+            .split_once("\n</task-state>")
+            .unwrap()
+            .0;
+        let task: Value = serde_json::from_str(task).unwrap();
+        assert_eq!(task["objective"], "start");
+        assert!(summary.contains(if generation == 1 {
+            "pending"
+        } else {
+            "completed"
+        }));
+        drop(harness);
+        harness = CodingSessionHarness::open(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(harness.store.store().plan()).unwrap(),
+            plan
+        );
+        if generation == 1 {
+            for _ in 0..8 {
+                harness
+                    .append_message(AgentMessage::user("additional work ".repeat(1200), vec![]))
+                    .unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn reload_uses_checkpoint_tail_but_transcript_keeps_original_entries() {
     let (_dir, path) = temp_session();
     let mut harness = open_long_run(&path);
@@ -551,6 +656,7 @@ fn reload_uses_checkpoint_tail_but_transcript_keeps_original_entries() {
             "run-compact",
             boundary_request(false),
             &AgentConfig::default(),
+            &HashMap::new(),
         )
         .unwrap();
     drop(harness);
@@ -574,6 +680,7 @@ fn compaction_persistence_failure_appends_no_checkpoint_prefix() {
         "run-compact",
         boundary_request(false),
         &AgentConfig::default(),
+        &HashMap::new(),
     );
     fs::set_permissions(&path, original).unwrap();
     assert!(result.is_err());
@@ -607,6 +714,7 @@ fn ineffective_compaction_retries_once() {
         "run-compact",
         boundary_request(false),
         &AgentConfig::default(),
+        &HashMap::new(),
     );
     let error = result.expect_err("strict compaction must remain over budget");
     assert_eq!(
@@ -642,6 +750,7 @@ fn provider_overflow_retries_once() {
             "run-compact",
             boundary_request(true),
             &AgentConfig::default(),
+            &HashMap::new(),
         )
         .unwrap();
     let recoveries = harness
@@ -850,6 +959,7 @@ fn cancellation_before_compaction_has_no_partial_operation_or_provider_start() {
             "run-compact",
             boundary_request(false),
             &AgentConfig::default(),
+            &HashMap::new(),
         )
         .is_err());
     assert!(!harness.store.records().iter().any(|record| {
@@ -867,6 +977,7 @@ fn cancellation_after_accepted_checkpoint_keeps_complete_canonical_state() {
             "run-compact",
             boundary_request(false),
             &AgentConfig::default(),
+            &HashMap::new(),
         )
         .unwrap();
     let compacted = harness.model_context("main").unwrap();
@@ -891,6 +1002,7 @@ fn cancellation_after_accepted_checkpoint_keeps_complete_canonical_state() {
             "run-compact",
             boundary_request(false),
             &AgentConfig::default(),
+            &HashMap::new(),
         )
         .expect_err("accepted cancellation blocks subsequent provider preparation");
     assert_eq!(error, "context preparation cancelled");

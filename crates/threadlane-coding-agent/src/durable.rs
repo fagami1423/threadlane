@@ -143,10 +143,9 @@ impl CodingAgent {
                 let harness = boundary_harness.clone();
                 let run_id = boundary_run_id.clone();
                 let config = boundary_config.clone();
-                Box::pin(async move {
-                    let mut harness = harness.lock().await;
-                    harness.prepare_provider_boundary(&run_id, request, &config)
-                })
+                Box::pin(CodingSessionHarness::prepare_shared_provider_boundary(
+                    harness, run_id, request, config,
+                ))
             })));
         self.agent
             .set_message_recorder(Some(Arc::new(move |message| {

@@ -1,6 +1,7 @@
 mod agent;
 mod diagnostics;
 mod effects;
+mod efficiency;
 mod events;
 mod hooks;
 mod jsonl;
@@ -19,6 +20,7 @@ pub use diagnostics::{
     QueuedWorkDiagnostic, RecoveryDecision, SessionDiagnostics,
 };
 pub use effects::{EffectAction, EffectsError, GatedEffects};
+pub use efficiency::{project_token_efficiency, TokenEfficiencyReport};
 pub use events::{
     has_open_subagent_lanes, interrupted_subagent_lanes, EventError,
     EventPayload, HarnessEvent, HarnessEventHub, Snapshot, StreamingState,

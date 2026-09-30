@@ -167,6 +167,7 @@ fn boundary_result(
     provider_request_id: String,
 ) -> ProviderBoundaryResult {
     ProviderBoundaryResult {
+        canonical_messages: None,
         messages,
         context_limit: budget.limit,
         context_limit_is_estimate: budget.limit_is_estimate,

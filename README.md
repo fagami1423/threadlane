@@ -57,6 +57,20 @@ cargo run -p threadlane-gpui
 
 On macOS, use `./scripts/run-gpui-macos.sh` rather than `cargo run -p threadlane-gpui`. Some framework calls require the application to run from an app bundle. The script creates `target/debug/Threadlane-dev.app`, preserves standard output and `RUST_LOG`, and accepts `--release` for a release build.
 
+### Inspect token efficiency
+
+The chat's Environment panel shows the active session's processed tokens, cache reads and writes, child usage, requests and failures, and context reductions. It loads the durable report in the background when opening a chat and refreshes after each run. While generating, it shows the last journal snapshot. Processed tokens include cache reads and are not a billed-cost estimate.
+
+```bash
+cargo run -p threadlane-gpui -- --token-efficiency /path/to/session.jsonl
+```
+
+This command prints a read-only JSON report without starting the UI or providers. It includes usage across main and child lanes, failed requests, repeated context by source, snapshot reloads, compactions, and estimated-versus-reported input tokens. Cache reads and writes are separate from uncached input. Repeated context is not automatically wasted context; compare reports from similar completed tasks. Requests without usage remain visible through the request and usage-coverage counts. Legacy run-level usage is a fallback when per-request usage is absent; partially traced runs may have incomplete accounting.
+
+Native foreground requests keep one inline copy of repeated file reads and the three most recently used distinct file/range/digest snapshots. Older large reads become reloadable references only when the snapshot matches the current file and `manage_context` is available. The journal and continuation retain full results. This reduction currently applies to the foreground durable request boundary; child lanes retain their existing context path and are included in the report.
+
+Checkpoints reserve space for bounded user-authored intent and the latest durable plan, with recent evidence and failure findings filling the remainder. Full instructions remain in the journal; checkpoint excerpts do not replace scoped instruction files. Delegation guidance favors narrow tasks, explicit context references, concise evidence, and continuing existing child lanes.
+
 ## Configure providers and agents
 
 Threadlane supports the following connection methods:

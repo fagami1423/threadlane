@@ -12,7 +12,11 @@ impl CodingSessionHarness {
             .into_iter()
             .map(|snapshot| snapshot.source_entry_id)
             .collect::<Vec<_>>();
-        if omitted_source_entry_ids.is_empty() {
+        let mut plan = self.store.store().plan();
+        if omitted_source_entry_ids.is_empty()
+            && plan.items.is_empty()
+            && plan.explanation.is_none()
+        {
             return Ok(summary.to_owned());
         }
         let dropped = self
@@ -22,12 +26,45 @@ impl CodingSessionHarness {
             .filter(|entry| !matches!(entry.message, AgentMessage::System { .. }))
             .take(compacted_messages)
             .collect::<Vec<_>>();
-        let params = CompactionParams::from(config);
+        let mut params = CompactionParams::from(config);
+        let plan = if plan.items.is_empty() && plan.explanation.is_none() {
+            String::new()
+        } else {
+            let budget = params.max_checkpoint_chars / 3;
+            let mut cap = budget;
+            loop {
+                let text = format!(
+                    "Current durable plan (agent-reported; full text in journal):\n{}\n\n",
+                    serde_json::to_string(&plan).map_err(|error| error.to_string())?
+                );
+                if text.chars().count() <= budget {
+                    break text;
+                }
+                if cap == 0 {
+                    break String::new();
+                }
+                cap /= 2;
+                plan.explanation = plan
+                    .explanation
+                    .map(|text| text.chars().take(cap).collect());
+                for item in &mut plan.items {
+                    item.step = item.step.chars().take(cap).collect();
+                }
+            }
+        };
+        params.max_checkpoint_chars = params
+            .max_checkpoint_chars
+            .saturating_sub(plan.chars().count());
         let pairs: Vec<(&AgentMessage, bool)> = dropped
             .iter()
             .map(|entry| (&entry.message, omitted_source_entry_ids.contains(&entry.id)))
             .collect();
-        Ok(build_checkpoint_omitting_tool_outputs(&pairs, &params))
+        let checkpoint = if pairs.is_empty() {
+            summary.to_owned()
+        } else {
+            build_checkpoint_omitting_tool_outputs(&pairs, &params)
+        };
+        Ok(format!("{plan}{checkpoint}"))
     }
 
     pub(crate) fn context_snapshot_index_for_compaction(

@@ -2899,6 +2899,196 @@ mod compaction_sync_tests {
     }
 
     #[derive(Default)]
+    struct ReadContextProvider {
+        requests: Mutex<Vec<Vec<AgentMessage>>>,
+    }
+
+    #[async_trait]
+    impl ProviderPort for ReadContextProvider {
+        async fn stream_request(
+            &self,
+            request: RuntimeRequest,
+            events: tokio::sync::mpsc::Sender<RuntimeStreamEvent>,
+        ) {
+            let messages: Vec<AgentMessage> = serde_json::from_value(request.messages).unwrap();
+            let attempt = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(messages);
+                requests.len()
+            };
+            let paths = ["a.rs", "a.rs", "b.rs", "c.rs", "d.rs", "a.rs"];
+            let calls = paths
+                .get(attempt - 1)
+                .map(|path| {
+                    vec![RuntimeToolCall {
+                        id: format!("read-{attempt}"),
+                        r#type: "function".into(),
+                        function: RuntimeToolCallFunction {
+                            name: "read_file".into(),
+                            arguments: serde_json::json!({"path": path}).to_string(),
+                        },
+                        thought_signature: None,
+                    }]
+                })
+                .unwrap_or_default();
+            if calls.is_empty() {
+                events
+                    .send(RuntimeStreamEvent::ContentToken(
+                        "inspection complete".into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            events
+                .send(RuntimeStreamEvent::Finished {
+                    tool_calls: calls,
+                    usage: RuntimeUsage {
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        cache_read_tokens: 50,
+                        cache_write_tokens: 0,
+                        total_tokens: 160,
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        async fn fetch_deferred(&self, _: &str, _: &str) -> Result<DeferredResponse, String> {
+            Ok(DeferredResponse::Pending)
+        }
+        async fn cancel_deferred(&self, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn provider_kind(&self, _: &str) -> &'static str {
+            "test"
+        }
+    }
+
+    #[tokio::test]
+    async fn read_context_reduces_provider_tokens_without_changing_durable_results() {
+        for prior_checkpoint in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("session.jsonl");
+            for name in ["a.rs", "b.rs", "c.rs", "d.rs"] {
+                std::fs::write(
+                    dir.path().join(name),
+                    format!("{name} {}", "body ".repeat(1400)),
+                )
+                .unwrap();
+            }
+            let provider = Arc::new(ReadContextProvider::default());
+            let mut agent = CodingAgent::new_with_provider(
+                CodingAgentOptions {
+                    api_key: "test-key".into(),
+                    account_id: None,
+                    model: "test-model".into(),
+                    work_dir: dir.path().into(),
+                    session_file: Some(path.clone()),
+                    system_prompt: SystemPromptConfig::default(),
+                    agent_config: None,
+                    coding_config: None,
+                    browser: BrowserBridge::unavailable(),
+                },
+                provider.clone(),
+            );
+            if prior_checkpoint {
+                agent
+                    .persist_harness_compaction("Earlier task context", &[], 0, 0)
+                    .unwrap();
+            }
+            let result = agent
+                .handle_input_with_images("Inspect these files; preserve public APIs", vec![])
+                .await;
+            assert!(result.is_none(), "{result:?}");
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 7);
+            let contents = |messages: &[AgentMessage], id: &str| {
+                messages
+                    .iter()
+                    .find_map(|message| match message {
+                        AgentMessage::Tool {
+                            tool_call_id,
+                            content,
+                            ..
+                        } if tool_call_id == id => Some(content.clone()),
+                        _ => None,
+                    })
+                    .unwrap()
+            };
+            assert!(contents(&requests[2], "read-1").contains("body body"));
+            assert!(contents(&requests[2], "read-2").contains("Unchanged read"));
+            assert!(contents(&requests[5], "read-1").contains("manage_context"));
+            // When a new read makes this file recent again, restore a full copy
+            // before emitting duplicate references. Never reference an evicted body.
+            assert!(contents(&requests[6], "read-1").contains("body body"));
+            assert!(contents(&requests[6], "read-6").contains("Unchanged read"));
+            drop(requests);
+            drop(agent);
+            let store = JsonlStore::open_read_only(&path).unwrap();
+            let canonical = store.model_context("main").unwrap().messages();
+            for id in ["read-1", "read-2", "read-6"] {
+                assert!(contents(&canonical, id).contains("body body"));
+            }
+            let requests = provider.requests.lock().unwrap();
+            let full_read_bytes: usize = (1..=5)
+                .map(|index| contents(&canonical, &format!("read-{index}")).len())
+                .sum();
+            let sent_read_bytes: usize = (1..=5)
+                .map(|index| contents(&requests[5], &format!("read-{index}")).len())
+                .sum();
+            assert!(sent_read_bytes * 100 < full_read_bytes * 70,
+            "expected >30% reduction in this fixture: sent={sent_read_bytes}, full={full_read_bytes}");
+            drop(requests);
+            assert_eq!(
+                store
+                    .records()
+                    .iter()
+                    .filter(|record| matches!(record, Record::ContextCompacted { .. }))
+                    .count(),
+                usize::from(prior_checkpoint),
+                "request-only reduction must not manufacture compaction during reconciliation"
+            );
+            let report = threadlane_runtime::harness::project_token_efficiency(&store);
+            assert_eq!(report.completed_foreground_runs, 1);
+            assert_eq!(report.usage.uncached_input_tokens, 700);
+            assert_eq!(report.usage.cache_read_tokens, 350);
+            assert_eq!(report.usage.output_tokens, 70);
+            assert_eq!(report.lanes["main"].provider_requests, 7);
+            assert!(report.lanes["main"].reduced_context_items > 0);
+            assert_eq!(report.calibrated_requests, 7);
+            assert_eq!(report.repeated_snapshot_reads, 2);
+            let snapshot = store
+                .records()
+                .iter()
+                .find_map(|record| match record {
+                    Record::ContextSnapshotIndexed { snapshot, .. }
+                        if snapshot.source_tool_call_id == "read-1" =>
+                    {
+                        Some(snapshot.context_id.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let loaded =
+                crate::context_snapshots::resolve_context_snapshot(&path, dir.path(), &snapshot)
+                    .unwrap();
+            assert!(loaded.content.contains("body body"));
+            let before = std::fs::read(&path).unwrap();
+            crate::config_dump::dump_token_efficiency(&[
+                "app".into(),
+                "--token-efficiency".into(),
+                path.to_string_lossy().into(),
+            ])
+            .unwrap();
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "report must be read-only"
+            );
+        }
+    }
+
+    #[derive(Default)]
     struct FollowUpProvider {
         work: Mutex<Option<super::CodingAgentWorkHandle>>,
         prompts: Mutex<Vec<String>>,
@@ -3289,6 +3479,11 @@ mod compaction_sync_tests {
         drop(agent);
         let store = JsonlStore::open(&path).unwrap();
         let records = store.records();
+        let efficiency = threadlane_runtime::harness::project_token_efficiency(&store);
+        assert_eq!(efficiency.lanes["main"].provider_requests, 102);
+        assert_eq!(efficiency.lanes["main"].requests_with_usage, 102);
+        assert_eq!(efficiency.calibrated_requests, 102);
+        assert_eq!(efficiency.completed_foreground_runs, 1);
         let emitted_context_limit = records
             .iter()
             .filter_map(|record| match record {

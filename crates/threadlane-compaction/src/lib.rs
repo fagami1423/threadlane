@@ -586,34 +586,117 @@ fn build_checkpoint_from_entries<'a>(
     config: &CompactionParams,
 ) -> String {
     let mut excerpts = Vec::new();
-    let mut used_chars = 0;
 
     // Findings first: condensed dead-ends survive rotation while raw
     // transcripts do not. A bounded slice of the same budget.
     let dropped: Vec<(&AgentMessage, bool)> = entries.collect();
+    let task_state = checkpoint_task_state(&dropped, config.max_checkpoint_chars / 2);
+    let mut used_chars = task_state.chars().count();
     let findings = build_findings(&dropped);
-    if !findings.is_empty() {
-        used_chars += findings.len();
-    }
+    used_chars += findings.chars().count();
 
     for (message, output_omitted) in dropped.iter().rev() {
         let Some(excerpt) = message_excerpt(message, *output_omitted) else {
             continue;
         };
-        if used_chars + excerpt.len() > config.max_checkpoint_chars {
-            break;
+        let excerpt_chars = excerpt.chars().count();
+        if used_chars + excerpt_chars > config.max_checkpoint_chars {
+            // An oversized recent message must not hide all older evidence.
+            continue;
         }
-        used_chars += excerpt.len();
+        used_chars += excerpt_chars;
         excerpts.push(excerpt);
     }
     excerpts.reverse();
 
     format!(
-        "Context checkpoint from {} earlier messages. Continue the same task using the retained recent messages and these earlier excerpts:\n\n{}{}",
+        "Context checkpoint from {} earlier messages. Continue the same task using the retained recent messages and these earlier excerpts:\n\n{}{}{}",
         message_count,
+        task_state,
         findings,
         excerpts.join("\n\n")
     )
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct CheckpointTaskState {
+    objective: String,
+    instructions: Vec<String>,
+}
+
+/// Preserve user-authored intent explicitly; never infer decisions or success
+/// from prose. The durable adapter adds the current plan separately.
+fn checkpoint_task_state(dropped: &[(&AgentMessage, bool)], budget: usize) -> String {
+    let mut state = dropped
+        .iter()
+        .find_map(|(message, _)| {
+            let summary = compaction_summary_text(message)?;
+            let text = summary
+                .split_once("<task-state>\n")?
+                .1
+                .split_once("\n</task-state>")?
+                .0;
+            serde_json::from_str::<CheckpointTaskState>(text).ok()
+        })
+        .unwrap_or_default();
+    let users: Vec<_> = dropped
+        .iter()
+        .filter_map(|(message, _)| match message {
+            AgentMessage::User { content } | AgentMessage::UserWithImages { content, .. } => {
+                Some(content)
+            }
+            _ => None,
+        })
+        .collect();
+    if state.objective.is_empty() {
+        state.objective = users
+            .first()
+            .map(|text| (*text).clone())
+            .unwrap_or_default();
+    }
+    for text in users {
+        if text != &state.objective && !state.instructions.contains(text) {
+            state.instructions.push(text.clone());
+        }
+    }
+    if state.objective.is_empty() && state.instructions.is_empty() {
+        return String::new();
+    }
+    if state.instructions.len() > 2 {
+        state.instructions.drain(..state.instructions.len() - 2);
+    }
+    // ponytail: bounded verbatim intent, not semantic summarization. Retain
+    // the original journal for full instructions beyond the checkpoint budget.
+    let mut cap = budget;
+    loop {
+        let excerpt = |text: &str| {
+            if text.chars().count() <= cap {
+                text.to_owned()
+            } else {
+                format!(
+                    "{} [excerpt; full text remains in transcript]",
+                    text.chars().take(cap).collect::<String>()
+                )
+            }
+        };
+        let bounded = CheckpointTaskState {
+            objective: excerpt(&state.objective),
+            instructions: state
+                .instructions
+                .iter()
+                .map(|text| excerpt(text))
+                .collect(),
+        };
+        let json = serde_json::to_string(&bounded).unwrap_or_default();
+        let text = format!("<task-state>\n{json}\n</task-state>\n\n");
+        if text.chars().count() <= budget {
+            return text;
+        }
+        if cap == 0 {
+            return String::new();
+        }
+        cap /= 2;
+    }
 }
 
 /// Condensed episodic memory for the dropped range: failed tool calls
@@ -776,6 +859,61 @@ fn extract_session_insights(messages: &[AgentMessage]) -> (Vec<String>, Vec<Stri
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn task_intent_survives_repeated_checkpoints_and_oversized_recent_excerpt() {
+        let config = super::CompactionParams::default();
+        let initial = vec![
+            threadlane_protocol::AgentMessage::user(
+                "Fix pricing; preserve immutable history",
+                vec![],
+            ),
+            threadlane_protocol::AgentMessage::Assistant {
+                content: Some("successful verification evidence".into()),
+                tool_calls: None,
+                stop_reason: None,
+                deferred_handle: None,
+            },
+            threadlane_protocol::AgentMessage::user("Do not change public APIs", vec![]),
+            threadlane_protocol::AgentMessage::Assistant {
+                content: Some("large output ".repeat(2000)),
+                tool_calls: None,
+                stop_reason: None,
+                deferred_handle: None,
+            },
+        ];
+        let first = super::build_checkpoint(&initial, &config);
+        assert!(first.contains("successful verification evidence"));
+        assert!(first.contains("Do not change public APIs"));
+        let checkpoint = threadlane_protocol::AgentMessage::Custom {
+            custom_type: "compaction_summary".into(),
+            payload: serde_json::json!({"summary": first}),
+        };
+        let second = super::build_checkpoint(
+            &[
+                checkpoint,
+                threadlane_protocol::AgentMessage::user("Verify reload", vec![]),
+            ],
+            &config,
+        );
+        let state = second
+            .split_once("<task-state>\n")
+            .unwrap()
+            .1
+            .split_once("\n</task-state>")
+            .unwrap()
+            .0;
+        let state: serde_json::Value = serde_json::from_str(state).unwrap();
+        assert_eq!(
+            state["objective"],
+            "Fix pricing; preserve immutable history"
+        );
+        assert_eq!(
+            state["instructions"],
+            serde_json::json!(["Do not change public APIs", "Verify reload"])
+        );
+        assert!(second.chars().count() < config.max_checkpoint_chars + 200);
+    }
+
     use super::*;
     use std::collections::HashSet;
     use threadlane_protocol::ImageAttachment;
