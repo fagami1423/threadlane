@@ -1314,7 +1314,7 @@ pub fn project_context_window(store: &JsonlStore) -> Option<ContextWindowInfo> {
         context_limit_is_estimate: persisted_limit.is_none() || persisted_limit_estimate,
         effective_model,
         compaction_generation: manifest_generation,
-        last_compaction_seq: compaction.map(|value| value.2),
+        last_compaction_seq: compaction.map(|value| value.1),
         provisional: false,
         estimating,
     };
