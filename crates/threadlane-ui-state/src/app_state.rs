@@ -1611,6 +1611,10 @@ impl AppState {
     }
 
     pub fn request_open_file(&mut self, relative_path: String) {
+        self.request_open_file_at_line(relative_path, None);
+    }
+
+    pub fn request_open_file_at_line(&mut self, relative_path: String, line: Option<usize>) {
         let Some(root) = self.active_git_work_dir() else {
             return;
         };
@@ -1638,6 +1642,7 @@ impl AppState {
         self.requested_editor_target = Some(RequestedEditorTarget::File {
             project: root,
             path: relative.to_string_lossy().into_owned(),
+            line,
         });
     }
 

@@ -2061,7 +2061,7 @@ fn completed_activity_disclosure_renders_interactive_tool_rows(cx: &mut gpui::Te
             tool_activities: vec![ToolActivityInfo {
                 id: "read-file".into(),
                 category: "Completed".into(),
-                title: "read_file".into(),
+                title: "get_repo_map".into(),
                 display_summary: "Read source file".into(),
                 detail: "Large source file line\n".repeat(250),
                 arguments: String::new(),
@@ -2123,6 +2123,119 @@ fn completed_activity_disclosure_renders_interactive_tool_rows(cx: &mut gpui::Te
         assert_eq!((after.item_ix, after.offset_in_item), (before.item_ix, before.offset_in_item));
     });
 
+}
+
+#[gpui::test]
+fn command_card_keeps_command_visible_and_bounds_output(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    cx.update(gpui_component::init);
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::default();
+        state.is_new_task = false;
+        state.messages = vec![ChatMessageInfo {
+            id: "command-message".into(),
+            role: MessageRole::Assistant,
+            content: String::new(),
+            tool_activities: vec![ToolActivityInfo {
+                id: "command".into(),
+                category: "Working".into(),
+                title: "run_command".into(),
+                display_summary: "Run cargo check".into(),
+                detail: "checking crate\n".repeat(60),
+                arguments: serde_json::json!({
+                    "command": "cargo check --workspace && ".repeat(20),
+                    "cwd": "/tmp/project",
+                })
+                .to_string(),
+                is_expanded: false,
+            }],
+            streaming: false,
+            reasoning_content: None,
+            reasoning_expanded: false,
+        }]
+        .into();
+        std::sync::Arc::make_mut(&mut state.messages).push(ChatMessageInfo {
+            id: "following-message".into(),
+            role: MessageRole::User,
+            content: "Keep the surrounding transcript scrollable.\n".repeat(200),
+            tool_activities: Vec::new(),
+            streaming: false,
+            reasoning_content: None,
+            reasoning_expanded: false,
+        });
+        state
+    });
+    let retained_model = model.clone();
+    let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let holder_clone = holder.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        holder_clone.borrow_mut().replace(chat.clone());
+        gpui_component::Root::new(chat, window, cx)
+    });
+    cx.run_until_parked();
+    let chat = holder.borrow().as_ref().unwrap().clone();
+    chat.update(cx, |chat, cx| {
+        chat.initial_scroll_frames = 0;
+        chat.transcript_list_state.pause_following_tail();
+        chat.transcript_list_state.scroll_to(gpui::ListOffset {
+            item_ix: 0,
+            offset_in_item: gpui::px(0.),
+        });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("command-card").is_some());
+    assert!(cx.debug_bounds("tool-activity-disclosure").is_none());
+    assert!(cx.debug_bounds("command-output-disclosure").is_none());
+    let output = cx
+        .debug_bounds("command-output")
+        .expect("output is automatically visible");
+    assert!(
+        output.size.height <= gpui::px(96.),
+        "compact output viewport"
+    );
+    let content_before = cx.debug_bounds("command-output-content").unwrap();
+    let chat_before = chat.read_with(cx, |chat, _| {
+        chat.transcript_list_state.logical_scroll_top()
+    });
+    for delta in [-40., -10000., -40., 10000., 40.] {
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: output.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(delta))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        if delta == -40. {
+            assert!(
+                cx.debug_bounds("command-output-content").unwrap().origin.y
+                    < content_before.origin.y,
+                "wheel input scrolls command output"
+            );
+        }
+        let after = chat.read_with(cx, |chat, _| {
+            chat.transcript_list_state.logical_scroll_top()
+        });
+        assert_eq!(
+            (after.item_ix, after.offset_in_item),
+            (chat_before.item_ix, chat_before.offset_in_item),
+            "output scrolling must not move the transcript, even at its edges"
+        );
+    }
+    retained_model.update(cx, |state, cx| {
+        std::sync::Arc::make_mut(&mut state.messages)[0].tool_activities[0].detail =
+            "checking crate\n".repeat(600);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.debug_bounds("command-output").unwrap().size.height,
+        output.size.height,
+        "streaming more output must not grow the card"
+    );
 }
 
 // Check the painted content masks, not only the outer button bounds: Button's

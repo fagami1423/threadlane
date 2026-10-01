@@ -11,6 +11,7 @@ pub enum RequestedEditorTarget {
     File {
         project: PathBuf,
         path: String,
+        line: Option<usize>,
     },
     Diff {
         project: PathBuf,

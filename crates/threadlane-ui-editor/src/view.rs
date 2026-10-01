@@ -16,7 +16,8 @@ actions!(editor, [SaveFile]);
 /// How long a save/open status message stays visible before auto-expiring.
 const STATUS_MSG_TTL: std::time::Duration = std::time::Duration::from_secs(3);
 
-fn detect_language(path_str: &str) -> &'static str {
+/// Resolve the language used by the editor and inline file previews.
+pub fn detect_language(path_str: &str) -> &'static str {
     let path = Path::new(path_str);
     match path
         .extension()
@@ -94,6 +95,7 @@ pub struct EditorTab {
     /// editor on the next render (which owns the `Window` that `set_value`
     /// requires). Applied once by `sync_pending_content`, then cleared.
     pending_content: Option<String>,
+    pending_line: Option<usize>,
     editor_state: Option<Entity<EditorState>>,
     text_view_state: Option<Entity<TextViewState>>,
     _subscription: Option<Subscription>,
@@ -101,7 +103,11 @@ pub struct EditorTab {
 
 #[derive(Clone, Debug)]
 enum PendingOpen {
-    File { project: PathBuf, path: String },
+    File {
+        project: PathBuf,
+        path: String,
+        line: Option<usize>,
+    },
     Diff { path: String, content: String },
 }
 
@@ -162,8 +168,19 @@ impl EditorView {
             return;
         };
         match pending {
-            PendingOpen::File { project, path } => {
-                self.open_file_internal(&project, &path, window, cx)
+            PendingOpen::File {
+                project,
+                path,
+                line,
+            } => {
+                self.open_file_internal(&project, &path, window, cx);
+                if let Some(tab) = self
+                    .tabs
+                    .iter_mut()
+                    .find(|tab| tab.project_dir == project && tab.relative_path == path)
+                {
+                    tab.pending_line = line;
+                }
             }
             PendingOpen::Diff { path, content } => {
                 self.open_diff_internal(&path, &content, window, cx)
@@ -171,14 +188,20 @@ impl EditorView {
         }
     }
 
-    pub fn open_file(
+    pub fn open_file(&mut self, project: PathBuf, relative_path: &str, cx: &mut Context<Self>) {
+        self.open_file_at_line(project, relative_path, None, cx);
+    }
+
+    pub fn open_file_at_line(
         &mut self,
         project: PathBuf,
         relative_path: &str,
+        line: Option<usize>,
         cx: &mut Context<Self>,
     ) {
         self.pending_open = Some(PendingOpen::File {
             project,
+            line,
             path: relative_path.to_string(),
         });
         cx.notify();
@@ -233,6 +256,7 @@ impl EditorView {
             is_dirty: false,
             is_diff: true,
             pending_content: None,
+            pending_line: None,
             editor_state: None,
             text_view_state: Some(markdown_state),
             _subscription: None,
@@ -309,6 +333,7 @@ impl EditorView {
             is_dirty: false,
             is_diff: false,
             pending_content: None,
+            pending_line: None,
             editor_state: Some(editor.clone()),
             text_view_state: None,
             _subscription: Some(subscription),
@@ -390,16 +415,50 @@ impl EditorView {
     /// Each tab applies at most once: content is taken, never re-read.
     fn sync_pending_content(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut applied = false;
-        for tab in self.tabs.iter_mut().filter(|tab| !tab.is_diff) {
-            let Some(content) = tab.pending_content.take() else {
-                continue;
-            };
+        for (ix, tab) in self
+            .tabs
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, tab)| !tab.is_diff)
+        {
             if let Some(editor) = tab.editor_state.clone() {
-                editor.update(cx, |editor, cx| {
-                    editor.set_value(content, window, cx);
-                });
-                tab.is_dirty = false;
-                applied = true;
+                if let Some(content) = tab.pending_content.take() {
+                    editor.update(cx, |editor, cx| editor.set_value(content, window, cx));
+                    tab.is_dirty = false;
+                    applied = true;
+                }
+                if Some(ix) == self.active_tab_index
+                    && editor.read(cx).value().as_str() != "Loading…"
+                    && tab.pending_line.is_some()
+                {
+                    // Cursor scrolling needs the loaded document's completed layout.
+                    // Keep the request pending if the user switches tabs before then.
+                    cx.on_next_frame(window, move |this, window, cx| {
+                        let Some(tab) = this.active_tab_index.and_then(|ix| this.tabs.get_mut(ix))
+                        else {
+                            return;
+                        };
+                        if tab.editor_state.as_ref() != Some(&editor)
+                            || tab.pending_content.is_some()
+                        {
+                            return;
+                        }
+                        let Some(line) = tab.pending_line.take() else {
+                            return;
+                        };
+                        editor.update(cx, |editor, cx| {
+                            editor.set_cursor_position(
+                                gpui_component::input::Position::new(
+                                    line.saturating_sub(1).min(u32::MAX as usize) as u32,
+                                    0,
+                                ),
+                                window,
+                                cx,
+                            )
+                        });
+                        cx.notify();
+                    });
+                }
             }
         }
         if applied {
@@ -914,5 +973,85 @@ impl Render for EditorView {
             } else {
                 self.render_empty_state(cx).into_any_element()
             })
+    }
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::EditorView;
+    use gpui::AppContext as _;
+
+    #[gpui::test]
+    fn opens_at_requested_line_after_loading_and_reuses_tab(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sample.rs"), "fn sample() {}\n".repeat(400)).unwrap();
+        let project = dir.path().to_path_buf();
+        let model = cx.new(|_| threadlane_ui_state::AppState::default());
+        let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let holder_clone = holder.clone();
+        let project_clone = project.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let editor = cx.new(|cx| {
+                let mut editor = EditorView::new(model, window, cx);
+                editor.open_file_at_line(project_clone, "sample.rs", Some(200), cx);
+                editor
+            });
+            holder_clone.borrow_mut().replace(editor.clone());
+            gpui_component::Root::new(editor, window, cx)
+        });
+        cx.run_until_parked();
+        for _ in 0..4 {
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.run_until_parked();
+        }
+        let editor = holder.borrow().as_ref().unwrap().clone();
+        editor.read_with(cx, |editor, cx| {
+            assert_eq!(editor.tabs.len(), 1);
+            assert_eq!(
+                editor.tabs[0]
+                    .editor_state
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .cursor_position()
+                    .line,
+                199
+            );
+            let state = editor.tabs[0].editor_state.as_ref().unwrap().read(cx);
+            let (mut caret, _) = state.cursor_layout().expect("caret laid out");
+            let viewport = state.input_bounds();
+            // cursor_layout reports unscrolled Y; painting adds the text's scroll offset.
+            caret.origin.y += state.text_bounds().unwrap().top() - viewport.top();
+            assert!(
+                caret.top() >= viewport.top() && caret.bottom() <= viewport.bottom(),
+                "requested line must be visibly revealed: {caret:?} in {viewport:?}"
+            );
+        });
+        editor.update(cx, |editor, cx| {
+            editor.open_file_at_line(project, "sample.rs", Some(3), cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        editor.read_with(cx, |editor, cx| {
+            assert_eq!(editor.tabs.len(), 1);
+            assert_eq!(
+                editor.tabs[0]
+                    .editor_state
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .cursor_position()
+                    .line,
+                2
+            );
+        });
     }
 }

@@ -19,6 +19,7 @@ use gpui_component::tab::{Tab, TabBar};
 use gpui_component::tag::{Tag, TagVariant};
 use gpui_component::text::{TextView, TextViewState};
 use gpui_component::tree::{Tree, TreeEvent, TreeItem, TreeState};
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, WindowExt};
 use threadlane_git::{can_create_pull_request, GitBranchInfo, GitCommitInfo, GitFile, GitStatus};
 
@@ -1705,13 +1706,23 @@ impl RightPanelView {
                         .w_full()
                         .child(
                             TabBar::new("right-panel-surface-tabs")
+                                .flex_1()
+                                .min_w_0()
                                 .segmented()
                                 .small()
                                 .selected_index(selected_index)
                                 .children(surfaces.iter().map(|surface| {
                                     Tab::new()
-                                        .label(surface.label())
+                                        .icon(surface.icon())
+                                        .debug_selector({
+                                            let label = surface.label();
+                                            move || format!("right-panel-tab-{label}")
+                                        })
                                         .aria_label(format!("{} panel", surface.label()))
+                                        .tooltip({
+                                            let label = surface.label();
+                                            move |window, cx| Tooltip::new(label).build(window, cx)
+                                        })
                                 }))
                                 .on_click(cx.listener(move |this, ix, _window, cx| {
                                     if let Some(surface) = Surface::all().get(*ix).copied() {
@@ -1719,7 +1730,6 @@ impl RightPanelView {
                                     }
                                 })),
                         )
-                        .child(div().flex_1())
                         .children((!matches!(self.active_surface, Some(Surface::Agents | Surface::Trajectory))).then(|| {
                             Button::new("right-panel-refresh")
                                 .accessibility_label("Refresh surface")
@@ -1739,6 +1749,7 @@ impl RightPanelView {
     fn render_chooser(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().colors;
         div()
+            .min_w_0()
             .flex_1()
             .flex()
             .items_center()
@@ -1764,35 +1775,22 @@ impl RightPanelView {
                             .text_color(theme.muted_foreground)
                             .child("Choose what to show in the right panel"),
                     )
-                    .child(div().mt_4().w_full().flex().gap_2().children(
+                    .child(div().mt_4().w_full().flex().flex_col().gap_2().children(
                         Surface::all().into_iter().map(|surface| {
                             Button::new(SharedString::from(format!(
                                 "right-panel-card-{}",
                                 surface.label().to_lowercase()
                             )))
                             .accessibility_label(surface.label())
-                            .child(
-                                div()
-                                    .size_full()
-                                    .p_3()
-                                    .flex()
-                                    .flex_col()
-                                    .items_start()
-                                    .justify_center()
-                                    .gap_2()
-                                    .text_sm()
-                                    .child(surface.icon())
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .child(surface.label()),
-                                    ),
-                            )
+                            .debug_selector({
+                                let label = surface.label();
+                                move || format!("right-panel-choice-{label}")
+                            })
+                            .icon(surface.icon())
+                            .label(surface.label())
                             .outline()
-                            .flex_1()
-                            .h(rems(6.5))
-                            .p_0()
+                            .w_full()
+                            .justify_start()
                             .on_click(cx.listener(
                                 move |this, _event, _window, cx| {
                                     this.open_surface(surface, cx);
@@ -6135,7 +6133,7 @@ mod dialog_keyboard_tests {
 
 #[cfg(test)]
 mod review_layout_tests {
-    use super::RightPanelView;
+    use super::{RightPanelView, Surface};
     use gpui::{
         AppContext, Context, Entity, IntoElement, ListSizingBehavior, ParentElement, Render, Styled,
         TestAppContext, Window, div, list, px,
@@ -6146,6 +6144,67 @@ mod review_layout_tests {
     struct RowHost {
         panel: Entity<RightPanelView>,
         width: f32,
+    }
+
+    struct SurfaceHost {
+        panel: Entity<RightPanelView>,
+        width: f32,
+    }
+
+    impl Render for SurfaceHost {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.panel.update(cx, |panel, cx| {
+                div()
+                    .w(px(self.width))
+                    .h(px(600.0))
+                    .flex()
+                    .flex_col()
+                    .child(panel.render_header(cx))
+                    .child(panel.render_chooser(cx))
+            })
+        }
+    }
+
+    #[gpui::test]
+    fn surface_controls_fit_narrow_panels(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let model = cx.new(|_| AppState::default());
+        let (host, cx) = cx.add_window_view(move |window, cx| SurfaceHost {
+            panel: cx.new(|cx| RightPanelView::new(model, window, cx)),
+            width: 280.0,
+        });
+        for rem_size in [16.0, 20.0] {
+            for width in [280.0, 320.0, 480.0] {
+                host.update(cx, |host, cx| {
+                    host.width = width;
+                    cx.notify();
+                });
+                cx.update(|window, cx| {
+                    window.set_rem_size(px(rem_size));
+                    window.draw(cx).clear(cx);
+                });
+                let mut previous_choice = None;
+                for (tab, choice) in [
+                    ("right-panel-tab-Trajectory", "right-panel-choice-Trajectory"),
+                    ("right-panel-tab-Agents", "right-panel-choice-Agents"),
+                    ("right-panel-tab-Review", "right-panel-choice-Review"),
+                    ("right-panel-tab-Files", "right-panel-choice-Files"),
+                    ("right-panel-tab-Browser", "right-panel-choice-Browser"),
+                ].into_iter().take(Surface::all().len()) {
+                    for selector in [tab, choice] {
+                        let bounds = cx.debug_bounds(selector).expect("surface control rendered");
+                        assert!(bounds.left() >= px(0.0) && bounds.right() <= px(width),
+                            "{selector} overflows at width {width}, rem {rem_size}: {bounds:?}");
+                        if selector == choice {
+                            if let Some(bottom) = previous_choice {
+                                assert!(bounds.top() >= bottom, "surface choices overlap");
+                            }
+                            previous_choice = Some(bounds.bottom());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     impl Render for RowHost {

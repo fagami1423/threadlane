@@ -442,8 +442,18 @@ fn opening_a_file_targets_the_active_session_checkout() {
     assert_eq!(
         state.requested_editor_target,
         Some(RequestedEditorTarget::File {
+            project: worktree.clone(),
+            path: "src/lib.rs".into(),
+            line: None,
+        })
+    );
+    state.request_open_file_at_line("src/lib.rs".into(), Some(7));
+    assert_eq!(
+        state.requested_editor_target,
+        Some(RequestedEditorTarget::File {
             project: worktree,
             path: "src/lib.rs".into(),
+            line: Some(7),
         })
     );
 }
