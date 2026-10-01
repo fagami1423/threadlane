@@ -105,7 +105,7 @@ pub struct RemoteDaemon {
     /// Whether a socket is live right now — commands sent while down fail
     /// fast instead of firing stale after a reconnect.
     connected: Arc<AtomicBool>,
-    /// Highest journal sequence delivered so far; sent back as `?since=`
+    /// Most recent journal sequence delivered; sent back as `?since=`
     /// on reconnect so the tail replay covers only the gap.
     last_seq: Arc<AtomicU64>,
     /// The peer's wire protocol version from the last successful
@@ -117,6 +117,10 @@ pub struct RemoteDaemon {
 }
 
 impl RemoteDaemon {
+    /// Transport failures after enqueueing cannot prove whether dispatch ran.
+    /// Reserved prefix on request errors; daemon rejection replies are unchanged.
+    pub const UNKNOWN_REQUEST_OUTCOME: &'static str = "request outcome unknown: ";
+
     /// Construct the client and spawn its connection driver on the shared
     /// Threadlane reactor. The returned client is usable immediately —
     /// commands issued before the first successful dial are reported as
@@ -388,9 +392,10 @@ impl RemoteDaemon {
                         waiter.survived_disconnect = true;
                         pending.insert(request_id, waiter);
                     } else {
-                        let _ = waiter
-                            .waiter
-                            .send(Err("daemon connection lost".to_string()));
+                        let _ = waiter.waiter.send(Err(format!(
+                            "{}daemon connection lost",
+                            Self::UNKNOWN_REQUEST_OUTCOME
+                        )));
                     }
                 }
                 drop(pending);
@@ -459,6 +464,7 @@ impl RemoteDaemon {
             backoff = RECONNECT_BACKOFF_INITIAL;
             connected.store(true, Ordering::SeqCst);
             connection.send_replace(ConnectionState::Connected);
+            let mut connection_seq = 0u64;
             // Server replays the journal tail newer than `?since=` first,
             // then live events — the same attach semantics LocalDaemon's
             // subscribe() exposes.
@@ -502,8 +508,13 @@ impl RemoteDaemon {
                                                 let _ = waiter.waiter.send(reply.result);
                                             }
                                         } else if let Some(event) = frame.event {
-                                            if frame.seq > 0 && frame.seq <= last_seq.load(Ordering::SeqCst) { continue; }
-                                            if frame.seq > 0 { last_seq.store(frame.seq, Ordering::SeqCst); }
+                                            if frame.seq > 0 {
+                                                // The server filters replay by `since`. A new daemon
+                                                // restarts its counter, so dedupe only this socket.
+                                                if frame.seq <= connection_seq { continue; }
+                                                connection_seq = frame.seq;
+                                                last_seq.store(frame.seq, Ordering::SeqCst);
+                                            }
                                             // The journaled cancellation
                                             // answers a parked requester
                                             // the way its lost reply
@@ -629,15 +640,21 @@ impl RemoteDaemon {
             return Err("daemon connection driver is gone".to_string());
         }
         match tokio::time::timeout(COMMAND_REQUEST_TIMEOUT, rx).await {
-            Ok(result) => {
-                result.unwrap_or_else(|_| Err("daemon connection driver is gone".to_string()))
-            }
+            Ok(result) => result.unwrap_or_else(|_| {
+                Err(format!(
+                    "{}daemon connection driver is gone",
+                    Self::UNKNOWN_REQUEST_OUTCOME
+                ))
+            }),
             Err(_) => {
                 pending_requests
                     .lock()
                     .expect("command waiters poisoned")
                     .remove(&request_id);
-                Err(format!("daemon did not answer request {request_id}"))
+                Err(format!(
+                    "{}daemon did not answer request {request_id}",
+                    Self::UNKNOWN_REQUEST_OUTCOME
+                ))
             }
         }
     }
@@ -773,17 +790,17 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for attempt in 0..2 {
+            for attempt in 0..3 {
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut socket = tokio_tungstenite::accept_hdr_async(
                     socket,
                     move |request: &Request, mut response: Response| {
-                        if attempt == 1 {
+                        if attempt > 0 {
                             assert!(request
                                 .uri()
                                 .query()
                                 .unwrap_or_default()
-                                .contains("since=1"));
+                                .contains(if attempt == 1 { "since=1" } else { "since=2" }));
                         }
                         response
                             .headers_mut()
@@ -793,7 +810,9 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                for seq in 1..=attempt + 1 {
+                // Same daemon resumes at 2; a restarted daemon starts at 1.
+                let seq = if attempt == 1 { 2 } else { 1 };
+                for _duplicate in 0..2 {
                     let event = SessionEvent::Agent {
                         session_id: "session".into(),
                         event: AgentEvent::MessageUpdate {
@@ -811,7 +830,7 @@ mod tests {
                         .await
                         .unwrap();
                 }
-                if attempt == 1 {
+                if attempt == 2 {
                     let frame = socket.next().await.unwrap().unwrap().into_text().unwrap();
                     let request: CommandRequest = serde_json::from_str(&frame).unwrap();
                     assert!(matches!(request.command, SessionCommand::GetProjects));
@@ -826,6 +845,15 @@ mod tests {
                         .await
                         .unwrap();
                 }
+                if attempt == 2 {
+                    // The server accepts a prompt, but its reply is lost.
+                    let frame = socket.next().await.unwrap().unwrap().into_text().unwrap();
+                    let request: CommandRequest = serde_json::from_str(&frame).unwrap();
+                    assert!(matches!(
+                        request.command,
+                        SessionCommand::SubmitPrompt { .. }
+                    ));
+                }
                 socket.close(None).await.unwrap();
             }
         });
@@ -837,7 +865,7 @@ mod tests {
         let mut events = client.subscribe();
         let received = tokio::time::timeout(Duration::from_secs(10), async {
             let mut text = String::new();
-            while text.len() < 2 {
+            while text.len() < 3 {
                 if let Some(SessionEvent::Agent {
                     event:
                         AgentEvent::MessageUpdate {
@@ -854,11 +882,27 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(received, "12");
+        assert_eq!(received, "121");
         assert!(matches!(
             client.request(SessionCommand::GetProjects).await,
             Ok(CommandResponse::Ack)
         ));
+        let error = client
+            .request(SessionCommand::SubmitPrompt {
+                session_id: "session".into(),
+                work_dir: "/tmp".into(),
+                text: "accepted before disconnect".into(),
+                images: Vec::new(),
+                effort: None,
+                acp_config: Vec::new(),
+                model: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error.starts_with(RemoteDaemon::UNKNOWN_REQUEST_OUTCOME),
+            "{error}"
+        );
         server.await.unwrap();
     }
 }

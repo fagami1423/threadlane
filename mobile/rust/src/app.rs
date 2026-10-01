@@ -5,7 +5,7 @@
 //! [`crate::client::MobileDaemon`]; the view pumps its event stream on
 //! the GPUI executor and keeps a flat projection of the wire types.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -46,6 +46,16 @@ pub fn push_deeplink(url: String) {
 
 fn take_pending_links() -> Vec<String> {
     std::mem::take(&mut *PENDING_LINKS.lock().unwrap())
+}
+
+fn composer_command_session(command: &SessionCommand) -> Option<&str> {
+    match command {
+        SessionCommand::GetComposerOptions { session_id, .. } => session_id.as_deref(),
+        SessionCommand::SetModel { session_id, .. }
+        | SessionCommand::SetReasoningEffort { session_id, .. }
+        | SessionCommand::SetOrchestratorMode { session_id, .. } => Some(session_id),
+        _ => None,
+    }
 }
 
 const PREF_HOST: &str = "threadlane.pair.host";
@@ -152,6 +162,8 @@ pub struct MobileApp {
     /// Whether a persisted pairing exists — drives the Forget button.
     saved_pairing: bool,
     sending: bool,
+    pending_composer: HashMap<String, usize>,
+    uncertain_prompts: HashSet<String>,
     daemon: Option<MobileDaemon>,
     /// Human-readable link state shown in the sessions header.
     link_state: String,
@@ -278,6 +290,8 @@ impl MobileApp {
             connect_error: None,
             saved_pairing,
             sending: false,
+            pending_composer: HashMap::new(),
+            uncertain_prompts: HashSet::new(),
             daemon: None,
             link_state: "Disconnected".to_string(),
             seen_links: Vec::new(),
@@ -410,6 +424,7 @@ impl MobileApp {
         self.daemon = None;
         self._pump = None;
         self.sending = false;
+        self.pending_composer.clear();
         self.client.projects.clear();
         self.active = None;
         self.client.pending_permissions.clear();
@@ -439,12 +454,10 @@ impl MobileApp {
                 });
             }
         }
-        if let Some(daemon) = &self.daemon {
-            daemon.request(SessionCommand::GetComposerOptions {
-                work_dir: info.work_dir.clone(),
-                session_id: Some(info.id.clone()),
-            });
-        }
+        self.request_composer(SessionCommand::GetComposerOptions {
+            work_dir: info.work_dir.clone(),
+            session_id: Some(info.id.clone()),
+        });
         self.models.clear();
         self.selected_model = None;
         self.effort = None;
@@ -521,12 +534,10 @@ impl MobileApp {
                     .update(cx, |input, cx| input.set_value("", window, cx));
                 self.active = Some(ActiveSession::new(&session, window));
                 self.screen = Screen::Session;
-                if let Some(daemon) = &self.daemon {
-                    daemon.request(SessionCommand::GetComposerOptions {
-                        work_dir: session.work_dir,
-                        session_id: Some(session.id),
-                    });
-                }
+                self.request_composer(SessionCommand::GetComposerOptions {
+                    work_dir: session.work_dir,
+                    session_id: Some(session.id),
+                });
             }
             CommandResponse::ComposerOptions {
                 models,
@@ -593,6 +604,22 @@ impl MobileApp {
         }
     }
 
+    fn request_composer(&mut self, command: SessionCommand) {
+        if let Some(daemon) = &self.daemon {
+            if let Some(id) = composer_command_session(&command) {
+                *self.pending_composer.entry(id.to_owned()).or_default() += 1;
+            }
+            daemon.request(command);
+        }
+    }
+
+    fn composer_pending(&self) -> bool {
+        self.client
+            .active_session_id
+            .as_ref()
+            .is_some_and(|id| self.pending_composer.get(id).copied().unwrap_or_default() > 0)
+    }
+
     fn composer_options(&self, cx: &mut Context<Self>) -> AnyElement {
         let entity = cx.entity();
         let models = self.models.clone();
@@ -615,7 +642,7 @@ impl MobileApp {
         let effort = self.effort;
         let mode = self.mode;
         let enabled =
-            self.daemon.as_ref().is_some_and(|d| d.is_connected()) && !self.client.is_generating;
+            self.daemon.as_ref().is_some_and(|d| d.is_connected()) && !self.client.is_generating && !self.composer_pending();
         let model_entity = entity.clone();
         let effort_entity = entity.clone();
         div().flex().flex_col().w_full().gap_1()
@@ -626,8 +653,11 @@ impl MobileApp {
                         let entity = model_entity.clone(); let id = model.id.clone();
                         menu.item(PopupMenuItem::new(format!("{}{}", if Some(&model.id) == selected.as_ref() { "✓ " } else { "" }, model.label)).checked(Some(&model.id) == selected.as_ref())
                             .on_click(move |_, _, cx| { entity.update(cx, |this, cx| {
-                                if let (Some(active), Some(daemon)) = (&this.active, &this.daemon) {
-                                    daemon.request(SessionCommand::SetModel { session_id: active.id.clone(), model: id.clone() });
+                                if !this.composer_pending() {
+                                    if let Some(active) = &this.active {
+                                        let session_id = active.id.clone();
+                                        this.request_composer(SessionCommand::SetModel { session_id, model: id.clone() });
+                                    }
                                 } cx.notify();
                             }); }))
                     })
@@ -641,8 +671,11 @@ impl MobileApp {
                                 let entity = effort_entity.clone(); let value = *value;
                                 menu.item(PopupMenuItem::new(format!("{}{}", if Some(value) == effort { "✓ " } else { "" }, value.label())).checked(Some(value) == effort)
                                     .on_click(move |_, _, cx| { entity.update(cx, |this, cx| {
-                                        if let (Some(active), Some(daemon)) = (&this.active, &this.daemon) {
-                                            daemon.request(SessionCommand::SetReasoningEffort { session_id: active.id.clone(), effort: value });
+                                        if !this.composer_pending() {
+                                            if let Some(active) = &this.active {
+                                                let session_id = active.id.clone();
+                                                this.request_composer(SessionCommand::SetReasoningEffort { session_id, effort: value });
+                                            }
                                         } cx.notify();
                                     }); }))
                             })
@@ -654,8 +687,11 @@ impl MobileApp {
                             let entity = entity.clone();
                             menu.item(PopupMenuItem::new(format!("{}{}", if value == mode { "✓ " } else { "" }, value.label())).checked(value == mode)
                                 .on_click(move |_, _, cx| { entity.update(cx, |this, cx| {
-                                    if let (Some(active), Some(daemon)) = (&this.active, &this.daemon) {
-                                        daemon.request(SessionCommand::SetOrchestratorMode { session_id: active.id.clone(), mode: value });
+                                    if !this.composer_pending() {
+                                        if let Some(active) = &this.active {
+                                            let session_id = active.id.clone();
+                                            this.request_composer(SessionCommand::SetOrchestratorMode { session_id, mode: value });
+                                        }
                                     } cx.notify();
                                 }); }))
                         })
@@ -664,6 +700,13 @@ impl MobileApp {
     }
 
     fn apply_event(&mut self, event: MobileEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if let MobileEvent::CommandResult { command, .. } = &event {
+            if let Some(id) = composer_command_session(command) {
+                if let Some(count) = self.pending_composer.get_mut(id) {
+                    *count = count.saturating_sub(1);
+                }
+            }
+        }
         match event {
             MobileEvent::Connected => {
                 if let Some(daemon) = &self.daemon {
@@ -673,6 +716,16 @@ impl MobileApp {
                             session_id: active.id.clone(),
                         });
                     }
+                }
+                if let (Some(work_dir), Some(session_id)) = (
+                    self.client.active_work_dir.clone(),
+                    self.client.active_session_id.clone(),
+                ) {
+                    self.selected_model = None;
+                    self.request_composer(SessionCommand::GetComposerOptions {
+                        work_dir,
+                        session_id: Some(session_id),
+                    });
                 }
                 self.link_state = "Live".to_string();
                 self.connect_error = None;
@@ -774,8 +827,22 @@ impl MobileApp {
                     }
                 }
                 Err(error) => {
-                    self.sending = false;
+                    if matches!(
+                        command,
+                        SessionCommand::SubmitPrompt { .. } | SessionCommand::BeginSession { .. }
+                    ) {
+                        self.sending = false;
+                    }
                     if let SessionCommand::SubmitPrompt { session_id, .. } = &command {
+                        if error
+                            .starts_with(threadlane_client::RemoteDaemon::UNKNOWN_REQUEST_OUTCOME)
+                        {
+                            // Dispatch may still be running. Keep the echo and draft,
+                            // and require the user to check before submitting again.
+                            self.uncertain_prompts.insert(session_id.clone());
+                            cx.notify();
+                            return;
+                        }
                         self.client
                             .messages_mut()
                             .retain(|m| m.id != format!("pending-user-{session_id}"));
@@ -786,6 +853,23 @@ impl MobileApp {
                                 false,
                                 true,
                             );
+                        }
+                    }
+                    if matches!(
+                        command,
+                        SessionCommand::SetModel { .. }
+                            | SessionCommand::SetReasoningEffort { .. }
+                            | SessionCommand::SetOrchestratorMode { .. }
+                    ) {
+                        if let (Some(work_dir), Some(session_id)) = (
+                            self.client.active_work_dir.clone(),
+                            self.client.active_session_id.clone(),
+                        ) {
+                            self.selected_model = None;
+                            self.request_composer(SessionCommand::GetComposerOptions {
+                                work_dir,
+                                session_id: Some(session_id),
+                            });
                         }
                     }
                     if matches!(command, SessionCommand::GitRequest { .. }) {
@@ -870,6 +954,16 @@ impl MobileApp {
     fn submit_composer(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().trim().to_owned();
         if text.is_empty() {
+            return;
+        }
+        if self.composer_pending()
+            || self.selected_model.is_none()
+            || self
+                .client
+                .active_session_id
+                .as_ref()
+                .is_some_and(|id| self.uncertain_prompts.contains(id))
+        {
             return;
         }
         let Some(active) = &mut self.active else {
@@ -1493,6 +1587,8 @@ impl MobileApp {
     }
 
     fn render_session(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let uncertain_prompt = self.client.active_session_id.as_ref()
+            .is_some_and(|id| self.uncertain_prompts.contains(id));
         let Some(active) = &self.active else {
             return div().size_full().bg(cx.theme().background);
         };
@@ -1672,6 +1768,15 @@ impl MobileApp {
                                 .min_w_0()
                                 .child(threadlane_ui_session::composer_input(&self.composer)),
                         )
+                        .when(uncertain_prompt, |this| this.child(
+                            div().flex().flex_col().gap_1()
+                                .child("Submission is unconfirmed. Check the chat before sending again; the original prompt may still run.")
+                                .child(Button::new("acknowledge-uncertain-prompt").ghost().label("I checked — allow another send")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(active) = &this.active { this.uncertain_prompts.remove(&active.id); }
+                                        cx.notify();
+                                    })))
+                        ))
                         .child(self.composer_options(cx))
                         .child(
                             div().flex().justify_end().child(
@@ -1687,6 +1792,9 @@ impl MobileApp {
                                     .disabled(
                                         composer_empty
                                             || self.sending
+                                            || self.composer_pending()
+                                            || self.selected_model.is_none()
+                                            || uncertain_prompt
                                             || !self
                                                 .daemon
                                                 .as_ref()
