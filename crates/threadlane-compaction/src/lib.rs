@@ -484,6 +484,9 @@ const AGED_TOOL_PRUNE_TAIL_CHARS: usize = 400;
 
 fn aged_tool_output_preview(content: &str) -> String {
     let total_chars = content.chars().count();
+    if total_chars <= AGED_TOOL_PRUNE_HEAD_CHARS + AGED_TOOL_PRUNE_TAIL_CHARS {
+        return content.to_string();
+    }
     let head: String = content.chars().take(AGED_TOOL_PRUNE_HEAD_CHARS).collect();
     let tail: String = content
         .chars()
@@ -549,13 +552,14 @@ pub fn prune_historical_tool_outputs(
                 images,
             } => {
                 let image_bytes: usize = images.iter().map(|image| image.data_url.len()).sum();
+                let content_chars = content.chars().count();
                 if keep_full[i]
-                    || (content.len() <= AGED_TOOL_INLINE_LIMIT
+                    || (content_chars <= AGED_TOOL_INLINE_LIMIT
                         && image_bytes <= AGED_TOOL_INLINE_LIMIT)
                 {
                     result.push(msg.clone());
                 } else {
-                    let pruned_content = if content.len() > AGED_TOOL_INLINE_LIMIT {
+                    let pruned_content = if content_chars > AGED_TOOL_INLINE_LIMIT {
                         aged_tool_output_preview(content)
                     } else {
                         content.clone()
@@ -1434,6 +1438,57 @@ mod tests {
         let optimal = prepare_token_optimal_context(&msgs, 10_000, &CompactionParams::default());
         assert!(!optimal.is_empty());
         assert_eq!(optimal[0].role_str(), "system");
+    }
+
+    #[test]
+    fn prune_historical_tool_outputs_measures_limits_in_characters() {
+        let mut msgs = vec![AgentMessage::User {
+            content: "prompt".into(),
+        }];
+        for i in 0..6 {
+            msgs.push(AgentMessage::Assistant {
+                content: None,
+                tool_calls: None,
+                stop_reason: None,
+                deferred_handle: None,
+            });
+            msgs.push(AgentMessage::Tool {
+                tool_call_id: format!("call_{i}"),
+                name: "run_command".into(),
+                content: if i == 0 {
+                    // 1_500 chars but >2_000 bytes: under the limit and
+                    // must stay verbatim, never enter the preview path.
+                    "🔥".repeat(1_500)
+                } else {
+                    "🔥".repeat(3_000)
+                },
+                is_error: false,
+                terminate: false,
+                images: Vec::new(),
+            });
+        }
+
+        let pruned = prune_historical_tool_outputs(&msgs, 1);
+        let contents: Vec<&str> = pruned
+            .iter()
+            .filter_map(|message| match message {
+                AgentMessage::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(contents.len(), 6);
+        assert_eq!(contents[0], "🔥".repeat(1_500));
+        for content in &contents[1..4] {
+            assert!(content.contains("characters pruned from the middle"));
+            // Head and tail must not overlap or duplicate content for
+            // multibyte bodies: the preview is strictly smaller than the
+            // input and ends on the body's real tail.
+            assert!(content.chars().count() < 3_000);
+            assert!(content.starts_with('🔥'));
+            assert!(content.ends_with('🔥'));
+        }
+        // The one kept-recent tool turn stays verbatim regardless of size.
+        assert_eq!(contents[5], "🔥".repeat(3_000));
     }
 
     #[test]
