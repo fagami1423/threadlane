@@ -6995,30 +6995,38 @@ impl Render for ChatListView {
                                         div()
                                             .id("chat-transcript-container")
                                             .relative()
+                                            .flex()
+                                            .gap_2()
                                             .w_full()
                                             .flex_1()
                                             .min_w_0()
                                             .min_h_0()
+                                            .child(self.render_prompt_rail(cx))
                                             .child(
-                                                list(
-                                                    self.transcript_list_state.clone(),
-                                                    cx.processor(Self::render_transcript_row),
-                                                )
-                                                .w_full()
-                                                .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
-                                                .h_full()
-                                                .mx_auto()
-                                                .pt_3()
-                                                .pl_8()
-                                                .pb_6()
-                                                .with_sizing_behavior(ListSizingBehavior::Auto),
+                                                div()
+                                                    .debug_selector(|| "chat-transcript-viewport".into())
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .h_full()
+                                                    .child(
+                                                        list(
+                                                            self.transcript_list_state.clone(),
+                                                            cx.processor(Self::render_transcript_row),
+                                                        )
+                                                        .w_full()
+                                                        .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
+                                                        .h_full()
+                                                        .mx_auto()
+                                                        .pt_3()
+                                                        .pb_6()
+                                                        .with_sizing_behavior(ListSizingBehavior::Auto),
+                                                    ),
                                             )
                                             .child(div().absolute().inset_0().child(
                                                 gpui_component::scroll::Scrollbar::vertical(
                                                     &self.transcript_list_state,
                                                 ),
                                             ))
-                                            .child(self.render_prompt_rail(cx))
                                             .when(
                                                 !self.transcript_list_state.is_following_tail(),
                                                 |el| {

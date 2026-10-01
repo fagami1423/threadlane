@@ -4496,6 +4496,13 @@ fn prompt_rail_reveals_unmeasured_active_tick(cx: &mut gpui::TestAppContext) {
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let rail = cx.debug_bounds("prompt-navigation-rail").expect("rail mounted");
+    let transcript = cx
+        .debug_bounds("chat-transcript-viewport")
+        .expect("transcript mounted");
+    assert!(
+        rail.right() < transcript.left(),
+        "prompt rail must stay beside the transcript"
+    );
     let newest = cx.debug_bounds("prompt-rail-rail-user-23")
         .expect("newest prompt must be visible without prior item measurements");
     assert!(newest.top() >= rail.top() && newest.bottom() <= rail.bottom());
