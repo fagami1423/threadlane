@@ -384,7 +384,11 @@ impl ChatListView {
         if let Some(ix) = self.active_prompt_rail_index(&entries) {
             let id = &entries[ix].message_id;
             if self.prompt_rail_active_id.as_ref() != Some(id) {
-                self.prompt_rail_list_state.scroll_to_reveal_item(ix);
+                // Logical offsets work before offscreen tick heights are measured.
+                self.prompt_rail_list_state.scroll_to(ListOffset {
+                    item_ix: ix,
+                    offset_in_item: px(0.),
+                });
                 self.prompt_rail_active_id = Some(id.clone());
             }
         }
