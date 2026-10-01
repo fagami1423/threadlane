@@ -47,14 +47,20 @@ cd ios && ./build.sh            # or: ./build.sh "iPhone 17"
 
 ```bash
 cd ios
-DEVELOPMENT_TEAM=ABCDE12345 ./build.sh device            # first connected iPhone
-DEVELOPMENT_TEAM=ABCDE12345 ./build.sh device "Sab's iPhone"
+DEVELOPMENT_TEAM=5VW98ZM2UM ./build.sh device            # first connected iPhone
+DEVELOPMENT_TEAM=5VW98ZM2UM ./build.sh device "Sab's iPhone"
 ```
 
 `DEVELOPMENT_TEAM` is your ten-character team id (Apple Developer
 account → Membership, or the Personal Team Xcode created). The script
 cross-compiles the Rust staticlib for `aarch64-apple-ios`, builds the
 Release app, signs it, and installs + launches via `devicectl`.
+Device builds allow Xcode to contact Apple to create or update signing
+assets and register the destination device with the selected team. The
+Apple account in Xcode must have permission to manage those assets.
+If provisioning fails, verify the team selection and account permissions
+in Xcode; an installed distribution certificate alone is not enough for
+a development install.
 
 On-device pairing works like the simulator path: scan the desktop's QR
 with the Camera app while both devices share the same LAN.

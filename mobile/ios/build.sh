@@ -65,7 +65,11 @@ if [ "$MODE" = "sim" ]; then
     DESTINATION="platform=iOS Simulator"
     [ -n "$DEVICE" ] && DESTINATION="platform=iOS Simulator,name=$DEVICE"
 else
-    EXTRA_SETTINGS+=("DEVELOPMENT_TEAM=$DEVELOPMENT_TEAM")
+    EXTRA_SETTINGS+=(
+        "DEVELOPMENT_TEAM=$DEVELOPMENT_TEAM"
+        -allowProvisioningUpdates
+        -allowProvisioningDeviceRegistration
+    )
     DESTINATION="platform=iOS"
     if [ -n "$DEVICE" ]; then
         # Resolve a device name to its identifier for a stable destination.
