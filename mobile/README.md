@@ -36,6 +36,29 @@ brew install xcodegen
 cd ios && ./build.sh            # or: ./build.sh "iPhone 17"
 ```
 
+## Build & run (physical iPhone over USB)
+
+1. Add an Apple ID in Xcode → Settings → Accounts — a free "Personal
+   Team" is enough for dev installs.
+2. Plug the iPhone in over USB and trust the Mac on the phone; enable
+   Developer Mode on the phone (Settings → Privacy & Security →
+   Developer Mode) if it is not already on.
+3. Run:
+
+```bash
+cd ios
+DEVELOPMENT_TEAM=ABCDE12345 ./build.sh device            # first connected iPhone
+DEVELOPMENT_TEAM=ABCDE12345 ./build.sh device "Sab's iPhone"
+```
+
+`DEVELOPMENT_TEAM` is your ten-character team id (Apple Developer
+account → Membership, or the Personal Team Xcode created). The script
+cross-compiles the Rust staticlib for `aarch64-apple-ios`, builds the
+Release app, signs it, and installs + launches via `devicectl`.
+
+On-device pairing works like the simulator path: scan the desktop's QR
+with the Camera app while both devices share the same LAN.
+
 Same-machine testing: when the desktop app and the simulator run on the
 same Mac, the pairing QR encodes the LAN address, which the simulator
 reaches directly — no special config needed.
