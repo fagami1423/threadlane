@@ -433,9 +433,9 @@ fn flatten_history_sessions_with_pins(
         left_group
             .rank()
             .cmp(&right_group.rank())
-            .then_with(|| match (left.4, right.4) {
+            .then_with(|| match (left_group, left.4, right.4) {
                 // Snoozed rows order by soonest return; everything else by recency.
-                (Some(left_snooze), Some(right_snooze)) => {
+                (DateGroup::Snoozed, Some(left_snooze), Some(right_snooze)) => {
                     left_snooze.wake_at.cmp(&right_snooze.wake_at)
                 }
                 _ => right.0.updated_at.cmp(&left.0.updated_at),
@@ -1563,7 +1563,9 @@ impl SidebarView {
         // labels — never a color-only cue.
         let snooze_suffix = session_snooze
             .map(|snooze| {
-                if snooze.pending {
+                if snooze.pending && snooze.save_failed {
+                    ", couldn't save snooze".to_string()
+                } else if snooze.pending {
                     ", saving snooze".to_string()
                 } else {
                     format!(", snoozed until {}", snooze_return_label(snooze.wake_at))

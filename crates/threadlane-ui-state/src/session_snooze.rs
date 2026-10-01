@@ -137,15 +137,30 @@ impl SessionSnoozeStore {
                     .sessions
                     .into_iter()
                     .filter(|(session_id, record)| {
-                        let keep = record.wake_at > now && !session_id.is_empty();
+                        // An out-of-range deadline cannot render a return
+                        // time or be reached sanely — drop it like an
+                        // expired record instead of hiding the row forever.
+                        let keep = record.wake_at > now
+                            && i64::try_from(record.wake_at).is_ok()
+                            && !session_id.is_empty();
                         dirty |= !keep;
                         keep
                     })
                     .collect(),
                 _ => {
                     // Preserve the unreadable file for diagnosis instead of
-                    // silently overwriting whatever it held.
-                    let unreadable = path.with_file_name("session_snooze.unreadable.json");
+                    // silently overwriting whatever it held. A previous
+                    // diagnostic copy must survive, so an existing target
+                    // moves the new copy to a `.{now}.{n}` name.
+                    let mut unreadable =
+                        path.with_file_name("session_snooze.unreadable.json");
+                    let mut suffix = 0_u32;
+                    while unreadable.exists() {
+                        suffix += 1;
+                        unreadable = path.with_file_name(format!(
+                            "session_snooze.unreadable.{now}.{suffix}.json"
+                        ));
+                    }
                     if let Err(error) = std::fs::rename(&path, &unreadable) {
                         tracing::warn!(
                             "could not preserve unreadable {}: {error}",
@@ -185,6 +200,14 @@ impl SessionSnoozeStore {
     /// Whether the newest write for this store failed.
     pub fn save_failed(&self) -> bool {
         self.save_failed
+    }
+
+    /// Whether the failed write carried a deletion. The removed record has
+    /// no row left to offer the menu retry, so the drain resubmits it —
+    /// otherwise the stale on-disk record would hide the session again on
+    /// the next load.
+    pub fn failed_delete_dirty(&self) -> bool {
+        self.save_failed && self.dirty && self.records.is_empty()
     }
 
     /// The record a row should respect: confirmed records hide, pending
@@ -349,6 +372,7 @@ mod tests {
                 sessions: std::collections::HashMap::from([
                     ("live".into(), record(now + 600, None)),
                     ("expired".into(), record(now.saturating_sub(1), None)),
+                    ("far-future".into(), record(u64::MAX, None)),
                     ("".into(), record(now + 600, None)),
                 ]),
             })
@@ -359,6 +383,10 @@ mod tests {
         let mut store = store(dir.path(), now);
         assert!(store.record("live").is_some());
         assert!(store.record("expired").is_none());
+        assert!(
+            store.record("far-future").is_none(),
+            "out-of-range deadlines fail open"
+        );
         assert!(store.record("").is_none());
         // The dropped metadata rewrites itself on the next flush.
         assert!(store.take_dirty_json().is_some());
@@ -464,6 +492,30 @@ mod tests {
         assert!(!store.remove("session"), "already gone");
         assert!(store.record("session").is_none());
         assert!(store.take_dirty_json().is_some(), "delete persists");
+    }
+
+    #[test]
+    fn a_failed_delete_re_arms_for_the_drain_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(dir.path(), unix_now());
+        store.snooze("session", record(unix_now() + 3600, None));
+        let (_, revision) = store.take_dirty_json().unwrap();
+        assert_eq!(
+            store.apply_write_result(revision, None),
+            SnoozeWriteOutcome::Confirmed
+        );
+
+        store.remove("session");
+        let (_, delete_revision) = store.take_dirty_json().unwrap();
+        assert_eq!(
+            store.apply_write_result(delete_revision, Some("read-only fs".into())),
+            SnoozeWriteOutcome::Failed
+        );
+        assert!(store.failed_delete_dirty());
+        assert!(
+            store.take_dirty_json().is_some(),
+            "a failed deletion resubmits — the stale file must not come back on reload"
+        );
     }
 
     #[test]

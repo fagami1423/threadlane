@@ -725,6 +725,21 @@ impl AppState {
                 }
             }
         }
+        // A failed deletion leaves no row behind to offer a retry — the
+        // drained-or-idle loop resubmits it automatically, or the stale
+        // on-disk record would hide the session again on the next load.
+        // Stores that still hold records surface the failure on a visible
+        // row, whose menu retry rewrites the whole file anyway.
+        let orphaned_keys: Vec<PathBuf> = self
+            .session_snooze
+            .iter()
+            .filter(|(_, store)| store.failed_delete_dirty())
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in orphaned_keys {
+            self.flush_session_snooze(&key);
+            changed = true;
+        }
         if changed {
             changed |= self.reconcile_session_snoozes();
         }

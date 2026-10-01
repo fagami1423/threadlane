@@ -788,11 +788,15 @@ impl ChatListView {
                 .update(cx, |view, cx| {
                     // The chat pump only wakes on stream events, so session_seen
                     // write results are also observed here — a failed save
-                    // otherwise sits unobserved until the next chat event.
-                    let seen_changed = view
-                        .model
-                        .update(cx, |state, _| state.drain_session_seen_write_results());
-                    if view.model.read(cx).is_generating || seen_changed {
+                    // otherwise sits unobserved until the next chat event. The
+                    // same holds for session_snooze writes: without this a
+                    // settled session's snooze stays "Saving snooze…" until an
+                    // unrelated event drains the acknowledgment.
+                    let writes_changed = view.model.update(cx, |state, _| {
+                        state.drain_session_seen_write_results()
+                            | state.drain_session_snooze_write_results()
+                    });
+                    if view.model.read(cx).is_generating || writes_changed {
                         cx.notify();
                     }
                 })
