@@ -11,6 +11,7 @@ extern crate gpui_mobile;
 
 pub mod app;
 pub mod client;
+pub mod preferences;
 
 #[cfg(target_os = "ios")]
 use gpui::{prelude::*, App, WindowOptions};
@@ -75,7 +76,9 @@ pub extern "C" fn gpui_ios_register_app() {
 
     gpui_mobile::ios::ffi::set_app_callback(Box::new(|cx: &mut App| {
         gpui_kit::init(cx);
-        gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
+        // Register the bundled Threadlane themes and apply the saved/default
+        // selection — `init`'s themes-dir watch is desktop-only.
+        threadlane_ui_theme::init_bundled(cx);
         cx.open_window(WindowOptions::default(), |window, cx| {
             let content = cx.new(|cx| app::MobileApp::new(window, cx));
             cx.new(|cx| gpui_kit::component::Root::new(content, window, cx))
