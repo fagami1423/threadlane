@@ -140,6 +140,13 @@ fn args_str<'a>(args: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
+/// Like `args_str` but preserves whitespace — for code/content payloads
+/// where leading indentation and blank lines are significant.
+fn args_payload<'a>(args: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| args.get(*key).and_then(|value| value.as_str()))
+}
+
 fn args_path(args: &serde_json::Value) -> Option<String> {
     args_str(
         args,
@@ -348,10 +355,10 @@ fn push_old_new_rows(rows: &mut Vec<DiffRow>, edit: &serde_json::Value) {
         "newText",
         "new",
     ];
-    let Some(old) = args_str(edit, OLD_KEYS) else {
+    let Some(old) = args_payload(edit, OLD_KEYS) else {
         return;
     };
-    let new = args_str(edit, NEW_KEYS).unwrap_or_default();
+    let new = args_payload(edit, NEW_KEYS).unwrap_or_default();
     push_content_rows(rows, DiffRowKind::Remove, old, 1);
     push_content_rows(rows, DiffRowKind::Add, new, 1);
 }
@@ -374,7 +381,7 @@ fn diff_rows(activity: &ToolActivityInfo) -> Vec<DiffRow> {
 
     // Whole-file writes render as a pure addition.
     if name.starts_with("write") || name.starts_with("create") {
-        if let Some(content) = args_str(&args, &["content", "file_text", "new_content"]) {
+        if let Some(content) = args_payload(&args, &["content", "file_text", "new_content"]) {
             push_content_rows(&mut rows, DiffRowKind::Add, content, 1);
         }
         return rows;
@@ -459,11 +466,15 @@ fn command_detail(activity: &ToolActivityInfo) -> CommandDetail {
         detail.cwd = args_str(&args, &["cwd", "workdir", "working_dir"]).map(str::to_owned);
     }
     // While the call is in flight `detail` still holds the raw arguments;
-    // surface that as a pending body instead of dumping JSON into the card.
+    // surface a pending body instead of dumping JSON into the card. A body
+    // that differs from the arguments is real output — partial results
+    // stream in while `Working`, and finished results can be JSON that
+    // merely starts with `{` — so compare against the actual arguments.
     let body = activity.detail.trim();
-    let body_is_args = body.is_empty() || body.starts_with('{');
-    detail.pending = activity.category == "Working" || (detail.command.is_some() && body_is_args);
-    if detail.pending && body_is_args {
+    let body_is_args = body.is_empty() || body == activity.arguments.trim();
+    detail.pending =
+        detail.command.is_some() && body_is_args && activity.category == "Working";
+    if detail.pending {
         return detail;
     }
     detail.output = parse_command_output(&activity.detail);
@@ -721,6 +732,16 @@ fn diff_row_element(row: &DiffRow, theme: &gpui_component::theme::ThemeColor) ->
     }
 }
 
+/// The path a finished edit/write actually touched: results quote the
+/// resolved path (`... to 'src/lib.rs'`), which can differ from the
+/// argument when fuzzy resolution recovered a stale path.
+fn result_path(detail: &str) -> Option<String> {
+    let start = detail.find('\'')? + 1;
+    let end = detail[start..].find('\'')? + start;
+    let path = detail[start..end].trim();
+    (!path.is_empty()).then(|| path.to_string())
+}
+
 /// Renders an edit/write activity as a small code card: a file-path header
 /// with add/remove counts, then the unified diff (or the pending change
 /// synthesized from the call's arguments) with tinted +/- rows.
@@ -734,7 +755,8 @@ fn render_diff_card(
         return None;
     }
     let theme = cx.theme().colors;
-    let path = args_json(&activity.arguments).and_then(|args| args_path(&args));
+    let path = result_path(&activity.detail)
+        .or_else(|| args_json(&activity.arguments).and_then(|args| args_path(&args)));
     let (added, removed) = diff_stats(&rows);
 
     let mut header = card_header(&theme)
@@ -845,7 +867,7 @@ pub(crate) fn render_activity_detail_card(
 mod tests {
     use super::{
         command_detail, diff_rows, diff_stats, exit_status_label, parse_command_output,
-        parse_unified_diff, DiffRow, DiffRowKind,
+        parse_unified_diff, result_path, DiffRow, DiffRowKind,
     };
     use threadlane_ui_state::ToolActivityInfo;
 
@@ -974,5 +996,61 @@ mod tests {
             exit_status_label(detail.output.status.as_deref().unwrap()),
             Some(("exit 1".to_string(), false))
         );
+    }
+
+    #[test]
+    fn command_json_result_is_not_pending() {
+        // A finished call whose output happens to be JSON must not be
+        // mistaken for the still-pending argument payload.
+        let act = activity(
+            "run_command",
+            r#"{"command":"ls --json"}"#,
+            r#"{"files":["a.rs","b.rs"]}"#,
+            "Completed",
+        );
+        let detail = command_detail(&act);
+        assert!(!detail.pending);
+        assert!(detail.output.stdout.contains("files"));
+    }
+
+    #[test]
+    fn command_partial_output_streams_while_working() {
+        let act = activity(
+            "run_command",
+            r#"{"command":"make"}"#,
+            "compiling first crate\n",
+            "Working",
+        );
+        let detail = command_detail(&act);
+        assert!(!detail.pending);
+        assert_eq!(detail.output.stdout, "compiling first crate\n");
+    }
+
+    #[test]
+    fn write_file_args_preserve_whitespace() {
+        let act = activity(
+            "write_file",
+            r#"{"path":"src/new.rs","content":"  indented\n\nlast"}"#,
+            "",
+            "Working",
+        );
+        let rows = diff_rows(&act);
+        assert_eq!(
+            rows,
+            vec![
+                DiffRow::changed(DiffRowKind::Add, "  indented", 1),
+                DiffRow::changed(DiffRowKind::Add, "", 2),
+                DiffRow::changed(DiffRowKind::Add, "last", 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn result_path_prefers_quoted_resolved_path() {
+        assert_eq!(
+            result_path("Successfully applied 1 hashline edit(s) to 'src/resolved.rs'\n\nDiff:"),
+            Some("src/resolved.rs".to_string())
+        );
+        assert_eq!(result_path(""), None);
     }
 }
