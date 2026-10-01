@@ -20,13 +20,13 @@ pub const PROMPT_RECALL_BINDING_CONTEXT: &str = "ComposerPromptRecall > Input";
 
 // Content widths are rem-based so the reading column follows interface zoom.
 pub const CHAT_CONTENT_MAX_WIDTH: f32 = 48.0;
-pub const USER_BUBBLE_MAX_WIDTH: f32 = 40.0;
 // Questions should read as a compact inline card, not fill the composer column.
 pub const QUESTION_CARD_MAX_WIDTH: f32 = 32.0;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use threadlane_ui_theme::USER_BUBBLE_MAX_WIDTH;
 
     #[test]
     fn question_card_is_narrower_than_chat_content() {

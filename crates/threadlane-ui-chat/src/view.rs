@@ -3379,18 +3379,7 @@ impl ChatListView {
                         )
                     })
                     .child(
-                        div()
-                            .min_w_0()
-                            .max_w(rems(USER_BUBBLE_MAX_WIDTH))
-                            .px_4()
-                            .py_3()
-                            .rounded_2xl()
-                            .rounded_br_md()
-                            .border_1()
-                            .border_color(theme.border.opacity(0.22))
-                            .bg(theme.secondary.opacity(0.85))
-                            .text_sm()
-                            .text_color(theme.secondary_foreground)
+                        threadlane_ui_theme::user_message_bubble(cx)
                             .child({
                                 let markdown_state =
                                     self.markdown_state(msg.id.clone(), &msg.content, cx);
