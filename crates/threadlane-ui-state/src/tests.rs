@@ -5157,6 +5157,53 @@ fn remote_edit_queued_message_restores_staged_images_via_command_result() {
 }
 
 #[test]
+fn remote_edit_queued_message_scopes_restore_to_project() {
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.daemon_remote = true;
+    state.active_work_dir = Some(std::path::PathBuf::from("/tmp/project-a"));
+    state.active_session_id = Some("sess-1".into());
+    state.messages = vec![ChatMessageInfo {
+        id: "queued-user-sess-1-entry-1".into(),
+        role: MessageRole::User,
+        content: "draft text".into(),
+        tool_activities: Vec::new(),
+        streaming: false,
+        reasoning_content: None,
+        reasoning_expanded: false,
+    }]
+    .into();
+
+    state
+        .edit_queued_message("entry-1")
+        .expect("remote edit succeeds");
+
+    let changed = state.drain_chat_stream(vec![SessionEvent::CommandResult {
+        request_id: 1,
+        result: Ok(CommandResponse::CancelledQueuedMessage {
+            session_id: "sess-1".into(),
+            entry_id: "entry-1".into(),
+            text: "draft text".into(),
+            images: vec![ImageAttachment {
+                display_name: "shot.png".into(),
+                data_url: "data:image/png;base64,AAAA".into(),
+            }],
+        }),
+    }]);
+    assert!(changed);
+    let insert = state
+        .requested_composer_inserts
+        .last()
+        .expect("composer insert queued");
+    // The staged payload keys on the project too: a same-named session in
+    // another project's draft must not receive it.
+    assert_eq!(insert.session_id.as_deref(), Some("sess-1"));
+    assert_eq!(
+        insert.work_dir.as_deref(),
+        Some(std::path::Path::new("/tmp/project-a"))
+    );
+}
+
+#[test]
 fn remote_edit_queued_message_reply_survives_a_session_switch() {
     let mut state = AppState::load_from_registry(Vec::new());
     state.daemon_remote = true;

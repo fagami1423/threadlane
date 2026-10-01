@@ -734,6 +734,7 @@ impl BrowserView {
                         text: note,
                         images,
                         session_id: None,
+                        work_dir: None,
                     });
                 cx.notify();
             });

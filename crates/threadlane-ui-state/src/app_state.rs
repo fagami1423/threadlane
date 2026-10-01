@@ -209,10 +209,13 @@ pub struct AppState {
 /// A queued-message cancel awaiting its `CommandResult` reply: which echo
 /// it belongs to, and whether the optimistic echo already put the staged
 /// text back in the composer (then the reply only needs to deliver the
-/// images the echo could not carry).
+/// images the echo could not carry). `work_dir` pins the project that
+/// queued the message so the restored payload is scoped to
+/// `(work_dir, session_id)`, matching how composer drafts are keyed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingQueuedRestore {
     pub session_id: String,
+    pub work_dir: Option<PathBuf>,
     pub entry_id: String,
     pub text_restored: bool,
 }
@@ -5188,6 +5191,7 @@ impl AppState {
                     request_id,
                     PendingQueuedRestore {
                         session_id: session_id.clone(),
+                        work_dir: self.active_work_dir.clone(),
                         entry_id: entry_id.to_string(),
                         text_restored: !staged_text.is_empty(),
                     },
@@ -5254,6 +5258,7 @@ impl AppState {
                 },
                 images,
                 session_id: Some(session_id.to_string()),
+                work_dir: pending.work_dir,
             });
         true
     }
@@ -5539,6 +5544,7 @@ impl AppState {
                         text: setup.text,
                         images: setup.images,
                         session_id: None,
+                        work_dir: None,
                     });
                 return Ok(());
             }
