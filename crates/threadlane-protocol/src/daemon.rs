@@ -18,6 +18,11 @@
 //! - [`SessionSnapshot`] / [`ProjectInfo`]: attach-mid-run semantics — a
 //!   client that connects or selects a session gets one snapshot and then
 //!   tails live `SessionEvent`s.
+//! - [`CommandRequest`] / [`CommandReply`] / [`CommandResponse`]: the
+//!   optional request/reply pair for commands that must return a payload
+//!   (e.g. the staged content of a cancelled queued message). Replies are
+//!   point-to-point on the requesting connection — never journaled or
+//!   broadcast, so a `?since=` replay never resends them.
 //!
 //! Session files stay `PathBuf`s on the wire: the daemon owns the filesystem
 //! and paths are the canonical identity handle. Consumers must not assume
@@ -153,7 +158,9 @@ pub enum SessionCommand {
     /// Re-route a still-pending queued follow-up into the live steer queue
     /// so it reaches the model during the current turn instead of after it.
     SteerQueuedMessage { session_id: String, entry_id: String },
-    /// Drop a still-pending queued input.
+    /// Drop a still-pending queued input. Sent inside a [`CommandRequest`]
+    /// the reply carries the entry's staged text and images as
+    /// `CommandResponse::CancelledQueuedMessage`.
     CancelQueuedMessage { session_id: String, entry_id: String },
     /// Request a project snapshot; answered by `SessionEvent::ProjectChanged`.
     GetProjectState { work_dir: PathBuf },
@@ -257,6 +264,57 @@ pub enum SessionEvent {
         session_id: String,
         session_file: PathBuf,
     },
+    /// A reply to a [`CommandRequest`] this client issued. Client
+    /// transports synthesize it for the requester — the daemon answers
+    /// requests point-to-point on the requesting connection, never
+    /// through the journal broadcast — so it never appears in a replayed
+    /// tail.
+    CommandResult {
+        request_id: u64,
+        result: Result<CommandResponse, String>,
+    },
+}
+
+/// A `SessionCommand` that expects a reply, sent as a
+/// `{"request_id": N, "command": {...}}` frame instead of a bare command.
+/// The daemon answers on the same connection with a `{"response": ...}`
+/// [`CommandReply`] — point-to-point, never journaled or broadcast.
+/// `request_id` is caller-chosen, unique per connection, and correlates
+/// the reply.
+// No `PartialEq`: `SessionCommand` has none.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandRequest {
+    pub request_id: u64,
+    pub command: SessionCommand,
+}
+
+/// Payload a [`CommandRequest`] resolves to. `Ack` is the reply for
+/// commands that carry no return value — the payload-carrying variants
+/// are the point of the request/reply channel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CommandResponse {
+    /// Completed; no payload.
+    Ack,
+    /// `CancelQueuedMessage` dropped the entry: its staged content so the
+    /// requesting client can restore text and images into the composer —
+    /// a bare `CancelQueuedMessage` command cannot deliver them back.
+    CancelledQueuedMessage {
+        session_id: String,
+        entry_id: String,
+        text: String,
+        #[serde(default)]
+        images: Vec<ImageAttachment>,
+    },
+}
+
+/// The daemon's reply to a [`CommandRequest`]: one `{"response": ...}`
+/// frame on the requesting connection only — never journaled, so a
+/// `?since=` replay never re-delivers it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommandReply {
+    pub request_id: u64,
+    pub result: Result<CommandResponse, String>,
 }
 
 /// A permission decision the client sends back to the daemon.
@@ -901,11 +959,79 @@ mod tests {
                 session_id: "sess_1".into(),
                 session_file: PathBuf::from("/repo/.threadlane/sessions/sess_1.jsonl"),
             },
+            SessionEvent::CommandResult {
+                request_id: 7,
+                result: Ok(CommandResponse::CancelledQueuedMessage {
+                    session_id: "sess_1".into(),
+                    entry_id: "entry-1".into(),
+                    text: "staged".into(),
+                    images: vec![ImageAttachment {
+                        display_name: "shot.png".into(),
+                        data_url: "data:image/png;base64,AAAA".into(),
+                    }],
+                }),
+            },
+            SessionEvent::CommandResult {
+                request_id: 8,
+                result: Err("no live runtime".into()),
+            },
         ];
         for event in events {
             let json = serde_json::to_string(&event).expect("event serializes");
             let back: SessionEvent = serde_json::from_str(&json).expect("event deserializes");
             assert_eq!(event, back);
+        }
+    }
+
+    #[test]
+    fn command_request_and_reply_round_trip_through_json() {
+        let request = CommandRequest {
+            request_id: 7,
+            command: SessionCommand::CancelQueuedMessage {
+                session_id: "sess_1".into(),
+                entry_id: "entry-1".into(),
+            },
+        };
+        let json = serde_json::to_string(&request).expect("request serializes");
+        let back: CommandRequest = serde_json::from_str(&json).expect("request deserializes");
+        assert_eq!(back.request_id, request.request_id);
+        assert_eq!(
+            serde_json::to_string(&back.command).unwrap(),
+            serde_json::to_string(&request.command).unwrap()
+        );
+        // The wire picks bare-command vs request by shape: neither may
+        // deserialize as the other.
+        let bare = serde_json::to_string(&request.command).expect("command serializes");
+        assert!(serde_json::from_str::<CommandRequest>(&bare).is_err());
+        assert!(serde_json::from_str::<SessionCommand>(&json).is_err());
+
+        for reply in [
+            CommandReply {
+                request_id: 7,
+                result: Ok(CommandResponse::Ack),
+            },
+            CommandReply {
+                request_id: 7,
+                result: Ok(CommandResponse::CancelledQueuedMessage {
+                    session_id: "sess_1".into(),
+                    entry_id: "entry-1".into(),
+                    text: "staged".into(),
+                    images: vec![ImageAttachment {
+                        display_name: "shot.png".into(),
+                        data_url: "data:image/png;base64,AAAA".into(),
+                    }],
+                }),
+            },
+            CommandReply {
+                request_id: 7,
+                result: Err("no live runtime".into()),
+            },
+        ] {
+            let json = serde_json::to_string(&reply).expect("reply serializes");
+            assert_eq!(
+                serde_json::from_str::<CommandReply>(&json).expect("reply deserializes"),
+                reply
+            );
         }
     }
 

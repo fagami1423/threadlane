@@ -12,9 +12,11 @@
 //!   server replays its bounded journal tail before live events, which is
 //!   what makes attach-mid-run work.
 //!
-//! Framing is one JSON value per WebSocket text message — no envelope. The
-//! client-facing `subscribe()` receiver collapses every transport into one
-//! ordered `SessionEvent` stream so views never learn which side they are on.
+//! Framing is one JSON value per WebSocket text message — bare commands
+//! outbound (a `CommandRequest` envelope for reply-carrying commands),
+//! `{"seq", "event"}` and `{"response"}` frames inbound. The client-facing
+//! `subscribe()` receiver collapses every transport into one ordered
+//! `SessionEvent` stream so views never learn which side they are on.
 
 mod local;
 mod remote;
@@ -24,7 +26,9 @@ pub use remote::RemoteDaemon;
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
-use threadlane_protocol::daemon::{SessionCommand, SessionEvent};
+use threadlane_protocol::daemon::{
+    CommandRequest, CommandResponse, SessionCommand, SessionEvent,
+};
 
 /// The session contract a daemon serves and clients consume.
 #[async_trait]
@@ -34,6 +38,16 @@ pub trait DaemonClient: Send + Sync {
     /// (`AppState::dispatch_command` also converts `Err` into the event
     /// stream for its callers).
     async fn command(&self, command: SessionCommand) -> Result<(), String>;
+
+    /// Dispatch one command expecting the daemon's [`CommandResponse`]
+    /// back: `Ok` carries the payload (`Ack` for commands that return
+    /// nothing), `Err` is the send or dispatch failure (the daemon also
+    /// broadcasts a dispatch failure as `DaemonError`). `request_id` is
+    /// caller-chosen and must be unique per client connection.
+    async fn command_request(
+        &self,
+        request: CommandRequest,
+    ) -> Result<CommandResponse, String>;
 
     /// Attach to the daemon's event stream. Each call returns an
     /// independent receiver; journal replay (for late attach/reconnect)

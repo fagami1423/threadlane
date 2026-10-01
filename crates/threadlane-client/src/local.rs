@@ -8,7 +8,9 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc};
 
 use threadlane_daemon::core::DaemonCore;
-use threadlane_protocol::daemon::{SessionCommand, SessionEvent};
+use threadlane_protocol::daemon::{
+    CommandRequest, CommandResponse, SessionCommand, SessionEvent,
+};
 
 use crate::DaemonClient;
 
@@ -33,7 +35,16 @@ impl LocalDaemon {
 #[async_trait]
 impl DaemonClient for LocalDaemon {
     async fn command(&self, command: SessionCommand) -> Result<(), String> {
-        self.core.clone().dispatch(command).await
+        self.core.clone().dispatch(command).await.map(|_| ())
+    }
+
+    async fn command_request(
+        &self,
+        request: CommandRequest,
+    ) -> Result<CommandResponse, String> {
+        // In-process the reply is just the dispatch return — no frame
+        // correlation needed.
+        self.core.clone().dispatch(request.command).await
     }
 
     fn subscribe(&self) -> mpsc::UnboundedReceiver<SessionEvent> {

@@ -5193,7 +5193,7 @@ impl ChatListView {
                                                             cx,
                                                             |state, cx| {
                                                                 let restored = state
-                                                                    .cancel_queued_message(
+                                                                    .edit_queued_message(
                                                                         &entry_id,
                                                                     )
                                                                     .map_err(|error| {

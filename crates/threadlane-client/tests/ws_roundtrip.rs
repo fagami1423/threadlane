@@ -6,7 +6,9 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 
 use threadlane_client::{DaemonClient, RemoteDaemon};
-use threadlane_protocol::daemon::{SessionCommand, SessionEvent, TerminalEvent};
+use threadlane_protocol::daemon::{
+    CommandRequest, CommandResponse, SessionCommand, SessionEvent, TerminalEvent,
+};
 
 async fn next_event(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
@@ -86,6 +88,81 @@ fn remote_client_speaks_protocol_end_to_end() {
             message.contains("no live runtime"),
             "journal tail did not replay the earlier error: {message}"
         );
+    });
+}
+
+/// A `CommandRequest` carries the command inside a request_id envelope and
+/// resolves to the daemon's `CommandResponse`: dispatch errors resolve the
+/// caller's request (not just the broadcast DaemonError), and successful
+/// commands resolve to `Ack` while the journal broadcast keeps flowing.
+#[test]
+fn remote_command_request_round_trips() {
+    let executor = threadlane_daemon::chat::executor().expect("daemon executor");
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    executor.spawn(async move {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let core = threadlane_daemon::core::DaemonCore::new().expect("daemon core");
+        tokio::spawn(threadlane_daemon::server::serve(listener, core, None));
+        done_tx.send(addr).expect("send addr");
+    });
+    let addr = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("server did not start");
+
+    executor.block_on(async move {
+        let client = RemoteDaemon::connect(format!("ws://{addr}"), None);
+        let mut events = client.subscribe();
+
+        // Commands fail fast until the dial completes; retry until connected.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let result = loop {
+            match client
+                .command_request(CommandRequest {
+                    request_id: 1,
+                    command: SessionCommand::CancelQueuedMessage {
+                        session_id: "no-such-session".to_string(),
+                        entry_id: "entry-1".to_string(),
+                    },
+                })
+                .await
+            {
+                Err(error) if error.contains("not connected") => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "client never connected to the daemon"
+                    );
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                result => break result,
+            }
+        };
+        // A dispatch failure resolves the request's own Err — the caller's
+        // pending intent can resolve without watching the broadcast.
+        let error = result.expect_err("dispatch of a dead session must fail");
+        assert!(
+            error.contains("no live runtime"),
+            "unexpected error text: {error}"
+        );
+
+        // The same failure still arrives on the broadcast stream.
+        next_event(&mut events, |event| {
+            matches!(event, SessionEvent::DaemonError { .. })
+        })
+        .await;
+
+        // A dispatchable command resolves to Ack.
+        let result = client
+            .command_request(CommandRequest {
+                request_id: 2,
+                command: SessionCommand::GetProjectState {
+                    work_dir: std::env::temp_dir(),
+                },
+            })
+            .await;
+        assert_eq!(result, Ok(CommandResponse::Ack));
     });
 }
 
