@@ -1108,7 +1108,7 @@ mod tests {
                     assert_eq!(message_items.len(), expected.len());
                     for (item, message) in message_items.iter().zip(&expected) {
                         let normalized = provider_normalized_message(message);
-                        let accounted = normalized.as_ref().unwrap_or(message);
+                        let accounted = normalized.as_deref().unwrap_or(message);
                         let serialized = serde_json::to_vec(accounted).unwrap();
                         assert_eq!(
                             item.digest_sha256.as_str(),
@@ -1124,7 +1124,7 @@ mod tests {
                         );
                         assert_eq!(
                             item.token_estimate as usize,
-                            normalized.as_ref().map_or(0, |message| {
+                            normalized.as_deref().map_or(0, |message| {
                                 estimate_message_tokens(
                                     message,
                                     &CompactionParams::from(&config)

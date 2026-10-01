@@ -7,7 +7,6 @@ impl CodingSessionHarness {
         tools: &[HarnessRecord],
     ) -> Result<Vec<HarnessRecord>, String> {
         let records = self.store.records().to_vec();
-        let entries = self.store.entries().to_vec();
         let mut claimed = Vec::new();
         for tool in tools {
             let HarnessRecord::ToolStarted {
@@ -37,7 +36,7 @@ impl CodingSessionHarness {
                         && finished_call == tool_call_id
                         && finished_result == result_entry_id
                 )
-            }) || entries.iter().any(|entry| entry.id == *result_entry_id);
+            }) || self.store.entry(result_entry_id).is_some();
             if already_completed {
                 continue;
             }

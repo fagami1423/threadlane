@@ -1,7 +1,7 @@
 use super::reducer::ReductionContext;
 use super::store::SessionStore;
 use super::types::{Entry, Record, ReduceError};
-use threadlane_protocol::PlanItem;
+use threadlane_protocol::{AgentMessage, PlanItem};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::collections::HashSet as IdSet;
@@ -29,6 +29,7 @@ fn stamp_lifecycle_time(record: &mut Record) {
 #[cfg(test)]
 thread_local! {
     static LOAD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FULL_RELOAD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(unix)]
@@ -481,11 +482,18 @@ pub struct JsonlStore {
     /// Entry ids only (valid parents for new entries), maintained
     /// incrementally for O(1) parent and duplicate checks.
     entry_ids: HashSet<String>,
+    /// `entry_id -> index into entries`, maintained incrementally for O(1)
+    /// id lookups (entries are append-only, so positions never shift).
+    entry_positions: HashMap<String, usize>,
     /// Record ids, maintained incrementally for O(1) duplicate checks.
     record_ids: HashSet<String>,
     /// Streaming reduction state advanced by guard/commit pairs on append;
     /// rebuilt wholesale whenever the file is reloaded.
     reduction: ReductionContext,
+    /// Count of session-journal lines that parsed into values, maintained
+    /// incrementally so tail classification derives the same positional
+    /// indexes (legacy seq fallbacks, fact ids) as a full reload.
+    journal_line_count: usize,
 }
 
 impl JsonlStore {
@@ -513,7 +521,8 @@ impl JsonlStore {
             .gate
             .lock()
             .map_err(|_| io::Error::other("writer claim poisoned"))?;
-        let (session_id, preferred_leaf, entries, records) = Self::load_parts(&path)?;
+        let (session_id, preferred_leaf, entries, records, journal_line_count) =
+            Self::load_parts(&path)?;
         let (session_file_len, session_mtime) = file_fingerprint(&path)?;
         let (harness_file_len, harness_mtime) =
             file_fingerprint(&path.with_extension("harness.jsonl"))?;
@@ -546,6 +555,11 @@ impl JsonlStore {
             .iter()
             .map(|record| record.id().to_owned())
             .collect();
+        let entry_positions = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.id.clone(), index))
+            .collect();
         Ok(Self {
             path,
             session_id,
@@ -560,8 +574,10 @@ impl JsonlStore {
             harness_mtime,
             max_seq,
             entry_ids,
+            entry_positions,
             record_ids,
             reduction,
+            journal_line_count,
         })
     }
 
@@ -583,6 +599,12 @@ impl JsonlStore {
             .max()
             .unwrap_or(0);
         self.entry_ids = self.entries.iter().map(|entry| entry.id.clone()).collect();
+        self.entry_positions = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.id.clone(), index))
+            .collect();
         self.record_ids = self
             .records
             .iter()
@@ -646,14 +668,24 @@ impl JsonlStore {
             && self.harness_mtime == harness_mtime)
     }
 
-    fn load_parts(path: &Path) -> io::Result<(String, Option<String>, Vec<Entry>, Vec<Record>)> {
+    fn load_parts(
+        path: &Path,
+    ) -> io::Result<(String, Option<String>, Vec<Entry>, Vec<Record>, usize)> {
         let lines = read_strict::<SessionLine>(path)?;
-        let (session_id, preferred_leaf, entries, mut records) = classify_lines(path, lines);
+        let journal_line_count = lines.len();
+        let (session_id, preferred_leaf, entries, mut records) =
+            classify_lines(path, lines, 0);
         let record_path = path.with_extension("harness.jsonl");
         records.extend(read_strict(&record_path)?);
         records.sort_by_key(Record::seq);
         validate_harness_records(&records, path)?;
-        Ok((session_id, preferred_leaf, entries, records))
+        Ok((
+            session_id,
+            preferred_leaf,
+            entries,
+            records,
+            journal_line_count,
+        ))
     }
 
     /// Read recoverable main-lane entries without reducing a damaged journal.
@@ -661,7 +693,7 @@ impl JsonlStore {
     /// distinct identities remain separate conversation occurrences.
     pub fn recover_main_entries(path: &Path) -> io::Result<Vec<Entry>> {
         let lines = read_strict::<SessionLine>(path)?;
-        let (_, _, entries, _) = classify_lines(path, lines);
+        let (_, _, entries, _) = classify_lines(path, lines, 0);
         let mut seen = std::collections::HashSet::new();
         Ok(entries
             .into_iter()
@@ -685,6 +717,42 @@ impl JsonlStore {
 
     pub fn records(&self) -> &[Record] {
         &self.records
+    }
+
+    /// Whether a `ToolStarted` intent for `(run_id, tool_call_id)` is already
+    /// committed, without rescanning the record stream.
+    pub fn has_tool_started(&self, run_id: &str, tool_call_id: &str) -> bool {
+        self.reduction.has_tool_started(run_id, tool_call_id)
+    }
+
+    /// Latest entry on `lane` whose message equals `message`.
+    pub fn find_entry_by_message(
+        &self,
+        lane: &str,
+        message: &AgentMessage,
+    ) -> Option<&Entry> {
+        self.reduction
+            .entry_id_by_message(lane, message)
+            .and_then(|id| self.entry(id))
+    }
+
+    /// Latest assistant entry declaring `tool_call_id`; `lane` scopes the
+    /// lookup to that lane while `None` searches all lanes.
+    pub fn assistant_entry_for_call(
+        &self,
+        lane: Option<&str>,
+        tool_call_id: &str,
+    ) -> Option<&Entry> {
+        self.reduction
+            .assistant_entry_for_call(lane, tool_call_id)
+            .and_then(|id| self.entry(id))
+    }
+
+    /// Latest assistant entry on `lane`.
+    pub fn last_assistant_entry(&self, lane: &str) -> Option<&Entry> {
+        self.reduction
+            .last_assistant_entry_id(lane)
+            .and_then(|id| self.entry(id))
     }
 }
 
@@ -729,6 +797,10 @@ impl SessionStore for JsonlStore {
 
     fn records(&self) -> &[Record] {
         &self.records
+    }
+
+    fn entry(&self, id: &str) -> Option<&Entry> {
+        self.entry_positions.get(id).map(|index| &self.entries[*index])
     }
 
     fn append_actions_atomically(
@@ -807,14 +879,49 @@ impl SessionStore for JsonlStore {
         // concatenating onto it. Recovery recognizes only that reserved torn
         // atomic-frame prefix; existing canonical bytes are never truncated or
         // rewritten.
-        append_atomic_batch_line(
-            &self.path,
-            &AtomicBatchLine {
-                atomic_batch: items,
-            },
-        )?;
-        self.reload_unlocked()?;
-        Ok(())
+        let batch = AtomicBatchLine {
+            atomic_batch: items,
+        };
+        let written = append_atomic_batch_line(&self.path, &batch)?;
+        // The writer gate and append lock already serialized this commit, so a
+        // file that grew by exactly the bytes we wrote needs no re-parse: the
+        // pre-validated reduction clone becomes the committed state and the
+        // items join the in-memory streams. Any other delta means a foreign
+        // writer interleaved (or the side file changed) — fold or reload.
+        let (new_len, new_mtime) = file_fingerprint(&self.path)
+            .map_err(|error| ReduceError::Storage(error.to_string()))?;
+        let (harness_len, harness_mtime) =
+            file_fingerprint(&self.path.with_extension("harness.jsonl"))
+                .map_err(|error| ReduceError::Storage(error.to_string()))?;
+        if new_len.checked_sub(self.session_file_len) == Some(written)
+            && harness_len == self.harness_file_len
+            && harness_mtime == self.harness_mtime
+        {
+            self.session_file_len = new_len;
+            self.session_mtime = new_mtime;
+            self.journal_line_count += 1;
+            self.reduction = reduction;
+            if let Some(leaf) = final_main_leaf {
+                self.preferred_leaf = Some(leaf);
+            }
+            for item in batch.atomic_batch {
+                match item {
+                    AtomicBatchItem::Entry(entry) => {
+                        self.max_seq = self.max_seq.max(entry.seq);
+                        self.entry_ids.insert(entry.id.clone());
+                        self.entry_positions.insert(entry.id.clone(), self.entries.len());
+                        self.entries.push(entry);
+                    }
+                    AtomicBatchItem::Record(record) => {
+                        self.max_seq = self.max_seq.max(record.seq());
+                        self.record_ids.insert(record.id().to_owned());
+                        self.records.push(record);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        self.reload_unlocked()
     }
 
     fn append_entry(&mut self, mut entry: Entry) -> Result<(), ReduceError> {
@@ -850,7 +957,9 @@ impl SessionStore for JsonlStore {
         self.reduction.commit_entry(&entry);
         self.max_seq = entry.seq;
         self.entry_ids.insert(entry.id.clone());
+        self.entry_positions.insert(entry.id.clone(), self.entries.len());
         self.entries.push(entry);
+        self.journal_line_count += 1;
         Ok(())
     }
 
@@ -892,6 +1001,7 @@ impl SessionStore for JsonlStore {
         self.max_seq = record.seq();
         self.record_ids.insert(record.id().to_owned());
         self.records.push(record);
+        self.journal_line_count += 1;
         Ok(())
     }
 }
@@ -918,16 +1028,111 @@ impl JsonlStore {
     /// Reloads in-memory state from disk when another writer has appended.
     /// Caller must hold the claim gate.
     fn reload_unlocked(&mut self) -> Result<(), ReduceError> {
+        if self.fold_appended_tail()? {
+            return Ok(());
+        }
+        #[cfg(test)]
+        FULL_RELOAD_COUNT.with(|count| count.set(count.get() + 1));
         let refreshed = Self::load_parts(&self.path)
             .map_err(|error| ReduceError::Storage(error.to_string()))?;
         self.session_id = refreshed.0;
         self.preferred_leaf = refreshed.1;
         self.entries = refreshed.2;
         self.records = refreshed.3;
+        self.journal_line_count = refreshed.4;
         self.refresh_file_lengths()
             .map_err(|error| ReduceError::Storage(error.to_string()))?;
         self.rebuild_derived_state()
             .map_err(|error| ReduceError::Storage(error.to_string()))
+    }
+
+    /// Applies foreign appends by parsing only the bytes past the last
+    /// fingerprint instead of re-reading the whole journal. Returns `false`
+    /// whenever the file did anything other than grow cleanly — truncation,
+    /// a same-length rewrite, a side-file change, a mid-line offset, an
+    /// unparsable or mis-sequenced tail — so the caller can fall back to the
+    /// canonical full reload (which also reports canonical errors).
+    fn fold_appended_tail(&mut self) -> Result<bool, ReduceError> {
+        let (session_len, session_mtime) = file_fingerprint(&self.path)
+            .map_err(|error| ReduceError::Storage(error.to_string()))?;
+        let (harness_len, harness_mtime) =
+            file_fingerprint(&self.path.with_extension("harness.jsonl"))
+                .map_err(|error| ReduceError::Storage(error.to_string()))?;
+        if harness_len != self.harness_file_len
+            || harness_mtime != self.harness_mtime
+            || session_len < self.session_file_len
+        {
+            return Ok(false);
+        }
+        if session_len == self.session_file_len {
+            // Same length with a different mtime is a rewrite — full reload.
+            return Ok(session_mtime == self.session_mtime);
+        }
+        let Some(lines) = read_tail::<SessionLine>(&self.path, self.session_file_len)
+            .map_err(|error| ReduceError::Storage(error.to_string()))?
+        else {
+            return Ok(false);
+        };
+        let parsed = lines.len();
+        let (_session_id, tail_preferred, entries, mut records) =
+            classify_lines(&self.path, lines, self.journal_line_count);
+        // Legacy seq-0 records get virtual sequences above every durable one,
+        // matching the full-load assignment.
+        let real_max = entries
+            .iter()
+            .map(|entry| entry.seq)
+            .chain(records.iter().map(Record::seq))
+            .max()
+            .unwrap_or(0)
+            .max(self.max_seq);
+        let mut next_seq = real_max + 1;
+        for record in &mut records {
+            if record.seq() == 0 {
+                *record = record.clone().with_seq(next_seq);
+                next_seq += 1;
+            }
+        }
+        // A foreign item numbered inside committed history means a stale or
+        // interleaved writer; only the full sorted merge reproduces that file.
+        if entries
+            .iter()
+            .map(|entry| entry.seq)
+            .chain(records.iter().map(Record::seq))
+            .any(|seq| seq <= self.max_seq)
+        {
+            return Ok(false);
+        }
+        // Match the full load's global record sort; entries keep file order.
+        records.sort_by_key(Record::seq);
+        let effective_preferred = tail_preferred.clone().or_else(|| self.preferred_leaf.clone());
+        let mut reduction = self.reduction.clone();
+        if reduction
+            .fold(&entries, &records, &|lane: &str| {
+                (lane == "main").then(|| effective_preferred.clone()).flatten()
+            })
+            .is_err()
+        {
+            return Ok(false);
+        }
+        self.reduction = reduction;
+        if let Some(leaf) = tail_preferred {
+            self.preferred_leaf = Some(leaf);
+        }
+        for entry in entries {
+            self.max_seq = self.max_seq.max(entry.seq);
+            self.entry_ids.insert(entry.id.clone());
+            self.entry_positions.insert(entry.id.clone(), self.entries.len());
+            self.entries.push(entry);
+        }
+        for record in records {
+            self.max_seq = self.max_seq.max(record.seq());
+            self.record_ids.insert(record.id().to_owned());
+            self.records.push(record);
+        }
+        self.session_file_len = session_len;
+        self.session_mtime = session_mtime;
+        self.journal_line_count += parsed;
+        Ok(true)
     }
 
     fn next_seq(&self) -> u64 {
@@ -1062,7 +1267,10 @@ fn append_json_line<T: serde::Serialize>(
         .map_err(|error| ReduceError::Storage(error.to_string()))
 }
 
-fn append_atomic_batch_line(path: &Path, value: &AtomicBatchLine) -> Result<(), ReduceError> {
+/// Appends one atomic frame and returns the number of bytes the file grew,
+/// so callers can confirm no foreign writer interleaved between open and
+/// sync without re-parsing the journal.
+fn append_atomic_batch_line(path: &Path, value: &AtomicBatchLine) -> Result<u64, ReduceError> {
     let encoded =
         serde_json::to_vec(value).map_err(|error| ReduceError::Storage(error.to_string()))?;
     let _guard = session_append_lock()
@@ -1077,11 +1285,16 @@ fn append_atomic_batch_line(path: &Path, value: &AtomicBatchLine) -> Result<(), 
             tracing::error!(session_file = %path.display(), %error, "session journal open failed");
         })
         .map_err(|error| ReduceError::Storage(error.to_string()))?;
+    let before = file
+        .metadata()
+        .map_err(|error| ReduceError::Storage(error.to_string()))?
+        .len();
     prepare_append_boundary(&mut file)
         .and_then(|_| file.write_all(ATOMIC_FRAME_SENTINEL.as_bytes()))
         .and_then(|_| file.write_all(&encoded))
         .and_then(|_| file.write_all(b"\n"))
         .and_then(|_| file.sync_all())
+        .and_then(|_| file.metadata().map(|metadata| metadata.len() - before))
         .inspect_err(|error| {
             tracing::error!(session_file = %path.display(), %error, "session journal atomic append failed");
         })
@@ -1092,12 +1305,15 @@ fn append_atomic_batch_line(path: &Path, value: &AtomicBatchLine) -> Result<(), 
 #[cfg(test)]
 fn read_entries(path: &Path) -> io::Result<(String, Option<String>, Vec<Entry>, Vec<Record>)> {
     let lines = read_strict::<SessionLine>(path)?;
-    Ok(classify_lines(path, lines))
+    Ok(classify_lines(path, lines, 0))
 }
 
+/// `line_offset` is the number of already-classified journal lines before
+/// this batch; positional indexes stay identical to a full-file parse.
 fn classify_lines(
     path: &Path,
     lines: Vec<SessionLine>,
+    line_offset: usize,
 ) -> (String, Option<String>, Vec<Entry>, Vec<Record>) {
     let session_id = path
         .file_stem()
@@ -1106,7 +1322,8 @@ fn classify_lines(
     let mut preferred_leaf = None;
     let mut entries = Vec::new();
     let mut records = Vec::new();
-    for (index, line) in lines.into_iter().enumerate() {
+    for (ordinal, line) in lines.into_iter().enumerate() {
+        let index = line_offset + ordinal;
         match line {
             SessionLine::AtomicBatch(batch) => {
                 for item in batch.atomic_batch {
@@ -1286,6 +1503,52 @@ fn is_recoverable_journal_fragment(bytes: &[u8], is_physical_eof: bool) -> bool 
     // skip it if the quarantined payload is not valid JSON.
     let payload = atomic_frame_payload(stripped).unwrap_or(stripped);
     serde_json::from_slice::<serde_json::Value>(payload).is_err()
+}
+
+/// Parses only the journal bytes appended after `offset`. Returns `None`
+/// when the offset does not land on a line boundary or the tail is not
+/// fully classifiable, so callers can fall back to a strict full read that
+/// reports canonical line numbers.
+fn read_tail<T: DeserializeOwned>(path: &Path, offset: u64) -> io::Result<Option<Vec<T>>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len <= offset {
+        return Ok(None);
+    }
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset - 1))?;
+        let mut boundary = [0u8; 1];
+        file.read_exact(&mut boundary)?;
+        if boundary[0] != b'\n' {
+            return Ok(None);
+        }
+    }
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)?;
+    let count = data.split(|byte| *byte == b'\n').count();
+    let mut values = Vec::new();
+    for (index, line) in data.split(|byte| *byte == b'\n').enumerate() {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let is_physical_eof = index == count - 1 && !data.ends_with(b"\n");
+        let payload = atomic_frame_payload(line).unwrap_or(line);
+        match serde_json::from_slice(payload) {
+            Ok(value) => values.push(value),
+            Err(_error) if is_recoverable_journal_fragment(line, is_physical_eof) => {
+                tracing::warn!(session_file = %path.display(), tail_line = index + 1,
+                    "skipping incomplete session journal frame; interruption cause unknown");
+                continue;
+            }
+            // Unrecoverable content: let the full strict read produce the
+            // canonical InvalidData error with file-relative line numbers.
+            Err(_) => return Ok(None),
+        }
+    }
+    Ok(Some(values))
 }
 
 fn read_strict<T: DeserializeOwned>(path: &Path) -> io::Result<Vec<T>> {
@@ -2163,6 +2426,116 @@ mod tests {
         {
             assert_eq!(reloaded_lane, fresh_lane, "reload: lane state diverged");
         }
+    }
+
+    /// The frame this store just serialized is applied to in-memory state
+    /// directly; the journal is not re-parsed after its own commits.
+    #[test]
+    fn atomic_commit_folds_new_frame_without_full_reload() {
+        use crate::harness::EffectAction;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atomic-fold.jsonl");
+        let mut store = JsonlStore::open(&path).unwrap();
+        store.append_entry(user_entry("seed", "main")).unwrap();
+        super::FULL_RELOAD_COUNT.with(|count| count.set(0));
+
+        store
+            .append_actions_atomically(&[
+                EffectAction::AppendEntry {
+                    entry: user_entry("msg-1", "main"),
+                },
+                EffectAction::AppendRecord {
+                    id: "fact-1".into(),
+                    record: Record::FactSet {
+                        id: "fact-1".into(),
+                        seq: 0,
+                        lane: "main".into(),
+                        timestamp: 1,
+                        run_id: None,
+                        key: "model".into(),
+                        value: "test-model".into(),
+                    },
+                },
+                EffectAction::AppendEntry {
+                    entry: crate::harness::Entry::new(
+                        "asst-1",
+                        Some("msg-1".to_owned()),
+                        "main",
+                        0,
+                        0,
+                        assistant("hi"),
+                        false,
+                    ),
+                },
+            ])
+            .unwrap();
+
+        super::FULL_RELOAD_COUNT.with(|count| assert_eq!(count.get(), 0));
+        let reloaded = JsonlStore::open_read_only(&path).unwrap();
+        assert_eq!(store.entries(), reloaded.entries());
+        assert_eq!(store.records(), reloaded.records());
+        assert_eq!(store.reduced_state(), reloaded.reduced_state());
+        assert_eq!(store.preferred_leaf("main"), reloaded.preferred_leaf("main"));
+    }
+
+    /// A journal grown by another writer is merged by parsing only the new
+    /// tail; the result is byte-identical to a full reload.
+    #[test]
+    fn foreign_appends_fold_tail_without_full_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tail-fold.jsonl");
+        let mut store = JsonlStore::open(&path).unwrap();
+        store.append_entry(user_entry("seed", "main")).unwrap();
+        let mut peer = JsonlStore::open(&path).unwrap();
+        super::FULL_RELOAD_COUNT.with(|count| count.set(0));
+
+        peer.append_entry(user_entry("peer-1", "main")).unwrap();
+        peer.append_record(Record::FactSet {
+            id: "peer-fact".into(),
+            seq: peer.next_sequence(),
+            lane: "main".into(),
+            timestamp: 1,
+            run_id: None,
+            key: "name".into(),
+            value: "peer".into(),
+        })
+        .unwrap();
+        store.refresh().unwrap();
+        // A second growth folds on top of the first tail-apply.
+        peer.append_entry(user_entry("peer-2", "lane-2")).unwrap();
+        peer.append_entry(user_entry("peer-3", "main")).unwrap();
+        store.refresh().unwrap();
+
+        super::FULL_RELOAD_COUNT.with(|count| assert_eq!(count.get(), 0));
+        let reloaded = JsonlStore::open_read_only(&path).unwrap();
+        assert_eq!(store.entries(), reloaded.entries());
+        assert_eq!(store.records(), reloaded.records());
+        assert_eq!(store.reduced_state(), reloaded.reduced_state());
+        assert_eq!(store.preferred_leaf("main"), reloaded.preferred_leaf("main"));
+    }
+
+    /// A tail numbered inside committed history cannot be folded; the store
+    /// falls back to the canonical full reload, which surfaces the
+    /// duplicate-sequence error the strict path always reported.
+    #[test]
+    fn unclassifiable_tail_falls_back_to_full_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fallback.jsonl");
+        let mut store = JsonlStore::open(&path).unwrap();
+        store.append_entry(user_entry("seed", "main")).unwrap();
+        super::FULL_RELOAD_COUNT.with(|count| count.set(0));
+
+        let mut low_seq = user_entry("low-seq", "main");
+        low_seq.seq = 1;
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(format!("{}\n", serde_json::to_string(&low_seq).unwrap()).as_bytes())
+            .unwrap();
+        store.refresh().unwrap_err();
+        super::FULL_RELOAD_COUNT.with(|count| assert_eq!(count.get(), 1));
     }
 
     #[test]

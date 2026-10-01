@@ -806,6 +806,14 @@ impl<S: SessionStore> SessionStore for AgentHarness<S> {
         self.store.records()
     }
 
+    fn entry(&self, id: &str) -> Option<&super::Entry> {
+        self.store.entry(id)
+    }
+
+    fn record(&self, id: &str) -> Option<&super::Record> {
+        self.store.record(id)
+    }
+
     fn append_entry(&mut self, entry: super::Entry) -> Result<(), super::ReduceError> {
         let lane = entry.lane.clone();
         self.store.append_entry(entry.clone())?;

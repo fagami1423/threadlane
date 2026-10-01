@@ -13,6 +13,7 @@ use threadlane_protocol::AgentMessage;
 use threadlane_protocol::ImageAttachment;
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 // Checkpoint text helpers live in `threadlane-provider` (payload translation
 // needs them); re-exported here so existing paths keep working.
@@ -86,20 +87,52 @@ pub fn serialized_message(message: &AgentMessage) -> Vec<u8> {
 
 /// Returns the model-visible equivalent of a canonical message. Providers
 /// intentionally omit arbitrary custom records, while durable compaction
-/// summaries are converted to an ordinary user checkpoint message.
-pub fn provider_normalized_message(message: &AgentMessage) -> Option<AgentMessage> {
+/// summaries are converted to an ordinary user checkpoint message. The
+/// borrowed variant covers the common identity case, so normalization does
+/// not deep-clone every message on a hot accounting pass.
+pub fn provider_normalized_message(message: &AgentMessage) -> Option<Cow<'_, AgentMessage>> {
     match message {
         AgentMessage::Custom { .. } => {
-            compaction_checkpoint_text(message).map(|checkpoint| AgentMessage::User {
-                content: format!("<context-checkpoint>\n{checkpoint}\n</context-checkpoint>"),
+            compaction_checkpoint_text(message).map(|checkpoint| {
+                Cow::Owned(AgentMessage::User {
+                    content: format!("<context-checkpoint>\n{checkpoint}\n</context-checkpoint>"),
+                })
             })
         }
-        _ => Some(message.clone()),
+        _ => Some(Cow::Borrowed(message)),
     }
 }
 
 pub fn estimate_message_tokens(message: &AgentMessage, config: &CompactionParams) -> usize {
-    let (image_data_bytes, image_count) = match message {
+    estimate_message_tokens_serialized(message, &serialized_message(message), config)
+}
+
+/// The same estimate as [`estimate_message_tokens`] for a caller that
+/// already holds the serialized message bytes — the manifest and digest
+/// paths serialize each message once and reuse the bytes here.
+pub fn estimate_message_tokens_serialized(
+    message: &AgentMessage,
+    serialized: &[u8],
+    config: &CompactionParams,
+) -> usize {
+    let (image_data_bytes, image_count) = image_payload_stats(message);
+    // Inline image payloads (base64 data URLs persisted with the message so
+    // reloads reproduce provider context) are not text tokens: providers bill
+    // images separately. Charging the raw bytes here made one screenshot read
+    // as ~230k tokens, tripping a compaction that could never retain the
+    // recent image message under any tail target — so `compact_for_budget`
+    // returned None and the turn failed with "could not drop historical
+    // messages". Count the surrounding JSON only, plus the configured
+    // per-image charge.
+    let serialized_tokens = serialized
+        .len()
+        .saturating_sub(image_data_bytes)
+        .div_ceil(4);
+    serialized_tokens.saturating_add(image_count.saturating_mul(config.estimated_image_tokens))
+}
+
+fn image_payload_stats(message: &AgentMessage) -> (usize, usize) {
+    match message {
         AgentMessage::UserWithImages { images, .. } => (
             images.iter().map(|image| image.data_url.len()).sum(),
             images.len(),
@@ -109,20 +142,7 @@ pub fn estimate_message_tokens(message: &AgentMessage, config: &CompactionParams
             images.len(),
         ),
         _ => (0usize, 0usize),
-    };
-    // Inline image payloads (base64 data URLs persisted with the message so
-    // reloads reproduce provider context) are not text tokens: providers bill
-    // images separately. Charging the raw bytes here made one screenshot read
-    // as ~230k tokens, tripping a compaction that could never retain the
-    // recent image message under any tail target — so `compact_for_budget`
-    // returned None and the turn failed with "could not drop historical
-    // messages". Count the surrounding JSON only, plus the configured
-    // per-image charge.
-    let serialized_tokens = serialized_message(message)
-        .len()
-        .saturating_sub(image_data_bytes)
-        .div_ceil(4);
-    serialized_tokens.saturating_add(image_count.saturating_mul(config.estimated_image_tokens))
+    }
 }
 
 fn estimate_context_tokens(messages: &[AgentMessage], config: &CompactionParams) -> usize {
@@ -1106,7 +1126,7 @@ mod tests {
 
         assert_eq!(compaction_summary_text(&message), Some(summary));
         assert_eq!(
-            provider_normalized_message(&message),
+            provider_normalized_message(&message).map(Cow::into_owned),
             Some(AgentMessage::User {
                 content: format!(
                     "<context-checkpoint>\n{summary}\n\n## Available context snapshots\n- ctx-1 src/lib.rs:2-4 sha256=abc123\n</context-checkpoint>"
@@ -1119,7 +1139,7 @@ mod tests {
             payload: serde_json::json!({"summary": "legacy summary"}),
         };
         assert_eq!(
-            provider_normalized_message(&legacy),
+            provider_normalized_message(&legacy).map(Cow::into_owned),
             Some(AgentMessage::User {
                 content: "<context-checkpoint>\nlegacy summary\n</context-checkpoint>".into(),
             })

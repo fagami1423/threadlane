@@ -3,6 +3,7 @@ use super::types::{
     Entry, LaneState, LaneStatus, OperationOutcome, QueuedEntry, Record, ReduceError, ReducedState,
     RetryState, ToolReplaySafety, ToolState,
 };
+use sha2::Digest;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[cfg(test)]
@@ -86,8 +87,20 @@ struct LaneAux {
     tool_by_call: HashMap<(String, String), usize>,
     /// `(run_id, assistant_entry_id, tool_index) -> index into lane.tools`.
     tool_by_ordinal: HashMap<(String, String, usize), usize>,
+    /// `sha256(serialized message) -> entry id` of the latest entry on this
+    /// lane carrying that message; used by append-side dedup lookups.
+    entry_by_message_digest: HashMap<[u8; 32], String>,
+    /// Latest assistant entry on this lane.
+    last_assistant_entry: Option<String>,
     queued_ids: HashSet<String>,
     pending_deferred: bool,
+}
+
+/// Digest of a serialized message for O(1) message-equality probes.
+/// Serialization cannot fail for `AgentMessage`; the fallback keeps the
+/// index total rather than surfacing an error.
+fn message_digest(message: &threadlane_protocol::AgentMessage) -> [u8; 32] {
+    sha2::Sha256::digest(serde_json::to_vec(message).unwrap_or_default()).into()
 }
 
 /// Streaming reducer core. Build once from full history (identical semantics
@@ -106,6 +119,12 @@ pub(crate) struct ReductionContext {
     min_step_attempt_seq: HashMap<(String, u32), u64>,
     has_v2_operation: bool,
     preferred_leaf_main: Option<String>,
+    /// `(lane, tool_call_id) -> entry id` of the latest assistant entry on
+    /// that lane declaring the call.
+    assistant_entry_by_call: HashMap<(String, String), String>,
+    /// `tool_call_id -> entry id` of the latest assistant entry declaring
+    /// the call on any lane.
+    assistant_entry_by_call_any: HashMap<String, String>,
     lanes: HashMap<String, LaneState>,
     aux: HashMap<String, LaneAux>,
 }
@@ -141,6 +160,8 @@ impl ReductionContext {
             min_step_attempt_seq: HashMap::new(),
             has_v2_operation: false,
             preferred_leaf_main: None,
+            assistant_entry_by_call: HashMap::new(),
+            assistant_entry_by_call_any: HashMap::new(),
             lanes,
             aux: HashMap::new(),
         }
@@ -160,6 +181,21 @@ impl ReductionContext {
         #[cfg(test)]
         BUILD_COUNT.with(|count| count.set(count.get() + 1));
         let mut ctx = Self::empty(fact_seed);
+        ctx.fold(entries, records, preferred_leaf)?;
+        Ok(ctx)
+    }
+
+    /// Advances the context by a newly appended slice of history. Runs the
+    /// same phases as `build` against the delta — the existing sets already
+    /// hold every previously committed id and sequence, so duplicate and
+    /// ordering checks behave exactly as they would on the full stream.
+    pub(crate) fn fold(
+        &mut self,
+        entries: &[Entry],
+        records: &[Record],
+        preferred_leaf: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), ReduceError> {
+        let ctx = self;
         for entry in entries {
             if entry.id.trim().is_empty() {
                 return Err(ReduceError::InvalidRecord("empty entry id".into()));
@@ -190,7 +226,7 @@ impl ReductionContext {
                 });
             }
         }
-        ctx.has_v2_operation = records
+        ctx.has_v2_operation |= records
             .iter()
             .any(|record| matches!(record, Record::OperationStarted { .. }));
 
@@ -236,7 +272,7 @@ impl ReductionContext {
         for ordered in ctx.lane_entries.values_mut() {
             ordered.sort_unstable_by_key(|(seq, _)| *seq);
         }
-        Ok(ctx)
+        Ok(())
     }
 
     pub(crate) fn from_store<S: SessionStore>(store: &S) -> Result<Self, ReduceError> {
@@ -350,13 +386,35 @@ impl ReductionContext {
                 }
             }
         });
-        self.edit_aux(&entry.lane, |aux| match deferred {
-            DeferredKind::AssistantDeferred => aux.pending_deferred = true,
-            DeferredKind::AssistantPlain if aux.pending_deferred => {
-                aux.pending_deferred = false;
+        let assistant_calls = match &entry.message {
+            threadlane_protocol::AgentMessage::Assistant { tool_calls, .. } => {
+                Some(tool_calls.clone().unwrap_or_default())
             }
-            _ => {}
+            _ => None,
+        };
+        let digest = message_digest(&entry.message);
+        self.edit_aux(&entry.lane, |aux| {
+            match deferred {
+                DeferredKind::AssistantDeferred => aux.pending_deferred = true,
+                DeferredKind::AssistantPlain if aux.pending_deferred => {
+                    aux.pending_deferred = false;
+                }
+                _ => {}
+            }
+            aux.entry_by_message_digest
+                .insert(digest, entry.id.clone());
+            if assistant_calls.is_some() {
+                aux.last_assistant_entry = Some(entry.id.clone());
+            }
         });
+        if let Some(calls) = assistant_calls {
+            for call in calls {
+                self.assistant_entry_by_call
+                    .insert((entry.lane.clone(), call.id.clone()), entry.id.clone());
+                self.assistant_entry_by_call_any
+                    .insert(call.id, entry.id.clone());
+            }
+        }
         self.entry_ids.insert(entry.id.clone());
         self.seen_seqs.insert(entry.seq);
         self.entry_facts
@@ -376,6 +434,57 @@ impl ReductionContext {
     /// main-lane entry append).
     pub(crate) fn set_preferred_leaf_main(&mut self, leaf: String) {
         self.preferred_leaf_main = Some(leaf);
+    }
+
+    // ── Indexed lookups ───────────────────────────────────────────────
+
+    /// Whether a `ToolStarted` intent for `(run_id, tool_call_id)` has been
+    /// committed on any lane. Equivalent to scanning committed records for a
+    /// matching intent: every committed intent inserts one tool slot, and the
+    /// only slot removal (a never-replay claim) re-inserts the same key.
+    pub(crate) fn has_tool_started(&self, run_id: &str, tool_call_id: &str) -> bool {
+        self.aux.values().any(|aux| {
+            aux.tool_by_call
+                .contains_key(&(run_id.to_owned(), tool_call_id.to_owned()))
+        })
+    }
+
+    /// Latest entry id on `lane` whose serialized message matches `message`.
+    pub(crate) fn entry_id_by_message(
+        &self,
+        lane: &str,
+        message: &threadlane_protocol::AgentMessage,
+    ) -> Option<&str> {
+        self.aux
+            .get(lane)
+            .and_then(|aux| aux.entry_by_message_digest.get(&message_digest(message)))
+            .map(String::as_str)
+    }
+
+    /// Latest assistant entry id declaring `tool_call_id`, scoped to `lane`
+    /// when given or across all lanes when `None`.
+    pub(crate) fn assistant_entry_for_call(
+        &self,
+        lane: Option<&str>,
+        tool_call_id: &str,
+    ) -> Option<&str> {
+        match lane {
+            Some(lane) => self
+                .assistant_entry_by_call
+                .get(&(lane.to_owned(), tool_call_id.to_owned()))
+                .map(String::as_str),
+            None => self
+                .assistant_entry_by_call_any
+                .get(tool_call_id)
+                .map(String::as_str),
+        }
+    }
+
+    /// Latest assistant entry id on `lane`.
+    pub(crate) fn last_assistant_entry_id(&self, lane: &str) -> Option<&str> {
+        self.aux
+            .get(lane)
+            .and_then(|aux| aux.last_assistant_entry.as_deref())
     }
 
     // ── Records ───────────────────────────────────────────────────────

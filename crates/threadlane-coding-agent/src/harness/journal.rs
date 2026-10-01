@@ -53,10 +53,8 @@ impl CodingSessionHarness {
                     };
                     let existing = journal
                         .store
-                        .entries()
-                        .iter()
-                        .rev()
-                        .find(|entry| entry.lane == lane && entry.message == thinking)
+                        .store()
+                        .find_entry_by_message(lane, &thinking)
                         .map(|entry| entry.id.clone());
                     Some(match existing {
                         Some(id) => id,
@@ -67,10 +65,8 @@ impl CodingSessionHarness {
                 };
                 let existing = journal
                     .store
-                    .entries()
-                    .iter()
-                    .rev()
-                    .find(|entry| entry.lane == lane && entry.message == message)
+                    .store()
+                    .find_entry_by_message(lane, &message)
                     .map(|entry| entry.id.clone());
                 let entry_id = match existing {
                     Some(id) => id,
@@ -291,16 +287,10 @@ impl CodingSessionHarness {
             ..
         } = &event
         {
-            let has_intent = journal.store.records().iter().any(|record| {
-                matches!(
-                    record,
-                    HarnessRecord::ToolStarted {
-                        run_id: intent_run_id,
-                        tool_call_id: intent_call_id,
-                        ..
-                    } if intent_run_id == run_id && intent_call_id == tool_call_id
-                )
-            });
+            let has_intent = journal
+                .store
+                .store()
+                .has_tool_started(run_id, tool_call_id);
             if !has_intent {
                 let effective_args = serde_json::from_str(effective_arguments)
                     .unwrap_or_else(|_| Value::String(effective_arguments.clone()));

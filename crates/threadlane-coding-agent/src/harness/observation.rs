@@ -79,12 +79,7 @@ impl CodingSessionHarness {
                     // ToolStarted may be durable while its result entry is
                     // not, if the process was interrupted between those
                     // writes. Recreate the entry before closing the intent.
-                    if !self
-                        .store
-                        .entries()
-                        .iter()
-                        .any(|entry| entry.id == result_entry_id)
-                    {
+                    if self.store.entry(&result_entry_id).is_none() {
                         self.append_synced_message(msg.clone())?;
                     }
                     self.finish_tool_message(&run_id, msg)?;

@@ -173,15 +173,14 @@ impl CodingSessionHarness {
         let seq_hint = self.next_seq();
         let entry_id =
             result_entry_id.unwrap_or_else(|| format!("abort-entry-{run_id}-{seq_hint}"));
-        let has_abort_entry = self.store.entries().iter().any(|entry| {
-            entry.id == entry_id
-                && matches!(
-                    &entry.message,
-                    AgentMessage::Assistant {
-                        stop_reason: Some(reason),
-                        ..
-                    } if reason == "aborted"
-                )
+        let has_abort_entry = self.store.entry(&entry_id).is_some_and(|entry| {
+            matches!(
+                &entry.message,
+                AgentMessage::Assistant {
+                    stop_reason: Some(reason),
+                    ..
+                } if reason == "aborted"
+            )
         });
         if !had_result_entry && !has_abort_entry {
             let attempt_seq = self.next_seq();

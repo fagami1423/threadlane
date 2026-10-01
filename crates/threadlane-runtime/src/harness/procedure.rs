@@ -203,9 +203,7 @@ impl AssistantAttemptProcedure {
     ) -> Result<(), ProcedureError> {
         let lane = open_lane(store, run_id)?;
         let entry = store
-            .entries()
-            .iter()
-            .find(|entry| entry.id == result_entry_id)
+            .entry(result_entry_id)
             .ok_or_else(|| ProcedureError::Invalid("assistant result does not exist".into()))?;
         if !matches!(entry.message, AgentMessage::Assistant { .. }) {
             return Err(ProcedureError::Invalid(
@@ -313,11 +311,7 @@ impl OperationProcedure {
             )));
         }
         if let Some(source_leaf_id) = &source_leaf_id {
-            if !store
-                .entries()
-                .iter()
-                .any(|entry| &entry.id == source_leaf_id)
-            {
+            if store.entry(source_leaf_id).is_none() {
                 return Err(ProcedureError::Invalid("source leaf does not exist".into()));
             }
         }
@@ -506,11 +500,7 @@ impl NoToolRun {
         {
             return Err(ProcedureError::Invalid("operation is not open".into()));
         }
-        if !store
-            .entries()
-            .iter()
-            .any(|entry| entry.id == target_leaf_id)
-        {
+        if store.entry(target_leaf_id).is_none() {
             return Err(ProcedureError::Invalid("target leaf does not exist".into()));
         }
         let moved = store.records().iter().any(|record| {
@@ -556,7 +546,7 @@ impl NoToolRun {
                 })?;
                 seq += 1;
             }
-            if !store.entries().iter().any(|entry| entry.id == summary_id) {
+            if store.entry(&summary_id).is_none() {
                 effects.park(EffectAction::AppendEntry {
                     entry: Entry {
                         id: summary_id,
@@ -656,11 +646,7 @@ impl NavigationProcedure {
         if lane.open_operation.is_some() {
             return Err(ProcedureError::Invalid(format!("lane {lane_name} is busy")));
         }
-        if !store
-            .entries()
-            .iter()
-            .any(|entry| entry.id == target_leaf_id)
-        {
+        if store.entry(target_leaf_id).is_none() {
             return Err(ProcedureError::Invalid("target leaf does not exist".into()));
         }
         let first_seq = next_seq_with_effects(store, effects);

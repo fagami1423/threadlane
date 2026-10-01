@@ -329,11 +329,10 @@ impl CodingSessionHarness {
     ) -> Result<(), String> {
         self.ensure_fresh()?;
         let prompt_entry_id = format!("entry-{run_id}-user");
-        if !self
+        if self
             .store
-            .entries()
-            .iter()
-            .any(|entry| entry.id == prompt_entry_id && entry.lane == lane)
+            .entry(&prompt_entry_id)
+            .is_none_or(|entry| entry.lane != lane)
         {
             return Err(format!("Missing accepted subagent task for lane {lane}"));
         }
@@ -383,11 +382,7 @@ impl CodingSessionHarness {
                     for tool in &l.tools {
                         if !tool.completed
                             && tool.run_id == run_id
-                            && !self
-                                .store
-                                .entries()
-                                .iter()
-                                .any(|entry| entry.id == tool.result_entry_id)
+                            && self.store.entry(&tool.result_entry_id).is_none()
                         {
                             self.append_message_to_lane(
                                 &l.name,
