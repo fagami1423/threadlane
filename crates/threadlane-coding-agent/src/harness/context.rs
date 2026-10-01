@@ -2,6 +2,12 @@ use super::*;
 
 const KEEP_RECENT_READS: usize = 3;
 
+/// Prefix of the reference text a duplicate read carries; the call id that
+/// follows it names the earlier result whose body must stay inline for the
+/// pointer to resolve.
+pub(super) const UNCHANGED_READ_REFERENCE_PREFIX: &str =
+    "[Unchanged read; full content remains in earlier tool result ";
+
 /// Request-only reduction. The first visible copy of a recent read stays
 /// inline; duplicate results point to it. Older reads are evictable only while
 /// their snapshot is fresh and the request exposes manage_context.
@@ -55,7 +61,7 @@ fn reduce_read_context_with_digests(
         let AgentMessage::Tool { content, .. } = message else { unreachable!() };
         let snapshot_key = key(snapshot);
         let replacement = if let Some(first_call) = visible.get(&snapshot_key) {
-            Some(format!("[Unchanged read; full content remains in earlier tool result {first_call}. Do not repeat this read without changed arguments or file contents.]"))
+            Some(format!("{UNCHANGED_READ_REFERENCE_PREFIX}{first_call}. Do not repeat this read without changed arguments or file contents.]"))
         } else if can_load && !recent.contains(&snapshot_key) {
             let digest = current_digests.get(&snapshot.path);
             if digest.map(String::as_str) == Some(snapshot.file_sha256.as_str()) {

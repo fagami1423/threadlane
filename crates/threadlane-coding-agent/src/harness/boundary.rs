@@ -173,9 +173,22 @@ impl CodingSessionHarness {
         // recovery.
         if !request.overflow_recovery {
             const KEEP_RECENT_TOOL_TURNS: usize = 3;
-            let pruned = threadlane_compaction::prune_historical_tool_outputs(
+            // Results an unchanged-read reference points at stay verbatim:
+            // the reference promises the earlier body is inline, and a
+            // preview would leave it pointing at an excerpt.
+            let anchored_calls: std::collections::HashSet<&str> = visible
+                .iter()
+                .filter_map(|message| match message {
+                    AgentMessage::Tool { content, .. } => content
+                        .strip_prefix(super::context::UNCHANGED_READ_REFERENCE_PREFIX)
+                        .and_then(|rest| rest.split('.').next()),
+                    _ => None,
+                })
+                .collect();
+            let pruned = threadlane_compaction::prune_historical_tool_outputs_preserving(
                 &visible,
                 KEEP_RECENT_TOOL_TURNS,
+                &anchored_calls,
             );
             let pruned_tokens = estimate_request_tokens(
                 &pruned,

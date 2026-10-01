@@ -14,6 +14,7 @@ use threadlane_protocol::ImageAttachment;
 
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 // Checkpoint text helpers live in `threadlane-provider` (payload translation
 // needs them); re-exported here so existing paths keep working.
@@ -518,6 +519,19 @@ pub fn prune_historical_tool_outputs(
     messages: &[AgentMessage],
     keep_recent_tool_turns: usize,
 ) -> Vec<AgentMessage> {
+    prune_historical_tool_outputs_preserving(messages, keep_recent_tool_turns, &HashSet::new())
+}
+
+/// Same squeeze as [`prune_historical_tool_outputs`], except tool results whose
+/// `tool_call_id` appears in `preserve_call_ids` always stay verbatim. Requests
+/// may carry earlier messages that reference those results by call id (e.g.
+/// "full content remains in earlier tool result X"), and previewing the anchor
+/// would leave the pointer pointing at an excerpt.
+pub fn prune_historical_tool_outputs_preserving(
+    messages: &[AgentMessage],
+    keep_recent_tool_turns: usize,
+    preserve_call_ids: &HashSet<&str>,
+) -> Vec<AgentMessage> {
     const USER_IMAGE_KEEP_RECENT: usize = 1;
     let mut tool_seen_count = 0;
     let mut user_image_seen_count = 0;
@@ -525,9 +539,11 @@ pub fn prune_historical_tool_outputs(
 
     let mut keep_full = vec![false; messages.len()];
     for (i, msg) in messages.iter().enumerate().rev() {
-        if matches!(msg, AgentMessage::Tool { .. }) {
+        if let AgentMessage::Tool { tool_call_id, .. } = msg {
             tool_seen_count += 1;
-            if tool_seen_count <= keep_recent_tool_turns {
+            if tool_seen_count <= keep_recent_tool_turns
+                || preserve_call_ids.contains(tool_call_id.as_str())
+            {
                 keep_full[i] = true;
             }
         } else if matches!(
@@ -1489,6 +1505,48 @@ mod tests {
         }
         // The one kept-recent tool turn stays verbatim regardless of size.
         assert_eq!(contents[5], "🔥".repeat(3_000));
+    }
+
+    #[test]
+    fn prune_historical_tool_outputs_preserving_keeps_referenced_anchors() {
+        let mut msgs = vec![AgentMessage::User {
+            content: "prompt".into(),
+        }];
+        for i in 0..6 {
+            msgs.push(AgentMessage::Assistant {
+                content: None,
+                tool_calls: None,
+                stop_reason: None,
+                deferred_handle: None,
+            });
+            msgs.push(AgentMessage::Tool {
+                tool_call_id: format!("call_{i}"),
+                name: "read_file".into(),
+                content: "a".repeat(5_000),
+                is_error: false,
+                terminate: false,
+                images: Vec::new(),
+            });
+        }
+
+        let mut preserve = HashSet::new();
+        preserve.insert("call_1");
+        let pruned = prune_historical_tool_outputs_preserving(&msgs, 1, &preserve);
+        let contents: Vec<&str> = pruned
+            .iter()
+            .filter_map(|message| match message {
+                AgentMessage::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(contents.len(), 6);
+        assert!(contents[0].contains("characters pruned from the middle"));
+        // The referenced anchor stays full even though it is aged.
+        assert_eq!(contents[1], "a".repeat(5_000));
+        for content in &contents[2..5] {
+            assert!(content.contains("characters pruned from the middle"));
+        }
+        assert_eq!(contents[5], "a".repeat(5_000));
     }
 
     #[test]
