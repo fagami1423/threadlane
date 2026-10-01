@@ -112,6 +112,17 @@ fn model_picker_search_commits_the_highlighted_row(cx: &mut gpui::TestAppContext
     model.read_with(cx, |state, _| {
         assert_eq!(state.selected_model, "antigravity/gemini-3");
     });
+
+    // The kit dedupes commits by IndexPath, so the retained selection must
+    // reset: a different row at the same filtered index still commits.
+    open_model_picker(&chat, cx);
+    cx.simulate_input("gpt");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    model.read_with(cx, |state, _| {
+        assert_eq!(state.selected_model, "gpt-5");
+    });
 }
 
 #[gpui::test]

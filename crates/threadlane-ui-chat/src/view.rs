@@ -5449,11 +5449,19 @@ impl ChatListView {
             self.model_picker_subscription = Some(cx.subscribe_in(
                 &picker_state,
                 window,
-                |this, _state, event, window, cx| match event {
+                |this, picker, event, window, cx| match event {
                     ComboboxEvent::Change(values) => {
                         if let Some(value) = values.first().cloned() {
                             this.commit_model_picker_choice(value, window, cx);
                         }
+                        // The kit detects a selection change by comparing
+                        // IndexPaths, not values: a kept selection at
+                        // {section, row} would suppress the next commit at
+                        // the same filtered index. Rows are actions, so the
+                        // selection resets after every commit.
+                        picker.update(cx, |picker, cx| {
+                            picker.set_selected_indices(Vec::new(), window, cx);
+                        });
                     }
                     ComboboxEvent::Confirm(_) => {}
                 },
@@ -5472,6 +5480,7 @@ impl ChatListView {
             if let Some(picker_state) = self.model_picker.as_ref() {
                 picker_state.update(cx, |picker, cx| {
                     picker.set_items(delegate, window, cx);
+                    picker.set_selected_indices(Vec::new(), window, cx);
                     if !picker.query(cx).is_empty() {
                         picker.set_query("", window, cx);
                     }
@@ -5519,6 +5528,9 @@ impl ChatListView {
                     picker_open_flag.set(trigger.is_open());
                     let button = Button::new("composer-model-picker")
                         .debug_selector(|| "composer-model-picker".into())
+                        // Visual only — the combobox's own trigger owns
+                        // focus and activation.
+                        .tab_stop(false)
                         .small()
                         .label(model_label_for_trigger.clone())
                         .accessibility_label(format!("Model: {model_label_for_trigger}"))
