@@ -1,0 +1,12 @@
+[package]
+name = "threadlane-ui-session"
+version = "0.1.0"
+edition = "2021"
+description = "Shared desktop and iOS session navigation, transcript and composer components"
+
+[dependencies]
+gpui.workspace = true
+gpui-component.workspace = true
+gpui-kit-assets.workspace = true
+threadlane-protocol.workspace = true
+threadlane-ui-theme.workspace = true

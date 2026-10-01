@@ -9,6 +9,7 @@ pub mod live;
 pub mod messages;
 pub mod orchestration;
 pub mod repo;
+pub mod projection;
 pub mod tool;
 
 pub use acp::{

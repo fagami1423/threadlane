@@ -38,58 +38,7 @@ pub struct UiChatMessage {
     pub reasoning_content: Option<String>,
 }
 
-pub fn tool_activity_summary(name: &str, arguments: &str) -> String {
-    let display_name = name.replace('_', " ");
-    let Ok(args_val) = serde_json::from_str::<serde_json::Value>(arguments) else {
-        return display_name;
-    };
-    let context = [
-        "path",
-        "file_path",
-        "FilePath",
-        "TargetFile",
-        "command",
-        "CommandLine",
-        "query",
-        "Query",
-        "regex",
-        "glob",
-        "pattern",
-        "Pattern",
-        "prompt",
-        "Prompt",
-        "description",
-        "Description",
-    ]
-    .iter()
-    .find_map(|key| args_val.get(key).and_then(|v| v.as_str()));
-
-    if let Some(ctx) = context {
-        let trimmed = ctx.trim();
-        if !trimmed.is_empty() {
-            let first_line = trimmed.lines().next().unwrap_or(trimmed).trim();
-            let has_more_lines = trimmed.lines().nth(1).is_some();
-            let mut summary_ctx = first_line.to_string();
-            if has_more_lines && !summary_ctx.ends_with('…') && !summary_ctx.ends_with("...") {
-                summary_ctx.push_str(" …");
-            }
-            return format!("{display_name}: {summary_ctx}");
-        }
-    }
-    display_name
-}
-
-pub fn tool_activity_display_summary(summary: &str) -> String {
-    let first_line = summary.lines().next().unwrap_or(summary).trim();
-    if summary.lines().nth(1).is_some()
-        && !first_line.ends_with('…')
-        && !first_line.ends_with("...")
-    {
-        format!("{first_line} …")
-    } else {
-        first_line.to_string()
-    }
-}
+pub use threadlane_protocol::projection::{tool_activity_summary, tool_activity_display_summary};
 
 /// Projects a sequence of [`AgentMessage`]s into canonical [`UiChatMessage`]s.
 pub fn project_chat_messages(agent_messages: &[AgentMessage]) -> Vec<UiChatMessage> {

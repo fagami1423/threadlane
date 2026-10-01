@@ -31,23 +31,17 @@ gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "201b55a431fb
 ] }
 
 # The wire contract shared with the desktop daemon — data types only.
+threadlane-client = { path = "../../crates/threadlane-client", default-features = false }
 threadlane-protocol = { path = "../../crates/threadlane-protocol" }
 # The shared desktop visual language (theme registry, tokens, vendored
 # icons). Its gpui-component / gpui-kit-assets deps ride the same gpui-kit
 # rev pinned below so the whole graph stays on one gpui-pre.
+threadlane-ui-session = { path = "../../crates/threadlane-ui-session" }
 threadlane-ui-theme = { path = "../../crates/threadlane-ui-theme" }
 gpui-component = { git = "https://github.com/longbridge/gpui-kit", rev = "201b55a431fb1b82a6047e908de63913db3d4354", default-features = false }
 gpui-kit-assets = { git = "https://github.com/longbridge/gpui-kit", rev = "201b55a431fb1b82a6047e908de63913db3d4354" }
 
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-futures = "0.3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
-# Plain ws:// only: pairing traffic is LAN bearer-token transport; the
-# daemon refuses non-loopback listeners without a token.
-tokio-tungstenite = { version = "0.30", default-features = false, features = [
-    "connect",
-] }
 log = "0.4"
 url = "2"
 

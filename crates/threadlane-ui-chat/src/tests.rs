@@ -1413,9 +1413,9 @@ fn queue_filter_transitions_keep_retained_list_in_sync(cx: &mut gpui::TestAppCon
             for generating in [false, true, false] {
                 chat.sync_transcript_rows(messages.clone(), generating, false);
                 let expected = build_transcript_rows(&messages, generating);
-                assert_eq!(chat.transcript_rows, expected);
+                assert_eq!(chat.transcript.rows, expected);
                 assert_eq!(
-                    chat.transcript_list_state.item_count(),
+                    chat.transcript.list.item_count(),
                     expected.len(),
                     "queue size {queued_count}, generating {generating}"
                 );
@@ -1909,7 +1909,7 @@ fn reading_history_survives_new_activity_and_jump_resumes_following(cx: &mut gpu
     cx.run_until_parked();
     chat.update(cx, |chat, cx| {
         chat.initial_scroll_frames = 0;
-        chat.transcript_list_state.scroll_to(gpui::ListOffset {
+        chat.transcript.list.scroll_to(gpui::ListOffset {
             item_ix: 10,
             offset_in_item: gpui::px(0.),
         });
@@ -1917,7 +1917,7 @@ fn reading_history_survives_new_activity_and_jump_resumes_following(cx: &mut gpu
     });
     cx.run_until_parked();
     let before = chat.read_with(cx, |chat, _| {
-        chat.transcript_list_state.logical_scroll_top()
+        chat.transcript.list.logical_scroll_top()
     });
     retained_model.update(cx, |state, cx| {
         let mut next = state.messages.last().unwrap().clone();
@@ -1927,8 +1927,8 @@ fn reading_history_survives_new_activity_and_jump_resumes_following(cx: &mut gpu
     });
     cx.run_until_parked();
     chat.read_with(cx, |chat, _| {
-        assert!(!chat.transcript_list_state.is_following_tail());
-        let after = chat.transcript_list_state.logical_scroll_top();
+        assert!(!chat.transcript.list.is_following_tail());
+        let after = chat.transcript.list.logical_scroll_top();
         assert_eq!(after.item_ix, before.item_ix);
         assert_eq!(after.offset_in_item, before.offset_in_item);
     });
@@ -1939,7 +1939,7 @@ fn reading_history_survives_new_activity_and_jump_resumes_following(cx: &mut gpu
     cx.simulate_click(jump.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     chat.read_with(cx, |chat, _| {
-        assert!(chat.transcript_list_state.is_following_tail())
+        assert!(chat.transcript.list.is_following_tail())
     });
 }
 
@@ -2097,11 +2097,11 @@ fn completed_activity_disclosure_renders_interactive_tool_rows(cx: &mut gpui::Te
     cx.run_until_parked();
     chat.update(cx, |chat, cx| {
         chat.initial_scroll_frames = 0;
-        chat.transcript_list_state.scroll_to(gpui::ListOffset { item_ix: 20, offset_in_item: gpui::px(0.) });
+        chat.transcript.list.scroll_to(gpui::ListOffset { item_ix: 20, offset_in_item: gpui::px(0.) });
         cx.notify();
     });
     cx.run_until_parked();
-    let before = chat.read_with(cx, |chat, _| chat.transcript_list_state.logical_scroll_top());
+    let before = chat.read_with(cx, |chat, _| chat.transcript.list.logical_scroll_top());
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let disclosure = cx.debug_bounds("activity-group-disclosure").expect("completed group has a disclosure");
     cx.simulate_click(disclosure.center(), gpui::Modifiers::default());
@@ -2109,7 +2109,7 @@ fn completed_activity_disclosure_renders_interactive_tool_rows(cx: &mut gpui::Te
     cx.update(|window, cx| window.draw(cx).clear(cx));
     chat.read_with(cx, |chat, _| {
         assert_eq!(chat.expanded_activity_groups.len(), 1);
-        let after = chat.transcript_list_state.logical_scroll_top();
+        let after = chat.transcript.list.logical_scroll_top();
         assert_eq!((after.item_ix, after.offset_in_item), (before.item_ix, before.offset_in_item));
     });
     let tool = cx.debug_bounds("tool-activity-disclosure").expect("expanded group exposes tool");
@@ -2118,8 +2118,8 @@ fn completed_activity_disclosure_renders_interactive_tool_rows(cx: &mut gpui::Te
     cx.update(|window, cx| window.draw(cx).clear(cx));
     chat.read_with(cx, |chat, cx| {
         assert!(chat.model.read(cx).messages.iter().flat_map(|message| &message.tool_activities).any(|activity| activity.id == "read-file" && activity.is_expanded));
-        assert!(!chat.transcript_list_state.is_following_tail());
-        let after = chat.transcript_list_state.logical_scroll_top();
+        assert!(!chat.transcript.list.is_following_tail());
+        let after = chat.transcript.list.logical_scroll_top();
         assert_eq!((after.item_ix, after.offset_in_item), (before.item_ix, before.offset_in_item));
     });
 
@@ -2177,8 +2177,8 @@ fn command_card_keeps_command_visible_and_bounds_output(cx: &mut gpui::TestAppCo
     let chat = holder.borrow().as_ref().unwrap().clone();
     chat.update(cx, |chat, cx| {
         chat.initial_scroll_frames = 0;
-        chat.transcript_list_state.pause_following_tail();
-        chat.transcript_list_state.scroll_to(gpui::ListOffset {
+        chat.transcript.list.pause_following_tail();
+        chat.transcript.list.scroll_to(gpui::ListOffset {
             item_ix: 0,
             offset_in_item: gpui::px(0.),
         });
@@ -2198,7 +2198,7 @@ fn command_card_keeps_command_visible_and_bounds_output(cx: &mut gpui::TestAppCo
     );
     let content_before = cx.debug_bounds("command-output-content").unwrap();
     let chat_before = chat.read_with(cx, |chat, _| {
-        chat.transcript_list_state.logical_scroll_top()
+        chat.transcript.list.logical_scroll_top()
     });
     for delta in [-40., -10000., -40., 10000., 40.] {
         cx.simulate_event(gpui::ScrollWheelEvent {
@@ -2216,7 +2216,7 @@ fn command_card_keeps_command_visible_and_bounds_output(cx: &mut gpui::TestAppCo
             );
         }
         let after = chat.read_with(cx, |chat, _| {
-            chat.transcript_list_state.logical_scroll_top()
+            chat.transcript.list.logical_scroll_top()
         });
         assert_eq!(
             (after.item_ix, after.offset_in_item),
@@ -2374,7 +2374,7 @@ fn reasoning_disclosure_supports_keyboard_and_pauses_following(cx: &mut gpui::Te
     cx.run_until_parked();
     chat.update(cx, |chat, cx| {
         chat.initial_scroll_frames = 0;
-        chat.transcript_list_state.scroll_to(gpui::ListOffset { item_ix: 0, offset_in_item: gpui::px(0.) });
+        chat.transcript.list.scroll_to(gpui::ListOffset { item_ix: 0, offset_in_item: gpui::px(0.) });
         cx.notify();
     });
     cx.run_until_parked();
@@ -2384,7 +2384,7 @@ fn reasoning_disclosure_supports_keyboard_and_pauses_following(cx: &mut gpui::Te
     cx.run_until_parked();
     chat.read_with(cx, |chat, cx| {
         assert!(chat.model.read(cx).messages[0].reasoning_expanded);
-        assert!(!chat.transcript_list_state.is_following_tail());
+        assert!(!chat.transcript.list.is_following_tail());
     });
     cx.update(|window, cx| {
         window.blur(cx);
@@ -3629,8 +3629,8 @@ fn conversation_find_keyboard_offscreen_streaming_and_close(cx: &mut gpui::TestA
             chat.find_generation
         );
         assert_eq!(chat.find_selected.as_deref(), Some("m4"));
-        assert!(!chat.transcript_list_state.is_following_tail());
-        assert!(chat.transcript_list_state.logical_scroll_top().item_ix <= 4);
+        assert!(!chat.transcript.list.is_following_tail());
+        assert!(chat.transcript.list.logical_scroll_top().item_ix <= 4);
     });
     cx.simulate_keystrokes("shift-enter");
     cx.run_until_parked();
@@ -3639,7 +3639,7 @@ fn conversation_find_keyboard_offscreen_streaming_and_close(cx: &mut gpui::TestA
         Some("m150".into())
     );
     let before = chat.read_with(cx, |chat, _| {
-        chat.transcript_list_state.logical_scroll_top()
+        chat.transcript.list.logical_scroll_top()
     });
     retained.update(cx, |state, cx| {
         std::sync::Arc::make_mut(&mut state.messages)[199]
@@ -3654,11 +3654,11 @@ fn conversation_find_keyboard_offscreen_streaming_and_close(cx: &mut gpui::TestA
     chat.read_with(cx, |chat, _| {
         assert_eq!(chat.find_selected.as_deref(), Some("m150"));
         assert_eq!(
-            chat.transcript_list_state.logical_scroll_top().item_ix,
+            chat.transcript.list.logical_scroll_top().item_ix,
             before.item_ix
         );
         assert_eq!(
-            chat.transcript_list_state
+            chat.transcript.list
                 .logical_scroll_top()
                 .offset_in_item,
             before.offset_in_item
@@ -3803,7 +3803,7 @@ fn conversation_find_keyboard_offscreen_streaming_and_close(cx: &mut gpui::TestA
     chat.read_with(cx, |chat, _| {
         assert!(chat.find_selected.is_none());
         assert_eq!(
-            chat.transcript_list_state.logical_scroll_top().item_ix,
+            chat.transcript.list.logical_scroll_top().item_ix,
             before.item_ix,
             "hydration must not reset a find reader to the streaming tail"
         );
@@ -3821,11 +3821,11 @@ fn conversation_find_keyboard_offscreen_streaming_and_close(cx: &mut gpui::TestA
                 .focus_handle(cx)
                 .is_focused(window));
             assert_eq!(
-                chat.transcript_list_state.logical_scroll_top().item_ix,
+                chat.transcript.list.logical_scroll_top().item_ix,
                 before.item_ix
             );
             assert_eq!(
-                chat.transcript_list_state
+                chat.transcript.list
                     .logical_scroll_top()
                     .offset_in_item,
                 before.offset_in_item
@@ -4089,7 +4089,7 @@ fn conversation_find_same_count_row_replacement_is_reachable(cx: &mut gpui::Test
             let mut after = before;
             after[0].content = "answer needle".into();
             chat.sync_transcript_rows(after.into(), true, false);
-            assert_eq!(chat.transcript_rows[0], TranscriptRow::Message(0));
+            assert_eq!(chat.transcript.rows[0], TranscriptRow::Message(0));
         });
         gpui_component::Root::new(chat, window, cx)
     });
@@ -4869,8 +4869,8 @@ fn prompt_rail_reveals_unmeasured_active_tick(cx: &mut gpui::TestAppContext) {
 
     chat.update(cx, |chat, cx| {
         chat.initial_scroll_frames = 0;
-        chat.transcript_list_state.pause_following_tail();
-        chat.transcript_list_state.scroll_to(gpui::ListOffset {
+        chat.transcript.list.pause_following_tail();
+        chat.transcript.list.scroll_to(gpui::ListOffset {
             item_ix: 0,
             offset_in_item: gpui::px(0.),
         });
@@ -4932,8 +4932,8 @@ fn conversation_outline_focuses_and_jumps_to_prompts(cx: &mut gpui::TestAppConte
     chat.read_with(cx, |chat, cx| {
         assert_eq!(chat.outline_selected_id.as_deref(), Some("u1"));
         assert_eq!(chat.prompt_rail_active_id.as_deref(), Some("u1"));
-        assert!(!chat.transcript_list_state.is_following_tail());
-        assert_eq!(chat.transcript_list_state.logical_scroll_top().item_ix, 0);
+        assert!(!chat.transcript.list.is_following_tail());
+        assert_eq!(chat.transcript.list.logical_scroll_top().item_ix, 0);
         assert_eq!(chat.input_state.read(cx).value().as_ref(), "");
     });
     let latest = cx.debug_bounds("jump-to-latest").expect("return to latest");
@@ -4957,7 +4957,7 @@ fn conversation_outline_focuses_and_jumps_to_prompts(cx: &mut gpui::TestAppConte
     cx.simulate_keystrokes("up");
     chat.read_with(cx, |chat, _| {
         assert_eq!(chat.outline_focus_id.as_deref(), Some("u2"));
-        assert!(chat.transcript_list_state.is_following_tail(), "focus alone never scrolls");
+        assert!(chat.transcript.list.is_following_tail(), "focus alone never scrolls");
     });
     cx.simulate_keystrokes("home");
     chat.read_with(cx, |chat, _| {
@@ -4968,7 +4968,7 @@ fn conversation_outline_focuses_and_jumps_to_prompts(cx: &mut gpui::TestAppConte
     chat.read_with(cx, |chat, _| {
         assert!(!chat.outline_open, "jump closes the outline");
         assert_eq!(chat.outline_selected_id.as_deref(), Some("u1"));
-        assert!(!chat.transcript_list_state.is_following_tail(), "the jump pauses tail following");
+        assert!(!chat.transcript.list.is_following_tail(), "the jump pauses tail following");
     });
 
     // Reopening prefers the last jumped-to prompt when it is still listed.

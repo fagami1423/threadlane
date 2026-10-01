@@ -48,6 +48,7 @@ threadlane-ui-pairing = { version = "0.1.0", path = "crates/threadlane-ui-pairin
 threadlane-ui-right-panel = { version = "0.1.0", path = "crates/threadlane-ui-right-panel" }
 threadlane-ui-settings = { version = "0.1.0", path = "crates/threadlane-ui-settings" }
 threadlane-ui-sidebar = { version = "0.1.0", path = "crates/threadlane-ui-sidebar" }
+threadlane-ui-session = { version = "0.1.0", path = "crates/threadlane-ui-session" }
 threadlane-ui-state = { version = "0.1.0", path = "crates/threadlane-ui-state" }
 threadlane-ui-terminal = { version = "0.1.0", path = "crates/threadlane-ui-terminal" }
 threadlane-ui-theme = { version = "0.1.0", path = "crates/threadlane-ui-theme" }

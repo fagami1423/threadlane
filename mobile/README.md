@@ -1,9 +1,16 @@
 # Threadlane mobile client (iOS)
 
 A thin GPUI client (gpui-mobile + gpui-kit) that connects to the Threadlane
-desktop app and monitors sessions live over the daemon's WebSocket
-contract. Read-mostly: watch transcripts stream, see tool activity, and
-answer permission prompts; it is not a control surface.
+desktop app over the shared daemon WebSocket contract. Browse projects and
+Git summaries, search chats, start a chat, stream transcripts, send or queue
+messages, and answer permission and question prompts. The composer offers
+models from the desktop catalog, supported reasoning efforts, and Agent/Fusion
+mode. Session options include refresh, new chat in the project, and archive.
+
+New chats begin as drafts and persist on the first accepted prompt. New-chat
+creation and composer options require desktop protocol version 4 or newer;
+older desktops show an update message. Fusion mode follows the desktop's
+project setting.
 
 ## Pairing
 
@@ -20,10 +27,10 @@ answer permission prompts; it is not a control surface.
 ## Layout
 
 - `rust/` — `threadlane-mobile` crate: `staticlib` + `rlib`, its own
-  Cargo workspace (the desktop workspace pins `gpui-pre` 0.3.3 while
-  gpui-mobile requires `=0.3.4`). `client.rs` is a minimal WS driver
-  (reconnect + `?since=` replay, bearer auth); `app.rs` holds the
-  connect/session-list/transcript views.
+  Cargo workspace using the same GPUI 0.3.7 API as desktop. `client.rs`
+  adapts the shared `threadlane-client` transport to the iOS executor;
+  `app.rs` owns pairing and mobile navigation. Shared state, session cards,
+  transcripts, and composer surfaces live in the client and UI leaf crates.
 - `ios/` — XcodeGen container: `App.swift` embeds the GPUI surface and
   forwards deep links; `project.yml` builds `libthreadlane_mobile.a` in
   a pre-build script.

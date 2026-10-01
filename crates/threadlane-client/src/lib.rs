@@ -18,11 +18,15 @@
 //! `subscribe()` receiver collapses every transport into one ordered
 //! `SessionEvent` stream so views never learn which side they are on.
 
+#[cfg(feature = "local")]
 mod local;
 mod remote;
 
+#[cfg(feature = "local")]
 pub use local::LocalDaemon;
-pub use remote::RemoteDaemon;
+mod state;
+pub use state::{ClientState, ComposerDraft};
+pub use remote::{RemoteDaemon, ConnectionState};
 
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicU64, Ordering};
