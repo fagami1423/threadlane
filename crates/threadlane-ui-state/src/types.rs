@@ -24,12 +24,15 @@ pub enum RequestedEditorTarget {
 /// disturbing already-typed input. `session_id` scopes the insert: `None`
 /// applies to whatever composer is on screen, `Some` is held until that
 /// session is active so a reply for one session never lands in another's
-/// draft.
+/// draft. `work_dir` carries the project the session belongs to — drafts
+/// key on `(work_dir, session_id)`, so a scoped insert only applies when
+/// both match, never to a same-named session in another project.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequestedComposerInsert {
     pub text: String,
     pub images: Vec<ImageAttachment>,
     pub session_id: Option<String>,
+    pub work_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

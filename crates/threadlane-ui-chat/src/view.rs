@@ -591,13 +591,15 @@ impl ChatListView {
             // without disturbing already-typed input or staged attachments.
             // Session-scoped inserts wait for their session to be active.
             let inserts = model.update(cx, |state, _cx| {
-                let active = state.active_session_id.clone();
+                let active_session = state.active_session_id.clone();
+                let active_work_dir = state.active_work_dir.clone();
                 let (ready, waiting): (Vec<_>, Vec<_>) =
                     std::mem::take(&mut state.requested_composer_inserts)
                         .into_iter()
                         .partition(|insert| {
-                            insert.session_id.as_deref().is_none()
-                                || insert.session_id.as_deref() == active.as_deref()
+                            insert.session_id.is_none()
+                                || (insert.session_id == active_session
+                                    && insert.work_dir == active_work_dir)
                         });
                 state.requested_composer_inserts = waiting;
                 ready
