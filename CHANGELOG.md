@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.1.37](https://github.com/wheregmis/threadlane/compare/v0.1.36...v0.1.37) (2026-10-01)
+
+
+### Bug Fixes
+
+* **harness:** reproject main leaf on first OperationStarted ([a91eb34](https://github.com/wheregmis/threadlane/commit/a91eb344ea6180818be9f6601ea8597cd89aa7d4))
+* Improve right panel surface layout ([fab5342](https://github.com/wheregmis/threadlane/commit/fab53427bd827e5c3ffdce3a7461e3a0227d0302))
+* **ui-chat:** lay out prompt rail beside transcript viewport ([7d26cb3](https://github.com/wheregmis/threadlane/commit/7d26cb335b2294824b82e1ccde82779e0e47cb80))
+
+
+### Performance Improvements
+
+* **harness:** eliminate per-commit reparses and per-attempt rescanning ([b62bcfe](https://github.com/wheregmis/threadlane/commit/b62bcfe28cf6c914f886f08771757f08afb6f769))
+
+
+### Code Refactoring
+
+* **ui:** Simplify Git commit controls ([7c407e1](https://github.com/wheregmis/threadlane/commit/7c407e1612c69fc333b6cf0baaebc7195c08ddaa))
+
+
+### Maintenance
+
+* address reviews ([805f024](https://github.com/wheregmis/threadlane/commit/805f02462bd1f534c52b56d41491cb59c529321f))
+
 ## [0.1.36](https://github.com/wheregmis/threadlane/compare/v0.1.35...v0.1.36) (2026-10-01)
 
 
