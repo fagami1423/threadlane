@@ -35,6 +35,7 @@ use threadlane_ui_state::{
 
 use super::composer::*;
 use super::context_meter::*;
+use super::tool_detail;
 use super::markdown::*;
 use super::trajectory::*;
 use super::transcript::*;
@@ -591,13 +592,15 @@ impl ChatListView {
             // without disturbing already-typed input or staged attachments.
             // Session-scoped inserts wait for their session to be active.
             let inserts = model.update(cx, |state, _cx| {
-                let active = state.active_session_id.clone();
+                let active_session = state.active_session_id.clone();
+                let active_work_dir = state.active_work_dir.clone();
                 let (ready, waiting): (Vec<_>, Vec<_>) =
                     std::mem::take(&mut state.requested_composer_inserts)
                         .into_iter()
                         .partition(|insert| {
-                            insert.session_id.as_deref().is_none()
-                                || insert.session_id.as_deref() == active.as_deref()
+                            insert.session_id.is_none()
+                                || (insert.session_id == active_session
+                                    && insert.work_dir == active_work_dir)
                         });
                 state.requested_composer_inserts = waiting;
                 ready
@@ -2239,9 +2242,11 @@ impl ChatListView {
             _ => theme.muted_foreground,
         };
         let model = self.model.clone();
+        let detail_model = self.model.clone();
         let transcript = self.transcript_list_state.clone();
         let tool_call_id = activity.id.clone();
-        let has_detail = !activity.detail.trim().is_empty();
+        let has_detail = !activity.detail.trim().is_empty()
+            || tool_detail::expandable(activity);
         let row_id = SharedString::from(activity.id.clone());
         let display_summary = activity.display_summary.clone();
         let is_error = activity.category == "Error";
@@ -2312,19 +2317,23 @@ impl ChatListView {
                     })),
             )
             .children(activity.is_expanded.then(|| {
-                div()
-                    .ml(rems(1.625))
-                    .mt_1()
-                    .p_2p5()
-                    .max_h(rems(15.0))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme.border.opacity(0.5))
-                    .bg(theme.title_bar)
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .overflow_y_scrollbar()
-                    .child(activity.detail.clone())
+                tool_detail::render_activity_detail_card(activity, &detail_model, cx)
+                    .unwrap_or_else(|| {
+                        div()
+                            .ml(rems(1.625))
+                            .mt_1()
+                            .p_2p5()
+                            .max_h(rems(15.0))
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(theme.border.opacity(0.5))
+                            .bg(theme.title_bar)
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .overflow_y_scrollbar()
+                            .child(activity.detail.clone())
+                            .into_any_element()
+                    })
             }))
     }
 

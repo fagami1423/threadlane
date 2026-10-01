@@ -213,10 +213,13 @@ pub struct AppState {
 /// the staged content goes back into the composer (edit) or is discarded
 /// (plain remove), and whether the echo already put the staged text back
 /// in the composer (then the reply only needs to deliver the images the
-/// echo could not carry).
+/// echo could not carry). `work_dir` pins the project that queued the
+/// message so the restored payload is scoped to `(work_dir, session_id)`,
+/// matching how composer drafts are keyed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingQueuedCancel {
     pub session_id: String,
+    pub work_dir: Option<PathBuf>,
     pub entry_id: String,
     pub restore: bool,
     pub text_restored: bool,
@@ -3729,6 +3732,7 @@ impl AppState {
                                 name, arguments,
                             )),
                             detail: arguments.clone(),
+                            arguments: arguments.clone(),
                             is_expanded: false,
                         };
                         if let Some(message) = subagent.messages.last_mut().filter(|message| {
@@ -4568,7 +4572,8 @@ impl AppState {
                                 category: "Working".into(),
                                 display_summary,
                                 title: name,
-                                detail: arguments,
+                                detail: arguments.clone(),
+                                arguments,
                                 is_expanded: false,
                             };
                             if let Some(message) =
@@ -5242,6 +5247,7 @@ impl AppState {
                     request_id,
                     PendingQueuedCancel {
                         session_id: session_id.clone(),
+                        work_dir: self.active_work_dir.clone(),
                         entry_id: entry_id.to_string(),
                         restore,
                         text_restored: restore && !staged_text.is_empty(),
@@ -5252,6 +5258,7 @@ impl AppState {
                     command: SessionCommand::CancelQueuedMessage {
                         session_id: session_id.clone(),
                         entry_id: entry_id.to_string(),
+                        work_dir: self.active_work_dir.clone(),
                     },
                 });
                 // The echo stays until the reply or the journaled
@@ -5271,6 +5278,7 @@ impl AppState {
             self.dispatch_command(SessionCommand::CancelQueuedMessage {
                 session_id,
                 entry_id: entry_id.to_string(),
+                work_dir: self.active_work_dir.clone(),
             });
             self.remove_queued_echo_by_id(&echo_id);
             self.session_status = Some("Queued message removed".into());
@@ -5350,6 +5358,7 @@ impl AppState {
                     },
                     images,
                     session_id: Some(session_id.to_string()),
+                    work_dir: pending.work_dir,
                 });
         }
         self.session_status = Some("Queued message removed".into());
@@ -5638,6 +5647,7 @@ impl AppState {
                         text: setup.text,
                         images: setup.images,
                         session_id: None,
+                        work_dir: None,
                     });
                 return Ok(());
             }

@@ -125,6 +125,7 @@ fn remote_command_request_round_trips() {
                     command: SessionCommand::CancelQueuedMessage {
                         session_id: "no-such-session".to_string(),
                         entry_id: "entry-1".to_string(),
+                        work_dir: None,
                     },
                 })
                 .await
@@ -414,6 +415,7 @@ fn remote_client_fails_command_requests_fast_on_a_v1_peer() {
                 command: SessionCommand::CancelQueuedMessage {
                     session_id: "no-such-session".to_string(),
                     entry_id: "entry-1".to_string(),
+                    work_dir: None,
                 },
             })
             .await
