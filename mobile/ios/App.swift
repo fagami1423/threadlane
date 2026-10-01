@@ -2,32 +2,50 @@ import UIKit
 
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
+    func application(_ application: UIApplication,
+                     configurationForConnecting connectingSceneSession: UISceneSession,
+                     options: UIScene.ConnectionOptions) -> UISceneConfiguration {
+        let config = UISceneConfiguration(name: "Default Configuration",
+                                          sessionRole: connectingSceneSession.role)
+        config.delegateClass = SceneDelegate.self
+        return config
+    }
+}
+
+final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     var window: UIWindow?
 
-    func application(_ application: UIApplication,
-                     didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        let window = UIWindow(frame: UIScreen.main.bounds)
+    func scene(_ scene: UIScene,
+               willConnectTo session: UISceneSession,
+               options connectionOptions: UIScene.ConnectionOptions) {
+        guard let windowScene = scene as? UIWindowScene else { return }
+        let window = UIWindow(windowScene: windowScene)
         window.rootViewController = ThreadlaneContainerController()
         window.makeKeyAndVisible()
         self.window = window
-        return true
+        // Cold-launch deep link (QR pairing via `threadlane://pair?...`).
+        if let url = connectionOptions.urlContexts.first?.url {
+            Self.handleOpenURL(url)
+        }
     }
 
-    func applicationDidBecomeActive(_ application: UIApplication) {
+    func sceneDidBecomeActive(_ scene: UIScene) {
         gpui_ios_did_become_active(nil)
     }
 
-    func applicationWillResignActive(_ application: UIApplication) {
+    func sceneWillResignActive(_ scene: UIScene) {
         gpui_ios_will_resign_active(nil)
     }
 
     /// QR pairing: the Camera app opens `threadlane://pair?...` here and
     /// Rust applies it via the deep-link handler.
-    func application(_ app: UIApplication,
-                     open url: URL,
-                     options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
+    func scene(_ scene: UIScene, openURLContexts urlContexts: Set<UIOpenURLContext>) {
+        guard let url = urlContexts.first?.url else { return }
+        Self.handleOpenURL(url)
+    }
+
+    private static func handleOpenURL(_ url: URL) {
         gpui_ios_handle_open_url(Unmanaged.passUnretained(url.absoluteString as NSString).toOpaque())
-        return true
     }
 }
 

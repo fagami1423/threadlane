@@ -33,8 +33,7 @@ struct ThemePreferences {
 }
 
 pub fn init(cx: &mut App) {
-    register_bundled_themes(cx);
-    apply_saved_or_default_theme(cx);
+    init_bundled(cx);
 
     let themes_dir = global_threadlane_dir().join("themes");
     if let Err(error) = std::fs::create_dir_all(&themes_dir) {
@@ -53,6 +52,14 @@ pub fn init(cx: &mut App) {
     }) {
         tracing::warn!("failed to watch Threadlane themes: {error}");
     }
+}
+
+/// Register bundled themes and apply the saved/default selection, without
+/// the `~/.threadlane/themes` directory watch — for platforms where that
+/// directory is unavailable or unwatchable (the iOS client).
+pub fn init_bundled(cx: &mut App) {
+    register_bundled_themes(cx);
+    apply_saved_or_default_theme(cx);
 }
 
 pub fn active_theme_name(cx: &App) -> SharedString {
