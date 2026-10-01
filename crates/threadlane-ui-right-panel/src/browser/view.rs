@@ -730,7 +730,11 @@ impl BrowserView {
             let _ = model.update(cx, |state, cx| {
                 state
                     .requested_composer_inserts
-                    .push(RequestedComposerInsert { text: note, images });
+                    .push(RequestedComposerInsert {
+                        text: note,
+                        images,
+                        session_id: None,
+                    });
                 cx.notify();
             });
         })

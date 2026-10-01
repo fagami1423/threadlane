@@ -4881,12 +4881,12 @@ impl AppState {
                                 text,
                                 images,
                             }) => {
-                                // Restore only while the session that queued
-                                // the message is still the one on screen.
+                                // Scoped to the session that queued the
+                                // message: if another session is on screen
+                                // the insert waits for it to come back
+                                // rather than landing in a foreign draft.
                                 if session_id == pending.session_id
                                     && entry_id == pending.entry_id
-                                    && self.active_session_id.as_deref()
-                                        == Some(session_id.as_str())
                                 {
                                     self.requested_composer_inserts.push(
                                         RequestedComposerInsert {
@@ -4896,6 +4896,7 @@ impl AppState {
                                                 text
                                             },
                                             images,
+                                            session_id: Some(session_id),
                                         },
                                     );
                                     changed = true;
@@ -5454,6 +5455,7 @@ impl AppState {
                     .push(RequestedComposerInsert {
                         text: setup.text,
                         images: setup.images,
+                        session_id: None,
                     });
                 return Ok(());
             }

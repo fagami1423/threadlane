@@ -5153,4 +5153,51 @@ fn remote_edit_queued_message_restores_staged_images_via_command_result() {
     // Text already came back through the echo — the reply adds the images.
     assert!(insert.text.is_empty());
     assert_eq!(insert.images, vec![image]);
+    assert_eq!(insert.session_id.as_deref(), Some("sess-1"));
+}
+
+#[test]
+fn remote_edit_queued_message_reply_survives_a_session_switch() {
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.daemon_remote = true;
+    state.active_session_id = Some("sess-1".into());
+    state.messages = vec![ChatMessageInfo {
+        id: "queued-user-sess-1-entry-1".into(),
+        role: MessageRole::User,
+        content: "draft text".into(),
+        tool_activities: Vec::new(),
+        streaming: false,
+        reasoning_content: None,
+        reasoning_expanded: false,
+    }]
+    .into();
+
+    state
+        .edit_queued_message("entry-1")
+        .expect("remote edit succeeds");
+
+    // The user switches sessions before the reply lands: the payload is
+    // retained, scoped to the session that owned the queued message —
+    // it must not be dropped or delivered to the wrong composer.
+    state.active_session_id = Some("sess-2".into());
+    let changed = state.drain_chat_stream(vec![SessionEvent::CommandResult {
+        request_id: 1,
+        result: Ok(CommandResponse::CancelledQueuedMessage {
+            session_id: "sess-1".into(),
+            entry_id: "entry-1".into(),
+            text: "draft text".into(),
+            images: vec![ImageAttachment {
+                display_name: "shot.png".into(),
+                data_url: "data:image/png;base64,AAAA".into(),
+            }],
+        }),
+    }]);
+    assert!(changed);
+    assert!(state.pending_queued_restores.is_empty());
+    let insert = state
+        .requested_composer_inserts
+        .last()
+        .expect("composer insert queued");
+    assert_eq!(insert.session_id.as_deref(), Some("sess-1"));
+    assert_eq!(insert.images.len(), 1);
 }
