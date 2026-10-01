@@ -2,32 +2,46 @@ import UIKit
 
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
+    func application(_ application: UIApplication,
+                     configurationForConnecting session: UISceneSession,
+                     options: UIScene.ConnectionOptions) -> UISceneConfiguration {
+        let configuration = UISceneConfiguration(name: "Threadlane", sessionRole: session.role)
+        configuration.delegateClass = SceneDelegate.self
+        return configuration
+    }
+}
+
+final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     var window: UIWindow?
 
-    func application(_ application: UIApplication,
-                     didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        let window = UIWindow(frame: UIScreen.main.bounds)
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession,
+               options connectionOptions: UIScene.ConnectionOptions) {
+        guard let windowScene = scene as? UIWindowScene else { return }
+        let window = UIWindow(windowScene: windowScene)
         window.rootViewController = ThreadlaneContainerController()
-        window.makeKeyAndVisible()
         self.window = window
-        return true
+        window.makeKeyAndVisible()
+        // Creating the root controller registers Rust's deep-link handler first.
+        forwardPairingLinks(connectionOptions.urlContexts)
     }
 
-    func applicationDidBecomeActive(_ application: UIApplication) {
+    func sceneDidBecomeActive(_ scene: UIScene) {
         gpui_ios_did_become_active(nil)
     }
 
-    func applicationWillResignActive(_ application: UIApplication) {
+    func sceneWillResignActive(_ scene: UIScene) {
         gpui_ios_will_resign_active(nil)
     }
 
-    /// QR pairing: the Camera app opens `threadlane://pair?...` here and
-    /// Rust applies it via the deep-link handler.
-    func application(_ app: UIApplication,
-                     open url: URL,
-                     options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
-        gpui_ios_handle_open_url(Unmanaged.passUnretained(url.absoluteString as NSString).toOpaque())
-        return true
+    func scene(_ scene: UIScene, openURLContexts contexts: Set<UIOpenURLContext>) {
+        forwardPairingLinks(contexts)
+    }
+
+    private func forwardPairingLinks(_ contexts: Set<UIOpenURLContext>) {
+        for context in contexts {
+            let url = context.url.absoluteString as NSString
+            gpui_ios_handle_open_url(Unmanaged.passUnretained(url).toOpaque())
+        }
     }
 }
 

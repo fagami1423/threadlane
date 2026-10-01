@@ -47,8 +47,8 @@ cd ios && ./build.sh            # or: ./build.sh "iPhone 17"
 
 ```bash
 cd ios
-DEVELOPMENT_TEAM=5VW98ZM2UM ./build.sh device            # first connected iPhone
-DEVELOPMENT_TEAM=5VW98ZM2UM ./build.sh device "Sab's iPhone"
+DEVELOPMENT_TEAM=D9MPPGN38L ./build.sh device            # first connected iPhone
+DEVELOPMENT_TEAM=D9MPPGN38L ./build.sh device "Sab's iPhone"
 ```
 
 `DEVELOPMENT_TEAM` is your ten-character team id (Apple Developer
@@ -68,3 +68,30 @@ with the Camera app while both devices share the same LAN.
 Same-machine testing: when the desktop app and the simulator run on the
 same Mac, the pairing QR encodes the LAN address, which the simulator
 reaches directly — no special config needed.
+
+## Diagnosing device startup failures
+
+A successful build/install and `Launched application` message do not prove
+that the app stayed alive. List connected devices with `xcrun devicectl list devices`,
+then replace `DEVICE_ID` in these commands with your phone's identifier:
+
+```bash
+xcrun devicectl device info processes --device DEVICE_ID --search Threadlane
+xcrun devicectl device process launch --device DEVICE_ID --terminate-existing --console --timeout 30 dev.threadlane.mobile
+xcrun devicectl device info files --device DEVICE_ID --domain-type systemCrashLogs --search Threadlane
+```
+
+The console command restarts the app and waits for exit, bounded to 30 seconds;
+a timeout alone is not evidence of a crash. UIKit crash details may be absent
+from the console even when the launch command reports exit code 0. Copy a
+specific report returned by the last command for its exception and stack:
+
+```bash
+xcrun devicectl device copy from --device DEVICE_ID --domain-type systemCrashLogs --source REPORT_NAME.ips --destination /tmp/threadlane-mobile-crash.ips
+```
+
+The Swift host uses a single `UIWindowScene` and `SceneDelegate`. Keep window
+creation, activation callbacks, and cold/warm pairing URL delivery on that
+lifecycle: iOS 27 device logs showed a startup `SIGTRAP` in
+`UIApplicationEvaluateRuntimeIssueForNoSceneLifecycleAdoption` with the old
+app-delegate-only host.
