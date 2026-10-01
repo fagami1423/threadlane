@@ -429,8 +429,23 @@ impl EditorView {
                 }
                 if Some(ix) == self.active_tab_index
                     && editor.read(cx).value().as_str() != "Loading…"
+                    && tab.pending_line.is_some()
                 {
-                    if let Some(line) = tab.pending_line.take() {
+                    // Cursor scrolling needs the loaded document's completed layout.
+                    // Keep the request pending if the user switches tabs before then.
+                    cx.on_next_frame(window, move |this, window, cx| {
+                        let Some(tab) = this.active_tab_index.and_then(|ix| this.tabs.get_mut(ix))
+                        else {
+                            return;
+                        };
+                        if tab.editor_state.as_ref() != Some(&editor)
+                            || tab.pending_content.is_some()
+                        {
+                            return;
+                        }
+                        let Some(line) = tab.pending_line.take() else {
+                            return;
+                        };
                         editor.update(cx, |editor, cx| {
                             editor.set_cursor_position(
                                 gpui_component::input::Position::new(
@@ -441,8 +456,8 @@ impl EditorView {
                                 cx,
                             )
                         });
-                        applied = true;
-                    }
+                        cx.notify();
+                    });
                 }
             }
         }
@@ -970,7 +985,7 @@ mod navigation_tests {
     fn opens_at_requested_line_after_loading_and_reuses_tab(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("sample.rs"), "fn sample() {}\n".repeat(40)).unwrap();
+        std::fs::write(dir.path().join("sample.rs"), "fn sample() {}\n".repeat(400)).unwrap();
         let project = dir.path().to_path_buf();
         let model = cx.new(|_| threadlane_ui_state::AppState::default());
         let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
@@ -979,16 +994,20 @@ mod navigation_tests {
         let (_, cx) = cx.add_window_view(move |window, cx| {
             let editor = cx.new(|cx| {
                 let mut editor = EditorView::new(model, window, cx);
-                editor.open_file_at_line(project_clone, "sample.rs", Some(20), cx);
+                editor.open_file_at_line(project_clone, "sample.rs", Some(200), cx);
                 editor
             });
             holder_clone.borrow_mut().replace(editor.clone());
             gpui_component::Root::new(editor, window, cx)
         });
         cx.run_until_parked();
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        cx.run_until_parked();
-        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for _ in 0..4 {
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.run_until_parked();
+        }
         let editor = holder.borrow().as_ref().unwrap().clone();
         editor.read_with(cx, |editor, cx| {
             assert_eq!(editor.tabs.len(), 1);
@@ -1000,13 +1019,26 @@ mod navigation_tests {
                     .read(cx)
                     .cursor_position()
                     .line,
-                19
+                199
+            );
+            let state = editor.tabs[0].editor_state.as_ref().unwrap().read(cx);
+            let (mut caret, _) = state.cursor_layout().expect("caret laid out");
+            let viewport = state.input_bounds();
+            // cursor_layout reports unscrolled Y; painting adds the text's scroll offset.
+            caret.origin.y += state.text_bounds().unwrap().top() - viewport.top();
+            assert!(
+                caret.top() >= viewport.top() && caret.bottom() <= viewport.bottom(),
+                "requested line must be visibly revealed: {caret:?} in {viewport:?}"
             );
         });
         editor.update(cx, |editor, cx| {
             editor.open_file_at_line(project, "sample.rs", Some(3), cx)
         });
         cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
         cx.update(|window, cx| window.draw(cx).clear(cx));
         editor.read_with(cx, |editor, cx| {
             assert_eq!(editor.tabs.len(), 1);

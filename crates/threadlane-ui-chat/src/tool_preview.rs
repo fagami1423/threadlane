@@ -290,6 +290,22 @@ pub(crate) fn render(
             );
         }
     } else {
+        let entry_base = if std::path::Path::new(&path).is_absolute() {
+            model
+                .read(cx)
+                .active_git_work_dir()
+                .and_then(|root| {
+                    let validated = threadlane_tools::validate_path_in_workspace(&path, &root).ok()?;
+                    let canonical_root = root.canonicalize().ok()?;
+                    validated
+                        .strip_prefix(canonical_root)
+                        .ok()
+                        .map(std::path::PathBuf::from)
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from(&path))
+        } else {
+            std::path::PathBuf::from(&path)
+        };
         for line in activity.detail.lines() {
             let entry = line
                 .strip_prefix("[DIR]  ")
@@ -304,7 +320,7 @@ pub(crate) fn render(
                 );
                 continue;
             };
-            let entry_path = std::path::Path::new(&path)
+            let entry_path = entry_base
                 .join(name)
                 .to_string_lossy()
                 .into_owned();
@@ -461,19 +477,26 @@ mod tests {
             Root::new(harness, window, cx)
         });
         let harness = holder.borrow().as_ref().unwrap().clone();
-        for (tool, selector, expected_line) in [
-            ("read_file", "tool-preview-open", Some(10)),
+        for (tool, selector, expected_line, absolute_listing) in [
+            ("read_file", "tool-preview-open", Some(10), false),
             (
                 "grep_search",
                 "tool-preview-search-match-sample.rs-10",
                 Some(10),
+                false,
             ),
-            ("list_dir", "tool-preview-directory-entry-sample.rs", None),
+            ("list_dir", "tool-preview-directory-entry-sample.rs", None, false),
+            ("list_dir", "tool-preview-directory-entry-sample.rs", None, true),
         ] {
+            retained_model.update(cx, |model, _| model.requested_editor_target = None);
             if tool != "read_file" {
                 harness.update(cx, |harness, cx| {
                     harness.activity.title = tool.into();
                     harness.activity.arguments = r#"{"path":".","pattern":"sample"}"#.into();
+                    if absolute_listing {
+                        harness.activity.arguments =
+                            serde_json::json!({"path": dir.path()}).to_string();
+                    }
                     harness.activity.detail = if tool == "grep_search" {
                         (10..80)
                             .map(|no| format!("sample.rs:{no}:fn sample() {{}}\n"))
@@ -537,5 +560,24 @@ mod tests {
                 "wheel events stay inside every preview, including at edges"
             );
         }
+        retained_model.update(cx, |model, _| model.requested_editor_target = None);
+        harness.update(cx, |harness, cx| {
+            harness.activity.arguments =
+                serde_json::json!({"path": dir.path().parent().unwrap()}).to_string();
+            harness.activity.detail = "[FILE] sample.rs\n".into();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let button = cx
+            .debug_bounds("tool-preview-directory-entry-sample.rs")
+            .unwrap();
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        retained_model.read_with(cx, |model, _| {
+            assert!(
+                model.requested_editor_target.is_none(),
+                "outside-workspace targets stay disabled"
+            );
+        });
     }
 }
