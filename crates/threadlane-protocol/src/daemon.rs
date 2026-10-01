@@ -38,6 +38,31 @@ use crate::messages::{ImageAttachment, ReasoningEffort, SessionPlan, TokenUsage}
 use crate::orchestration::{ModelRoles, OrchestratorMode};
 use crate::events::{AgentEvent, SubagentIsolation};
 
+/// Daemon wire protocol version, announced by the server in the
+/// [`PROTOCOL_VERSION_HEADER`] WebSocket handshake response header.
+///
+/// Version 1 is the pre-announcement wire: bare `SessionCommand` frames
+/// inbound, `{"seq", "event"}` frames outbound. A daemon that sends no
+/// header is version 1 — it cannot decode a [`CommandRequest`] envelope
+/// (it rejects the frame as an undecodable command and never dispatches
+/// it), so clients must gate request/reply calls on
+/// [`COMMAND_REQUEST_PROTOCOL_VERSION`]. Version 2 adds the
+/// `CommandRequest`/`CommandReply` pair and the journaled
+/// [`SessionEvent::QueuedEntryCancelled`].
+pub const WIRE_PROTOCOL_VERSION: u64 = 2;
+
+/// The lowest protocol version able to decode a [`CommandRequest`]
+/// envelope. Gate request/reply calls on this constant, not on
+/// [`WIRE_PROTOCOL_VERSION`] itself: when this build's version advances
+/// past 2, older-but-still-capable daemons must keep qualifying.
+pub const COMMAND_REQUEST_PROTOCOL_VERSION: u64 = 2;
+
+/// The handshake response header carrying [`WIRE_PROTOCOL_VERSION`].
+/// Absent on pre-2 daemons, which is exactly how a client learns it is
+/// talking to one — the answer arrives with the socket upgrade, before
+/// any command frame is risked.
+pub const PROTOCOL_VERSION_HEADER: &str = "x-threadlane-protocol";
+
 /// A command a client sends to the daemon.
 ///
 /// Every variant is accepted in any session state; the daemon is the one
@@ -320,7 +345,10 @@ pub struct CommandRequest {
 
 /// Payload a [`CommandRequest`] resolves to. `Ack` is the reply for
 /// commands that carry no return value — the payload-carrying variants
-/// are the point of the request/reply channel.
+/// are the point of the request/reply channel. Only a peer advertising
+/// a protocol version of at least [`COMMAND_REQUEST_PROTOCOL_VERSION`]
+/// can decode the envelope; on a version-1 daemon the frame is rejected
+/// as an undecodable command.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CommandResponse {

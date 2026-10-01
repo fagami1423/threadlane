@@ -44,10 +44,22 @@ pub trait DaemonClient: Send + Sync {
     /// nothing), `Err` is the send or dispatch failure (the daemon also
     /// broadcasts a dispatch failure as `DaemonError`). `request_id` is
     /// caller-chosen and must be unique per client connection.
+    ///
+    /// Only valid when [`Self::supports_command_requests`] is true — a
+    /// version-1 daemon cannot decode the envelope, so an ungated call
+    /// fails the request without the command ever being dispatched.
     async fn command_request(
         &self,
         request: CommandRequest,
     ) -> Result<CommandResponse, String>;
+
+    /// Whether the attached daemon speaks the `CommandRequest` envelope
+    /// (wire protocol version ≥ 2). Always true in-process; a remote
+    /// client learns it from the handshake's `x-threadlane-protocol`
+    /// response header and reports false while unconnected or attached
+    /// to a pre-2 daemon. Callers use it to pick a degraded path (e.g. a
+    /// fire-and-forget bare command) rather than lose the command.
+    fn supports_command_requests(&self) -> bool;
 
     /// Attach to the daemon's event stream. Each call returns an
     /// independent receiver; journal replay (for late attach/reconnect)

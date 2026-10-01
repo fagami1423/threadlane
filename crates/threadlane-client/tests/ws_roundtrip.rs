@@ -317,3 +317,112 @@ fn remote_terminal_lifecycle_round_trips() {
         .await;
     });
 }
+
+/// The daemon announces its wire protocol version in the
+/// `x-threadlane-protocol` handshake response header: a fresh client
+/// reports `supports_command_requests() == false` while unconnected and
+/// flips to true once the upgrade completes and the header is read.
+#[test]
+fn remote_client_learns_protocol_version_from_handshake() {
+    let executor = threadlane_daemon::chat::executor().expect("daemon executor");
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    executor.spawn(async move {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let core = threadlane_daemon::core::DaemonCore::new().expect("daemon core");
+        tokio::spawn(threadlane_daemon::server::serve(listener, core, None));
+        done_tx.send(addr).expect("send addr");
+    });
+    let addr = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("server did not start");
+
+    executor.block_on(async move {
+        let client = RemoteDaemon::connect(format!("ws://{addr}"), None);
+        // Not connected yet — no handshake header has been seen.
+        assert!(!client.supports_command_requests());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !client.supports_command_requests() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "client never learned the protocol version"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    });
+}
+
+/// A pre-envelope (v1) daemon upgrades the socket but sends no
+/// `x-threadlane-protocol` header: the client reports no command-request
+/// support, bare commands still dispatch, and `command_request` fails
+/// fast rather than send a frame the peer would reject as undecodable.
+#[test]
+fn remote_client_fails_command_requests_fast_on_a_v1_peer() {
+    use futures::StreamExt;
+
+    let executor = threadlane_daemon::chat::executor().expect("daemon executor");
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    executor.spawn(async move {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // A v1 peer: plain WebSocket accept, no protocol
+                    // header, no event protocol — just drain the socket.
+                    if let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await {
+                        while socket.next().await.is_some() {}
+                    }
+                });
+            }
+        });
+        done_tx.send(addr).expect("send addr");
+    });
+    let addr = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("server did not start");
+
+    executor.block_on(async move {
+        let client = RemoteDaemon::connect(format!("ws://{addr}"), None);
+
+        // Bare commands still go out once the socket is up.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if client
+                .command(SessionCommand::CancelRun {
+                    session_id: "no-such-session".to_string(),
+                })
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "client never connected to the v1 peer"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert!(!client.supports_command_requests());
+        let error = client
+            .command_request(CommandRequest {
+                request_id: 1,
+                command: SessionCommand::CancelQueuedMessage {
+                    session_id: "no-such-session".to_string(),
+                    entry_id: "entry-1".to_string(),
+                    work_dir: None,
+                },
+            })
+            .await
+            .expect_err("a v1 peer cannot answer a CommandRequest");
+        assert!(
+            error.contains("does not support command requests"),
+            "unexpected error text: {error}"
+        );
+    });
+}
