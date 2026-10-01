@@ -44,6 +44,7 @@ threadlane-ui-chat = { version = "0.1.0", path = "crates/threadlane-ui-chat" }
 threadlane-ui-editor = { version = "0.1.0", path = "crates/threadlane-ui-editor" }
 threadlane-ui-github = { version = "0.1.0", path = "crates/threadlane-ui-github" }
 threadlane-ui-mirror = { version = "0.1.0", path = "crates/threadlane-ui-mirror" }
+threadlane-ui-pairing = { version = "0.1.0", path = "crates/threadlane-ui-pairing" }
 threadlane-ui-right-panel = { version = "0.1.0", path = "crates/threadlane-ui-right-panel" }
 threadlane-ui-settings = { version = "0.1.0", path = "crates/threadlane-ui-settings" }
 threadlane-ui-sidebar = { version = "0.1.0", path = "crates/threadlane-ui-sidebar" }
@@ -69,6 +70,7 @@ hotpath = "0.26"
 image = "0.25"
 notify = "8.2"
 portable-pty = "0.9"
+qrcode = { version = "0.14", default-features = false }
 regex = "1.10"
 reqwest = { version = "0.12", default-features = false }
 rfd = "0.17.2"

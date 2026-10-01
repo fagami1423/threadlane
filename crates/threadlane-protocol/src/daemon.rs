@@ -162,6 +162,11 @@ pub enum SessionCommand {
     /// the reply carries the entry's staged text and images as
     /// `CommandResponse::CancelledQueuedMessage`.
     CancelQueuedMessage { session_id: String, entry_id: String },
+    /// Request the full attached-project list; answered by one
+    /// `SessionEvent::ProjectChanged` per attached project. A freshly
+    /// attached thin client sends this instead of relying on the bounded
+    /// journal still holding the original attach events.
+    GetProjects,
     /// Request a project snapshot; answered by `SessionEvent::ProjectChanged`.
     GetProjectState { work_dir: PathBuf },
     /// Request a session snapshot; answered by `SessionEvent::SessionSnapshot`.

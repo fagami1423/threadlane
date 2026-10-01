@@ -18,6 +18,7 @@
 //! for a per-client credential) — a shared static token is not a safe
 //! network-exposed auth scheme.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -36,20 +37,40 @@ use crate::core::DaemonCore;
 
 /// Accept loop: every connection gets a [`serve_connection`] task.
 pub async fn serve(listener: TcpListener, core: Arc<DaemonCore>, token: Option<String>) {
+    serve_until(listener, core, token, std::future::pending()).await;
+}
+
+/// [`serve`] plus a shutdown: when `shutdown` resolves the listener stops
+/// accepting and every live client connection is aborted. Used by the LAN
+/// pairing flow, where "stop sharing" must actually disconnect attached
+/// clients rather than just closing the front door.
+pub async fn serve_until(
+    listener: TcpListener,
+    core: Arc<DaemonCore>,
+    token: Option<String>,
+    shutdown: impl Future<Output = ()> + Send,
+) {
+    tokio::pin!(shutdown);
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        match listener.accept().await {
-            Ok((stream, peer)) => {
-                let core = core.clone();
-                let token = token.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = serve_connection(core, stream, peer, token).await {
-                        tracing::debug!(%peer, %error, "daemon connection ended");
-                    }
-                });
-            }
-            Err(error) => tracing::warn!(%error, "daemon accept failed"),
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accept = listener.accept() => match accept {
+                Ok((stream, peer)) => {
+                    let core = core.clone();
+                    let token = token.clone();
+                    connections.spawn(async move {
+                        if let Err(error) = serve_connection(core, stream, peer, token).await {
+                            tracing::debug!(%peer, %error, "daemon connection ended");
+                        }
+                    });
+                }
+                Err(error) => tracing::warn!(%error, "daemon accept failed"),
+            },
         }
     }
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
 }
 
 /// One outbound frame: the journal sequence (0 for frames the daemon

@@ -1,0 +1,115 @@
+name: ThreadlaneMobile
+options:
+  bundleIdPrefix: dev.threadlane
+  deploymentTarget:
+    iOS: "17.0"
+  generateEmptyDirectories: true
+  createIntermediateGroups: true
+
+targets:
+  ThreadlaneMobile:
+    type: application
+    platform: iOS
+    scheme: {}
+    sources:
+      - path: App.swift
+        type: file
+        buildPhase: sources
+      - path: gpui_ios.h
+        type: file
+        buildPhase: headers
+      - path: LaunchScreen.storyboard
+        type: file
+        buildPhase: resources
+      - path: Assets.xcassets
+        type: folder
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.threadlane.mobile
+        PRODUCT_NAME: ThreadlaneMobile
+        INFOPLIST_FILE: Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        TARGETED_DEVICE_FAMILY: "1,2"
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        CODE_SIGN_STYLE: Automatic
+        # Set DEVELOPMENT_TEAM for device builds; simulators do not need it.
+        SWIFT_VERSION: "5.0"
+        SWIFT_OBJC_BRIDGING_HEADER: "Embedding.h"
+        CLANG_ENABLE_MODULES: YES
+        CLANG_ENABLE_OBJC_ARC: YES
+        ENABLE_BITCODE: NO
+        ENABLE_DEBUG_DYLIB: NO
+        OTHER_LINK_BINARY_WITH_LIBRARIES_SECTION_TYPE: static
+        DEAD_CODE_STRIPPING: NO
+        # Link the Rust static library — explicit .a path so the linker
+        # cannot pick a same-named dylib out of the target dir.
+        OTHER_LDFLAGS:
+          - "-force_load"
+          - "$(THREADLANE_STATIC_LIB)"
+          - "-lc++"
+          - "-framework UIKit"
+          - "-framework Metal"
+          - "-framework MetalKit"
+          - "-framework QuartzCore"
+          - "-framework CoreGraphics"
+          - "-framework CoreText"
+          - "-framework CoreFoundation"
+          - "-framework Foundation"
+          - "-framework Security"
+          - "-framework SystemConfiguration"
+          - "-framework AudioToolbox"
+          - "-framework WebKit"
+          - "-framework CoreMedia"
+          - "-framework AVFoundation"
+          - "-framework CoreImage"
+          - "-ObjC"
+        GCC_PREPROCESSOR_DEFINITIONS:
+          - "USE_GPUI_RUST=1"
+          - "$(inherited)"
+        HEADER_SEARCH_PATHS:
+          - "$(PROJECT_DIR)"
+        VALID_ARCHS: "arm64"
+        ARCHS: "arm64"
+        ONLY_ACTIVE_ARCH: YES
+        "THREADLANE_STATIC_LIB[sdk=iphonesimulator*]": "$(PROJECT_DIR)/../rust/target/aarch64-apple-ios-sim/debug/libthreadlane_mobile.a"
+        "THREADLANE_STATIC_LIB[sdk=iphoneos*]": "$(PROJECT_DIR)/../rust/target/aarch64-apple-ios/debug/libthreadlane_mobile.a"
+      configs:
+        Debug:
+          GCC_OPTIMIZATION_LEVEL: "0"
+          DEBUG_INFORMATION_FORMAT: "dwarf-with-dsym"
+          SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+        Release:
+          "THREADLANE_STATIC_LIB[sdk=iphonesimulator*]": "$(PROJECT_DIR)/../rust/target/aarch64-apple-ios-sim/release/libthreadlane_mobile.a"
+          "THREADLANE_STATIC_LIB[sdk=iphoneos*]": "$(PROJECT_DIR)/../rust/target/aarch64-apple-ios/release/libthreadlane_mobile.a"
+          GCC_OPTIMIZATION_LEVEL: "s"
+          DEBUG_INFORMATION_FORMAT: "dwarf-with-dsym"
+          SWIFT_OPTIMIZATION_LEVEL: "-O"
+    preBuildScripts:
+      - name: "Build Rust Static Library"
+        script: |
+          set -euo pipefail
+
+          RUST_PROJECT_DIR="${PROJECT_DIR}/../rust"
+          cd "${RUST_PROJECT_DIR}"
+
+          if [ "${PLATFORM_NAME}" = "iphonesimulator" ]; then
+            RUST_TARGET="aarch64-apple-ios-sim"
+          else
+            RUST_TARGET="aarch64-apple-ios"
+          fi
+
+          if [ "${CONFIGURATION}" = "Release" ]; then
+            CARGO_FLAGS="--release"
+          else
+            CARGO_FLAGS=""
+          fi
+
+          echo "Building threadlane-mobile for ${RUST_TARGET} (${CONFIGURATION})..."
+
+          rustup target add "${RUST_TARGET}" 2>/dev/null || true
+          cargo build --lib --target "${RUST_TARGET}" ${CARGO_FLAGS} 2>&1
+
+          echo "Rust build complete for ${RUST_TARGET}"
+        shell: /bin/bash
+        basedOnDependencyAnalysis: false

@@ -150,6 +150,11 @@ pub struct AppState {
     /// True when `daemon_client` is remote: runtime handles are then
     /// process-remote and only the command/event surface can reach them.
     pub daemon_remote: bool,
+    /// Live LAN pairing listener while "share with mobile" is on; dropping
+    /// it disconnects every attached thin client.
+    pub pairing: Option<threadlane_daemon::pairing::PairingServer>,
+    /// The last async pairing-start failure, shown by the pairing dialog.
+    pub pairing_error: Option<String>,
     /// Ordered channel for `SessionCommand::Terminal*` commands — they must
     /// not reorder relative to each other (TerminalOpen before its Input),
     /// so they go through one forward loop rather than a task per command.
@@ -751,6 +756,8 @@ impl AppState {
             daemon_core,
             daemon_client,
             daemon_remote,
+            pairing: None,
+            pairing_error: None,
             terminal_command_tx,
             terminal_event_tx,
             pending_remote_deletes: HashMap::new(),
@@ -785,6 +792,7 @@ impl AppState {
             .collect();
         for work_dir in store_dirs {
             state.session_seen_store_for(&work_dir);
+            state.daemon_core.attach_project(work_dir);
         }
         if let (Some(session_id), Some(session_file)) = (
             state.active_session_id.clone(),
@@ -2735,6 +2743,7 @@ impl AppState {
                 is_expanded: true,
             });
         }
+        self.daemon_core.attach_project(canonical.clone());
 
         if let Some(session_id) = session_to_restore {
             self.select_session(canonical, session_id);
@@ -3505,6 +3514,40 @@ impl AppState {
             commands: self.terminal_command_tx.clone(),
             events: self.terminal_event_tx.clone(),
         }
+    }
+
+    /// Begin sharing this daemon with thin clients on the LAN: binds a
+    /// `server::serve_until` listener on every interface behind a fresh
+    /// bearer token. The bind runs on the shared tokio executor, so this
+    /// returns its join handle — the caller awaits it and stores the
+    /// `PairingServer` in `pairing` (or the error in `pairing_error`).
+    pub fn start_pairing(
+        &mut self,
+    ) -> Result<
+        tokio::task::JoinHandle<Result<threadlane_daemon::pairing::PairingServer, String>>,
+        String,
+    > {
+        self.pairing_error = None;
+        if self.pairing.is_some() {
+            return Err("device pairing is already running".to_string());
+        }
+        if self.daemon_remote {
+            // Sessions live in the attached daemon process; re-serving the
+            // local empty core would show a paired client nothing.
+            return Err(
+                "device pairing needs the embedded session core (unset THREADLANE_DAEMON_URL)"
+                    .to_string(),
+            );
+        }
+        let executor = crate::chat::executor()?;
+        Ok(executor.spawn(threadlane_daemon::pairing::PairingServer::start(
+            self.daemon_core.clone(),
+        )))
+    }
+
+    /// Stop sharing: dropping the server disconnects every attached client.
+    pub fn stop_pairing(&mut self) {
+        self.pairing = None;
     }
 
     /// Sends a `SessionCommand` through the attached `DaemonClient` —

@@ -1,0 +1,13 @@
+[package]
+name = "threadlane-ui-pairing"
+version = "0.1.0"
+edition = "2021"
+description = "\"Share with mobile\" pairing dialog for the Threadlane desktop app: starts the LAN listener and renders the pairing deep link as a QR code"
+
+[dependencies]
+gpui.workspace = true
+gpui-component.workspace = true
+qrcode.workspace = true
+threadlane-daemon.workspace = true
+threadlane-ui-state.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }

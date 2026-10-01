@@ -2269,6 +2269,7 @@ impl SidebarView {
 
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let settings_model = self.model.clone();
+        let pairing_model = self.model.clone();
         let theme = cx.theme().colors;
         let settings_selected =
             self.model.read(cx).workspace_page == threadlane_ui_state::WorkspacePage::Settings;
@@ -2313,6 +2314,25 @@ impl SidebarView {
                             controller::dispatch(state, AppAction::OpenSettings);
                             cx.notify();
                         });
+                    }),
+            )
+            .child(
+                Button::new("sidebar-pair-device")
+                    .accessibility_label("Share with mobile")
+                    .tooltip("Share with mobile")
+                    .ghost()
+                    .child(
+                        Icon::default()
+                            .path("icons/smartphone.svg")
+                            .size_4()
+                            .text_color(theme.muted_foreground),
+                    )
+                    .on_click(move |_event, window, cx| {
+                        threadlane_ui_pairing::open_pairing_dialog(
+                            pairing_model.clone(),
+                            window,
+                            cx,
+                        );
                     }),
             )
             .children(self.render_update_control(cx))
