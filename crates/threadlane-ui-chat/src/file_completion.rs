@@ -1,6 +1,7 @@
 use super::*;
 
-use threadlane_git::{list_project_files, FileInventoryError, GitFileInventory};
+use threadlane_git::GitFileInventory;
+use threadlane_protocol::repo::FILE_INVENTORY_NOT_A_REPOSITORY;
 
 actions!(
     threadlane_file_completion,
@@ -141,10 +142,14 @@ impl ChatListView {
         self.file_scroll_handle.scroll_to_item(0);
         cx.notify();
         let task_root = root.clone();
+        let client = self.model.read(cx).daemon_client.clone();
         self.file_completion_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { list_project_files(&task_root) })
+                .spawn(async move {
+                    threadlane_ui_state::project_io::file_inventory(&client, &task_root)
+                        .await
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.file_completion_generation != generation
@@ -161,14 +166,12 @@ impl ChatListView {
                     composer_key,
                     status: match result {
                         Ok(inventory) => FileCompletionStatus::Ready(inventory),
-                        Err(FileInventoryError::NotARepository) => {
+                        Err(error) if error == FILE_INVENTORY_NOT_A_REPOSITORY => {
                             FileCompletionStatus::Unsupported(
                                 "File completion requires a Git workspace".to_string(),
                             )
                         }
-                        Err(FileInventoryError::Failed(error)) => {
-                            FileCompletionStatus::Failed(error.message)
-                        }
+                        Err(error) => FileCompletionStatus::Failed(error),
                     },
                 });
                 cx.notify();
@@ -243,22 +246,57 @@ impl ChatListView {
         if !matches.iter().any(|candidate| candidate == path) {
             return;
         }
-        // `symlink_metadata` does not follow links; it only checks that the
-        // repo-relative name still exists inside the resolved root. A file
-        // deleted since enumeration refreshes the list instead of inserting.
-        let exists = is_safe_relative_path(path) && std::fs::symlink_metadata(root.join(path)).is_ok();
-        if !exists {
-            self.request_file_inventory(root, cx);
-            return;
-        }
-        let insertion = format_path_insertion(path);
-        self.input_state.update(cx, |input, cx| {
-            input.set_selected_range(trigger.range.clone(), cx);
-            input.replace(insertion, window, cx);
-            input.focus(window, cx);
-        });
-        self.clear_file_completion();
-        cx.notify();
+        // Existence is verified on the daemon host through the guarded
+        // project-io path. A pre-3 remote daemon answers UNSUPPORTED:
+        // probing the *client's* disk at the daemon-side root would
+        // judge the wrong filesystem, so unsupported counts as absent —
+        // the inventory refresh below re-asks the daemon and degrades
+        // to its own unsupported state.
+        let client = self.model.read(cx).daemon_client.clone();
+        let path = path.to_string();
+        cx.spawn_in(window, async move |this, cx| {
+            let exists = client.supports_project_io()
+                && is_safe_relative_path(&path)
+                && {
+                    // The in-process daemon answers inline on the caller's
+                    // thread, so the probe hops to a background executor
+                    // instead of `stat`ing on the UI thread.
+                    let probe_client = client.clone();
+                    let probe_root = root.clone();
+                    let probe_path = path.clone();
+                    cx.background_executor()
+                        .spawn(async move {
+                            threadlane_ui_state::project_io::file_exists(
+                                &probe_client,
+                                &probe_root,
+                                probe_path,
+                            )
+                            .await
+                            .unwrap_or(false)
+                        })
+                        .await
+                };
+            let _ = this.update_in(cx, |this, window, cx| {
+                if !exists {
+                    this.request_file_inventory(root, cx);
+                    return;
+                }
+                // The remote existence check yielded; re-verify the
+                // trigger before editing the composer.
+                if this.current_file_trigger(cx).as_ref() != Some(&trigger) {
+                    return;
+                }
+                let insertion = format_path_insertion(&path);
+                this.input_state.update(cx, |input, cx| {
+                    input.set_selected_range(trigger.range.clone(), cx);
+                    input.replace(insertion, window, cx);
+                    input.focus(window, cx);
+                });
+                this.clear_file_completion();
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Enter/Tab: insert the current result if one is valid. `true` means the

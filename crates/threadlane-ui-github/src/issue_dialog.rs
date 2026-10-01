@@ -83,36 +83,116 @@ pub struct IssueStartDialog {
     effort: ReasoningEffort,
     mode: OrchestratorMode,
     models: Vec<threadlane_daemon::catalog::ModelOption>,
+    /// Repo validation / task creation is in flight on the daemon.
+    pub starting: bool,
 }
 
 impl IssueStartDialog {
-    pub fn start(&mut self, cx: &mut Context<Self>) -> bool {
-        let result = issue_start_activation(self.confirmation.start_enabled, || {
-            self.model.update(cx, |state, cx| {
-                let result = state.start_issue_work_with_options(
-                    self.work_dir.clone(),
-                    self.issue.clone(),
-                    self.title.clone(),
-                    self.confirmation.model.clone(),
-                    self.effort,
-                    self.mode,
-                );
-                if let Err(error) = &result {
-                    state.session_status = Some(error.clone());
-                }
-                cx.notify();
-                result.map(|_| ())
-            })
-        });
-        issue_start_dialog_result(result, |error| {
-            self.error = Some(error);
+    /// Validate the checkout on the daemon host, then create the worktree
+    /// task. Runs async: failures stay on the dialog; a successful start
+    /// closes it.
+    pub fn start(&mut self, window_handle: AnyWindowHandle, cx: &mut Context<Self>) {
+        if !self.confirmation.start_enabled || self.starting {
+            return;
+        }
+        if self.model.read(cx).daemon_remote {
+            // Worktree/session creation for issue work is not
+            // daemon-side yet; surface that instead of running the repo
+            // checks against the client's disk.
+            self.error =
+                Some("GitHub issue work is not yet supported on remote daemons".into());
             cx.notify();
+            return;
+        }
+        self.starting = true;
+        self.error = None;
+        cx.notify();
+        let work_dir = self.work_dir.clone();
+        let issue = self.issue.clone();
+        let title = self.title.clone();
+        let selected = self.confirmation.model.clone();
+        let effort = self.effort;
+        let mode = self.mode;
+        let client = self.model.read(cx).daemon_client.clone();
+        cx.spawn(async move |this, cx| {
+            // The same checks `start_issue_work_with_prompt` applies
+            // locally, run against the daemon host's filesystem. The IO
+            // stays on a background thread so an in-process daemon never
+            // blocks the UI.
+            let preflight_dir = work_dir.clone();
+            let preflight = cx.background_executor().spawn(async move {
+                match threadlane_ui_state::project_io::is_repo(&client, &preflight_dir)
+                    .await
+                {
+                    Err(error) => {
+                        return Err(format!("Could not check the repository: {error}"));
+                    }
+                    Ok(false) => {
+                        return Err(
+                            "GitHub issue work requires a Git repository".to_string()
+                        );
+                    }
+                    Ok(true) => {}
+                }
+                let status =
+                    threadlane_ui_state::project_io::inspect(&client, &preflight_dir, false)
+                        .await
+                        .map_err(|error| {
+                            format!("Could not inspect the repository: {error}")
+                        })?;
+                if status.recent_commits.is_empty() {
+                    return Err("GitHub issue work requires an initial commit".to_string());
+                }
+                Ok(())
+            });
+            match preflight.await {
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.starting = false;
+                        this.error = Some(error);
+                        cx.notify();
+                    });
+                }
+                Ok(()) => {
+                    let _ = this.update(cx, |this, cx| {
+                        let result = this.model.update(cx, |state, cx| {
+                            let result = state.start_issue_work_with_options(
+                                work_dir, issue, title, selected, effort, mode,
+                            );
+                            if let Err(error) = &result {
+                                state.session_status = Some(error.clone());
+                            }
+                            cx.notify();
+                            result.map(|_| ())
+                        });
+                        match result {
+                            Ok(()) => {
+                                let _ = cx.update_window(
+                                    window_handle,
+                                    |_, window, cx| window.close_dialog(cx),
+                                );
+                            }
+                            Err(error) => {
+                                this.starting = false;
+                                this.error = Some(error);
+                                cx.notify();
+                            }
+                        }
+                    });
+                }
+            }
         })
+        .detach();
     }
 }
 
-pub fn activate_issue_start_dialog(dialog: &Entity<IssueStartDialog>, cx: &mut App) -> bool {
-    dialog.update(cx, |dialog, cx| dialog.start(cx))
+pub fn activate_issue_start_dialog(
+    dialog: &Entity<IssueStartDialog>,
+    window: &Window,
+    cx: &mut App,
+) {
+    let handle = window.window_handle();
+    dialog.update(cx, |dialog, cx| dialog.start(handle, cx));
 }
 
 impl Render for IssueStartDialog {
@@ -298,67 +378,105 @@ pub fn open_issue_start_dialog(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let (selected_model, reasoning_effort) = {
+    let (selected_model, reasoning_effort, client) = {
         let state = model.read(cx);
-        (state.selected_model.clone(), state.reasoning_effort)
+        (
+            state.selected_model.clone(),
+            state.reasoning_effort,
+            state.daemon_client.clone(),
+        )
     };
     let mode = threadlane_project::subagent_settings::load(&work_dir).orchestrator_mode;
-    let confirmation = issue_start_confirmation(
-        &issue,
-        &title,
-        &selected_model,
-        reasoning_effort.label(),
-        threadlane_git::is_git_repo(&work_dir),
-        has_linked_task,
-    );
     let models = threadlane_daemon::catalog::available_models_for_project(Some(&work_dir));
     let effort = effective_effort(&selected_model, reasoning_effort, Some(&work_dir));
-    let start_enabled = confirmation.start_enabled;
-    let start_label = confirmation.start_label;
-    let disabled_reason = confirmation.start_disabled_reason.clone();
-    let dialog_state = cx.new(|_| IssueStartDialog {
-        model,
-        work_dir,
-        issue,
-        title,
-        confirmation,
-        effort,
-        mode,
-        models,
-        error: None,
-    });
-    window.open_dialog(cx, move |dialog, _window, cx| {
-        let start_enabled = start_enabled && !dialog_state.read(cx).confirmation.model.is_empty();
-        let confirm_state = dialog_state.clone();
-        let on_ok_state = dialog_state.clone();
-        dialog
-            .title("Start task from issue")
-            .child(dialog_state.clone())
-            .footer(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        Button::new("cancel-issue-task")
-                            .label("Cancel")
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
+    let window_handle = window.window_handle();
+    // `is_git_repo` must answer for the checkout on the daemon host, not
+    // the client's disk, so the dialog opens once the daemon replies.
+    cx.spawn(async move |cx| {
+        let probe_dir = work_dir.clone();
+        // A failed probe is not "not a repository" — the dialog opens
+        // disabled with the probe error as the reason, so a retryable
+        // daemon failure isn't misreported as missing Git.
+        let is_git: Result<bool, String> = cx
+            .background_executor()
+            .spawn(async move {
+                threadlane_ui_state::project_io::is_repo(&client, &probe_dir).await
+            })
+            .await;
+        let (is_git, probe_error) = match is_git {
+            Ok(is_git) => (is_git, None),
+            Err(error) => (false, Some(format!("Could not check the repository: {error}"))),
+        };
+        let _ = cx.update_window(window_handle, |_, window, cx| {
+            let mut confirmation = issue_start_confirmation(
+                &issue,
+                &title,
+                &selected_model,
+                reasoning_effort.label(),
+                is_git,
+                has_linked_task,
+            );
+            if let Some(reason) = probe_error {
+                confirmation.start_disabled_reason = Some(reason);
+            }
+            let start_enabled = confirmation.start_enabled;
+            let start_label = confirmation.start_label;
+            let disabled_reason = confirmation.start_disabled_reason.clone();
+            let dialog_state = cx.new(|_| IssueStartDialog {
+                model,
+                work_dir,
+                issue,
+                title,
+                confirmation,
+                effort,
+                mode,
+                models,
+                error: None,
+                starting: false,
+            });
+            window.open_dialog(cx, move |dialog, _window, cx| {
+                let start_enabled =
+                    start_enabled && !dialog_state.read(cx).confirmation.model.is_empty();
+                let confirm_state = dialog_state.clone();
+                let on_ok_state = dialog_state.clone();
+                dialog
+                    .title("Start task from issue")
+                    .child(dialog_state.clone())
+                    .footer(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("cancel-issue-task")
+                                    .label("Cancel")
+                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                            )
+                            .child(
+                                Button::new("confirm-issue-task")
+                                    .primary()
+                                    .label(start_label)
+                                    .disabled(!start_enabled)
+                                    .tooltip(disabled_reason.clone().unwrap_or_default())
+                                    .on_click(move |_, window, cx| {
+                                        activate_issue_start_dialog(
+                                            &confirm_state,
+                                            window,
+                                            cx,
+                                        );
+                                    }),
+                            ),
                     )
-                    .child(
-                        Button::new("confirm-issue-task")
-                            .primary()
-                            .label(start_label)
-                            .disabled(!start_enabled)
-                            .tooltip(disabled_reason.clone().unwrap_or_default())
-                            .on_click(move |_, window, cx| {
-                                if activate_issue_start_dialog(&confirm_state, cx) {
-                                    window.close_dialog(cx);
-                                }
-                            }),
-                    ),
-            )
-            .on_ok(move |_, _, cx| activate_issue_start_dialog(&on_ok_state, cx))
-    });
+                    .on_ok(move |_, window, cx| {
+                        // Async start: keep the dialog open and let it
+                        // close itself once issue work is created.
+                        activate_issue_start_dialog(&on_ok_state, window, cx);
+                        false
+                    })
+            });
+        });
+    })
+    .detach();
 }
 
 /// Dialog state for creating a GitHub issue in one project.
@@ -533,6 +651,7 @@ mod tests {
                 label: "Test agent".into(),
                 provider: ModelProvider::Acp,
             }],
+            starting: false,
         });
         let view = state.clone();
         let (_, cx) =
@@ -594,6 +713,7 @@ mod tests {
             effort: ReasoningEffort::High,
             mode: OrchestratorMode::Normal,
             models: Vec::new(),
+            starting: false,
         });
         let view = state.clone();
         let (_, cx) =

@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use crate::error::GitError;
 use crate::github::{fresh_cache_value, inspect_pr, repository_key};
 use crate::types::{
-    GitBranchInfo, GitCommitInfo, GitFile, GitStashInfo, GitStatus, GitWorktreeInfo,
-    GIT_FIELD_SEPARATOR, GIT_RECORD_SEPARATOR,
+    DiffOptions, GitBranchInfo, GitCommitInfo, GitFile, GitFileInventory, GitStashInfo,
+    GitStatus, GitWorktreeInfo, GIT_FIELD_SEPARATOR, GIT_RECORD_SEPARATOR,
 };
 
 #[cfg(test)]
@@ -1202,11 +1202,6 @@ pub fn diff_file(work_dir: &Path, path: &str) -> Result<String, GitError> {
     })
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DiffOptions {
-    pub ignore_whitespace: bool,
-}
-
 fn tracked_diff(
     work_dir: &Path,
     path: Option<&str>,
@@ -1382,15 +1377,6 @@ pub fn is_git_repo(work_dir: &Path) -> bool {
     command(work_dir, &["rev-parse", "--is-inside-work-tree"])
         .map(|out| out.trim() == "true")
         .unwrap_or(false)
-}
-
-/// The files `git ls-files` reports for a repository, de-duplicated.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct GitFileInventory {
-    /// Repository-relative file paths (`/` separated), sorted.
-    pub paths: Vec<String>,
-    /// Names that were not valid UTF-8 and were skipped rather than mangled.
-    pub non_utf8_skipped: usize,
 }
 
 /// Why a file inventory could not be produced.

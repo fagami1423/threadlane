@@ -11,6 +11,7 @@
 pub mod actions;
 pub mod controller;
 mod app_state;
+pub mod project_io;
 pub mod session_seen;
 pub mod types;
 

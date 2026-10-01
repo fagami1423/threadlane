@@ -37,6 +37,7 @@ use crate::interaction::QuestionAnswer;
 use crate::messages::{ImageAttachment, ReasoningEffort, SessionPlan, TokenUsage};
 use crate::orchestration::{ModelRoles, OrchestratorMode};
 use crate::events::{AgentEvent, SubagentIsolation};
+use crate::repo::{GitOperation, GitResponse, ProjectFileNode};
 
 /// Daemon wire protocol version, announced by the server in the
 /// [`PROTOCOL_VERSION_HEADER`] WebSocket handshake response header.
@@ -48,8 +49,18 @@ use crate::events::{AgentEvent, SubagentIsolation};
 /// it), so clients must gate request/reply calls on
 /// [`COMMAND_REQUEST_PROTOCOL_VERSION`]. Version 2 adds the
 /// `CommandRequest`/`CommandReply` pair and the journaled
-/// [`SessionEvent::QueuedEntryCancelled`].
-pub const WIRE_PROTOCOL_VERSION: u64 = 2;
+/// [`SessionEvent::QueuedEntryCancelled`]. Version 3 adds the project-io
+/// surface — `ListProjectFiles`/`ReadProjectFile`/`WriteProjectFile`/
+/// `ProjectFileExists`/`GitRequest`/`WatchProject`/`UnwatchProject`/
+/// `GetWorktreeBases` commands, their `CommandResponse` payloads, and the
+/// ephemeral [`SessionEvent::WorkspaceChanged`].
+pub const WIRE_PROTOCOL_VERSION: u64 = 3;
+
+/// The lowest protocol version able to serve project filesystem and Git
+/// requests on the daemon's host. Gate file/git calls on this constant, not
+/// on [`WIRE_PROTOCOL_VERSION`] itself: when this build's version advances
+/// past 3, older-but-still-capable daemons must keep qualifying.
+pub const PROJECT_IO_PROTOCOL_VERSION: u64 = 3;
 
 /// The lowest protocol version able to decode a [`CommandRequest`]
 /// envelope. Gate request/reply calls on this constant, not on
@@ -207,6 +218,36 @@ pub enum SessionCommand {
     GetProjectState { work_dir: PathBuf },
     /// Request a session snapshot; answered by `SessionEvent::SessionSnapshot`.
     GetSessionSnapshot { session_id: String },
+    /// List the project's file tree on the daemon's filesystem; answered by
+    /// `CommandResponse::ProjectFiles`.
+    ListProjectFiles { work_dir: PathBuf, limit: usize },
+    /// Read one project file as UTF-8 text; answered by
+    /// `CommandResponse::FileContent`.
+    ReadProjectFile { work_dir: PathBuf, path: String },
+    /// Write one project file as UTF-8 text; answered by `Ack`/`Err`.
+    WriteProjectFile {
+        work_dir: PathBuf,
+        path: String,
+        content: String,
+    },
+    /// Whether `path` names an existing entry under `work_dir`; answered by
+    /// `CommandResponse::FileExists`.
+    ProjectFileExists { work_dir: PathBuf, path: String },
+    /// One Git repository operation — query or mutation — against the
+    /// checkout at `work_dir`; answered by `CommandResponse::Git`.
+    GitRequest {
+        work_dir: PathBuf,
+        operation: GitOperation,
+    },
+    /// Subscribe this client to `SessionEvent::WorkspaceChanged` for the
+    /// project's filesystem. Watchers are refcounted — a second `Watch`
+    /// for the same root just bumps the count; answered by `Ack`.
+    WatchProject { work_dir: PathBuf },
+    /// Release one `WatchProject` subscription; answered by `Ack`.
+    UnwatchProject { work_dir: PathBuf },
+    /// Answer `SessionEvent::WorktreeBases` with the project's base
+    /// branches for a new-task worktree picker; answered by `Ack`.
+    GetWorktreeBases { work_dir: PathBuf },
 }
 
 /// An event the daemon broadcasts to clients.
@@ -328,6 +369,17 @@ pub enum SessionEvent {
         #[serde(default)]
         images: Vec<ImageAttachment>,
     },
+    /// A watched project's filesystem changed. Ephemeral — never
+    /// journaled, like `TerminalEvent` output: each client refreshes from a
+    /// fresh `ListProjectFiles`/`GitRequest` rather than replayed state.
+    /// `git_dirty` means the `.git` index or refs changed (refresh status
+    /// surfaces); `files_dirty` means working-tree content changed
+    /// (refresh the file tree).
+    WorkspaceChanged {
+        work_dir: PathBuf,
+        git_dirty: bool,
+        files_dirty: bool,
+    },
 }
 
 /// A `SessionCommand` that expects a reply, sent as a
@@ -364,6 +416,14 @@ pub enum CommandResponse {
         #[serde(default)]
         images: Vec<ImageAttachment>,
     },
+    /// `ListProjectFiles` result: the project tree up to `limit` entries.
+    ProjectFiles { nodes: Vec<ProjectFileNode> },
+    /// `ReadProjectFile` result: the file's UTF-8 content.
+    FileContent { content: String },
+    /// `ProjectFileExists` result.
+    FileExists { exists: bool },
+    /// `GitRequest` result: the operation's payload.
+    Git { response: GitResponse },
 }
 
 /// The daemon's reply to a [`CommandRequest`]: one `{"response": ...}`

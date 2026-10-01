@@ -12,7 +12,8 @@ use super::types::{
     can_publish_branch, discard_options, message_generated_matches_active_project,
     selection_bar_discard_options, DiscardOption, GitAction, ReviewDiffRequest, ReviewDiffTarget,
 };
-use super::view::{retain_review_selection, scan_project_tree, RightPanelView};
+use super::view::{retain_review_selection, RightPanelView};
+use threadlane_project::files::scan_project_tree;
 
 fn paths(values: &[&str]) -> HashSet<String> {
     values.iter().map(|value| (*value).to_string()).collect()

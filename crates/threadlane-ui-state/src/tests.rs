@@ -5369,6 +5369,10 @@ impl threadlane_client::DaemonClient for RecordingDaemonClient {
         self.supports_requests
     }
 
+    fn supports_project_io(&self) -> bool {
+        false
+    }
+
     fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<SessionEvent> {
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
         rx

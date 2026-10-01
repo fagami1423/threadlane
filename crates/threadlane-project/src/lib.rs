@@ -7,6 +7,7 @@
 //! resolution, and `threadlane-protocol` for shared model/effort contracts
 //! — no runtime, wasi, or GPUI coupling.
 
+pub mod files;
 pub mod subagent_settings;
 pub mod watcher;
 

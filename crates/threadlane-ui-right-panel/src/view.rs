@@ -47,6 +47,12 @@ pub struct RightPanelView {
     visible: bool,
     project: Option<PathBuf>,
     worktree_unavailable: bool,
+    /// Whether the attached daemon answered `supports_project_io` at the
+    /// last sync. Part of the sync key: a remote client's handshake can
+    /// still be in flight when the panel first syncs, and the capability
+    /// flipping true later must re-run the watch arm instead of leaving
+    /// the client-side `WorkspaceWatcher` in place.
+    project_io_supported: bool,
     tree_state: Entity<TreeState>,
     expanded_paths: HashSet<String>,
     review_tab: ReviewTab,
@@ -107,6 +113,11 @@ pub struct RightPanelView {
     browser: Option<Entity<BrowserView>>,
     event_tx: tokio::sync::mpsc::UnboundedSender<PanelEvent>,
     _watcher: Option<WorkspaceWatcher>,
+    /// Project root currently held by a daemon-side `WatchProject`
+    /// subscription; unwatched on switch. `None` when the attached daemon
+    /// predates project-io (the local `WorkspaceWatcher` covers that
+    /// single-host case) or when nothing is selected.
+    watched_project: Option<PathBuf>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -142,6 +153,35 @@ impl RightPanelView {
             }
         })
         .detach();
+
+        // Daemon-side `WorkspaceChanged` events (emitted by its
+        // `WatchProject` registry) reach this client's own subscription;
+        // forwarding them as `PanelEvent`s gives the surfaces the same
+        // refresh signal the local watcher used to send. A pre-3 daemon
+        // emits none — the local watcher remains the source there.
+        {
+            let daemon_client = model.read(cx).daemon_client.clone();
+            let mut daemon_events = daemon_client.subscribe();
+            let workspace_tx = event_tx.clone();
+            if let Ok(executor) = threadlane_ui_state::chat::executor() {
+                executor.spawn(async move {
+                    while let Some(event) = daemon_events.recv().await {
+                        if let threadlane_protocol::daemon::SessionEvent::WorkspaceChanged {
+                            work_dir,
+                            git_dirty,
+                            files_dirty,
+                        } = event
+                        {
+                            let _ = workspace_tx.send(PanelEvent::WorkspaceChanged {
+                                project: work_dir,
+                                git_dirty,
+                                files_dirty,
+                            });
+                        }
+                    }
+                });
+            }
+        }
 
         // Agent browser commands arrive from tokio tool workers, which cannot
         // touch entities directly. The first panel to construct claims the
@@ -297,6 +337,7 @@ impl RightPanelView {
             visible: false,
             project: None,
             worktree_unavailable: false,
+            project_io_supported: false,
             tree_state,
             expanded_paths: HashSet::new(),
             review_tab: ReviewTab::Changes,
@@ -362,6 +403,7 @@ impl RightPanelView {
             browser,
             event_tx,
             _watcher: None,
+            watched_project: None,
             _subscriptions: vec![observe_model, tree_subscription],
         };
         panel.sync_project(cx);
@@ -369,19 +411,27 @@ impl RightPanelView {
     }
 
     fn sync_project(&mut self, cx: &mut Context<Self>) {
-        let (project, worktree_unavailable) = {
+        let (project, worktree_unavailable, project_io_supported) = {
             let state = self.model.read(cx);
             let project = state.active_git_work_dir();
             let unavailable = state.active_work_dir.is_some()
                 && state.active_session_id.is_some()
                 && project.is_none();
-            (project, unavailable)
+            (
+                project,
+                unavailable,
+                state.daemon_client.supports_project_io(),
+            )
         };
-        if self.project == project && self.worktree_unavailable == worktree_unavailable {
+        if self.project == project
+            && self.worktree_unavailable == worktree_unavailable
+            && self.project_io_supported == project_io_supported
+        {
             return;
         }
         self.project = project.clone();
         self.worktree_unavailable = worktree_unavailable;
+        self.project_io_supported = project_io_supported;
         self.draft_pr_context_revision = self.draft_pr_context_revision.wrapping_add(1);
         self.tree_state
             .update(cx, |state, cx| state.set_items(Vec::new(), cx));
@@ -411,20 +461,65 @@ impl RightPanelView {
         self.document_state
             .update(cx, |state, cx| state.set_text("", cx));
 
+        let daemon_client = self.model.read(cx).daemon_client.clone();
         if let Some(work_dir) = project {
-            let tx = self.event_tx.clone();
-            let proj = work_dir.clone();
-            self._watcher =
-                WorkspaceWatcher::start(work_dir, Duration::from_millis(200), move |change| {
-                    let _ = tx.send(PanelEvent::WorkspaceChanged {
-                        project: proj.clone(),
-                        git_dirty: change.git_dirty,
-                        files_dirty: change.files_dirty,
-                    });
-                })
+            if daemon_client.supports_project_io() {
+                self._watcher = None;
+                if self.watched_project.as_ref() != Some(&work_dir) {
+                    if let Some(previous) = self.watched_project.take() {
+                        let client = daemon_client.clone();
+                        if let Ok(executor) = threadlane_ui_state::chat::executor() {
+                            executor.spawn(async move {
+                                let _ = threadlane_ui_state::project_io::unwatch_project(
+                                    &client, &previous,
+                                )
+                                .await;
+                            });
+                        }
+                    }
+                    if let Ok(executor) = threadlane_ui_state::chat::executor() {
+                        let proj = work_dir.clone();
+                        let client = daemon_client.clone();
+                        executor.spawn(async move {
+                            let _ =
+                                threadlane_ui_state::project_io::watch_project(&client, &proj)
+                                    .await;
+                        });
+                    }
+                    self.watched_project = Some(work_dir);
+                }
+            } else {
+                // Pre-3 remote daemon: the only reachable filesystem is
+                // this client's, so the local watcher stays.
+                self.watched_project = None;
+                let tx = self.event_tx.clone();
+                let proj = work_dir.clone();
+                self._watcher = WorkspaceWatcher::start(
+                    work_dir,
+                    Duration::from_millis(200),
+                    move |change| {
+                        let _ = tx.send(PanelEvent::WorkspaceChanged {
+                            project: proj.clone(),
+                            git_dirty: change.git_dirty,
+                            files_dirty: change.files_dirty,
+                        });
+                    },
+                )
                 .ok();
+            }
         } else {
             self._watcher = None;
+            if let Some(previous) = self.watched_project.take() {
+                if let Ok(executor) = threadlane_ui_state::chat::executor() {
+                    let client = daemon_client.clone();
+                    executor.spawn(async move {
+                        let _ = threadlane_ui_state::project_io::unwatch_project(
+                            &client, &previous,
+                        )
+                        .await;
+                    });
+                }
+            }
         }
 
         self.refresh_active_surface(cx);
@@ -595,35 +690,61 @@ impl RightPanelView {
             return;
         };
         let tx = self.event_tx.clone();
-        std::thread::spawn(move || match surface {
-            Surface::Agents => {}
-            Surface::Trajectory => {
-                // Renders live off AppState; nothing to fetch.
-            }
-            Surface::Files => {
-                let nodes = scan_project_tree(&project, 500);
-                let _ = tx.send(PanelEvent::FilesLoaded { project, nodes });
-            }
-            Surface::Review => {
-                // Keep ahead/behind and PR checks current when the user refreshes Review.
-                // Fetch failures are tolerated so local status remains available offline.
-                let _ = threadlane_git::sync_remote(&project);
-                let (status, files, error) = match threadlane_git::inspect(&project) {
-                    Ok(status) => {
-                        let files = status.files.clone();
-                        (Some(status), files, None)
-                    }
-                    Err(error) => (None, Vec::new(), Some(error.to_string())),
-                };
+        let daemon_client = self.model.read(cx).daemon_client.clone();
+        let Ok(executor) = threadlane_ui_state::chat::executor() else {
+            if surface == Surface::Review {
                 let _ = tx.send(PanelEvent::ReviewLoaded {
                     project,
-                    status,
-                    files,
-                    error,
+                    status: None,
+                    files: Vec::new(),
+                    error: Some("The git runtime is unavailable.".into()),
                 });
             }
-            Surface::Browser => {
-                // The live webview needs no background refresh.
+            return;
+        };
+        executor.spawn(async move {
+            match surface {
+                Surface::Agents => {}
+                Surface::Trajectory => {
+                    // Renders live off AppState; nothing to fetch.
+                }
+                Surface::Files => {
+                    let nodes = threadlane_ui_state::project_io::project_files(
+                        &daemon_client,
+                        &project,
+                        500,
+                    )
+                    .await
+                    .unwrap_or_default();
+                    let _ = tx.send(PanelEvent::FilesLoaded { project, nodes });
+                }
+                Surface::Review => {
+                    // Keep ahead/behind and PR checks current when the user
+                    // refreshes Review; the daemon tolerates fetch failures so
+                    // local status remains available offline.
+                    let (status, files, error) = match threadlane_ui_state::project_io::inspect(
+                        &daemon_client,
+                        &project,
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(status) => {
+                            let files = status.files.clone();
+                            (Some(status), files, None)
+                        }
+                        Err(error) => (None, Vec::new(), Some(error)),
+                    };
+                    let _ = tx.send(PanelEvent::ReviewLoaded {
+                        project,
+                        status,
+                        files,
+                        error,
+                    });
+                }
+                Surface::Browser => {
+                    // The live webview needs no background refresh.
+                }
             }
         });
     }
@@ -691,21 +812,30 @@ impl RightPanelView {
         {
             self.review_diff_load_count += 1;
         }
+        let daemon_client = self.model.read(cx).daemon_client.clone();
         cx.spawn(async move |this, cx| {
             let background_request = request.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     match &background_request.target {
-                        ReviewDiffTarget::File(path) => threadlane_git::diff_file_with_options(
-                            &background_request.project,
-                            path,
-                            background_request.options,
-                        ),
-                        ReviewDiffTarget::AllChanges => threadlane_git::worktree_diff_with_options(
-                            &background_request.project,
-                            background_request.options,
-                        ),
+                        ReviewDiffTarget::File(path) => {
+                            threadlane_ui_state::project_io::diff_file(
+                                &daemon_client,
+                                &background_request.project,
+                                path.clone(),
+                                background_request.options,
+                            )
+                            .await
+                        }
+                        ReviewDiffTarget::AllChanges => {
+                            threadlane_ui_state::project_io::diff_worktree(
+                                &daemon_client,
+                                &background_request.project,
+                                background_request.options,
+                            )
+                            .await
+                        }
                     }
                 })
                 .await;
@@ -735,7 +865,7 @@ impl RightPanelView {
     fn apply_review_diff_result(
         &mut self,
         request: ReviewDiffRequest,
-        result: Result<String, threadlane_git::GitError>,
+        result: Result<String, String>,
         cx: &mut Context<Self>,
     ) {
         if self.git_checkout_pending
@@ -755,7 +885,7 @@ impl RightPanelView {
                     .update(cx, |state, cx| state.set_text(&markdown, cx));
             }
             Err(error) => {
-                self.review_diff_state = Some(ReviewDiffState::Failed(error.to_string()));
+                self.review_diff_state = Some(ReviewDiffState::Failed(error));
             }
         }
         cx.notify();
@@ -815,13 +945,39 @@ impl RightPanelView {
         let Some(project) = self.project.as_ref() else {
             return;
         };
-        let target_path = project.join(title);
+        // `title` is the project-relative document path.
+        let path = title.clone();
         let content = editor.read(cx).value().to_string();
-        if std::fs::write(&target_path, &content).is_ok() {
-            self.saved_content = content;
-            self.is_dirty = false;
-            cx.notify();
-        }
+        let daemon_client = self.model.read(cx).daemon_client.clone();
+        let work_dir = project.clone();
+        cx.spawn(async move |this, cx| {
+            let write_content = content.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    threadlane_ui_state::project_io::write_file(
+                        &daemon_client,
+                        &work_dir,
+                        path,
+                        write_content,
+                    )
+                    .await
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.saved_content = content;
+                        this.is_dirty = false;
+                    }
+                    Err(error) => {
+                        this.git_feedback = Some(format!("Save failed: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn apply_event(&mut self, event: PanelEvent, cx: &mut Context<Self>) {
@@ -1034,23 +1190,31 @@ impl RightPanelView {
 
         self.git_message_pending = true;
         self.git_feedback = Some("Generating a commit message…".into());
+        let daemon_client = self.model.read(cx).daemon_client.clone();
         executor.spawn(async move {
             let (result, diff_truncated) = async {
                 let diff = if selected_paths.len() == total_count {
-                    match threadlane_git::commit_message_diff(&work_dir) {
+                    match threadlane_ui_state::project_io::commit_message_diff(
+                        &daemon_client,
+                        &work_dir,
+                    )
+                    .await
+                    {
                         Ok(diff) => diff,
-                        Err(error) => return (Err(error.to_string()), false),
+                        Err(error) => return (Err(error), false),
                     }
                 } else {
-                    let mut diffs = Vec::new();
-                    for path in &selected_paths {
-                        if let Ok(d) = threadlane_git::diff_file(&work_dir, path) {
-                            if !d.trim().is_empty() {
-                                diffs.push(d);
-                            }
-                        }
+                    match threadlane_ui_state::project_io::diff_files(
+                        &daemon_client,
+                        &work_dir,
+                        selected_paths.clone(),
+                        threadlane_git::DiffOptions::default(),
+                    )
+                    .await
+                    {
+                        Ok(diff) => diff,
+                        Err(error) => return (Err(error), false),
                     }
-                    diffs.join("\n")
                 };
                 let diff_truncated = diff.chars().count() > 24_000;
                 let diff = if diff_truncated {
@@ -1218,149 +1382,29 @@ impl RightPanelView {
         };
         self.git_feedback = Some(feedback);
         let tx = self.event_tx.clone();
-        std::thread::spawn(move || {
-            let action_result = (|| {
-                let mut action_message = None;
-                match &action {
-                    GitAction::Commit | GitAction::CommitAndPush => {
-                        let status =
-                            threadlane_git::inspect(&work_dir).map_err(|e| e.to_string())?;
-                        let selected_set: HashSet<&str> =
-                            selected_paths.iter().map(String::as_str).collect();
-                        for file in &status.files {
-                            if selected_set.contains(file.path.as_str()) {
-                                threadlane_git::stage_file(&work_dir, &file.path)
-                                    .map_err(|e| e.to_string())?;
-                            } else {
-                                let _ = threadlane_git::unstage_file(&work_dir, &file.path);
-                            }
-                        }
-                        threadlane_git::commit_staged(&work_dir, &message)
-                            .map_err(|e| e.to_string())?;
-                        if matches!(action, GitAction::CommitAndPush) {
-                            threadlane_git::push(&work_dir).map_err(|e| e.to_string())?;
-                        }
-                    }
-                    GitAction::Push => {
-                        threadlane_git::push(&work_dir).map_err(|e| e.to_string())?;
-                    }
-                    GitAction::Pull => {
-                        threadlane_git::pull(&work_dir).map_err(|e| e.to_string())?;
-                    }
-                    GitAction::Fetch => {
-                        threadlane_git::fetch(&work_dir).map_err(|e| e.to_string())?;
-                    }
-                    GitAction::StageAll => {
-                        threadlane_git::stage_all(&work_dir).map_err(|e| e.to_string())?;
-                    }
-                    GitAction::UnstageAll => {
-                        threadlane_git::unstage_all(&work_dir).map_err(|e| e.to_string())?;
-                    }
-                    GitAction::CreatePullRequest => {
-                        let pr = threadlane_git::create_pull_request(&work_dir)
-                            .map_err(|e| e.to_string())?;
-                        action_message = Some(if pr.is_empty() {
-                            "Pull request created successfully.".into()
-                        } else {
-                            format!("Pull request created: {pr}")
-                        });
-                    }
-                    GitAction::Checkout(branch) => {
-                        threadlane_git::checkout(&work_dir, branch).map_err(|e| e.to_string())?;
-                    }
-                    GitAction::CheckoutStash(branch) => {
-                        threadlane_git::checkout_with_stash(&work_dir, branch)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    GitAction::CheckoutCarry(branch) => {
-                        threadlane_git::checkout_carrying_changes(&work_dir, branch)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    GitAction::CreateBranch(branch) => {
-                        threadlane_git::create_branch(&work_dir, branch)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    GitAction::DeleteBranch(branch) => {
-                        threadlane_git::delete_branch(&work_dir, branch, false)
-                            .map_err(|e| e.to_string())?;
-                        action_message = Some(format!("Deleted local branch {branch}"));
-                    }
-                    GitAction::Merge(branch) => {
-                        threadlane_git::merge(&work_dir, branch).map_err(|e| e.to_string())?;
-                    }
-                    GitAction::PopStash(idx) => {
-                        threadlane_git::pop_stash(&work_dir, *idx).map_err(|e| e.to_string())?;
-                    }
-                    GitAction::DropStash(idx) => {
-                        threadlane_git::drop_stash(&work_dir, *idx).map_err(|e| e.to_string())?;
-                    }
-                    GitAction::DiscardFile(path) => {
-                        threadlane_git::discard_file_changes(&work_dir, path)
-                            .map_err(|e| e.to_string())?;
-                        action_message = Some(format!("Discarded changes in {path}"));
-                    }
-                    GitAction::DiscardFiles(paths) => {
-                        if !paths.is_empty() {
-                            threadlane_git::discard_files(&work_dir, paths)
-                                .map_err(|e| e.to_string())?;
-                            action_message = Some(if paths.len() == 1 {
-                                format!("Discarded changes in {}", paths[0])
-                            } else {
-                                format!("Discarded changes in {} files", paths.len())
-                            });
-                        }
-                    }
-                    GitAction::DiscardAll => {
-                        threadlane_git::discard_all_changes(&work_dir)
-                            .map_err(|e| e.to_string())?;
-                        action_message = Some("Discarded all changes".to_string());
-                    }
-                    GitAction::IgnoreFile(path) => {
-                        threadlane_git::ignore_file(&work_dir, path).map_err(|e| e.to_string())?;
-                    }
-                    GitAction::IgnoreExtension(ext) => {
-                        threadlane_git::ignore_extension(&work_dir, ext)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    GitAction::StageFile(path) => {
-                        threadlane_git::stage_file(&work_dir, path).map_err(|e| e.to_string())?;
-                        action_message = Some(format!("Staged {path}"));
-                    }
-                    GitAction::UnstageFile(path) => {
-                        threadlane_git::unstage_file(&work_dir, path).map_err(|e| e.to_string())?;
-                        action_message = Some(format!("Unstaged {path}"));
-                    }
-                    GitAction::StageFiles(paths) => {
-                        threadlane_git::stage_files(&work_dir, paths).map_err(|e| e.to_string())?;
-                        action_message = Some(format!("Staged {} files", paths.len()));
-                    }
-                    GitAction::UnstageFiles(paths) => {
-                        threadlane_git::unstage_files(&work_dir, paths)
-                            .map_err(|e| e.to_string())?;
-                        action_message = Some(format!("Unstaged {} files", paths.len()));
-                    }
-                    GitAction::StashPush {
-                        message,
-                        include_untracked,
-                    } => {
-                        threadlane_git::stash_push(
-                            &work_dir,
-                            message.as_deref(),
-                            *include_untracked,
-                        )
-                        .map_err(|e| e.to_string())?;
-                        action_message = Some("Stashed changes successfully".to_string());
-                    }
-                }
-                Ok(action_message)
-            })();
-            let status = threadlane_git::inspect(&work_dir).map_err(|e| e.to_string());
+        let daemon_client = self.model.read(cx).daemon_client.clone();
+        let operation = git_action_to_operation(&action, message, selected_paths);
+        let Ok(executor) = threadlane_ui_state::chat::executor() else {
+            self.git_busy = false;
+            self.git_checkout_pending = false;
+            self.git_feedback = Some("The git runtime is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        executor.spawn(async move {
+            let outcome =
+                threadlane_ui_state::project_io::run_action(&daemon_client, &work_dir, operation)
+                    .await;
+            let (action_error, action_message, status) = match outcome {
+                Ok(outcome) => (outcome.action_error, outcome.message, outcome.status),
+                Err(error) => (Some(error.clone()), None, Err(error)),
+            };
             let _ = tx.send(PanelEvent::ActionFinished {
                 project: work_dir,
                 status,
-                action_error: action_result.as_ref().err().cloned(),
-                checkout_succeeded: checkout && action_result.is_ok(),
-                action_message: action_result.ok().flatten(),
+                checkout_succeeded: checkout && action_error.is_none(),
+                action_error,
+                action_message,
             });
         });
         cx.notify();
@@ -2477,13 +2521,20 @@ impl RightPanelView {
                                 let diff_project = proj.clone();
                                 let target = diff_path.clone();
                                 let m = model_ref.clone();
+                                let client = m.read(cx).daemon_client.clone();
                                 cx.spawn(async move |cx| {
                                     let diff_target = target.clone();
                                     let content = cx
                                         .background_executor()
                                         .spawn(async move {
-                                            threadlane_git::diff_file(&diff_project, &diff_target)
-                                                .unwrap_or_else(|error| error.to_string())
+                                            threadlane_ui_state::project_io::diff_file(
+                                                &client,
+                                                &diff_project,
+                                                diff_target,
+                                                threadlane_git::DiffOptions::default(),
+                                            )
+                                            .await
+                                            .unwrap_or_else(|error| error)
                                         })
                                         .await;
                                     let _ = m.update(cx, |state, cx| {
@@ -3748,15 +3799,25 @@ impl RightPanelView {
                                     if let Some(project) = this.project.clone() {
                                         this.loading_stash_index = Some(idx);
                                         let tx = this.event_tx.clone();
-                                        std::thread::spawn(move || {
-                                            let files =
-                                                threadlane_git::inspect_stash_files(&project, idx);
-                                            let _ = tx.send(PanelEvent::StashFilesLoaded {
-                                                project,
-                                                index: idx,
-                                                files,
+                                        let client =
+                                            this.model.read(cx).daemon_client.clone();
+                                        if let Ok(executor) =
+                                            threadlane_ui_state::chat::executor()
+                                        {
+                                            executor.spawn(async move {
+                                                let files =
+                                                    threadlane_ui_state::project_io::stash_files(
+                                                        &client, &project, idx,
+                                                    )
+                                                    .await
+                                                    .unwrap_or_default();
+                                                let _ = tx.send(PanelEvent::StashFilesLoaded {
+                                                    project,
+                                                    index: idx,
+                                                    files,
+                                                });
                                             });
-                                        });
+                                        }
                                     }
                                 }
                                 cx.notify();
@@ -3847,17 +3908,20 @@ impl RightPanelView {
                                         let target_path = file_path_for_click.clone();
                                         let diff_project = proj.clone();
                                         let m = model_for_click.clone();
+                                        let client = m.read(cx).daemon_client.clone();
                                         cx.spawn(async move |_this, cx| {
                                             let diff_target = target_path.clone();
                                             let content = cx
                                                 .background_executor()
                                                 .spawn(async move {
-                                                    threadlane_git::diff_stash_file(
+                                                    threadlane_ui_state::project_io::diff_stash_file(
+                                                        &client,
                                                         &diff_project,
                                                         idx,
-                                                        &diff_target,
+                                                        diff_target,
                                                     )
-                                                    .unwrap_or_else(|err| err.to_string())
+                                                    .await
+                                                    .unwrap_or_else(|err| err)
                                                 })
                                                 .await;
                                             let _ = m.update(cx, |state, cx| {
@@ -4144,6 +4208,7 @@ impl RightPanelView {
                     let click_sha = sha.clone();
                     let click_tx = event_tx.clone();
                     let click_project = project.clone();
+                    let click_model = model.clone();
 
                     div()
                         .id(SharedString::from(format!("commit-{sha}")))
@@ -4180,15 +4245,30 @@ impl RightPanelView {
                                         if let Some(proj) = click_project.clone() {
                                             let tx = click_tx.clone();
                                             let fetch_sha = click_sha.clone();
-                                            std::thread::spawn(move || {
-                                                let files = threadlane_git::inspect_commit_files(
-                                                    &proj, &fetch_sha,
-                                                );
-                                                let _ = tx.send(PanelEvent::CommitFilesLoaded {
-                                                    sha: fetch_sha,
-                                                    files,
+                                            let click_client = click_model
+                                                .read(cx)
+                                                .daemon_client
+                                                .clone();
+                                            if let Ok(executor) =
+                                                threadlane_ui_state::chat::executor()
+                                            {
+                                                executor.spawn(async move {
+                                                    let files =
+                                                        threadlane_ui_state::project_io::commit_files(
+                                                            &click_client,
+                                                            &proj,
+                                                            fetch_sha.clone(),
+                                                        )
+                                                        .await
+                                                        .unwrap_or_default();
+                                                    let _ = tx.send(
+                                                        PanelEvent::CommitFilesLoaded {
+                                                            sha: fetch_sha,
+                                                            files,
+                                                        },
+                                                    );
                                                 });
-                                            });
+                                            }
                                         }
                                     }
                                     cx.notify();
@@ -4315,14 +4395,16 @@ impl RightPanelView {
                                         let sha_str = diff_sha.clone();
                                         let label = format!("{target} @ {disp_sha}");
                                         let state_model = m.clone();
+                                        let client = m.read(cx).daemon_client.clone();
                                         cx.spawn(async move |_this, cx| {
                                             let content = cx
                                                 .background_executor()
                                                 .spawn(async move {
-                                                    threadlane_git::diff_commit_file(
-                                                        &p, &sha_str, &target,
+                                                    threadlane_ui_state::project_io::diff_commit_file(
+                                                        &client, &p, sha_str, target,
                                                     )
-                                                    .unwrap_or_else(|e| e.to_string())
+                                                    .await
+                                                    .unwrap_or_else(|e| e)
                                                 })
                                                 .await;
                                             let _ = state_model.update(cx, |state, cx| {
@@ -5882,57 +5964,85 @@ pub(crate) fn retain_review_selection(
     }
 }
 
-pub fn scan_project_tree(root: &Path, limit: usize) -> Vec<FileNode> {
-    fn visit(
-        root: &Path,
-        relative: &Path,
-        depth: usize,
-        limit: usize,
-        count: &mut usize,
-    ) -> Vec<FileNode> {
-        if *count >= limit || depth > 6 {
-            return Vec::new();
-        }
-        let Ok(read_dir) = std::fs::read_dir(root.join(relative)) else {
-            return Vec::new();
-        };
-        let mut children = read_dir
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name == ".git" || name == "target" || name == ".threadlane" {
-                    return None;
-                }
-                Some((name, entry.file_type().ok()?.is_dir()))
-            })
-            .collect::<Vec<_>>();
-        children.sort_by_key(|(name, is_dir)| (!*is_dir, name.to_ascii_lowercase()));
-
-        let mut nodes = Vec::new();
-        for (name, is_dir) in children {
-            if *count >= limit {
-                break;
-            }
-            *count += 1;
-            let path = relative.join(&name);
-            let rel_str = path.to_string_lossy().into_owned();
-            nodes.push(FileNode {
-                relative_path: rel_str,
-                name,
-                is_dir,
-                children: Vec::new(),
-            });
-        }
-        for node in &mut nodes {
-            if node.is_dir {
-                node.children = visit(root, Path::new(&node.relative_path), depth + 1, limit, count);
-            }
-        }
-        nodes
+/// Maps a panel `GitAction` onto the wire-level `GitOperation` the daemon
+/// executes (protocol v3). The daemon re-inspects afterwards, so the UI
+/// only needs the operation — status and messages come back in
+/// `GitActionOutcome`.
+fn git_action_to_operation(
+    action: &GitAction,
+    message: String,
+    selected_paths: Vec<String>,
+) -> threadlane_protocol::repo::GitOperation {
+    use threadlane_protocol::repo::{CheckoutMode, GitOperation};
+    match action {
+        GitAction::Commit | GitAction::CommitAndPush => GitOperation::Commit {
+            message,
+            selected_paths,
+            push: matches!(action, GitAction::CommitAndPush),
+        },
+        GitAction::Push => GitOperation::Push,
+        GitAction::Pull => GitOperation::Pull,
+        GitAction::Fetch => GitOperation::Fetch,
+        GitAction::StageAll => GitOperation::StageAll,
+        GitAction::UnstageAll => GitOperation::UnstageAll,
+        GitAction::CreatePullRequest => GitOperation::CreatePullRequest,
+        GitAction::Checkout(branch) => GitOperation::Checkout {
+            branch: branch.clone(),
+            mode: CheckoutMode::Clean,
+        },
+        GitAction::CheckoutStash(branch) => GitOperation::Checkout {
+            branch: branch.clone(),
+            mode: CheckoutMode::Stash,
+        },
+        GitAction::CheckoutCarry(branch) => GitOperation::Checkout {
+            branch: branch.clone(),
+            mode: CheckoutMode::Carry,
+        },
+        GitAction::CreateBranch(branch) => GitOperation::CreateBranch {
+            name: branch.clone(),
+        },
+        GitAction::DeleteBranch(branch) => GitOperation::DeleteBranch {
+            branch: branch.clone(),
+            force: false,
+        },
+        GitAction::Merge(branch) => GitOperation::Merge {
+            branch: branch.clone(),
+        },
+        GitAction::PopStash(index) => GitOperation::PopStash { index: *index },
+        GitAction::DropStash(index) => GitOperation::DropStash { index: *index },
+        GitAction::DiscardFile(path) => GitOperation::Discard {
+            paths: vec![path.clone()],
+        },
+        GitAction::DiscardFiles(paths) => GitOperation::Discard {
+            paths: paths.clone(),
+        },
+        GitAction::DiscardAll => GitOperation::DiscardAll,
+        GitAction::IgnoreFile(path) => GitOperation::IgnoreFile {
+            path: path.clone(),
+        },
+        GitAction::IgnoreExtension(ext) => GitOperation::IgnoreExtension {
+            extension: ext.clone(),
+        },
+        GitAction::StageFile(path) => GitOperation::Stage {
+            paths: vec![path.clone()],
+        },
+        GitAction::UnstageFile(path) => GitOperation::Unstage {
+            paths: vec![path.clone()],
+        },
+        GitAction::StageFiles(paths) => GitOperation::Stage {
+            paths: paths.clone(),
+        },
+        GitAction::UnstageFiles(paths) => GitOperation::Unstage {
+            paths: paths.clone(),
+        },
+        GitAction::StashPush {
+            message,
+            include_untracked,
+        } => GitOperation::StashPush {
+            message: message.clone(),
+            include_untracked: *include_untracked,
+        },
     }
-
-    let mut count = 0;
-    visit(root, Path::new(""), 0, limit, &mut count)
 }
 
 #[cfg(test)]
@@ -6616,7 +6726,7 @@ mod review_diff_tests {
             panel.reload_review_diff(cx);
             let request = panel.review_diff_request.clone().unwrap();
             let error = threadlane_git::diff_file_with_options(&request.project, "../outside", request.options).unwrap_err();
-            panel.apply_review_diff_result(request.clone(), Err(error), cx);
+            panel.apply_review_diff_result(request.clone(), Err(error.to_string()), cx);
             assert!(matches!(&panel.review_diff_state, Some(ReviewDiffState::Failed(error)) if error.contains("outside")));
             panel.reload_review_diff(cx);
             let retry = panel.review_diff_request.clone().unwrap();
@@ -6764,7 +6874,7 @@ mod review_diff_tests {
                 request.options,
             )
             .unwrap_err();
-            panel.apply_review_diff_result(request, Err(error), cx);
+            panel.apply_review_diff_result(request, Err(error.to_string()), cx);
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
         let retry = cx
