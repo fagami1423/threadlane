@@ -246,24 +246,25 @@ impl ChatListView {
         if !matches.iter().any(|candidate| candidate == path) {
             return;
         }
-        // Existence is verified against the daemon host: remote
-        // attachments ask the daemon (`symlink_metadata` is kept for a
-        // local attachment, where it checks the same disk). A file
-        // deleted since enumeration refreshes the list instead of
-        // inserting.
+        // Existence is verified on the daemon host through the guarded
+        // project-io path. A pre-3 remote daemon answers UNSUPPORTED:
+        // probing the *client's* disk at the daemon-side root would
+        // judge the wrong filesystem, so unsupported counts as absent —
+        // the inventory refresh below re-asks the daemon and degrades
+        // to its own unsupported state.
         let client = self.model.read(cx).daemon_client.clone();
         let path = path.to_string();
         cx.spawn_in(window, async move |this, cx| {
-            let exists = if client.supports_project_io() {
-                // The in-process daemon answers inline on the caller's
-                // thread, so the probe hops to a background executor
-                // instead of `stat`ing on the UI thread.
-                let probe_client = client.clone();
-                let probe_root = root.clone();
-                let probe_path = path.clone();
-                is_safe_relative_path(&path)
-                    && cx
-                        .background_executor()
+            let exists = client.supports_project_io()
+                && is_safe_relative_path(&path)
+                && {
+                    // The in-process daemon answers inline on the caller's
+                    // thread, so the probe hops to a background executor
+                    // instead of `stat`ing on the UI thread.
+                    let probe_client = client.clone();
+                    let probe_root = root.clone();
+                    let probe_path = path.clone();
+                    cx.background_executor()
                         .spawn(async move {
                             threadlane_ui_state::project_io::file_exists(
                                 &probe_client,
@@ -274,10 +275,7 @@ impl ChatListView {
                             .unwrap_or(false)
                         })
                         .await
-            } else {
-                is_safe_relative_path(&path)
-                    && std::fs::symlink_metadata(root.join(&path)).is_ok()
-            };
+                };
             let _ = this.update_in(cx, |this, window, cx| {
                 if !exists {
                     this.request_file_inventory(root, cx);

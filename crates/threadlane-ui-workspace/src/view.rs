@@ -1426,23 +1426,37 @@ impl WorkspaceView {
         cx.background_executor()
             .spawn(async move {
                 // A remote client's handshake can still be in flight when
-                // the first refresh fires — `supports_command_requests`
-                // stays false until the peer's protocol version lands, and
-                // a one-shot request would record that transient as the
-                // status error. Wait briefly for it to settle; a settled
-                // pre-3 daemon is not delayed (its version answers fast).
-                for _ in 0..10 {
-                    if client.supports_command_requests() {
-                        break;
+                // the first refresh fires — `supports_project_io` stays
+                // false until the peer's version lands, and a one-shot
+                // inspect would record that transient as the status
+                // error. Wait for it; `supports_command_requests` already
+                // true means the handshake *completed* at a pre-v3
+                // version, which should fail the inspect fast instead of
+                // waiting out the window. While still unsettled after the
+                // wait, retry the inspect once before reporting.
+                for attempt in 0..2 {
+                    for _ in 0..20 {
+                        if client.supports_project_io()
+                            || client.supports_command_requests()
+                        {
+                            break;
+                        }
+                        executor.timer(std::time::Duration::from_millis(200)).await;
                     }
-                    executor.timer(std::time::Duration::from_millis(200)).await;
+                    // `sync_remote` refreshes remote-tracking refs first;
+                    // a failed fetch must not hide the local Git status
+                    // (offline use is valid).
+                    let result =
+                        threadlane_ui_state::project_io::inspect(&client, &work_dir, true)
+                            .await;
+                    if result.is_ok()
+                        || client.supports_command_requests()
+                        || attempt == 1
+                    {
+                        let _ = tx.send(GitEvent::Loaded { work_dir, result });
+                        return;
+                    }
                 }
-                // `sync_remote` refreshes remote-tracking refs first; a
-                // failed fetch must not hide the local Git status
-                // (offline use is valid).
-                let result = threadlane_ui_state::project_io::inspect(&client, &work_dir, true)
-                    .await;
-                let _ = tx.send(GitEvent::Loaded { work_dir, result });
             })
             .detach();
     }

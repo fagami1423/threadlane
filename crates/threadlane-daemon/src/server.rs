@@ -264,9 +264,10 @@ async fn serve_connection(
     // so a long request — blocking Git work can take a while over a WAN —
     // never stalls the socket reader: terminal input, prompt submission,
     // and cancellation keep flowing while the request resolves. One
-    // worker preserves the ordering mutations rely on.
-    let (request_tx, mut request_rx) =
-        mpsc::unbounded_channel::<(u64, SessionCommand)>();
+    // worker preserves the ordering mutations rely on. The queue is
+    // bounded so a client can't grow daemon memory without limit — a
+    // full queue pauses the reader, which is the intended backpressure.
+    let (request_tx, mut request_rx) = mpsc::channel::<(u64, SessionCommand)>(64);
     tokio::spawn({
         let core = core.clone();
         let reply_tx = reply_tx.clone();
@@ -280,9 +281,10 @@ async fn serve_connection(
                 };
                 match reply_frame(&reply) {
                     Ok(frame) => {
-                        if reply_tx.send(frame).await.is_err() {
-                            break;
-                        }
+                        // Keep draining on a dead socket: queued cleanup
+                        // `UnwatchProject` dispatches must still run even
+                        // though their reply frames have nowhere to go.
+                        let _ = reply_tx.send(frame).await;
                     }
                     Err(error) => {
                         tracing::warn!(%error, "could not encode command reply");
@@ -312,7 +314,10 @@ async fn serve_connection(
                 {
                     note_terminal(&command, &mut owned_terminals);
                     note_watch(&command, &mut owned_watches);
-                    if request_tx.send((request_id, command)).is_err() {
+                    // Bounded: awaiting capacity here is the backpressure
+                    // that throttles a client queuing faster than the
+                    // worker can dispatch.
+                    if request_tx.send((request_id, command)).await.is_err() {
                         break;
                     }
                     continue;
@@ -353,12 +358,14 @@ async fn serve_connection(
     // before them would leak the watcher those dispatches just started.
     for (work_dir, count) in owned_watches {
         for _ in 0..count {
-            let _ = request_tx.send((
-                0,
-                SessionCommand::UnwatchProject {
-                    work_dir: work_dir.clone(),
-                },
-            ));
+            let _ = request_tx
+                .send((
+                    0,
+                    SessionCommand::UnwatchProject {
+                        work_dir: work_dir.clone(),
+                    },
+                ))
+                .await;
         }
     }
     Ok(())
