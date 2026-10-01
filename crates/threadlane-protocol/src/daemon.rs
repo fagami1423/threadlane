@@ -53,8 +53,12 @@ use crate::repo::{GitOperation, GitResponse, ProjectFileNode};
 /// surface — `ListProjectFiles`/`ReadProjectFile`/`WriteProjectFile`/
 /// `ProjectFileExists`/`GitRequest`/`WatchProject`/`UnwatchProject`/
 /// `GetWorktreeBases` commands, their `CommandResponse` payloads, and the
-/// ephemeral [`SessionEvent::WorkspaceChanged`].
-pub const WIRE_PROTOCOL_VERSION: u64 = 3;
+/// ephemeral [`SessionEvent::WorkspaceChanged`]. Version 4 adds draft creation
+/// and project-scoped composer options.
+pub const WIRE_PROTOCOL_VERSION: u64 = 4;
+
+/// Draft creation and composer catalog requests.
+pub const COMPOSER_PROTOCOL_VERSION: u64 = 4;
 
 /// The lowest protocol version able to serve project filesystem and Git
 /// requests on the daemon's host. Gate file/git calls on this constant, not
@@ -83,6 +87,13 @@ pub const PROTOCOL_VERSION_HEADER: &str = "x-threadlane-protocol";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionCommand {
+    /// Begin a draft in an attached project; persisted by the first prompt.
+    BeginSession { work_dir: PathBuf },
+    /// Desktop's configured model inventory and composer defaults.
+    GetComposerOptions {
+        work_dir: PathBuf,
+        session_id: Option<String>,
+    },
     /// Submit a user prompt. `work_dir` is the effective execution directory
     /// (the worktree for worktree sessions); `acp_config` holds pending ACP
     /// agent settings to apply before the first turn. `model` re-seeds the
@@ -404,6 +415,15 @@ pub struct CommandRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CommandResponse {
+    SessionDraft {
+        session: SessionInfo,
+    },
+    ComposerOptions {
+        models: Vec<ComposerModel>,
+        model: String,
+        effort: ReasoningEffort,
+        mode: OrchestratorMode,
+    },
     /// Completed; no payload.
     Ack,
     /// `CancelQueuedMessage` dropped the entry: its staged content so the
@@ -424,6 +444,13 @@ pub enum CommandResponse {
     FileExists { exists: bool },
     /// `GitRequest` result: the operation's payload.
     Git { response: GitResponse },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ComposerModel {
+    pub id: String,
+    pub label: String,
+    pub efforts: Vec<ReasoningEffort>,
 }
 
 /// The daemon's reply to a [`CommandRequest`]: one `{"response": ...}`

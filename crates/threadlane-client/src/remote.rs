@@ -133,6 +133,11 @@ impl RemoteDaemon {
         Self::start(url.into(), token, executor, false)
     }
 
+    pub fn supports_composer_options(&self) -> bool {
+        self.protocol_version.load(Ordering::SeqCst)
+            >= threadlane_protocol::daemon::COMPOSER_PROTOCOL_VERSION
+    }
+
     pub fn connect_with_runtime(
         url: impl Into<String>,
         token: Option<String>,

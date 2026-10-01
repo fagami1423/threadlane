@@ -1,7 +1,7 @@
 //! iOS executor and GPUI event-pump adapter for the shared daemon client.
 use std::sync::{Arc, OnceLock};
 use threadlane_client::{ConnectionState, DaemonClient, RemoteDaemon};
-use threadlane_protocol::daemon::{SessionCommand, SessionEvent};
+use threadlane_protocol::daemon::{CommandResponse, SessionCommand, SessionEvent};
 use tokio::sync::mpsc;
 
 pub enum MobileEvent {
@@ -12,7 +12,7 @@ pub enum MobileEvent {
     Fatal(String),
     CommandResult {
         command: SessionCommand,
-        result: Result<(), String>,
+        result: Result<CommandResponse, String>,
     },
 }
 pub struct MobileDaemon {
@@ -86,7 +86,9 @@ impl MobileDaemon {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         runtime().spawn(async move {
-            let result = if client.supports_command_requests() { client.request(command.clone()).await.map(|_| ()) }
+            let result = if matches!(command, SessionCommand::BeginSession { .. } | SessionCommand::GetComposerOptions { .. }) && !client.supports_composer_options() {
+                Err("Update desktop to use new chats and composer options".into())
+            } else if client.supports_command_requests() { client.request(command.clone()).await }
                 else { Err("This desktop version cannot acknowledge commands. Update desktop before sending.".into()) };
             let _ = tx.send(MobileEvent::CommandResult { command, result });
         });

@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use gpui::{prelude::*, *};
+use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::StyledExt;
 use gpui_kit::component::{
     button::{Button, ButtonVariants},
@@ -18,6 +19,9 @@ use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, Sizable,
 };
 use gpui_kit_assets::__private as kit_icons;
+use threadlane_protocol::daemon::{CommandResponse, ComposerModel};
+use threadlane_protocol::repo::{GitOperation, GitResponse, GitStatus};
+use threadlane_protocol::{OrchestratorMode, ReasoningEffort};
 
 use crate::client::{MobileDaemon, MobileEvent};
 use crate::preferences;
@@ -127,7 +131,7 @@ impl ActiveSession {
 }
 
 enum MobileSessionRow {
-    Project(String),
+    Project(threadlane_protocol::daemon::ProjectInfo),
     Session(SessionInfo),
 }
 
@@ -138,6 +142,7 @@ pub struct MobileApp {
     host: Entity<InputState>,
     port: Entity<InputState>,
     token: Entity<InputState>,
+    search: Entity<InputState>,
     composer: Entity<gpui_kit::component::input::TextareaState>,
     /// One custom-answer input per `allow_custom` question item, keyed by
     /// `question_key(request.id, item.id)` and created lazily on render.
@@ -158,6 +163,12 @@ pub struct MobileApp {
     active: Option<ActiveSession>,
     sessions_list: ListState,
     session_rows: Vec<MobileSessionRow>,
+    project_git: HashMap<std::path::PathBuf, GitStatus>,
+    models: Vec<ComposerModel>,
+    session_drafts: Vec<SessionInfo>,
+    selected_model: Option<String>,
+    effort: Option<ReasoningEffort>,
+    mode: OrchestratorMode,
     _link_task: Task<()>,
     _pump: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -168,6 +179,7 @@ impl MobileApp {
         let host = cx.new(|cx| InputState::new(window, cx).placeholder("192.168.x.x"));
         let port = cx.new(|cx| InputState::new(window, cx).placeholder("port"));
         let token = cx.new(|cx| InputState::new(window, cx).placeholder("pairing token"));
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search chats"));
         let composer = cx.new(|cx| {
             gpui_kit::component::input::TextareaState::new(window, cx)
                 .placeholder("Message")
@@ -175,7 +187,7 @@ impl MobileApp {
                 .submit_on_enter(true)
                 .soft_wrap(true)
         });
-        let mut subscriptions = [&host, &port, &token]
+        let mut subscriptions = [&host, &port, &token, &search]
             .iter()
             .map(|input| {
                 cx.subscribe_in(input, window, |_, _, event, _, _| match event {
@@ -196,6 +208,16 @@ impl MobileApp {
                     _ => {}
                 },
             ),
+        );
+
+        subscriptions.push(
+            cx.subscribe_in(&search, window, |this, input, event, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.client.search_query = input.read(cx).value().to_string();
+                    this.refresh_session_rows();
+                    cx.notify();
+                }
+            }),
         );
 
         // Poll for pairing deep links arriving while the app runs — the
@@ -230,6 +252,12 @@ impl MobileApp {
                         if let Some(daemon) = &this.daemon {
                             if daemon.is_connected() {
                                 daemon.send(SessionCommand::GetProjects);
+                                if let Some(work_dir) = &this.client.sidebar_project_filter {
+                                    daemon.request(SessionCommand::GitRequest {
+                                        work_dir: work_dir.clone(),
+                                        operation: GitOperation::Inspect { sync_remote: false },
+                                    });
+                                }
                             }
                         }
                     }
@@ -245,6 +273,7 @@ impl MobileApp {
             port,
             token,
             composer,
+            search,
             question_inputs: HashMap::new(),
             connect_error: None,
             saved_pairing,
@@ -257,6 +286,12 @@ impl MobileApp {
             active: None,
             sessions_list: ListState::new(0, ListAlignment::Top, window.rem_size() * 4.5),
             session_rows: Vec::new(),
+            project_git: HashMap::new(),
+            models: Vec::new(),
+            session_drafts: Vec::new(),
+            selected_model: None,
+            effort: None,
+            mode: OrchestratorMode::Normal,
             _link_task: link_task,
             _pump: None,
             _subscriptions: subscriptions,
@@ -342,6 +377,11 @@ impl MobileApp {
         self.link_state = "Connecting…".to_string();
         self.connect_error = None;
         self.client.projects.clear();
+        self.session_drafts.clear();
+        self.project_git.clear();
+        self.models.clear();
+        self.selected_model = None;
+        self.effort = None;
         self.active = None;
         self.daemon = Some(daemon);
         self.screen = Screen::Sessions;
@@ -392,11 +432,22 @@ impl MobileApp {
     }
 
     fn open_session(&mut self, info: &SessionInfo, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.session_drafts.iter().any(|draft| draft.id == info.id) {
+            if let Some(daemon) = &self.daemon {
+                daemon.send(SessionCommand::GetSessionSnapshot {
+                    session_id: info.id.clone(),
+                });
+            }
+        }
         if let Some(daemon) = &self.daemon {
-            daemon.send(SessionCommand::GetSessionSnapshot {
-                session_id: info.id.clone(),
+            daemon.request(SessionCommand::GetComposerOptions {
+                work_dir: info.work_dir.clone(),
+                session_id: Some(info.id.clone()),
             });
         }
+        self.models.clear();
+        self.selected_model = None;
+        self.effort = None;
         self.markdown_states.clear();
         self.client.select_session(info);
         let key = (
@@ -409,6 +460,207 @@ impl MobileApp {
         self.active = Some(ActiveSession::new(info, window));
         self.screen = Screen::Session;
         cx.notify();
+    }
+
+    fn begin_session(&mut self, cx: &mut Context<Self>) {
+        if self.sending {
+            return;
+        }
+        if self.active.is_some() {
+            self.client.composer_drafts.insert(
+                (
+                    self.client.active_work_dir.clone(),
+                    self.client.active_session_id.clone(),
+                ),
+                threadlane_client::ComposerDraft {
+                    text: self.composer.read(cx).value().to_string(),
+                    images: Vec::new(),
+                },
+            );
+        }
+        let project = self
+            .client
+            .sidebar_project_filter
+            .clone()
+            .or_else(|| self.client.active_work_dir.clone());
+        if let (Some(work_dir), Some(daemon)) = (project, &self.daemon) {
+            daemon.request(SessionCommand::BeginSession { work_dir });
+            self.sending = true;
+        }
+        cx.notify();
+    }
+
+    fn apply_response(
+        &mut self,
+        command: &SessionCommand,
+        response: CommandResponse,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match response {
+            CommandResponse::SessionDraft { session } => {
+                self.sending = false;
+                self.markdown_states.clear();
+                self.models.clear();
+                self.selected_model = None;
+                self.effort = None;
+                // A draft has no transcript until its first accepted prompt.
+                self.session_drafts.push(session.clone());
+                if let Some(project) = self
+                    .client
+                    .projects
+                    .iter_mut()
+                    .find(|project| project.work_dir == session.work_dir)
+                {
+                    project.sessions.push(session.clone());
+                }
+                self.refresh_session_rows();
+                self.client.select_session(&session);
+                self.client.messages = Default::default();
+                self.composer
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.active = Some(ActiveSession::new(&session, window));
+                self.screen = Screen::Session;
+                if let Some(daemon) = &self.daemon {
+                    daemon.request(SessionCommand::GetComposerOptions {
+                        work_dir: session.work_dir,
+                        session_id: Some(session.id),
+                    });
+                }
+            }
+            CommandResponse::ComposerOptions {
+                models,
+                model,
+                effort,
+                mode,
+            } => {
+                if let SessionCommand::GetComposerOptions {
+                    work_dir,
+                    session_id,
+                } = command
+                {
+                    if self.client.active_work_dir.as_ref() != Some(work_dir)
+                        || &self.client.active_session_id != session_id
+                    {
+                        return;
+                    }
+                }
+                self.models = models;
+                self.selected_model = Some(model);
+                self.effort = Some(effort);
+                self.mode = mode;
+            }
+            CommandResponse::Git {
+                response: GitResponse::Status { status },
+            } => {
+                if let SessionCommand::GitRequest { work_dir, .. } = command {
+                    self.project_git.insert(work_dir.clone(), *status);
+                    self.refresh_session_rows();
+                }
+            }
+            CommandResponse::Ack => {
+                let session_id = match command {
+                    SessionCommand::SetModel { session_id, .. }
+                    | SessionCommand::SetReasoningEffort { session_id, .. }
+                    | SessionCommand::SetOrchestratorMode { session_id, .. } => Some(session_id),
+                    _ => None,
+                };
+                if session_id.is_some_and(|id| self.client.active_session_id.as_ref() != Some(id)) {
+                    return;
+                }
+                match command {
+                    SessionCommand::SetModel { model, .. } => {
+                        self.selected_model = Some(model.clone());
+                        if let Some(efforts) = self
+                            .models
+                            .iter()
+                            .find(|m| m.id == *model)
+                            .map(|m| &m.efforts)
+                        {
+                            if !self.effort.is_some_and(|effort| efforts.contains(&effort)) {
+                                self.effort = efforts.first().copied();
+                            }
+                        }
+                    }
+                    SessionCommand::SetReasoningEffort { effort, .. } => {
+                        self.effort = Some(*effort)
+                    }
+                    SessionCommand::SetOrchestratorMode { mode, .. } => self.mode = *mode,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn composer_options(&self, cx: &mut Context<Self>) -> AnyElement {
+        let entity = cx.entity();
+        let models = self.models.clone();
+        let selected = self.selected_model.clone();
+        let model_label = models
+            .iter()
+            .find(|m| Some(&m.id) == selected.as_ref())
+            .map(|m| m.label.clone())
+            .unwrap_or_else(|| {
+                selected
+                    .clone()
+                    .filter(|model| !model.is_empty())
+                    .unwrap_or_else(|| "Connect a provider on desktop".into())
+            });
+        let efforts = models
+            .iter()
+            .find(|m| Some(&m.id) == selected.as_ref())
+            .map(|m| m.efforts.clone())
+            .unwrap_or_default();
+        let effort = self.effort;
+        let mode = self.mode;
+        let enabled =
+            self.daemon.as_ref().is_some_and(|d| d.is_connected()) && !self.client.is_generating;
+        let model_entity = entity.clone();
+        let effort_entity = entity.clone();
+        div().flex().flex_col().w_full().gap_1()
+            .child(Button::new("mobile-model").ghost().h_11().w_full().label(format!("{model_label} ▾"))
+                .accessibility_label("Select model").dropdown_caret(true).disabled(!enabled || models.is_empty())
+                .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                    models.iter().fold(menu.scrollable(true), |menu, model| {
+                        let entity = model_entity.clone(); let id = model.id.clone();
+                        menu.item(PopupMenuItem::new(format!("{}{}", if Some(&model.id) == selected.as_ref() { "✓ " } else { "" }, model.label)).checked(Some(&model.id) == selected.as_ref())
+                            .on_click(move |_, _, cx| { entity.update(cx, |this, cx| {
+                                if let (Some(active), Some(daemon)) = (&this.active, &this.daemon) {
+                                    daemon.request(SessionCommand::SetModel { session_id: active.id.clone(), model: id.clone() });
+                                } cx.notify();
+                            }); }))
+                    })
+                }))
+            .child(div().flex().items_center().gap_1()
+                .when(!efforts.is_empty(), |this| this.child(
+                    Button::new("mobile-effort").ghost().h_11().label(format!("{} ▾", effort.map(|e| e.label()).unwrap_or("Effort")))
+                        .accessibility_label("Reasoning effort").dropdown_caret(true).disabled(!enabled)
+                        .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                            efforts.iter().fold(menu, |menu, value| {
+                                let entity = effort_entity.clone(); let value = *value;
+                                menu.item(PopupMenuItem::new(format!("{}{}", if Some(value) == effort { "✓ " } else { "" }, value.label())).checked(Some(value) == effort)
+                                    .on_click(move |_, _, cx| { entity.update(cx, |this, cx| {
+                                        if let (Some(active), Some(daemon)) = (&this.active, &this.daemon) {
+                                            daemon.request(SessionCommand::SetReasoningEffort { session_id: active.id.clone(), effort: value });
+                                        } cx.notify();
+                                    }); }))
+                            })
+                        })))
+                .child(Button::new("mobile-mode").ghost().h_11().label(format!("{} ▾", mode.label())).accessibility_label("Agent mode")
+                    .dropdown_caret(true).disabled(!enabled)
+                    .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                        [OrchestratorMode::Normal, OrchestratorMode::Fusion].into_iter().fold(menu, |menu, value| {
+                            let entity = entity.clone();
+                            menu.item(PopupMenuItem::new(format!("{}{}", if value == mode { "✓ " } else { "" }, value.label())).checked(value == mode)
+                                .on_click(move |_, _, cx| { entity.update(cx, |this, cx| {
+                                    if let (Some(active), Some(daemon)) = (&this.active, &this.daemon) {
+                                        daemon.request(SessionCommand::SetOrchestratorMode { session_id: active.id.clone(), mode: value });
+                                    } cx.notify();
+                                }); }))
+                        })
+                    })))
+            .into_any_element()
     }
 
     fn apply_event(&mut self, event: MobileEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -443,78 +695,84 @@ impl MobileApp {
                 self.screen = Screen::Connect;
             }
             MobileEvent::CommandResult { command, result } => match result {
-                Ok(()) => match command {
-                    SessionCommand::SubmitPrompt {
-                        session_id, text, ..
-                    } => {
-                        self.sending = false;
-                        let accepted_id =
-                            format!("sent-user-{session_id}-{}", self.client.messages.len());
-                        if let Some(message) = self
-                            .client
-                            .messages_mut()
-                            .iter_mut()
-                            .find(|m| m.id == format!("pending-user-{session_id}"))
-                        {
-                            message.id = accepted_id;
-                        }
-                        let key = (
-                            self.client
-                                .projects
-                                .iter()
-                                .find(|p| p.sessions.iter().any(|s| s.id == session_id))
-                                .map(|p| p.work_dir.clone()),
-                            Some(session_id.clone()),
-                        );
-                        if self.client.active_session_id.as_deref() == Some(&session_id)
-                            && self.composer.read(cx).value().trim() == text
-                        {
-                            self.composer
-                                .update(cx, |input, cx| input.set_value("", window, cx));
-                        }
-                        if self
-                            .client
-                            .composer_drafts
-                            .get(&key)
-                            .is_some_and(|d| d.text.trim() == text)
-                        {
-                            self.client.composer_drafts.remove(&key);
-                        }
-                    }
-                    SessionCommand::AnswerPermission {
-                        session_id,
-                        request_id,
-                        ..
-                    } => {
-                        if self
-                            .client
-                            .pending_permissions
-                            .get(&session_id)
-                            .is_some_and(|r| r.id == request_id)
-                        {
-                            self.client.pending_permissions.remove(&session_id);
-                        }
-                    }
-                    SessionCommand::AnswerQuestion { session_id, answer } => {
-                        if self
-                            .client
-                            .pending_questions
-                            .get(&session_id)
-                            .is_some_and(|r| r.id == answer.request_id)
-                        {
-                            self.client.pop_question(&session_id);
-                        }
-                        let prefix = format!("{}\0", answer.request_id);
-                        if let Some(active) = &mut self.active {
-                            if active.id == session_id {
-                                active.answers.retain(|key, _| !key.starts_with(&prefix));
+                Ok(response) => {
+                    self.apply_response(&command, response, window, cx);
+                    match command {
+                        SessionCommand::SubmitPrompt {
+                            session_id, text, ..
+                        } => {
+                            self.sending = false;
+                            if let Some(daemon) = &self.daemon {
+                                daemon.send(SessionCommand::GetProjects);
+                            }
+                            let accepted_id =
+                                format!("sent-user-{session_id}-{}", self.client.messages.len());
+                            if let Some(message) = self
+                                .client
+                                .messages_mut()
+                                .iter_mut()
+                                .find(|m| m.id == format!("pending-user-{session_id}"))
+                            {
+                                message.id = accepted_id;
+                            }
+                            let key = (
+                                self.client
+                                    .projects
+                                    .iter()
+                                    .find(|p| p.sessions.iter().any(|s| s.id == session_id))
+                                    .map(|p| p.work_dir.clone()),
+                                Some(session_id.clone()),
+                            );
+                            if self.client.active_session_id.as_deref() == Some(&session_id)
+                                && self.composer.read(cx).value().trim() == text
+                            {
+                                self.composer
+                                    .update(cx, |input, cx| input.set_value("", window, cx));
+                            }
+                            if self
+                                .client
+                                .composer_drafts
+                                .get(&key)
+                                .is_some_and(|d| d.text.trim() == text)
+                            {
+                                self.client.composer_drafts.remove(&key);
                             }
                         }
-                        self.question_inputs
-                            .retain(|key, _| !key.starts_with(&prefix));
+                        SessionCommand::AnswerPermission {
+                            session_id,
+                            request_id,
+                            ..
+                        } => {
+                            if self
+                                .client
+                                .pending_permissions
+                                .get(&session_id)
+                                .is_some_and(|r| r.id == request_id)
+                            {
+                                self.client.pending_permissions.remove(&session_id);
+                            }
+                        }
+                        SessionCommand::AnswerQuestion { session_id, answer } => {
+                            if self
+                                .client
+                                .pending_questions
+                                .get(&session_id)
+                                .is_some_and(|r| r.id == answer.request_id)
+                            {
+                                self.client.pop_question(&session_id);
+                            }
+                            let prefix = format!("{}\0", answer.request_id);
+                            if let Some(active) = &mut self.active {
+                                if active.id == session_id {
+                                    active.answers.retain(|key, _| !key.starts_with(&prefix));
+                                }
+                            }
+                            self.question_inputs
+                                .retain(|key, _| !key.starts_with(&prefix));
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                },
+                }
                 Err(error) => {
                     self.sending = false;
                     if let SessionCommand::SubmitPrompt { session_id, .. } = &command {
@@ -530,6 +788,10 @@ impl MobileApp {
                             );
                         }
                     }
+                    if matches!(command, SessionCommand::GitRequest { .. }) {
+                        return;
+                    }
+                    self.connect_error = Some(error.clone());
                     self.client.session_status = Some(error);
                 }
             },
@@ -543,6 +805,32 @@ impl MobileApp {
             event,
             SessionEvent::ProjectChanged { .. } | SessionEvent::SessionRemoved { .. }
         );
+        let mut event = event;
+        if let SessionEvent::SessionRemoved { session_id, .. } = &event {
+            self.session_drafts.retain(|draft| draft.id != *session_id);
+        }
+        if let SessionEvent::ProjectChanged { project } = &mut event {
+            self.session_drafts.retain(|draft| {
+                !project
+                    .sessions
+                    .iter()
+                    .any(|session| session.id == draft.id)
+            });
+            project.sessions.extend(
+                self.session_drafts
+                    .iter()
+                    .filter(|draft| draft.work_dir == project.work_dir)
+                    .cloned(),
+            );
+            if !self.project_git.contains_key(&project.work_dir) {
+                if let Some(daemon) = &self.daemon {
+                    daemon.request(SessionCommand::GitRequest {
+                        work_dir: project.work_dir.clone(),
+                        operation: GitOperation::Inspect { sync_remote: false },
+                    });
+                }
+            }
+        }
         let commands = self.client.apply_event(event);
         if projects_changed {
             self.refresh_session_rows();
@@ -607,9 +895,9 @@ impl MobileApp {
             work_dir: active.work_dir.clone(),
             text,
             images: Vec::new(),
-            effort: None,
+            effort: self.effort,
             acp_config: Vec::new(),
-            model: None,
+            model: self.selected_model.clone(),
         };
         if let Some(daemon) = &self.daemon {
             let echo_id = format!("pending-user-{}", active.id);
@@ -932,7 +1220,7 @@ impl MobileApp {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(div().font_bold().child("Sessions"))
+                                    .child(div().font_bold().child("Projects & chats"))
                                     .child(self.link_dot(cx)),
                             )
                             .child(
@@ -950,6 +1238,58 @@ impl MobileApp {
                             .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx))),
                     ),
             )
+            .child(
+                div()
+                    .flex()
+                    .px_3()
+                    .py_2()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Choose a project"),
+                    )
+                    .child(
+                        Button::new("new-session")
+                            .ghost()
+                            .h_11()
+                            .label("New chat")
+                            .disabled(
+                                self.sending
+                                    || self.client.sidebar_project_filter.is_none()
+                                    || !self.daemon.as_ref().is_some_and(|d| d.is_connected()),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.begin_session(cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .pb_2()
+                    .child(Input::new(&self.search).aria_label("Search chats").h_11()),
+            )
+            .when_some(self.connect_error.clone(), |this, error| {
+                this.child(
+                    div()
+                        .px_3()
+                        .text_sm()
+                        .text_color(cx.theme().danger)
+                        .child(error),
+                )
+            })
+            .when(self.client.projects.is_empty(), |this| {
+                this.child(
+                    div()
+                        .px_4()
+                        .py_4()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Attach a project on desktop to start a chat."),
+                )
+            })
             .child(div().id("sessions").flex_1().min_h_0().w_full().child(
                 threadlane_ui_session::session_list(
                     self.sessions_list.clone(),
@@ -964,10 +1304,19 @@ impl MobileApp {
             .projects
             .iter()
             .flat_map(|project| {
-                std::iter::once(MobileSessionRow::Project(project.name.clone())).chain(
+                std::iter::once(MobileSessionRow::Project(project.clone())).chain(
                     project
                         .sessions
                         .iter()
+                        .filter(|session| {
+                            (self.client.sidebar_project_filter.as_ref() == Some(&project.work_dir)
+                                || !self.client.search_query.is_empty())
+                                && (self.client.search_query.is_empty()
+                                    || session
+                                        .title
+                                        .to_lowercase()
+                                        .contains(&self.client.search_query.to_lowercase()))
+                        })
                         .cloned()
                         .map(MobileSessionRow::Session),
                 )
@@ -983,15 +1332,84 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match self.session_rows.get(ix) {
-            Some(MobileSessionRow::Project(name)) => div()
-                .px_3()
-                .pt_4()
-                .pb_2()
-                .text_sm()
-                .font_bold()
-                .text_color(cx.theme().muted_foreground)
-                .child(name.clone())
-                .into_any_element(),
+            Some(MobileSessionRow::Project(project)) => {
+                let project = project.clone();
+                let work_dir = project.work_dir.clone();
+                let expanded = self.client.sidebar_project_filter.as_ref() == Some(&work_dir);
+                let status = self
+                    .project_git
+                    .get(&work_dir)
+                    .map(|git| {
+                        format!(
+                            "{} · {}{}",
+                            git.branch.as_deref().unwrap_or("Detached"),
+                            if git.has_changes { "Modified" } else { "Clean" },
+                            if git.ahead > 0 || git.behind > 0 {
+                                format!(" · ↑{} ↓{}", git.ahead, git.behind)
+                            } else {
+                                String::new()
+                            }
+                        )
+                    })
+                    .unwrap_or_else(|| "Git status unavailable".into());
+                div()
+                    .px_3()
+                    .pt_3()
+                    .child(
+                        Button::new(format!("project-{}", work_dir.display()))
+                            .ghost()
+                            .w_full()
+                            .h_auto()
+                            .min_h_16()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .items_start()
+                                    .w_full()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .child(div().font_bold().truncate().child(format!(
+                                        "{} {}",
+                                        if expanded { "▾" } else { "▸" },
+                                        project.name
+                                    )))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .w_full()
+                                            .truncate()
+                                            .child(format!(
+                                                "{} {} · {}",
+                                                project.sessions.len(),
+                                                if project.sessions.len() == 1 {
+                                                    "chat"
+                                                } else {
+                                                    "chats"
+                                                },
+                                                status
+                                            )),
+                                    ),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.client.sidebar_project_filter = if expanded {
+                                    None
+                                } else {
+                                    Some(work_dir.clone())
+                                };
+                                if let Some(daemon) = &this.daemon {
+                                    daemon.request(SessionCommand::GitRequest {
+                                        work_dir: work_dir.clone(),
+                                        operation: GitOperation::Inspect { sync_remote: false },
+                                    });
+                                }
+                                this.refresh_session_rows();
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element()
+            }
             Some(MobileSessionRow::Session(session)) => {
                 let info = session.clone();
                 let needs_you = self.client.pending_permissions.contains_key(&session.id)
@@ -1149,18 +1567,52 @@ impl MobileApp {
                         )
                     })
                     .child(
-                        Button::new("delete-session")
+                        Button::new("session-options")
                             .ghost()
                             .size_11()
-                            .icon(threadlane_ui_theme::bundled_icon("icons/archive.svg").unwrap())
-                            .accessibility_label("Archive session")
-                            .tooltip("Archive session")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(active) = &mut this.active {
-                                    active.confirm_delete = !active.confirm_delete;
+                            .icon(icon(kit_icons::Ellipsis.1))
+                            .accessibility_label("Session options")
+                            .tooltip("Session options")
+                            .dropdown_menu_with_anchor(Anchor::TopRight, {
+                                let entity = cx.entity();
+                                move |menu, _, _| {
+                                    let refresh = entity.clone();
+                                    let new = entity.clone();
+                                    let archive = entity.clone();
+                                    menu.item(PopupMenuItem::new("Refresh chat").on_click(
+                                        move |_, _, cx| {
+                                            refresh.update(cx, |this, _| {
+                                                if let (Some(active), Some(daemon)) =
+                                                    (&this.active, &this.daemon)
+                                                {
+                                                    daemon.send(
+                                                        SessionCommand::GetSessionSnapshot {
+                                                            session_id: active.id.clone(),
+                                                        },
+                                                    );
+                                                }
+                                            });
+                                        },
+                                    ))
+                                    .item(PopupMenuItem::new("New chat in project").on_click(
+                                        move |_, _, cx| {
+                                            new.update(cx, |this, cx| this.begin_session(cx));
+                                        },
+                                    ))
+                                    .item(
+                                        PopupMenuItem::new("Archive chat…").on_click(
+                                            move |_, _, cx| {
+                                                archive.update(cx, |this, cx| {
+                                                    if let Some(active) = &mut this.active {
+                                                        active.confirm_delete = true;
+                                                    }
+                                                    cx.notify();
+                                                });
+                                            },
+                                        ),
+                                    )
                                 }
-                                cx.notify();
-                            })),
+                            }),
                     ),
             )
             .when(confirm_delete, |this| {
@@ -1220,6 +1672,7 @@ impl MobileApp {
                                 .min_w_0()
                                 .child(threadlane_ui_session::composer_input(&self.composer)),
                         )
+                        .child(self.composer_options(cx))
                         .child(
                             div().flex().justify_end().child(
                                 Button::new("send")
