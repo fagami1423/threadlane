@@ -5,6 +5,7 @@
 //! [`crate::client::MobileDaemon`]; the view pumps its event stream on
 //! the GPUI executor and keeps a flat projection of the wire types.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -94,6 +95,10 @@ pub struct MobileApp {
     seen_links: Vec<String>,
     projects: Vec<ProjectInfo>,
     active: Option<ActiveSession>,
+    /// Pending permission requests keyed by session id — the wire has no
+    /// pending-permission field in `SessionSnapshot`, so requests that
+    /// arrive while another screen is shown must be retained here.
+    pending_permissions: HashMap<String, PermissionRequest>,
     sessions_scroll: ScrollHandle,
     _link_task: Task<()>,
     _pump: Option<Task<()>>,
@@ -125,17 +130,31 @@ impl MobileApp {
                     this.apply_pairing_link(&url, window, cx);
                 });
             }
+            let mut tick = 0u64;
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(500))
                     .await;
+                tick += 1;
                 let links = take_pending_links();
-                if links.is_empty() {
+                // The daemon only publishes `ProjectChanged` on attach/detach
+                // or when asked, so new sessions and renames inside an
+                // attached project never reach the client — re-ask on a
+                // slow cadence to keep the list current.
+                let refresh_projects = tick % 30 == 0;
+                if links.is_empty() && !refresh_projects {
                     continue;
                 }
                 let _ = this.update_in(cx, |this, window, cx| {
                     for url in links {
                         this.apply_pairing_link(&url, window, cx);
+                    }
+                    if refresh_projects {
+                        if let Some(daemon) = &this.daemon {
+                            if daemon.is_connected() {
+                                daemon.send(SessionCommand::GetProjects);
+                            }
+                        }
                     }
                 });
             }
@@ -152,6 +171,7 @@ impl MobileApp {
             seen_links: Vec::new(),
             projects: Vec::new(),
             active: None,
+            pending_permissions: HashMap::new(),
             sessions_scroll: ScrollHandle::new(),
             _link_task: link_task,
             _pump: None,
@@ -231,6 +251,7 @@ impl MobileApp {
         self._pump = None;
         self.projects.clear();
         self.active = None;
+        self.pending_permissions.clear();
         self.link_state = "Disconnected".to_string();
         self.screen = Screen::Connect;
         cx.notify();
@@ -242,7 +263,11 @@ impl MobileApp {
                 session_id: info.id.clone(),
             });
         }
-        self.active = Some(ActiveSession::new(info));
+        let mut active = ActiveSession::new(info);
+        // Recover a permission request that arrived before the session
+        // was opened — snapshots do not carry pending permissions.
+        active.permission = self.pending_permissions.remove(&info.id);
+        self.active = Some(active);
         self.screen = Screen::Session;
         cx.notify();
     }
@@ -295,6 +320,10 @@ impl MobileApp {
                 }
             }
             SessionEvent::Agent { session_id, event } => {
+                if let AgentEvent::PermissionRequested { request } = &event {
+                    self.pending_permissions
+                        .insert(session_id.clone(), request.clone());
+                }
                 if let Some(active) = self.active.as_mut().filter(|a| a.id == session_id) {
                     active.apply_agent_event(&event);
                     active.scroll.scroll_to_bottom();
@@ -320,6 +349,7 @@ impl MobileApp {
                 }
             }
             SessionEvent::SessionRemoved { session_id, .. } => {
+                self.pending_permissions.remove(&session_id);
                 for project in self.projects.iter_mut() {
                     project.sessions.retain(|session| session.id != session_id);
                 }
@@ -346,7 +376,20 @@ impl MobileApp {
 
     fn answer_permission(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {
         let Some(active) = &mut self.active else { return };
-        let Some(request) = active.permission.take() else { return };
+        let Some(request) = active.permission.clone() else { return };
+        // Commands queued while the socket is down are drained without
+        // delivery, so keep the prompt unless a live socket can take it.
+        let connected = self
+            .daemon
+            .as_ref()
+            .is_some_and(|daemon| daemon.is_connected());
+        if !connected {
+            active.status = Some("Not connected — answer was not sent".to_string());
+            cx.notify();
+            return;
+        }
+        active.permission = None;
+        self.pending_permissions.remove(&active.id);
         if let Some(daemon) = &self.daemon {
             daemon.send(SessionCommand::AnswerPermission {
                 session_id: active.id.clone(),
@@ -624,9 +667,14 @@ impl MobileApp {
                                             .text_color(cx.theme().muted_foreground)
                                             .child(project.name.clone()),
                                     )
-                                    .children(project.sessions.iter().enumerate().map(|(index, session)| {
+                                    .children(project.sessions.iter().map(|session| {
                                         let info = session.clone();
-                                        Button::new(("session", index))
+                                        // Key rows by session id — a
+                                        // per-project index collides across
+                                        // projects and shifts on reorder.
+                                        let needs_approval =
+                                            self.pending_permissions.contains_key(&session.id);
+                                        Button::new(format!("session-{}", session.id))
                                             .outline()
                                             .w_full()
                                             .child(
@@ -651,10 +699,15 @@ impl MobileApp {
                                                                 cx.theme().muted_foreground,
                                                             )
                                                             .child(format!(
-                                                                "{}{}",
+                                                                "{}{}{}",
                                                                 session.runtime_work_dir.display(),
                                                                 if session.is_worktree {
                                                                     " · worktree"
+                                                                } else {
+                                                                    ""
+                                                                },
+                                                                if needs_approval {
+                                                                    " · needs approval"
                                                                 } else {
                                                                     ""
                                                                 },

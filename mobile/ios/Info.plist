@@ -48,6 +48,11 @@
          carries its camera/video package symbols. -->
     <key>NSCameraUsageDescription</key>
     <string>Camera access is not used by this app.</string>
+    <!-- iOS 14+ gates local-network access behind this prompt even for
+         direct LAN sockets; without it the phone may refuse to reach
+         the desktop's pairing port. -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Threadlane connects to your desktop app on the local network to monitor sessions.</string>
     <key>CFBundleURLTypes</key>
     <array>
         <dict>

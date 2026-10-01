@@ -175,7 +175,9 @@ fn qr_grid(data: &str) -> AnyElement {
     let width = code.width();
     let cell = px(QR_CELL);
     div()
-        .p_2()
+        // The QR spec requires a quiet zone of ≥4 modules around the
+        // code for scanners to detect it reliably.
+        .p(px(QR_CELL * 4.0))
         .bg(rgb(0xffffff))
         .rounded_md()
         .flex()
