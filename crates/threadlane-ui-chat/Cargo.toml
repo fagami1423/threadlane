@@ -5,6 +5,8 @@ edition = "2021"
 description = "Chat surface for the Threadlane desktop app: composer, transcript, trajectory, and context meter"
 
 [dependencies]
+threadlane-client.workspace = true
+threadlane-ui-session.workspace = true
 base64.workspace = true
 image.workspace = true
 gpui.workspace = true

@@ -475,7 +475,9 @@ impl DaemonCore {
         // `FileInventory` "not a repository") as a global daemon fault.
         let reports_via_response = matches!(
             command,
-            SessionCommand::ListProjectFiles { .. }
+            SessionCommand::BeginSession { .. }
+                | SessionCommand::GetComposerOptions { .. }
+                | SessionCommand::ListProjectFiles { .. }
                 | SessionCommand::ReadProjectFile { .. }
                 | SessionCommand::ProjectFileExists { .. }
                 | SessionCommand::GitRequest { .. }
@@ -536,6 +538,71 @@ impl DaemonCore {
         // Project-io commands with a return payload resolve here; all are
         // blocking filesystem/Git work.
         match &command {
+            SessionCommand::BeginSession { work_dir } => {
+                if !self.attached_project_dirs().contains(work_dir) {
+                    return Err("Choose an attached project to start a session".into());
+                }
+                let id = format!(
+                    "mobile-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|e| e.to_string())?
+                        .as_nanos()
+                );
+                let session_file = canonical_session_file(work_dir, &id);
+                self.register_identity(&id, work_dir.clone(), session_file.clone());
+                return Ok(CommandResponse::SessionDraft {
+                    session: SessionInfo {
+                        id,
+                        title: "New session".into(),
+                        work_dir: work_dir.clone(),
+                        runtime_work_dir: work_dir.clone(),
+                        session_file,
+                        ..SessionInfo::default()
+                    },
+                });
+            }
+            SessionCommand::GetComposerOptions {
+                work_dir,
+                session_id,
+            } => {
+                let facts = session_id
+                    .as_deref()
+                    .and_then(|id| self.identity(id))
+                    .and_then(|identity| {
+                        threadlane_runtime::harness::JsonlStore::open_read_only(
+                            &identity.session_file,
+                        )
+                        .ok()
+                    })
+                    .map(|store| store.facts());
+                let models = crate::catalog::available_models_for_project(Some(work_dir))
+                    .into_iter()
+                    .map(|model| threadlane_protocol::daemon::ComposerModel {
+                        efforts: if crate::catalog::supports_reasoning(&model.id, Some(work_dir)) {
+                            crate::catalog::efforts_for_model(&model.id, Some(work_dir))
+                        } else {
+                            Vec::new()
+                        },
+                        id: model.id,
+                        label: model.label,
+                    })
+                    .collect();
+                return Ok(CommandResponse::ComposerOptions {
+                    models,
+                    model: facts
+                        .as_ref()
+                        .and_then(|facts| facts.get("model"))
+                        .cloned()
+                        .unwrap_or_else(|| self.model.read().expect("model poisoned").clone()),
+                    effort: facts
+                        .as_ref()
+                        .and_then(|facts| facts.get("reasoning_effort"))
+                        .and_then(|value| ReasoningEffort::from_label(value))
+                        .unwrap_or_else(|| *self.effort.read().expect("effort poisoned")),
+                    mode: threadlane_project::subagent_settings::load(work_dir).orchestrator_mode,
+                });
+            }
             SessionCommand::ListProjectFiles { work_dir, limit } => {
                 let work_dir = work_dir.clone();
                 let limit = *limit;
@@ -659,20 +726,22 @@ impl DaemonCore {
                 }
             }
             SessionCommand::SetModel { session_id, model } => {
-                *self.model.write().expect("model poisoned") = model.clone();
-                self.switch_runtime_fact(&session_id, "model", &model, "changing models")
+                self.switch_runtime_fact(&session_id, "model", &model, "changing models")?;
+                *self.model.write().expect("model poisoned") = model;
+                Ok(())
             }
             SessionCommand::SetReasoningEffort {
                 session_id,
                 effort,
             } => {
-                *self.effort.write().expect("effort poisoned") = effort;
                 self.switch_runtime_fact(
                     &session_id,
                     "reasoning_effort",
                     effort.label(),
                     "changing reasoning effort",
-                )
+                )?;
+                *self.effort.write().expect("effort poisoned") = effort;
+                Ok(())
             }
             SessionCommand::SetModelRoles { session_id, roles } => {
                 *self.model_roles.write().expect("model roles poisoned") = roles.clone();
@@ -867,6 +936,9 @@ impl DaemonCore {
             SessionCommand::CancelQueuedMessage { .. } => {
                 unreachable!("payload commands are handled in dispatch_inner")
             }
+            SessionCommand::BeginSession { .. } | SessionCommand::GetComposerOptions { .. } => {
+                unreachable!("payload commands are handled in dispatch_inner")
+            }
             SessionCommand::GetProjects => {
                 for work_dir in self.attached_project_dirs() {
                     let sessions = crate::discovery::discover_sessions_in_project(&work_dir);
@@ -991,6 +1063,17 @@ impl DaemonCore {
             return Ok(());
         };
         let Some(runtime) = self.runtime_for_file(&identity.session_file) else {
+            // Thin clients inspect transcripts without constructing a runtime.
+            // Persist settings through the same locked harness journal.
+            if identity.session_file.exists() {
+                return threadlane_coding_agent::harness::CodingSessionHarness::append_fact_to_path(
+                    &identity.session_file,
+                    "main",
+                    fact,
+                    value,
+                    None,
+                );
+            }
             return Ok(());
         };
         if runtime.is_generating() {
@@ -1279,5 +1362,98 @@ async fn run_blocking_io<R: Send + 'static>(
             .map_err(|error| error.to_string())
     } else {
         Ok(work())
+    }
+}
+
+#[cfg(test)]
+mod composer_tests {
+    use super::{canonical_session_file, DaemonCore};
+    use threadlane_protocol::daemon::{CommandResponse, SessionCommand};
+    use threadlane_protocol::{OrchestratorMode, ReasoningEffort};
+
+    #[tokio::test]
+    async fn drafts_require_attached_projects_and_composer_settings_are_acknowledged() {
+        let project = tempfile::tempdir().unwrap();
+        let work_dir = project.path().to_path_buf();
+        let core = DaemonCore::new().unwrap();
+        assert!(core
+            .dispatch(SessionCommand::BeginSession {
+                work_dir: work_dir.clone()
+            })
+            .await
+            .is_err());
+        core.attach_project(work_dir.clone());
+        core.seed_config(
+            "test/model".into(),
+            Default::default(),
+            ReasoningEffort::High,
+        );
+        let CommandResponse::SessionDraft { session } = core
+            .dispatch(SessionCommand::BeginSession {
+                work_dir: work_dir.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("draft response")
+        };
+        assert_eq!(
+            session.session_file,
+            canonical_session_file(&work_dir, &session.id)
+        );
+        assert!(
+            !session.session_file.exists(),
+            "a draft must not create a transcript"
+        );
+        core.dispatch(SessionCommand::SetOrchestratorMode {
+            session_id: session.id.clone(),
+            mode: OrchestratorMode::Fusion,
+        })
+        .await
+        .unwrap();
+        core.dispatch(SessionCommand::SetModel {
+            session_id: session.id.clone(),
+            model: "test/changed".into(),
+        })
+        .await
+        .unwrap();
+        threadlane_coding_agent::harness::CodingSessionHarness::append_fact_to_path(
+            &session.session_file,
+            "main",
+            "model",
+            "test/saved",
+            None,
+        )
+        .unwrap();
+        core.dispatch(SessionCommand::SetModel {
+            session_id: session.id.clone(),
+            model: "test/restored".into(),
+        })
+        .await
+        .unwrap();
+        let response = core
+            .dispatch(SessionCommand::GetComposerOptions {
+                work_dir,
+                session_id: Some(session.id),
+            })
+            .await
+            .unwrap();
+        let CommandResponse::ComposerOptions {
+            ref model,
+            effort,
+            mode,
+            ..
+        } = response
+        else {
+            panic!("composer response")
+        };
+        assert_eq!(model, "test/restored");
+        assert_eq!(effort, ReasoningEffort::High);
+        assert_eq!(mode, OrchestratorMode::Fusion);
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CommandResponse>(&encoded).unwrap(),
+            response
+        );
     }
 }

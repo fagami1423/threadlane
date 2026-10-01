@@ -6891,10 +6891,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "threadlane-client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "threadlane-protocol",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
 name = "threadlane-mobile"
 version = "0.1.0"
 dependencies = [
- "futures",
  "gpui-component",
  "gpui-kit",
  "gpui-kit-assets",
@@ -6902,12 +6915,11 @@ dependencies = [
  "gpui-pre-mobile",
  "log",
  "objc2 0.6.4",
- "serde",
- "serde_json",
+ "threadlane-client",
  "threadlane-protocol",
+ "threadlane-ui-session",
  "threadlane-ui-theme",
  "tokio",
- "tokio-tungstenite",
  "url",
 ]
 
@@ -6931,6 +6943,17 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "threadlane-ui-session"
+version = "0.1.0"
+dependencies = [
+ "gpui-component",
+ "gpui-kit-assets",
+ "gpui-pre",
+ "threadlane-protocol",
+ "threadlane-ui-theme",
 ]
 
 [[package]]
