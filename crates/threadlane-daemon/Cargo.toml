@@ -5,6 +5,8 @@ edition = "2021"
 description = "Headless Threadlane services: session discovery/projection, chat turn services, provider auth, settings, updater, worktree setup, automation, and the model catalog. GPUI-free; the in-process core a future threadlane-daemon process wraps."
 
 [dependencies]
+base64.workspace = true
+getrandom = "0.4"
 serde.workspace = true
 serde_json.workspace = true
 robius-open.workspace = true

@@ -15,7 +15,7 @@
 //! reconnecting client replays the journal tail and then tails live events —
 //! the attach-mid-run semantics the wire contract promises.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -60,6 +60,9 @@ pub struct DaemonCore {
     runtimes: Mutex<HashMap<PathBuf, Arc<SessionRuntime>>>,
     /// `session_id` → file/work_dir, populated at registration and hydration.
     identities: Mutex<HashMap<String, SessionIdentity>>,
+    /// Work dirs the host attached, fed by AppState/`AddProject` so remote
+    /// clients can enumerate projects without journal archaeology.
+    attached_projects: Mutex<BTreeSet<PathBuf>>,
     /// In-flight worktree preparations, for `CancelWorktreeSetup`.
     worktree_setups: Mutex<HashMap<String, WorktreeSetup>>,
     /// Daemon-hosted PTYs, addressed by client-chosen terminal ids.
@@ -125,6 +128,7 @@ impl DaemonCore {
         Ok(Arc::new(Self {
             runtimes: Mutex::new(HashMap::new()),
             identities: Mutex::new(HashMap::new()),
+            attached_projects: Mutex::new(BTreeSet::new()),
             worktree_setups: Mutex::new(HashMap::new()),
             terminals: crate::terminal::TerminalManager::default(),
             ingest_tx,
@@ -151,6 +155,32 @@ impl DaemonCore {
         *self.model.write().expect("model poisoned") = model;
         *self.model_roles.write().expect("model roles poisoned") = roles;
         *self.effort.write().expect("effort poisoned") = effort;
+    }
+
+    /// The host records an attached project; thin clients enumerate these
+    /// via `SessionCommand::GetProjects`.
+    pub fn attach_project(&self, work_dir: PathBuf) {
+        self.attached_projects
+            .lock()
+            .expect("attached_projects poisoned")
+            .insert(work_dir);
+    }
+
+    /// The host records a detached project.
+    pub fn detach_project(&self, work_dir: &Path) {
+        self.attached_projects
+            .lock()
+            .expect("attached_projects poisoned")
+            .remove(work_dir);
+    }
+
+    fn attached_project_dirs(&self) -> Vec<PathBuf> {
+        self.attached_projects
+            .lock()
+            .expect("attached_projects poisoned")
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Channel producers write `SessionEvent`s into (turns, ACP tasks,
@@ -636,6 +666,7 @@ impl DaemonCore {
                 delete_worktree,
             } => self.delete_session(&session_id, &session_file, delete_worktree),
             SessionCommand::AddProject { work_dir } => {
+                self.attach_project(work_dir.clone());
                 let sessions = crate::discovery::discover_sessions_in_project(&work_dir);
                 let name = work_dir
                     .file_name()
@@ -653,6 +684,7 @@ impl DaemonCore {
                 Ok(())
             }
             SessionCommand::RemoveProject { work_dir } => {
+                self.detach_project(&work_dir);
                 let _ = self.ingest_tx.send(SessionEvent::ProjectChanged {
                     project: ProjectInfo {
                         name: work_dir
@@ -734,6 +766,25 @@ impl DaemonCore {
             }
             SessionCommand::CancelQueuedMessage { .. } => {
                 unreachable!("payload commands are handled in dispatch_inner")
+            }
+            SessionCommand::GetProjects => {
+                for work_dir in self.attached_project_dirs() {
+                    let sessions = crate::discovery::discover_sessions_in_project(&work_dir);
+                    let name = work_dir
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let _ = self.ingest_tx.send(SessionEvent::ProjectChanged {
+                        project: ProjectInfo {
+                            name,
+                            work_dir,
+                            sessions,
+                            is_expanded: true,
+                        },
+                    });
+                }
+                Ok(())
             }
             SessionCommand::GetProjectState { work_dir } => {
                 let sessions = crate::discovery::discover_sessions_in_project(&work_dir);

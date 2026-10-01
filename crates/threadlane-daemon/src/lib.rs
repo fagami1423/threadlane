@@ -17,6 +17,7 @@ pub mod chat;
 pub mod core;
 pub mod discovery;
 pub mod events;
+pub mod pairing;
 pub mod projection;
 pub mod provider_auth;
 pub mod runtimes;
