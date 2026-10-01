@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.36](https://github.com/wheregmis/threadlane/compare/v0.1.35...v0.1.36) (2026-10-01)
+
+
+### Features
+
+* **terminal:** open visible web links through explicit browser actions ([9b9e102](https://github.com/wheregmis/threadlane/commit/9b9e102bf66f9de043fb6af44c23c3feec4329c4))
+* **terminal:** safely open visible URLs in Browser tabs ([c2cdf1f](https://github.com/wheregmis/threadlane/commit/c2cdf1f2d65e2d0c5cb00de058ecd6ef89ef2708))
+
+
+### Bug Fixes
+
+* **a11y:** expose terminal link picker scope in accessible name ([3ce6c68](https://github.com/wheregmis/threadlane/commit/3ce6c68b2f33d529469f64cbe40460328bf623ab))
+* **browser:** compose webviews beneath GPUI overlays ([6b86016](https://github.com/wheregmis/threadlane/commit/6b860168813fb060045de6279f9f70efb14d6d4f))
+* **browser:** compose webviews beneath GPUI overlays ([1af5ec7](https://github.com/wheregmis/threadlane/commit/1af5ec77090df0a119d7f28b3d4825a5125e798f))
+* **mobile:** Adopt iOS scene lifecycle ([8188fd9](https://github.com/wheregmis/threadlane/commit/8188fd9650b9f148667e6dd4eb010243b769fc40))
+
 ## [0.1.35](https://github.com/wheregmis/threadlane/compare/v0.1.34...v0.1.35) (2026-09-30)
 
 
