@@ -8395,6 +8395,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
+ "portable-pty",
  "robius-open",
  "serde",
  "serde_json",

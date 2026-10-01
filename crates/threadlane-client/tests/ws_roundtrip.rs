@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 
 use threadlane_client::{DaemonClient, RemoteDaemon};
-use threadlane_protocol::daemon::{SessionCommand, SessionEvent};
+use threadlane_protocol::daemon::{SessionCommand, SessionEvent, TerminalEvent};
 
 async fn next_event(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
@@ -86,5 +86,80 @@ fn remote_client_speaks_protocol_end_to_end() {
             message.contains("no live runtime"),
             "journal tail did not replay the earlier error: {message}"
         );
+    });
+}
+
+/// Terminal commands round-trip through the wire: a daemon-hosted PTY
+/// opens, takes input, and reports its exit back over the event stream.
+#[test]
+fn remote_terminal_lifecycle_round_trips() {
+    let executor = threadlane_daemon::chat::executor().expect("daemon executor");
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    executor.spawn(async move {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let core = threadlane_daemon::core::DaemonCore::new().expect("daemon core");
+        tokio::spawn(threadlane_daemon::server::serve(listener, core, None));
+        done_tx.send(addr).expect("send addr");
+    });
+    let addr = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("server did not start");
+
+    executor.block_on(async move {
+        let client = RemoteDaemon::connect(format!("ws://{addr}"), None);
+        let mut events = client.subscribe();
+
+        let terminal_id = "test-terminal-1".to_string();
+        let cwd = std::env::temp_dir();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if client
+                .command(SessionCommand::TerminalOpen {
+                    terminal_id: terminal_id.clone(),
+                    cwd: cwd.clone(),
+                    cols: 80,
+                    rows: 24,
+                })
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "client never connected to the daemon"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // `exit` ends /bin/sh and cmd alike; the daemon reports it as Exited.
+        client
+            .command(SessionCommand::TerminalInput {
+                terminal_id: terminal_id.clone(),
+                data: "exit\n".to_string(),
+            })
+            .await
+            .expect("terminal input command");
+        let event = next_event(&mut events, |event| {
+            matches!(
+                event,
+                SessionEvent::TerminalEvent {
+                    event: TerminalEvent::Exited { terminal_id: id, .. }
+                } if *id == "test-terminal-1"
+            )
+        })
+        .await;
+        let SessionEvent::TerminalEvent {
+            event: TerminalEvent::Exited { exit_code, .. },
+        } = event
+        else {
+            unreachable!()
+        };
+        // The shell exited normally rather than by signal; the code itself
+        // is shell-dependent.
+        assert!(exit_code.is_some());
     });
 }

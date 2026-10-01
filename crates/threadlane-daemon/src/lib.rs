@@ -22,11 +22,13 @@ pub mod provider_auth;
 pub mod runtimes;
 pub mod server;
 pub mod settings;
+pub mod terminal;
 pub mod types;
 pub mod updater;
 pub mod worktree_setup;
 
 pub use events::{next_event_batch, next_event_batch_capped};
+pub use terminal::TerminalManager;
 pub use types::{
     derive_session_attention, hash_session_identity, AttachedProject, ChatMessageInfo,
     ContextWindowInfo, HydrationRuntimeOptions, MessageRole, PendingComposerMessage,

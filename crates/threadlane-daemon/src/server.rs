@@ -7,6 +7,12 @@
 //! Errors travel as `DaemonError` events, so no error frame shape exists.
 //! `seq` is the daemon's journal sequence; synthesized frames (undecodable
 //! commands, lag notices) carry `seq: 0`.
+//!
+//! Auth today is a shared bearer token (`THREADLANE_DAEMON_TOKEN`) and the
+//! deployment is localhost-only by design. Binding beyond localhost needs a
+//! follow-up pairing flow (QR scan or entered pairing code that exchanges
+//! for a per-client credential) — a shared static token is not a safe
+//! network-exposed auth scheme.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};

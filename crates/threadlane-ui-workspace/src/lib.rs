@@ -6,8 +6,9 @@
 //! It is the last screen extracted from `threadlane-gpui`; the binary crate
 //! constructs it directly.
 
-mod view;
+mod remote_terminal;
 mod startup;
+mod view;
 
 pub use view::{init, WorkspaceView};
 pub use startup::StartupView;

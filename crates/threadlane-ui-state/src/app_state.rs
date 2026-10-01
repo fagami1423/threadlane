@@ -150,6 +150,12 @@ pub struct AppState {
     /// True when `daemon_client` is remote: runtime handles are then
     /// process-remote and only the command/event surface can reach them.
     pub daemon_remote: bool,
+    /// Ordered channel for `SessionCommand::Terminal*` commands — they must
+    /// not reorder relative to each other (TerminalOpen before its Input),
+    /// so they go through one forward loop rather than a task per command.
+    terminal_command_tx: tokio::sync::mpsc::UnboundedSender<SessionCommand>,
+    /// Daemon-hosted PTY frames routed by terminal_id to terminal views.
+    terminal_event_tx: tokio::sync::broadcast::Sender<TerminalEvent>,
     /// Remote deletes awaiting the daemon's `SessionRemoved` ack:
     /// `session_id` → project dir. Persisted cleanup (seen watermark,
     /// pins, pending prompts) runs only on the ack — a rejected delete
@@ -185,6 +191,27 @@ pub struct AppState {
     /// runs are restored history and must not be registered as new in-app
     /// sessions.
     automation_runs_restored: bool,
+}
+
+/// Handle terminal views use to reach daemon-hosted PTYs. `command()`
+/// forwards `SessionCommand::Terminal*` to the attached daemon in send
+/// order; `events()` yields the frames the daemon streams back, routed by
+/// `terminal_id`. The same surface serves the embedded core and a remote
+/// daemon.
+#[derive(Clone)]
+pub struct TerminalBus {
+    commands: tokio::sync::mpsc::UnboundedSender<SessionCommand>,
+    events: tokio::sync::broadcast::Sender<TerminalEvent>,
+}
+
+impl TerminalBus {
+    pub fn command(&self, command: SessionCommand) {
+        let _ = self.commands.send(command);
+    }
+
+    pub fn events(&self) -> tokio::sync::broadcast::Receiver<TerminalEvent> {
+        self.events.subscribe()
+    }
 }
 
 impl Default for AppState {
@@ -593,19 +620,40 @@ impl AppState {
                 false,
             ),
         };
+        let (terminal_command_tx, mut terminal_command_rx) =
+            tokio::sync::mpsc::unbounded_channel::<SessionCommand>();
+        let (terminal_event_tx, _) = tokio::sync::broadcast::channel::<TerminalEvent>(4096);
         // Daemon events flow into the UI stream: in local mode this is one
         // extra hop through the core's journal/broadcast, in remote mode it
         // is the whole event path. The view drains stream_rx unchanged.
         if let Ok(executor) = crate::chat::executor() {
             let mut daemon_events = daemon_client.subscribe();
-            let stream_tx = stream_tx.clone();
-            executor.spawn(async move {
-                while let Some(event) = daemon_events.recv().await {
-                    if stream_tx.send(event).is_err() {
-                        break;
+            {
+                let stream_tx = stream_tx.clone();
+                executor.spawn(async move {
+                    while let Some(event) = daemon_events.recv().await {
+                        if stream_tx.send(event).is_err() {
+                            break;
+                        }
                     }
-                }
-            });
+                });
+            }
+            // Terminal commands forward serially so Open/Input/Resize keep
+            // client order end to end; failures surface as DaemonError.
+            {
+                let client = daemon_client.clone();
+                let error_tx = stream_tx.clone();
+                executor.spawn(async move {
+                    while let Some(command) = terminal_command_rx.recv().await {
+                        if let Err(error) = client.command(command).await {
+                            let _ = error_tx.send(SessionEvent::DaemonError {
+                                session_id: None,
+                                message: error,
+                            });
+                        }
+                    }
+                });
+            }
         }
         let session_status = active_session_id
             .as_ref()
@@ -684,6 +732,8 @@ impl AppState {
             daemon_core,
             daemon_client,
             daemon_remote,
+            terminal_command_tx,
+            terminal_event_tx,
             pending_remote_deletes: HashMap::new(),
             scheduler_handles: HashMap::new(),
             scheduler_results: HashMap::new(),
@@ -3426,6 +3476,16 @@ impl AppState {
         true
     }
 
+    /// Terminal views use this to reach daemon-hosted PTYs: commands are
+    /// forwarded to the attached daemon in send order; frames stream back
+    /// on `events()` routed by terminal_id.
+    pub fn terminal_bus(&self) -> TerminalBus {
+        TerminalBus {
+            commands: self.terminal_command_tx.clone(),
+            events: self.terminal_event_tx.clone(),
+        }
+    }
+
     /// Sends a `SessionCommand` through the attached `DaemonClient` —
     /// fire-and-forget; failures arrive as `SessionEvent::DaemonError`.
     /// A command the client rejects outright (e.g. disconnected remote)
@@ -4758,12 +4818,12 @@ impl AppState {
                         .or_default()
                         .push(SessionEvent::Agent { session_id, event });
                 }
-                // Wire variants with no in-process producer yet: PTY output
-                // stays desktop-local, snapshots are a remote-daemon attach
-                // affordance, and project deltas arrive via the file watcher.
-                // PTY output stays client-local and project deltas arrive
-                // via the file watcher.
-                SessionEvent::TerminalEvent { .. } | SessionEvent::ProjectChanged { .. } => {}
+                // Daemon-hosted PTY frames route to the terminal that owns
+                // the id; project deltas arrive via the file watcher.
+                SessionEvent::TerminalEvent { event } => {
+                    let _ = self.terminal_event_tx.send(event);
+                }
+                SessionEvent::ProjectChanged { .. } => {}
                 SessionEvent::SessionSnapshot {
                     session_id,
                     snapshot,
@@ -4910,9 +4970,28 @@ impl AppState {
 
     pub(crate) fn steer_pending_message(&mut self) -> Result<(), String> {
         if self.daemon_remote {
-            // No wire-level steer yet; the daemon-side follow-up queue is the
-            // closest equivalent and preserves the message.
-            return self.queue_pending_message();
+            let (text, images, session_id) = {
+                let session_id = self
+                    .active_session_id
+                    .clone()
+                    .ok_or_else(|| "No active session".to_string())?;
+                let pending = self
+                    .pending_composer_messages
+                    .get(&session_id)
+                    .cloned()
+                    .ok_or_else(|| "No pending composer message".to_string())?;
+                (pending.text, pending.images, session_id)
+            };
+            self.pending_composer_messages.remove(&session_id);
+            self.dispatch_command(SessionCommand::SteerMessage {
+                session_id: session_id.clone(),
+                text: text.clone(),
+                images,
+            });
+            let echo_id = format!("steered-user-{session_id}-{}", self.messages.len());
+            self.push_optimistic_follow_up(&session_id, text, echo_id);
+            self.session_status = Some("Steering current turn…".into());
+            return Ok(());
         }
         let (runtime, session_id, text, images) = self.pending_runtime_message()?;
         runtime
@@ -4931,6 +5010,33 @@ impl AppState {
         &mut self,
         entry_id: &str,
     ) -> Result<(String, Vec<ImageAttachment>), String> {
+        if self.daemon_remote {
+            let session_id = self
+                .active_session_id
+                .clone()
+                .ok_or_else(|| "No active session".to_string())?;
+            let echo_id = format!("queued-user-{session_id}-{entry_id}");
+            // Wire commands carry no response payload: the staged text comes
+            // back from the optimistic echo; staged images are not in it, so
+            // a remote cancel restores text only.
+            let staged_text = self
+                .messages
+                .iter()
+                .find(|message| message.id == echo_id)
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            self.dispatch_command(SessionCommand::CancelQueuedMessage {
+                session_id,
+                entry_id: entry_id.to_string(),
+            });
+            let mut messages = (*self.messages).clone();
+            if messages.iter().any(|message| message.id == echo_id) {
+                messages.retain(|message| message.id != echo_id);
+                self.messages = messages.into();
+            }
+            self.session_status = Some("Queued message removed".into());
+            return Ok((staged_text, Vec::new()));
+        }
         let (runtime, session_id) = self.active_runtime()?;
         let staged = runtime.work_handle.cancel_queued_entry(entry_id)?;
         let echo_id = format!("queued-user-{session_id}-{entry_id}");
@@ -4946,6 +5052,24 @@ impl AppState {
     /// Re-route a still-pending queued follow-up into the live steer queue so
     /// it reaches the model during the current turn instead of after it.
     pub fn steer_queued_message(&mut self, entry_id: &str) -> Result<(), String> {
+        if self.daemon_remote {
+            let session_id = self
+                .active_session_id
+                .clone()
+                .ok_or_else(|| "No active session".to_string())?;
+            self.dispatch_command(SessionCommand::SteerQueuedMessage {
+                session_id: session_id.clone(),
+                entry_id: entry_id.to_string(),
+            });
+            let queued_id = format!("queued-user-{session_id}-{entry_id}");
+            let mut messages = (*self.messages).clone();
+            if let Some(message) = messages.iter_mut().find(|message| message.id == queued_id) {
+                message.id = format!("steered-user-{session_id}-{entry_id}");
+                self.messages = messages.into();
+            }
+            self.session_status = Some("Steering current turn…".into());
+            return Ok(());
+        }
         let (runtime, session_id) = self.active_runtime()?;
         runtime.work_handle.steer_queued_entry(entry_id)?;
         let queued_id = format!("queued-user-{session_id}-{entry_id}");

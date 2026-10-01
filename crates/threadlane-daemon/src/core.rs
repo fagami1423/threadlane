@@ -28,7 +28,7 @@ use threadlane_coding_agent::controller::{
 use threadlane_protocol::browser::BrowserBridge;
 use threadlane_protocol::daemon::{
     ProjectInfo, SessionCommand, SessionEvent, SessionHydrationRequest, SessionInfo,
-    SessionSnapshot, WorktreeSetup,
+    SessionSnapshot, TerminalEvent, WorktreeSetup,
 };
 use threadlane_protocol::orchestration::ModelRoles;
 use threadlane_protocol::ReasoningEffort;
@@ -62,6 +62,8 @@ pub struct DaemonCore {
     identities: Mutex<HashMap<String, SessionIdentity>>,
     /// In-flight worktree preparations, for `CancelWorktreeSetup`.
     worktree_setups: Mutex<HashMap<String, WorktreeSetup>>,
+    /// Daemon-hosted PTYs, addressed by client-chosen terminal ids.
+    terminals: crate::terminal::TerminalManager,
     /// Events producers write into; pumped onto the journal + broadcast.
     ingest_tx: mpsc::UnboundedSender<SessionEvent>,
     /// `(seq, event)` pairs: the pump assigns a monotonic journal sequence
@@ -95,10 +97,23 @@ impl DaemonCore {
             crate::chat::executor()?.spawn(async move {
                 while let Some(event) = ingest_rx.recv().await {
                     let seq = event_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                    // Terminal output is high-volume and per-spawn ephemeral:
+                    // journaled frames would evict session history during
+                    // floods and replay garbage into live emulators on
+                    // reconnect. Lifecycle frames (Exited/Resized) stay
+                    // journaled — they are rare and reconcile client state.
+                    let journalable = !matches!(
+                        &event,
+                        SessionEvent::TerminalEvent {
+                            event: TerminalEvent::Output { .. }
+                        }
+                    );
                     let mut journal = journal.lock().expect("daemon journal poisoned");
-                    journal.push_back((seq, event.clone()));
-                    while journal.len() > JOURNAL_CAPACITY {
-                        journal.pop_front();
+                    if journalable {
+                        journal.push_back((seq, event.clone()));
+                        while journal.len() > JOURNAL_CAPACITY {
+                            journal.pop_front();
+                        }
                     }
                     drop(journal);
                     // Slow subscribers drop via Lagged rather than blocking
@@ -111,6 +126,7 @@ impl DaemonCore {
             runtimes: Mutex::new(HashMap::new()),
             identities: Mutex::new(HashMap::new()),
             worktree_setups: Mutex::new(HashMap::new()),
+            terminals: crate::terminal::TerminalManager::default(),
             ingest_tx,
             broadcast_tx,
             journal,
@@ -586,8 +602,61 @@ impl DaemonCore {
                 });
                 Ok(())
             }
-            SessionCommand::TerminalInput { .. } | SessionCommand::TerminalResize { .. } => {
-                Err("terminal PTYs are client-local; wire them to the daemon when the web client lands".to_string())
+            SessionCommand::TerminalOpen {
+                terminal_id,
+                cwd,
+                cols,
+                rows,
+            } => self
+                .terminals
+                .open(&terminal_id, &cwd, cols, rows, self.ingest_tx.clone()),
+            SessionCommand::TerminalClose { terminal_id } => {
+                self.terminals.close(&terminal_id);
+                Ok(())
+            }
+            SessionCommand::TerminalInput { terminal_id, data } => {
+                self.terminals.input(&terminal_id, &data)
+            }
+            SessionCommand::TerminalResize {
+                terminal_id,
+                cols,
+                rows,
+            } => self
+                .terminals
+                .resize(&terminal_id, cols, rows, &self.ingest_tx),
+            SessionCommand::SteerMessage {
+                session_id,
+                text,
+                images,
+            } => {
+                let runtime = self
+                    .runtime_for_session(&session_id)
+                    .ok_or_else(|| format!("no live runtime for session {session_id}"))?;
+                runtime
+                    .work_handle
+                    .queue_steer_with_images(text, images)
+                    .map(|_| ())
+            }
+            SessionCommand::SteerQueuedMessage {
+                session_id,
+                entry_id,
+            } => {
+                let runtime = self
+                    .runtime_for_session(&session_id)
+                    .ok_or_else(|| format!("no live runtime for session {session_id}"))?;
+                runtime.work_handle.steer_queued_entry(&entry_id)
+            }
+            SessionCommand::CancelQueuedMessage {
+                session_id,
+                entry_id,
+            } => {
+                let runtime = self
+                    .runtime_for_session(&session_id)
+                    .ok_or_else(|| format!("no live runtime for session {session_id}"))?;
+                runtime
+                    .work_handle
+                    .cancel_queued_entry(&entry_id)
+                    .map(|_| ())
             }
             SessionCommand::GetProjectState { work_dir } => {
                 let sessions = crate::discovery::discover_sessions_in_project(&work_dir);
