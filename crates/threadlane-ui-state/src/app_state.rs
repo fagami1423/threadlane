@@ -18,6 +18,7 @@ use threadlane_project::load_project_registry;
 
 use crate::discovery::*;
 use crate::projection::*;
+use crate::session_snooze::{unix_now, SessionSnooze, SnoozeRecord};
 pub use crate::types::*;
 use threadlane_runtime::harness::{tool_activity_display_summary, tool_activity_summary};
 
@@ -196,12 +197,23 @@ pub struct AppState {
     session_seen: HashMap<PathBuf, crate::session_seen::SessionSeenStore>,
     /// Single serialized background writer for every session_seen file.
     session_seen_writer: crate::session_seen::SessionSeenWriter,
+    /// Per-project `session_snooze.json` stores — the sidebar Snoozed
+    /// group's absolute-deadline records. Same canonical-project keying as
+    /// the seen stores so a worktree session and its stub share a snooze.
+    session_snooze: HashMap<PathBuf, crate::session_snooze::SessionSnoozeStore>,
+    /// Dedicated serialized writer for snooze files — same machinery as
+    /// `session_seen_writer`, kept as a second instance so result channels
+    /// stay unambiguous.
+    session_snooze_writer: crate::session_snooze::SessionSnoozeWriter,
     /// Completion token captured before the active session's latest
     /// transcript load. Cleared when acknowledged by the chat surface and
     /// replaced by each applied load; never populated by a failed load.
     presented_completion: Option<(SessionProjectionKey, RunCompletionToken)>,
     /// One-shot flag so a failed session_seen write surfaces exactly once.
     session_seen_save_failed: bool,
+    /// One-shot flag so a failed session_snooze write surfaces exactly
+    /// once; the affected row stays unhidden and unsaved.
+    session_snooze_save_failed: bool,
     /// False until the first automation projection has been applied — its
     /// runs are restored history and must not be registered as new in-app
     /// sessions.
@@ -344,7 +356,7 @@ impl AppState {
             return;
         };
         let path = store.path().to_path_buf();
-        if !self.session_seen_writer.submit(key.clone(), path, json) {
+        if !self.session_seen_writer.submit(key.clone(), path, 0, json) {
             tracing::warn!("session_seen writer is gone; keeping {} dirty", key.display());
             if let Some(store) = self.session_seen.get_mut(&key) {
                 store.mark_dirty();
@@ -424,6 +436,299 @@ impl AppState {
         // replaces it.
         self.presented_completion = None;
         advanced
+    }
+
+    /// The store map key for a project. `session_seen_key` canonicalizes
+    /// when the directory exists, but a store created while the project
+    /// dir was missing lives under the raw path — honor whichever key an
+    /// existing store uses so a later canonicalization cannot fork it.
+    fn session_snooze_key(&self, work_dir: &Path) -> PathBuf {
+        let key = Self::session_seen_key(work_dir);
+        if self.session_snooze.contains_key(work_dir)
+            && !self.session_snooze.contains_key(&key)
+        {
+            work_dir.to_path_buf()
+        } else {
+            key
+        }
+    }
+
+    fn session_snooze_store_for(
+        &mut self,
+        work_dir: &Path,
+    ) -> &mut crate::session_snooze::SessionSnoozeStore {
+        let key = self.session_snooze_key(work_dir);
+        self.session_snooze
+            .entry(key)
+            .or_insert_with(|| crate::session_snooze::SessionSnoozeStore::load(work_dir, unix_now()))
+    }
+
+    /// Hands any dirty snooze store for `work_dir` to the serialized
+    /// writer. The revision captured by `take_dirty_json` rides the job so a
+    /// stale acknowledgment can never confirm a newer record.
+    fn flush_session_snooze(&mut self, work_dir: &Path) {
+        let key = self.session_snooze_key(work_dir);
+        let Some(store) = self.session_snooze.get_mut(&key) else {
+            return;
+        };
+        let Some((json, revision)) = store.take_dirty_json() else {
+            return;
+        };
+        let path = store.path().to_path_buf();
+        if !self
+            .session_snooze_writer
+            .submit(key.clone(), path, revision, json)
+        {
+            tracing::warn!("session_snooze writer is gone; keeping {} dirty", key.display());
+            if let Some(store) = self.session_snooze.get_mut(&key) {
+                store.write_submit_failed(revision);
+            }
+        }
+    }
+
+    fn session_for_store_key(&self, key: &Path, session_id: &str) -> Option<&SessionInfo> {
+        self.projects
+            .iter()
+            .flat_map(|project| project.sessions.iter())
+            .find(|session| {
+                session.id == session_id
+                    && (Self::session_seen_key(&session.work_dir) == key
+                        || session.work_dir == *key)
+            })
+    }
+
+    /// Whether a confirmed snooze ended: new Working/Needs you state, an
+    /// active scheduled run, or a confirmed completion newer than the
+    /// captured baseline. `Unknown`/`None` summaries are not new work — a
+    /// transient parse failure or Git refresh never ends a snooze.
+    fn snooze_ended_for(&self, session: &SessionInfo, record: &SnoozeRecord) -> bool {
+        if matches!(
+            self.session_attention(session),
+            SessionAttention::Working | SessionAttention::NeedsYou
+        ) {
+            return true;
+        }
+        if self
+            .daemon_core
+            .runtime_for_file(&session.session_file)
+            .is_some_and(|runtime| runtime.scheduled_work_active())
+        {
+            return true;
+        }
+        match &session.completion_summary {
+            SessionCompletionSummary::Latest(token) => match &record.baseline {
+                Some(baseline) => token.seq > baseline.seq,
+                None => true,
+            },
+            _ => false,
+        }
+    }
+
+    /// The row-facing snooze state. Fail-open: expired or unwritten
+    /// (pending-hidden ineligible) metadata never hides a session —
+    /// pending records report `pending: true` and the row stays put.
+    pub fn session_snooze(&self, work_dir: &Path, session_id: &str) -> Option<SessionSnooze> {
+        let store = self.session_snooze.get(&self.session_snooze_key(work_dir))?;
+        let (record, pending) = store.record(session_id)?;
+        if record.wake_at <= unix_now() {
+            return None;
+        }
+        Some(SessionSnooze {
+            wake_at: record.wake_at,
+            pending,
+            save_failed: store.save_failed(),
+        })
+    }
+
+    /// Whether a new snooze may be recorded for this session. Only
+    /// confirmed Ready/Idle local sessions qualify; the `Err` text is the
+    /// reason shown by the disabled menu item.
+    pub fn session_snooze_eligibility(&self, session: &SessionInfo) -> Result<(), String> {
+        if self.daemon_remote {
+            return Err("Snooze is local-only for now".into());
+        }
+        if self.worktree_setups.contains_key(&session.id) {
+            return Err("Session is preparing its worktree".into());
+        }
+        if session.completion_summary == SessionCompletionSummary::Unknown {
+            return Err("Session state is still loading".into());
+        }
+        match self.session_attention(session) {
+            SessionAttention::Working => return Err("Session is still working".into()),
+            SessionAttention::NeedsYou => return Err("Session needs you".into()),
+            _ => {}
+        }
+        if self
+            .daemon_core
+            .runtime_for_file(&session.session_file)
+            .is_some_and(|runtime| runtime.scheduled_work_active())
+        {
+            return Err("A scheduled run is active".into());
+        }
+        Ok(())
+    }
+
+    /// Records a snooze after revalidating the exact project/session: the
+    /// deadline is computed now (elapsed hours survive sleep and restart)
+    /// and the completion baseline is captured so newer work ends it.
+    pub fn snooze_session(
+        &mut self,
+        work_dir: &Path,
+        session_id: &str,
+        duration_secs: u64,
+    ) -> Result<(), String> {
+        let session = self
+            .projects
+            .iter()
+            .flat_map(|project| project.sessions.iter())
+            .find(|session| session.id == session_id && session.work_dir == work_dir)
+            .cloned()
+            .ok_or_else(|| "Session was not found".to_string())?;
+        self.session_snooze_eligibility(&session)?;
+        let baseline = match &session.completion_summary {
+            SessionCompletionSummary::Latest(token) => Some(token.clone()),
+            _ => None,
+        };
+        let record = SnoozeRecord {
+            wake_at: unix_now() + duration_secs,
+            baseline,
+        };
+        self.session_snooze_store_for(work_dir)
+            .snooze(session_id, record);
+        self.flush_session_snooze(work_dir);
+        Ok(())
+    }
+
+    /// Unsnooze is fail-open: the record disappears immediately and the row
+    /// rejoins its pin/attention/date grouping; the deletion persists in
+    /// the background.
+    pub fn unsnooze_session(&mut self, work_dir: &Path, session_id: &str) {
+        if self
+            .session_snooze_store_for(work_dir)
+            .remove(session_id)
+        {
+            self.flush_session_snooze(work_dir);
+        }
+    }
+
+    /// Retries persistence for a record whose save failed — the same
+    /// deadline and baseline, never a recomputed snooze.
+    pub fn retry_snooze_save(&mut self, work_dir: &Path, session_id: &str) {
+        if self
+            .session_snooze
+            .get(&self.session_snooze_key(work_dir))
+            .is_some_and(|store| store.record(session_id).is_some())
+        {
+            self.flush_session_snooze(work_dir);
+        }
+    }
+
+    /// Drops records that expired or ended: deadline passed, new
+    /// Working/Needs you state, or a confirmed completion newer than the
+    /// captured baseline. Sessions missing from discovery keep their
+    /// records — only confirmed removal prunes them. Returns true when
+    /// visible state changed.
+    pub fn reconcile_session_snoozes(&mut self) -> bool {
+        let now = unix_now();
+        let mut changed = false;
+        let keys: Vec<PathBuf> = self.session_snooze.keys().cloned().collect();
+        for key in keys {
+            let mut dropped = Vec::new();
+            if let Some(store) = self.session_snooze.get(&key) {
+                for (session_id, record) in store.records() {
+                    let drop = record.wake_at <= now
+                        || self
+                            .session_for_store_key(&key, session_id)
+                            .is_some_and(|session| self.snooze_ended_for(session, record));
+                    if drop {
+                        dropped.push(session_id.clone());
+                    }
+                }
+            }
+            if dropped.is_empty() {
+                continue;
+            }
+            let Some(store) = self.session_snooze.get_mut(&key) else {
+                continue;
+            };
+            for session_id in dropped {
+                store.remove(&session_id);
+            }
+            let work_dir = store.work_dir().to_path_buf();
+            self.flush_session_snooze(&work_dir);
+            changed = true;
+        }
+        changed
+    }
+
+    /// Earliest snooze deadline across every project's store — the
+    /// sidebar's single wake-up task re-arms against it.
+    pub fn next_snooze_deadline(&self) -> Option<u64> {
+        self.session_snooze
+            .values()
+            .filter_map(crate::session_snooze::SessionSnoozeStore::next_deadline)
+            .min()
+    }
+
+    /// Every snooze record keyed for fingerprinting: `(work_dir,
+    /// session_id, wake_at, pending, save_failed)` — a change to any of
+    /// them rebuilds the sidebar rows.
+    pub fn session_snooze_entries(&self) -> Vec<(PathBuf, String, u64, bool, bool)> {
+        let mut entries = Vec::new();
+        for store in self.session_snooze.values() {
+            for (session_id, record) in store.records() {
+                entries.push((
+                    store.work_dir().to_path_buf(),
+                    session_id.clone(),
+                    record.wake_at,
+                    store
+                        .record(session_id)
+                        .is_some_and(|(_, pending)| pending),
+                    store.save_failed(),
+                ));
+            }
+        }
+        entries.sort();
+        entries
+    }
+
+    /// Observes serialized session_snooze writes: a confirmation may let
+    /// pending records hide, a failure leaves them pending (unhidden) and
+    /// surfaces once, and either way the acknowledged state is reconciled
+    /// so a late ack never re-hides a session whose work resumed.
+    pub fn drain_session_snooze_write_results(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(result) = self.session_snooze_writer.try_recv_result() {
+            // Match on the submitted key verbatim — it is already the store
+            // map key. Re-canonicalizing here can produce a different path
+            // when the write itself just created the directory.
+            let Some(store) = self.session_snooze.get_mut(&result.work_dir) else {
+                continue;
+            };
+            match store.apply_write_result(result.generation, result.error.clone()) {
+                crate::session_snooze::SnoozeWriteOutcome::Confirmed => {
+                    if self.session_snooze_save_failed {
+                        self.session_snooze_save_failed = false;
+                    }
+                    changed = true;
+                }
+                crate::session_snooze::SnoozeWriteOutcome::Stale => {}
+                crate::session_snooze::SnoozeWriteOutcome::Failed => {
+                    if !self.session_snooze_save_failed {
+                        self.session_snooze_save_failed = true;
+                        self.session_status = Some(
+                            "Could not save snooze — the session stays visible. Retry from its actions menu."
+                                .into(),
+                        );
+                    }
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            changed |= self.reconcile_session_snoozes();
+        }
+        changed
     }
 
     /// Canonical project dir owning `session_file` — the sessions list when
@@ -779,8 +1084,11 @@ impl AppState {
             mirror_seen: HashSet::new(),
             session_seen: HashMap::new(),
             session_seen_writer: crate::session_seen::SessionSeenWriter::spawn(),
+            session_snooze: HashMap::new(),
+            session_snooze_writer: crate::session_snooze::SessionSnoozeWriter::spawn(),
             presented_completion: None,
             session_seen_save_failed: false,
+            session_snooze_save_failed: false,
             automation_runs_restored: false,
             pending_permissions: HashMap::new(),
             pending_questions: HashMap::new(),
@@ -800,8 +1108,13 @@ impl AppState {
             .collect();
         for work_dir in store_dirs {
             state.session_seen_store_for(&work_dir);
+            state.session_snooze_store_for(&work_dir);
             state.daemon_core.attach_project(work_dir);
         }
+        // Startup reconcile: deadlines that passed while the app slept and
+        // work that resumed since are dropped before the first row renders,
+        // so expired or ended records never hide a session.
+        state.reconcile_session_snoozes();
         if let (Some(session_id), Some(session_file)) = (
             state.active_session_id.clone(),
             active_session_file.as_deref(),
@@ -1419,6 +1732,9 @@ impl AppState {
         if selected_session_missing {
             self.active_session_id = None;
         }
+        // Discovery may confirm a newer completion or a resumed state
+        // that ends a snooze recorded before the app was last open.
+        self.reconcile_session_snoozes();
         true
     }
 
@@ -2410,6 +2726,9 @@ impl AppState {
         // disappear from discovery keep it.
         self.session_seen_store_for(work_dir).prune(session_id);
         self.flush_session_seen(work_dir);
+        if self.session_snooze_store_for(work_dir).remove(session_id) {
+            self.flush_session_snooze(work_dir);
+        }
         let pin_key = (work_dir.to_path_buf(), session_id.to_string());
         let was_pinned = self.pinned_sessions.contains(&pin_key);
         let mut pin_error = None;
@@ -4447,6 +4766,7 @@ impl AppState {
 
     pub fn drain_chat_stream(&mut self, mut events: Vec<SessionEvent>) -> bool {
         let seen_changed = self.drain_session_seen_write_results();
+        let snooze_changed = self.drain_session_snooze_write_results();
         let scheduler_files: Vec<PathBuf> = self.scheduler_results.keys().cloned().collect();
         for session_file in scheduler_files {
             if let Some(receiver) = self.scheduler_results.get_mut(&session_file) {
@@ -4483,7 +4803,7 @@ impl AppState {
             .and_then(|session_id| self.deferred_stream_events.remove(session_id))
             .unwrap_or_default()
             .into_iter();
-        let mut changed = seen_changed;
+        let mut changed = seen_changed | snooze_changed;
 
         for event in deferred.chain(events) {
             match event {
@@ -5101,6 +5421,9 @@ impl AppState {
                 }
             }
         }
+        // Stream events can flip a session to Working/Needs you — a snooze
+        // must end on new work, never re-hide after it is answered.
+        changed |= self.reconcile_session_snoozes();
         changed
     }
 

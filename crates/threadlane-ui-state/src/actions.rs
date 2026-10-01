@@ -27,6 +27,27 @@ pub enum AppAction {
         work_dir: PathBuf,
         session_id: String,
     },
+    /// Hide a settled session under the Snoozed section until an absolute
+    /// deadline. Presentation-only: no scheduler, agent, or worktree is
+    /// touched and `duration_secs` is one of `SNOOZE_OPTIONS`.
+    SnoozeSession {
+        work_dir: PathBuf,
+        session_id: String,
+        duration_secs: u64,
+    },
+    /// Return a snoozed (or still-saving) session to normal grouping
+    /// immediately, fail-open; the record's removal persists in the
+    /// background.
+    UnsnoozeSession {
+        work_dir: PathBuf,
+        session_id: String,
+    },
+    /// Re-flush a snooze record whose save failed — the existing deadline
+    /// and baseline are kept, only the write is retried.
+    RetrySnoozeSave {
+        work_dir: PathBuf,
+        session_id: String,
+    },
     BeginNewTask,
     SelectDraftProject(PathBuf),
     SelectWorkMode(crate::WorkMode),

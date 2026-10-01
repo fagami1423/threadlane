@@ -12,6 +12,7 @@ pub mod actions;
 pub mod controller;
 mod app_state;
 pub mod session_seen;
+pub mod session_snooze;
 pub mod types;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -19,6 +20,9 @@ mod test_support;
 
 pub use app_state::{close_work_needs_refresh, ActiveCloseWork, AppState, TerminalBus};
 pub use session_seen::{SessionSeenStore, SessionSeenWriter};
+pub use session_snooze::{
+    snooze_return_label, SessionSnooze, SessionSnoozeStore, SnoozeRecord, SNOOZE_OPTIONS,
+};
 pub use threadlane_daemon::{
     agent_events, automation, chat, discovery, events, projection, provider_auth, runtimes,
     settings, updater, worktree_setup,

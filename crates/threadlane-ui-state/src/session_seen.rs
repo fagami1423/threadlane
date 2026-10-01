@@ -179,11 +179,16 @@ impl SessionSeenStore {
 struct SeenWriteJob {
     work_dir: PathBuf,
     path: PathBuf,
+    /// Producer-assigned revision echoed back in the result; stores that
+    /// gate visibility on write confirmation use it to match acks. Stores
+    /// that do not (session_seen) pass `0`.
+    generation: u64,
     json: String,
 }
 
 pub struct SeenWriteResult {
     pub work_dir: PathBuf,
+    pub generation: u64,
     pub error: Option<String>,
 }
 
@@ -205,6 +210,7 @@ impl SessionSeenWriter {
                 if results_tx
                     .send(SeenWriteResult {
                         work_dir: job.work_dir,
+                        generation: job.generation,
                         error,
                     })
                     .is_err()
@@ -219,11 +225,18 @@ impl SessionSeenWriter {
         }
     }
 
-    pub fn submit(&self, work_dir: PathBuf, path: PathBuf, json: String) -> bool {
+    pub fn submit(
+        &self,
+        work_dir: PathBuf,
+        path: PathBuf,
+        generation: u64,
+        json: String,
+    ) -> bool {
         self.jobs
             .send(SeenWriteJob {
                 work_dir,
                 path,
+                generation,
                 json,
             })
             .is_ok()

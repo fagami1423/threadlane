@@ -18,7 +18,8 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::{Disableable, Icon, IconName, Selectable, Sizable, StyledExt, WindowExt};
 
 use threadlane_ui_state::{
-    AppState, GitHubTab, SessionAttention, SessionInfo, TrajectoryEntry, WorkspacePage,
+    snooze_return_label, AppState, GitHubTab, SessionAttention, SessionInfo, SessionSnooze,
+    TrajectoryEntry, WorkspacePage, SNOOZE_OPTIONS,
 };
 use threadlane_ui_state::{actions::AppAction, controller};
 use threadlane_updater::UpdateStatus;
@@ -329,20 +330,28 @@ enum DateGroup {
     Yesterday,
     ThisWeek,
     Older,
+    /// Confirmed snoozes live below every date group, ordered by return
+    /// time. Pending (unconfirmed) snoozes stay in their normal group.
+    Snoozed,
 }
 
 #[derive(Clone)]
 enum HistoryRow {
     Group(DateGroup),
+    /// The `Snoozed (n)` collapsible header; the count travels with the row
+    /// so rendering stays a pure function of cached rows.
+    SnoozedHeader(usize),
     /// The bool records whether the session showed a New result marker when
     /// the rows were built, so a marker toggling on an otherwise identical
-    /// row can invalidate its cached height.
-    Session(SessionInfo, SessionAttention, bool),
+    /// row can invalidate its cached height; the SessionSnooze plays the
+    /// same role for the snooze chip.
+    Session(SessionInfo, SessionAttention, bool, Option<SessionSnooze>),
 }
 
 fn same_history_row_identity(left: &HistoryRow, right: &HistoryRow) -> bool {
     match (left, right) {
         (HistoryRow::Group(left), HistoryRow::Group(right)) => left == right,
+        (HistoryRow::SnoozedHeader(_), HistoryRow::SnoozedHeader(_)) => true,
         (HistoryRow::Session(left, ..), HistoryRow::Session(right, ..)) => {
             left.id == right.id && left.work_dir == right.work_dir
         }
@@ -356,9 +365,13 @@ fn same_history_row_identity(left: &HistoryRow, right: &HistoryRow) -> bool {
 fn history_row_height_inputs(left: &HistoryRow, right: &HistoryRow) -> bool {
     match (left, right) {
         (
-            HistoryRow::Session(_, left_attention, left_unseen),
-            HistoryRow::Session(_, right_attention, right_unseen),
-        ) => left_attention != right_attention || left_unseen != right_unseen,
+            HistoryRow::Session(_, left_attention, left_unseen, left_snooze),
+            HistoryRow::Session(_, right_attention, right_unseen, right_snooze),
+        ) => {
+            left_attention != right_attention
+                || left_unseen != right_unseen
+                || left_snooze != right_snooze
+        }
         _ => false,
     }
 }
@@ -389,45 +402,81 @@ fn flatten_history_sessions(
     flatten_history_sessions_with_pins(
         sessions
             .into_iter()
-            .map(|(s, a)| (s, a, false, false))
+            .map(|(s, a)| (s, a, false, false, None))
             .collect(),
         now,
+        false,
     )
 }
 
 fn flatten_history_sessions_with_pins(
-    mut sessions: Vec<(SessionInfo, SessionAttention, bool, bool)>,
+    mut sessions: Vec<(SessionInfo, SessionAttention, bool, bool, Option<SessionSnooze>)>,
     now: u64,
+    snoozed_collapsed: bool,
 ) -> Vec<HistoryRow> {
-    sessions.sort_by(
-        |(left, left_attention, left_pinned, _), (right, right_attention, right_pinned, _)| {
-            let left_group =
-                history_group_with_pin(*left_pinned, *left_attention, left.updated_at, now);
-            let right_group =
-                history_group_with_pin(*right_pinned, *right_attention, right.updated_at, now);
-            left_group
-                .rank()
-                .cmp(&right_group.rank())
-                .then_with(|| right.updated_at.cmp(&left.updated_at))
-                .then_with(|| left.title.cmp(&right.title))
-        },
-    );
+    // Confirmed snoozes group under Snoozed regardless of pin or attention —
+    // the pin/attention grouping is preserved underneath and reasserts at
+    // return. Pending (unconfirmed) snoozes keep their normal group.
+    let group_of = |pinned: bool,
+                    attention: SessionAttention,
+                    updated_at: u64,
+                    snooze: Option<SessionSnooze>| {
+        if snooze.is_some_and(|snooze| !snooze.pending) {
+            DateGroup::Snoozed
+        } else {
+            history_group_with_pin(pinned, attention, updated_at, now)
+        }
+    };
+    sessions.sort_by(|left, right| {
+        let left_group = group_of(left.2, left.1, left.0.updated_at, left.4);
+        let right_group = group_of(right.2, right.1, right.0.updated_at, right.4);
+        left_group
+            .rank()
+            .cmp(&right_group.rank())
+            .then_with(|| match (left.4, right.4) {
+                // Snoozed rows order by soonest return; everything else by recency.
+                (Some(left_snooze), Some(right_snooze)) => {
+                    left_snooze.wake_at.cmp(&right_snooze.wake_at)
+                }
+                _ => right.0.updated_at.cmp(&left.0.updated_at),
+            })
+            .then_with(|| left.0.title.cmp(&right.0.title))
+    });
 
+    let snoozed_count = sessions
+        .iter()
+        .filter(|session| session.4.is_some_and(|snooze| !snooze.pending))
+        .count();
     let mut rows = Vec::with_capacity(sessions.len() + DateGroup::COUNT);
     let mut previous_group = None;
-    for (session, attention, pinned, has_unseen_result) in sessions {
-        let group = history_group_with_pin(pinned, attention, session.updated_at, now);
+    for (session, attention, pinned, has_unseen_result, snooze) in sessions {
+        let group = group_of(pinned, attention, session.updated_at, snooze);
         if previous_group != Some(group) {
-            rows.push(HistoryRow::Group(group));
+            rows.push(if group == DateGroup::Snoozed {
+                HistoryRow::SnoozedHeader(snoozed_count)
+            } else {
+                HistoryRow::Group(group)
+            });
             previous_group = Some(group);
         }
-        rows.push(HistoryRow::Session(session, attention, has_unseen_result));
+        // Collapse hides the rows, never the header; search bypasses the
+        // collapse because the caller passes `snoozed_collapsed` only when
+        // the query is empty.
+        if group == DateGroup::Snoozed && snoozed_collapsed {
+            continue;
+        }
+        rows.push(HistoryRow::Session(
+            session,
+            attention,
+            has_unseen_result,
+            snooze,
+        ));
     }
     rows
 }
 
 impl DateGroup {
-    const COUNT: usize = 7;
+    const COUNT: usize = 8;
 
     fn label(self) -> &'static str {
         match self {
@@ -438,6 +487,7 @@ impl DateGroup {
             Self::Yesterday => "Yesterday",
             Self::ThisWeek => "This Week",
             Self::Older => "Older",
+            Self::Snoozed => "Snoozed",
         }
     }
 
@@ -450,6 +500,7 @@ impl DateGroup {
             Self::Yesterday => 4,
             Self::ThisWeek => 5,
             Self::Older => 6,
+            Self::Snoozed => 7,
         }
     }
 }
@@ -542,6 +593,14 @@ pub struct SidebarView {
     /// Flattened, sorted rows cached per fingerprint for the virtual list.
     history_cache: Option<(u64, Vec<HistoryRow>)>,
     history_list_state: ListState,
+    /// Snoozed section collapsed state — view-owned, bypassed by search.
+    snoozed_collapsed: bool,
+    /// The deadline the view-owned wake task is sleeping for; `None` when
+    /// no snooze records exist.
+    snooze_deadline_armed: Option<u64>,
+    /// Bumped on every re-arm so a superseded task exits instead of
+    /// double-firing the reconcile.
+    snooze_timer_epoch: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -628,6 +687,18 @@ fn sidebar_fingerprint(state: &AppState, now: u64) -> u64 {
     for byte in state.search_query.trim().bytes() {
         hasher.write_u8(byte.to_ascii_lowercase());
     }
+    // Snooze records are hashed in full — a deadline is never folded into
+    // the minute bucket, so an expiry changes the rows only through the
+    // reconcile that drops the record (driven by the view's wake task).
+    for (work_dir, session_id, wake_at, pending, save_failed) in
+        state.session_snooze_entries()
+    {
+        work_dir.hash(&mut hasher);
+        session_id.hash(&mut hasher);
+        wake_at.hash(&mut hasher);
+        pending.hash(&mut hasher);
+        save_failed.hash(&mut hasher);
+    }
     (now / 60).hash(&mut hasher);
     for project in &state.projects {
         project.name.hash(&mut hasher);
@@ -707,6 +778,125 @@ fn pr_status_label(pr: &threadlane_git::GitHubPrInfo) -> &'static str {
     }
 }
 
+/// The snooze block shared by the row context menu and the visible
+/// session-actions menu. Confirmed snoozes report their resolved local
+/// deadline plus Unsnooze; a pending write shows "Saving snooze…" (or the
+/// failure and a retry); otherwise a native submenu offers the fixed
+/// durations — or, for ineligible sessions, a disabled item carrying the
+/// reason.
+fn session_snooze_menu_items(
+    menu: gpui_component::menu::PopupMenu,
+    window: &mut Window,
+    cx: &mut Context<gpui_component::menu::PopupMenu>,
+    model: &Entity<AppState>,
+    session: &SessionInfo,
+) -> gpui_component::menu::PopupMenu {
+    let state = model.read(cx);
+    let snooze = state.session_snooze(&session.work_dir, &session.id);
+    let eligibility = state.session_snooze_eligibility(session);
+    let work_dir = session.work_dir.clone();
+    let session_id = session.id.clone();
+    let unsnooze = |menu: gpui_component::menu::PopupMenu| {
+        let unsnooze_model = model.clone();
+        let unsnooze_work_dir = work_dir.clone();
+        let unsnooze_session_id = session_id.clone();
+        menu.item(PopupMenuItem::new("Unsnooze session").on_click(
+            move |_event, _window, cx| {
+                unsnooze_model.update(cx, |state, cx| {
+                    controller::dispatch(
+                        state,
+                        AppAction::UnsnoozeSession {
+                            work_dir: unsnooze_work_dir.clone(),
+                            session_id: unsnooze_session_id.clone(),
+                        },
+                    );
+                    cx.notify();
+                });
+            },
+        ))
+    };
+    match snooze {
+        Some(snooze) if snooze.pending => {
+            let mut menu = menu.item(
+                PopupMenuItem::new(if snooze.save_failed {
+                    "Couldn't save snooze"
+                } else {
+                    "Saving snooze…"
+                })
+                .disabled(true),
+            );
+            if snooze.save_failed {
+                let retry_model = model.clone();
+                let retry_work_dir = work_dir.clone();
+                let retry_session_id = session_id.clone();
+                menu = menu.item(PopupMenuItem::new("Retry saving snooze").on_click(
+                    move |_event, _window, cx| {
+                        retry_model.update(cx, |state, cx| {
+                            controller::dispatch(
+                                state,
+                                AppAction::RetrySnoozeSave {
+                                    work_dir: retry_work_dir.clone(),
+                                    session_id: retry_session_id.clone(),
+                                },
+                            );
+                            cx.notify();
+                        });
+                    },
+                ));
+            }
+            // Even while saving, abandoning the snooze stays one click.
+            unsnooze(menu)
+        }
+        Some(snooze) => unsnooze(menu.item(
+            PopupMenuItem::new(format!(
+                "Snoozed until {}",
+                snooze_return_label(snooze.wake_at)
+            ))
+            .disabled(true),
+        )),
+        None => match eligibility {
+            Ok(()) => {
+                let submenu_model = model.clone();
+                menu.submenu("Snooze session…", window, cx, move |submenu, _window, _cx| {
+                    let mut submenu = submenu;
+                    for (label, duration_secs) in SNOOZE_OPTIONS {
+                        let item_model = submenu_model.clone();
+                        let item_work_dir = work_dir.clone();
+                        let item_session_id = session_id.clone();
+                        let duration_secs = *duration_secs;
+                        // The label resolves the return time at menu-open;
+                        // the deadline itself is computed in `snooze_session`
+                        // at activation, never when the row mounted.
+                        let back_at =
+                            snooze_return_label(now_unix_secs() + duration_secs);
+                        submenu = submenu.item(
+                            PopupMenuItem::new(format!("{label} — back at {back_at}")).on_click(
+                                move |_event, _window, cx| {
+                                    item_model.update(cx, |state, cx| {
+                                        controller::dispatch(
+                                            state,
+                                            AppAction::SnoozeSession {
+                                                work_dir: item_work_dir.clone(),
+                                                session_id: item_session_id.clone(),
+                                                duration_secs,
+                                            },
+                                        );
+                                        cx.notify();
+                                    });
+                                },
+                            ),
+                        );
+                    }
+                    submenu
+                })
+            }
+            Err(reason) => menu.item(
+                PopupMenuItem::new(format!("Snooze session… — {reason}")).disabled(true),
+            ),
+        },
+    }
+}
+
 fn pr_status_tooltip(pr: &threadlane_git::GitHubPrInfo) -> String {
     format!(
         "PR #{} · {}\n{}\n{} → {}\nChecks: {} passed · {} pending · {} failed\nDiscussion: {} comments · {} review comments\n{}",
@@ -745,6 +935,9 @@ impl SidebarView {
             history_cache: None,
             title_generating: HashSet::new(),
             history_list_state: ListState::new(0, ListAlignment::Top, window.rem_size() * 4.5),
+            snoozed_collapsed: false,
+            snooze_deadline_armed: None,
+            snooze_timer_epoch: 0,
             _subscriptions: vec![sub1],
         }
     }
@@ -1299,6 +1492,21 @@ impl SidebarView {
             .model
             .read(cx)
             .is_session_pinned(&session.work_dir, &session.id);
+        let session_snooze = self
+            .model
+            .read(cx)
+            .session_snooze(&session.work_dir, &session.id);
+        let snooze_label = session_snooze.map(|snooze| {
+            if snooze.pending {
+                if snooze.save_failed {
+                    "Couldn't save snooze".to_string()
+                } else {
+                    "Saving snooze…".to_string()
+                }
+            } else {
+                format!("Snoozed until {}", snooze_return_label(snooze.wake_at))
+            }
+        });
         let session_git_status = {
             let state = self.model.read(cx);
             state
@@ -1328,6 +1536,13 @@ impl SidebarView {
         let quick_settle_session_id = session.id.clone();
         let quick_settle_is_worktree = session.is_worktree;
         let quick_settle_git_branch = session.git_branch.clone();
+        let actions_model = self.model.clone();
+        let actions_work_dir = session.work_dir.clone();
+        let actions_session_id = session.id.clone();
+        let actions_session = session.clone();
+        let actions_is_pinned = is_pinned;
+        let actions_is_worktree = session.is_worktree;
+        let actions_git_branch = session.git_branch.clone();
 
         // Full-row screen-reader label: the inner title button only carries
         // the title, so status, project, branch, and recency live here.
@@ -1344,14 +1559,26 @@ impl SidebarView {
         } else {
             ""
         };
+        // Snooze and deadline state are mirrored into the row and title
+        // labels — never a color-only cue.
+        let snooze_suffix = session_snooze
+            .map(|snooze| {
+                if snooze.pending {
+                    ", saving snooze".to_string()
+                } else {
+                    format!(", snoozed until {}", snooze_return_label(snooze.wake_at))
+                }
+            })
+            .unwrap_or_default();
         let session_row_label = format!(
-            "{pinned_prefix}{}, project {}, {}, {}{}{}",
+            "{pinned_prefix}{}, project {}, {}, {}{}{}{}",
             session_title,
             project,
             attention.label(),
             time_ago,
             branch_suffix,
             unseen_suffix,
+            snooze_suffix,
         );
 
         let pr_info = session_pr_info(session, &self.model.read(cx).git_prs).cloned();
@@ -1445,6 +1672,45 @@ impl SidebarView {
                     .font_medium()
                     .text_color(theme.muted_foreground)
                     .child("New result")
+                    .into_any_element(),
+            );
+        }
+        if let (Some(snooze), Some(label)) = (session_snooze, snooze_label.as_ref()) {
+            let snooze_tooltip = if snooze.pending {
+                format!("{label} — the session stays in its normal group until the save is confirmed")
+            } else {
+                format!("{label}\nReturns to its normal group when the deadline passes")
+            };
+            signal_items.push(
+                div()
+                    .id(SharedString::from(format!("session-snoozed-{}", session.id)))
+                    .debug_selector({
+                        let id = session.id.clone();
+                        move || format!("session-snoozed-{id}")
+                    })
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .px_1p5()
+                    .py(rems(0.125))
+                    .rounded_full()
+                    .bg(theme.muted.opacity(0.35))
+                    .tooltip(move |window, cx| {
+                        Tooltip::new(snooze_tooltip.clone()).build(window, cx)
+                    })
+                    .child(
+                        Icon::new(IconName::Moon)
+                            .xsmall()
+                            .text_color(theme.muted_foreground.opacity(0.9)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(theme.muted_foreground.opacity(0.9))
+                            .child(label.clone()),
+                    )
                     .into_any_element(),
             );
         }
@@ -1693,11 +1959,15 @@ impl SidebarView {
                                     let id = session.id.clone();
                                     move || format!("session-title-{id}")
                                 })
-                                .accessibility_label(if has_unseen_result {
-                                    format!("{session_title} — New result")
-                                } else {
-                                    session_title.clone()
-                                })
+                                .accessibility_label(format!(
+                                    "{session_title}{}{}",
+                                    if has_unseen_result {
+                                        " — New result"
+                                    } else {
+                                        ""
+                                    },
+                                    snooze_suffix
+                                ))
                                 .ghost()
                                 .xsmall()
                                 .compact()
@@ -1861,6 +2131,130 @@ impl SidebarView {
                                                 }
                                             },
                                         ),
+                                    )
+                                    .child(
+                                        // Visible session-actions menu: the
+                                        // same row actions as the context
+                                        // menu for keyboard and no-hover
+                                        // users — tabbable, and always
+                                        // shown on the selected row.
+                                        Button::new(SharedString::from(format!(
+                                            "session-actions-{}",
+                                            session.id
+                                        )))
+                                        .debug_selector({
+                                            let id = session.id.clone();
+                                            move || format!("session-actions-{id}")
+                                        })
+                                        .icon(IconName::Ellipsis)
+                                        .ghost()
+                                        .xsmall()
+                                        .compact()
+                                        .accessibility_label("Session actions")
+                                        .tooltip("Session actions")
+                                        .opacity(0.0)
+                                        .group_hover("session-card", |style| style.opacity(1.0))
+                                        .focus_visible(|style| style.opacity(1.0))
+                                        .when(is_active, |button| button.opacity(1.0))
+                                        // No stop_propagation: the popover
+                                        // toggle lives on an ancestor, and
+                                        // selecting the row on open is the
+                                        // desired behavior for this menu.
+                                        .dropdown_menu(move |menu, window, cx| {
+                                            let open_model = actions_model.clone();
+                                            let open_work_dir = actions_work_dir.clone();
+                                            let open_session_id = actions_session_id.clone();
+                                            let pin_model = actions_model.clone();
+                                            let pin_work_dir = actions_work_dir.clone();
+                                            let pin_session_id = actions_session_id.clone();
+                                            let settle_model = actions_model.clone();
+                                            let settle_work_dir = actions_work_dir.clone();
+                                            let settle_session_id = actions_session_id.clone();
+                                            let remove_model = actions_model.clone();
+                                            let remove_work_dir = actions_work_dir.clone();
+                                            let remove_session_id = actions_session_id.clone();
+                                            let settle_git_branch = actions_git_branch.clone();
+                                            let remove_git_branch = actions_git_branch.clone();
+                                            let menu = menu
+                                                .item(
+                                                    PopupMenuItem::new("Open Session")
+                                                        .on_click(move |_event, _window, cx| {
+                                                            open_model.update(cx, |state, cx| {
+                                                                controller::dispatch(
+                                                                    state,
+                                                                    AppAction::SelectSession {
+                                                                        work_dir: open_work_dir
+                                                                            .clone(),
+                                                                        session_id:
+                                                                            open_session_id
+                                                                                .clone(),
+                                                                    },
+                                                                );
+                                                                cx.notify();
+                                                            });
+                                                        }),
+                                                )
+                                                .item(
+                                                    PopupMenuItem::new(if actions_is_pinned {
+                                                        "Unpin Session"
+                                                    } else {
+                                                        "Pin Session"
+                                                    })
+                                                    .on_click(move |_event, _window, cx| {
+                                                        pin_model.update(cx, |state, cx| {
+                                                            controller::dispatch(
+                                                                state,
+                                                                AppAction::TogglePinSession {
+                                                                    work_dir: pin_work_dir
+                                                                        .clone(),
+                                                                    session_id: pin_session_id
+                                                                        .clone(),
+                                                                },
+                                                            );
+                                                            cx.notify();
+                                                        });
+                                                    }),
+                                                );
+                                            session_snooze_menu_items(
+                                                menu,
+                                                window,
+                                                cx,
+                                                &actions_model,
+                                                &actions_session,
+                                            )
+                                            .separator()
+                                            .item(
+                                                PopupMenuItem::new("Archive Session").on_click(
+                                                    move |_event, window, cx| {
+                                                        open_archive_session_dialog(
+                                                            window,
+                                                            cx,
+                                                            settle_model.clone(),
+                                                            settle_work_dir.clone(),
+                                                            settle_session_id.clone(),
+                                                            actions_is_worktree,
+                                                            settle_git_branch.clone(),
+                                                        );
+                                                    },
+                                                ),
+                                            )
+                                            .separator()
+                                            .item(
+                                                PopupMenuItem::new("Remove Session").on_click(
+                                                    move |_event, window, cx| {
+                                                        open_remove_session_dialog(
+                                                            window,
+                                                            cx,
+                                                            remove_model.clone(),
+                                                            remove_work_dir.clone(),
+                                                            remove_session_id.clone(),
+                                                            actions_is_worktree,
+                                                            remove_git_branch.clone(),
+                                                        );
+                                                    },
+                                                ),
+                                            )
+                                        }),
                                     ),
                             ),
                     )
@@ -1926,6 +2320,7 @@ impl SidebarView {
                         .title_generating
                         .contains(&title_session.session_file)
                 });
+                let snooze_session = title_session.clone();
                 let title_loading = context_model
                     .read(_cx)
                     .active_session_matches(&title_session.id, &title_session.session_file)
@@ -2015,6 +2410,16 @@ impl SidebarView {
                         });
                     }),
                 )
+                .map(|menu| {
+                    session_snooze_menu_items(
+                        menu,
+                        _window,
+                        _cx,
+                        &context_model,
+                        &snooze_session,
+                    )
+                })
+                .separator()
                 .item({
                     let item = PopupMenuItem::new(if terminal_unavailable {
                         "Open Terminal Here — worktree unavailable"
@@ -2596,10 +3001,23 @@ impl SidebarView {
                 let attention = state.session_attention(session);
                 let is_pinned = state.is_session_pinned(&session.work_dir, &session.id);
                 let has_unseen_result = state.session_has_unseen_result(session);
-                sessions.push((session.clone(), attention, is_pinned, has_unseen_result));
+                let snooze = state.session_snooze(&session.work_dir, &session.id);
+                sessions.push((
+                    session.clone(),
+                    attention,
+                    is_pinned,
+                    has_unseen_result,
+                    snooze,
+                ));
             }
         }
-        flatten_history_sessions_with_pins(sessions, now)
+        // Search reveals matching snoozed rows regardless of the section's
+        // collapsed state; only the plain list honors it.
+        flatten_history_sessions_with_pins(
+            sessions,
+            now,
+            self.snoozed_collapsed && query.is_empty(),
+        )
     }
 
     fn render_history_row(
@@ -2679,7 +3097,62 @@ impl SidebarView {
                     )
                     .into_any_element()
             }
-            Some(HistoryRow::Session(session, attention, _has_unseen_result)) => {
+            Some(HistoryRow::SnoozedHeader(count)) => {
+                let collapsed = self.snoozed_collapsed;
+                let chevron = if collapsed {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .pt(if index == 0 {
+                        window.rem_size() * 0.25
+                    } else {
+                        window.rem_size() * 0.75
+                    })
+                    .pb_1()
+                    .child(
+                        Icon::new(IconName::Moon)
+                            .xsmall()
+                            .text_color(theme.muted_foreground.opacity(0.85)),
+                    )
+                    .child(
+                        Button::new("snoozed-section-toggle")
+                            .debug_selector(|| "snoozed-section-toggle".into())
+                            .icon(Icon::new(chevron))
+                            .label(format!("Snoozed ({count})"))
+                            .accessibility_label(if collapsed {
+                                format!("Snoozed, {count} sessions, collapsed")
+                            } else {
+                                format!("Snoozed, {count} sessions, expanded")
+                            })
+                            .tooltip(if collapsed {
+                                "Expand snoozed sessions"
+                            } else {
+                                "Collapse snoozed sessions"
+                            })
+                            .ghost()
+                            .xsmall()
+                            .compact()
+                            .text_color(theme.muted_foreground.opacity(0.85))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.snoozed_collapsed = !this.snoozed_collapsed;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .h(rems(0.0625))
+                            .flex_1()
+                            .bg(theme.border.opacity(0.25)),
+                    )
+                    .into_any_element()
+            }
+            Some(HistoryRow::Session(session, attention, _has_unseen_result, _snooze)) => {
                 let state = self.model.read(cx);
                 let is_active = state.workspace_page == WorkspacePage::Chat
                     && state.active_work_dir.as_ref() == Some(&session.work_dir)
@@ -2693,6 +3166,51 @@ impl SidebarView {
         }
     }
 
+    /// One view-owned wake task for the nearest snooze deadline — no
+    /// per-row timers. The sleep is capped at 60s so a forward clock jump
+    /// or a resume lands within a minute instead of waiting out a stale
+    /// relative delay; each wake re-checks wall time and only reconciles
+    /// when the deadline truly passed.
+    fn arm_snooze_deadline(&mut self, cx: &mut Context<Self>) {
+        let next = self.model.read(cx).next_snooze_deadline();
+        if next == self.snooze_deadline_armed {
+            return;
+        }
+        self.snooze_deadline_armed = next;
+        self.snooze_timer_epoch += 1;
+        let Some(deadline) = next else {
+            return;
+        };
+        let epoch = self.snooze_timer_epoch;
+        cx.spawn(async move |this, cx| {
+            loop {
+                let remaining = deadline.saturating_sub(now_unix_secs());
+                if remaining == 0 {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(remaining.min(60)))
+                    .await;
+                let still_armed = this
+                    .update(cx, |this, _| {
+                        this.snooze_timer_epoch == epoch
+                            && this.snooze_deadline_armed == Some(deadline)
+                    })
+                    .unwrap_or(false);
+                if !still_armed {
+                    return;
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.model.update(cx, |state, _cx| {
+                    state.reconcile_session_snoozes();
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn render_history(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().colors;
         let state = self.model.read(cx);
@@ -2702,10 +3220,13 @@ impl SidebarView {
 
         let fingerprint = sidebar_fingerprint(state, now);
         self.history_fingerprint = fingerprint;
+        // The collapse flag is view-owned (not part of the model
+        // fingerprint), so it folds into the row-cache key here.
+        let cache_key = fingerprint ^ (self.snoozed_collapsed as u64);
         let cache_matches = self
             .history_cache
             .as_ref()
-            .is_some_and(|(cached, _)| *cached == fingerprint);
+            .is_some_and(|(cached, _)| *cached == cache_key);
         if !cache_matches {
             let rows = self.build_history_rows(state, &query, now);
             let same_rows = self.history_cache.as_ref().is_some_and(|(_, cached)| {
@@ -2734,8 +3255,9 @@ impl SidebarView {
                     self.history_list_state.remeasure_items(start..end);
                 }
             }
-            self.history_cache = Some((fingerprint, rows));
+            self.history_cache = Some((cache_key, rows));
         }
+        self.arm_snooze_deadline(cx);
 
         let row_count = self
             .history_cache
@@ -2863,7 +3385,7 @@ mod tests {
     use std::collections::HashMap;
     use threadlane_git::GitHubPrInfo;
     use threadlane_ui_state::{
-        SessionAttention, SessionCompletionSummary, SessionHealth, SessionInfo,
+        SessionAttention, SessionCompletionSummary, SessionHealth, SessionInfo, SessionSnooze,
     };
 
     #[gpui::test]
@@ -3095,6 +3617,7 @@ mod tests {
         }
 
         cx.update(|window, cx| window.focus_next(cx)); // Archive remains separate.
+        cx.update(|window, cx| window.focus_next(cx)); // Session actions menu.
         for (page, tab) in [
             (WorkspacePage::Automations, GitHubTab::Issues),
             (WorkspacePage::GitHub, GitHubTab::Issues),
@@ -3160,26 +3683,31 @@ mod tests {
 
         assert!(matches!(rows[0], HistoryRow::Group(DateGroup::NeedsYou)));
         assert!(
-            matches!(&rows[1], HistoryRow::Session(item, SessionAttention::NeedsYou, _) if item.id == "needs-newer")
+            matches!(&rows[1], HistoryRow::Session(item, SessionAttention::NeedsYou, ..) if item.id == "needs-newer")
         );
         assert!(
-            matches!(&rows[2], HistoryRow::Session(item, SessionAttention::NeedsYou, _) if item.id == "needs-older")
+            matches!(&rows[2], HistoryRow::Session(item, SessionAttention::NeedsYou, ..) if item.id == "needs-older")
         );
         assert!(matches!(rows[3], HistoryRow::Group(DateGroup::Working)));
         assert!(
-            matches!(&rows[4], HistoryRow::Session(item, SessionAttention::Working, _) if item.id == "working")
+            matches!(&rows[4], HistoryRow::Session(item, SessionAttention::Working, ..) if item.id == "working")
         );
         assert!(matches!(rows[5], HistoryRow::Group(DateGroup::Today)));
         assert!(
-            matches!(&rows[6], HistoryRow::Session(item, SessionAttention::Ready, _) if item.id == "ready-today")
+            matches!(&rows[6], HistoryRow::Session(item, SessionAttention::Ready, ..) if item.id == "ready-today")
         );
         assert!(matches!(rows[7], HistoryRow::Group(DateGroup::Yesterday)));
         assert!(
-            matches!(&rows[8], HistoryRow::Session(item, SessionAttention::Idle, _) if item.id == "idle-yesterday")
+            matches!(&rows[8], HistoryRow::Session(item, SessionAttention::Idle, ..) if item.id == "idle-yesterday")
         );
         assert!(same_history_row_identity(
             &rows[1],
-            &HistoryRow::Session(session("needs-newer"), SessionAttention::Idle, false)
+            &HistoryRow::Session(
+                session("needs-newer"),
+                SessionAttention::Idle,
+                false,
+                None,
+            )
         ));
         assert!(!same_history_row_identity(&rows[1], &rows[4]));
     }
@@ -3196,24 +3724,25 @@ mod tests {
 
         let rows = flatten_history_sessions_with_pins(
             vec![
-                (working, SessionAttention::Working, false, false),
-                (needs_newer, SessionAttention::NeedsYou, false, false),
-                (pinned_idle, SessionAttention::Idle, true, false),
+                (working, SessionAttention::Working, false, false, None),
+                (needs_newer, SessionAttention::NeedsYou, false, false, None),
+                (pinned_idle, SessionAttention::Idle, true, false, None),
             ],
             now,
+            false,
         );
 
         assert!(matches!(rows[0], HistoryRow::Group(DateGroup::Pinned)));
         assert!(
-            matches!(&rows[1], HistoryRow::Session(item, SessionAttention::Idle, _) if item.id == "pinned-idle")
+            matches!(&rows[1], HistoryRow::Session(item, SessionAttention::Idle, ..) if item.id == "pinned-idle")
         );
         assert!(matches!(rows[2], HistoryRow::Group(DateGroup::NeedsYou)));
         assert!(
-            matches!(&rows[3], HistoryRow::Session(item, SessionAttention::NeedsYou, _) if item.id == "needs-newer")
+            matches!(&rows[3], HistoryRow::Session(item, SessionAttention::NeedsYou, ..) if item.id == "needs-newer")
         );
         assert!(matches!(rows[4], HistoryRow::Group(DateGroup::Working)));
         assert!(
-            matches!(&rows[5], HistoryRow::Session(item, SessionAttention::Working, _) if item.id == "working")
+            matches!(&rows[5], HistoryRow::Session(item, SessionAttention::Working, ..) if item.id == "working")
         );
     }
 
@@ -3393,6 +3922,352 @@ mod tests {
             before,
             sidebar_session_fingerprint(&item, SessionAttention::Idle, false)
         );
+    }
+
+    fn snooze(wake_at: u64, pending: bool) -> Option<SessionSnooze> {
+        Some(SessionSnooze {
+            wake_at,
+            pending,
+            save_failed: false,
+        })
+    }
+
+    #[test]
+    fn snoozed_sessions_group_at_the_bottom_by_return_time() {
+        let now = 700_000;
+        let mut far = session("far");
+        far.updated_at = now - 10;
+        let mut near = session("near");
+        near.updated_at = now - 20;
+        let mut pinned = session("pinned");
+        pinned.updated_at = now - 5;
+
+        let rows = flatten_history_sessions_with_pins(
+            vec![
+                (far, SessionAttention::Idle, false, false, snooze(now + 7200, false)),
+                (pinned, SessionAttention::Idle, true, false, None),
+                (near, SessionAttention::Idle, false, false, snooze(now + 100, false)),
+            ],
+            now,
+            false,
+        );
+
+        assert!(matches!(rows[0], HistoryRow::Group(DateGroup::Pinned)));
+        assert!(matches!(
+            &rows[1],
+            HistoryRow::Session(item, ..) if item.id == "pinned"
+        ));
+        assert!(matches!(rows[2], HistoryRow::SnoozedHeader(2)));
+        assert!(matches!(
+            &rows[3],
+            HistoryRow::Session(item, ..) if item.id == "near"
+        ));
+        assert!(matches!(
+            &rows[4],
+            HistoryRow::Session(item, ..) if item.id == "far"
+        ));
+        assert_eq!(rows.len(), 5);
+    }
+
+    #[test]
+    fn a_pending_snooze_stays_in_its_normal_group() {
+        let now = 700_000;
+        let mut pending = session("pending");
+        pending.updated_at = now - 10;
+        let mut confirmed = session("confirmed");
+        confirmed.updated_at = now - 30;
+
+        let rows = flatten_history_sessions_with_pins(
+            vec![
+                (pending, SessionAttention::Idle, false, false, snooze(now + 100, true)),
+                (confirmed, SessionAttention::Idle, false, false, snooze(now + 200, false)),
+            ],
+            now,
+            false,
+        );
+
+        // The unconfirmed save keeps its date group; only the confirmed
+        // record lands under Snoozed.
+        assert!(matches!(rows[0], HistoryRow::Group(DateGroup::Today)));
+        assert!(matches!(
+            &rows[1],
+            HistoryRow::Session(item, ..) if item.id == "pending"
+        ));
+        assert!(matches!(rows[2], HistoryRow::SnoozedHeader(1)));
+        assert!(matches!(
+            &rows[3],
+            HistoryRow::Session(item, ..) if item.id == "confirmed"
+        ));
+        assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
+    fn collapsing_the_snoozed_section_keeps_only_its_header() {
+        let now = 700_000;
+        let mut item = session("snoozed");
+        item.updated_at = now - 10;
+
+        let rows = flatten_history_sessions_with_pins(
+            vec![(item, SessionAttention::Idle, false, false, snooze(now + 100, false))],
+            now,
+            true,
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0], HistoryRow::SnoozedHeader(1)));
+    }
+
+    #[gpui::test]
+    fn snoozed_rows_move_groups_and_stay_searchable_when_collapsed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::*;
+        use threadlane_ui_state::{AppState, ProjectInfo, RunCompletionToken};
+
+        cx.update(gpui_component::init);
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("snooze-project");
+        let session_file = project.join(".threadlane/sessions/sess.jsonl");
+        std::fs::create_dir_all(session_file.parent().unwrap()).unwrap();
+        let mut item = session("snoozed-task");
+        item.work_dir = project.clone();
+        item.runtime_work_dir = project.clone();
+        item.session_file = session_file;
+        item.completion_summary =
+            SessionCompletionSummary::Latest(RunCompletionToken {
+                record_id: "r".into(),
+                run_id: "r".into(),
+                seq: 1,
+            });
+
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let model = cx.new(|_| {
+                let mut state = AppState::default();
+                state.active_work_dir = None;
+                state.active_session_id = None;
+                state.pending_hydrations.clear();
+                state.projects.push(ProjectInfo {
+                    name: "snooze-project".into(),
+                    work_dir: project.clone(),
+                    sessions: vec![item.clone()],
+                    is_expanded: true,
+                });
+                state.sidebar_project_filter = Some(project.clone());
+                state
+            });
+            gpui_component::Root::new(
+                cx.new(|cx| super::SidebarView::new(model, window, cx)),
+                window,
+                cx,
+            )
+        });
+        let sidebar = root.read_with(cx, |root, _| {
+            root.view()
+                .clone()
+                .downcast::<super::SidebarView>()
+                .unwrap()
+        });
+        let model = sidebar.read_with(cx, |view, _| view.model.clone());
+
+        let rows_at = |cx: &mut gpui::VisualTestContext| {
+            sidebar.update(cx, |view, cx| {
+                view.build_history_rows(model.read(cx), "", 0)
+            })
+        };
+
+        // Baseline: the settled row sits in its normal date group.
+        assert!(rows_at(cx)
+            .iter()
+            .all(|row| !matches!(row, HistoryRow::SnoozedHeader(_))));
+        assert!(rows_at(cx).iter().any(|row| matches!(
+            row,
+            HistoryRow::Session(item, ..) if item.id == "snoozed-task"
+        )));
+
+        model.update(cx, |state, _| {
+            state
+                .snooze_session(&project, "snoozed-task", 3_600)
+                .unwrap();
+        });
+        // The write runs on the serialized background writer; drain until
+        // the confirmation lands so the row can move.
+        let confirmed = (0..200).any(|_| {
+            model.update(cx, |state, _| {
+                state.drain_chat_stream(Vec::new());
+            });
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            model.read_with(cx, |state, _| {
+                state
+                    .session_snooze(&project, "snoozed-task")
+                    .is_some_and(|snooze| !snooze.pending)
+            })
+        });
+        assert!(confirmed, "snooze write was never confirmed");
+        model.update(cx, |_, cx| cx.notify());
+
+        let rows = rows_at(cx);
+        let header = rows
+            .iter()
+            .position(|row| matches!(row, HistoryRow::SnoozedHeader(1)))
+            .expect("a snoozed section header is expected");
+        assert!(matches!(
+            &rows[header + 1],
+            HistoryRow::Session(item, SessionAttention::Idle | SessionAttention::Ready, _, Some(snooze))
+                if item.id == "snoozed-task" && !snooze.pending
+        ));
+        // Rows still appear in the snoozed section even while collapsed only
+        // the header remains.
+        sidebar.update(cx, |view, _| view.snoozed_collapsed = true);
+        let collapsed = rows_at(cx);
+        assert!(matches!(collapsed[header], HistoryRow::SnoozedHeader(1)));
+        assert_eq!(collapsed.len(), header + 1);
+
+        // Search reveals the matching row regardless of the collapse.
+        let searched = sidebar.update(cx, |view, cx| {
+            view.build_history_rows(model.read(cx), "snoozed-task", 0)
+        });
+        assert!(searched.iter().any(|row| matches!(
+            row,
+            HistoryRow::Session(item, ..) if item.id == "snoozed-task"
+        )));
+
+        // Unsnooze returns the row to its normal group immediately.
+        model.update(cx, |state, _| {
+            state.unsnooze_session(&project, "snoozed-task")
+        });
+        sidebar.update(cx, |view, _| view.snoozed_collapsed = false);
+        let rows = rows_at(cx);
+        assert!(rows
+            .iter()
+            .all(|row| !matches!(row, HistoryRow::SnoozedHeader(_))));
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            HistoryRow::Session(item, ..) if item.id == "snoozed-task"
+        )));
+    }
+
+    #[gpui::test]
+    fn session_actions_menu_opens_and_escape_dismisses(cx: &mut gpui::TestAppContext) {
+        use gpui::*;
+        use threadlane_ui_state::{AppState, RunCompletionToken};
+
+        struct Card {
+            sidebar: Entity<super::SidebarView>,
+            session: SessionInfo,
+        }
+        impl Render for Card {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar
+                        .render_session_card(&self.session, SessionAttention::Ready, false, cx)
+                        .into_any_element()
+                })
+            }
+        }
+
+        cx.update(gpui_component::init);
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("menu-project");
+        let session_file = project.join(".threadlane/sessions/sess.jsonl");
+        std::fs::create_dir_all(session_file.parent().unwrap()).unwrap();
+        let mut item = session("menu-task");
+        item.work_dir = project.clone();
+        item.runtime_work_dir = project.clone();
+        item.session_file = session_file;
+        item.completion_summary =
+            SessionCompletionSummary::Latest(RunCompletionToken {
+                record_id: "r".into(),
+                run_id: "r".into(),
+                seq: 1,
+            });
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let model = cx.new(|_| {
+                let mut state = AppState::default();
+                state.active_work_dir = None;
+                state.active_session_id = None;
+                state.pending_hydrations.clear();
+                state
+            });
+            let sidebar = cx.new(|cx| super::SidebarView::new(model, window, cx));
+            gpui_component::Root::new(
+                cx.new(|_| Card {
+                    sidebar,
+                    session: item.clone(),
+                }),
+                window,
+                cx,
+            )
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let focus_before = cx.update(|window, cx| window.focused(cx));
+        let trigger = cx
+            .debug_bounds("session-actions-menu-task")
+            .expect("the visible session-actions trigger exists");
+        cx.simulate_click(trigger.center(), Modifiers::default());
+        // The popover mounts its menu content on the next frame after any
+        // deferred open-state work settles.
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let menu_focus = cx.update(|window, cx| window.focused(cx));
+        assert!(
+            menu_focus.is_some() && menu_focus != focus_before,
+            "the actions menu opens from the row trigger and takes focus"
+        );
+
+        // Arrow/Enter operate the menu: nothing is preselected, so Down
+        // lands on "Open Session" and a second Down on "Pin Session" —
+        // Enter activates it, an observable state change that only the
+        // menu can produce.
+        cx.simulate_keystrokes("down");
+        cx.simulate_keystrokes("down");
+        cx.simulate_keystrokes("enter");
+        let pinned = _root.read_with(cx, |root, cx| {
+            root.view()
+                .clone()
+                .downcast::<Card>()
+                .unwrap()
+                .read(cx)
+                .sidebar
+                .read(cx)
+                .model
+                .read(cx)
+                .is_session_pinned(&project, "menu-task")
+        });
+        assert!(pinned, "activating Pin Session must pin the session");
+
+        // Activating the item dismisses the menu, but a dismissed menu is
+        // not observable through focus (the kit only restores focus that is
+        // contained in the popover's trigger focus). Probe it functionally:
+        // if the menu were still open, Down/Down/Enter would land on the
+        // relabeled "Unpin Session" and clear the pin. On a closed popover
+        // the same keystrokes do nothing more than re-open it.
+        let still_pinned = |cx: &mut gpui::VisualTestContext| {
+            cx.simulate_keystrokes("down");
+            cx.simulate_keystrokes("down");
+            cx.simulate_keystrokes("enter");
+            _root.read_with(cx, |root, cx| {
+                root.view()
+                    .clone()
+                    .downcast::<Card>()
+                    .unwrap()
+                    .read(cx)
+                    .sidebar
+                    .read(cx)
+                    .model
+                    .read(cx)
+                    .is_session_pinned(&project, "menu-task")
+            })
+        };
+        assert!(
+            still_pinned(cx),
+            "activating an item must dismiss the menu"
+        );
+
+        // The probe re-opened the popover; Escape must dismiss the topmost
+        // menu (verified the same way).
+        cx.simulate_keystrokes("escape");
+        assert!(still_pinned(cx), "escape must dismiss the topmost menu");
     }
 }
 
