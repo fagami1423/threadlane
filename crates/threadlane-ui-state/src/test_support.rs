@@ -41,7 +41,7 @@ impl threadlane_protocol::ProviderPort for ReportedShapeProvider {
             repeated_prefix_bytes / 4
         };
         let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
-        let tool_calls = (attempt < 102)
+        let tool_calls = (attempt < 280)
             .then(|| RuntimeToolCall {
                 id: format!("loop-{attempt}"),
                 r#type: "function".into(),
@@ -53,7 +53,7 @@ impl threadlane_protocol::ProviderPort for ReportedShapeProvider {
             })
             .into_iter()
             .collect();
-        if attempt == 102 {
+        if attempt == 280 {
             events
                 .send(RuntimeStreamEvent::ContentToken("complete".into()))
                 .await
@@ -66,11 +66,11 @@ impl threadlane_protocol::ProviderPort for ReportedShapeProvider {
                 tool_calls,
                 usage: RuntimeUsage {
                     input_tokens,
-                    output_tokens: if attempt == 102 { 1 } else { 20 },
+                    output_tokens: if attempt == 280 { 1 } else { 20 },
                     cache_read_tokens,
                     cache_write_tokens: 0,
                     total_tokens: u32::try_from(estimate).unwrap()
-                        + if attempt == 102 { 1 } else { 20 },
+                        + if attempt == 280 { 1 } else { 20 },
                 },
             })
             .await
@@ -123,11 +123,16 @@ pub async fn generated_reported_session_path() -> PathBuf {
             work_dir: root,
             session_file: Some(path.clone()),
             system_prompt: SystemPromptConfig::default(),
-            // Synthetic provider repeats one identical call 102 times; the
-            // loop guard would trip at 5 and end the run early.
+            // Synthetic provider repeats one identical call 279 times; the
+            // loop guard would trip at 5 and end the run early. A modest
+            // repeated-input ceiling keeps the loop crossing the adaptive
+            // trigger more than once now that request-scoped tool-output
+            // pruning defers compaction until the squeezed view also
+            // exceeds it.
             agent_config: Some(
                 AgentConfig::builder()
                     .loop_guard_enabled(false)
+                    .context_repeated_input_ceiling_tokens(48_000)
                     .build(),
             ),
             coding_config: None,
@@ -139,7 +144,7 @@ pub async fn generated_reported_session_path() -> PathBuf {
         .handle_input_with_images("continue the cached tool loop", vec![])
         .await;
     assert!(result.is_none(), "foreground run failed: {result:?}");
-    assert_eq!(provider.attempts.load(Ordering::SeqCst), 102);
+    assert_eq!(provider.attempts.load(Ordering::SeqCst), 280);
     drop(agent);
     path
 }

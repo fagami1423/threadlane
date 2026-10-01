@@ -160,6 +160,41 @@ impl CodingSessionHarness {
         } else {
             CompactionReason::AdaptiveBudget
         };
+        // Squeeze oversized aged tool outputs first: when the squeezed
+        // request fits under the trigger there is no checkpoint to commit at
+        // all. The squeezed view is request-only — the canonical journal and
+        // in-memory context keep the full outputs, and each attempt re-derives
+        // the reduction. Committing a checkpoint here would also hide verbatim
+        // history behind excerpts earlier than necessary.
+        //
+        // Overflow recovery skips this stage and always commits a checkpoint:
+        // the provider rejected the request at its real limit, so a gentler
+        // squeeze that only trims the estimated overage is not a reliable
+        // recovery.
+        if !request.overflow_recovery {
+            const KEEP_RECENT_TOOL_TURNS: usize = 3;
+            let pruned = threadlane_compaction::prune_historical_tool_outputs(
+                &visible,
+                KEEP_RECENT_TOOL_TURNS,
+            );
+            let pruned_tokens = estimate_request_tokens(
+                &pruned,
+                request.tool_schema_json.as_deref(),
+                &CompactionParams::from(config),
+            );
+            if pruned_tokens < budget.trigger_tokens {
+                let mut result = boundary_result(
+                    pruned,
+                    budget,
+                    self.compaction_generation(),
+                    Some(pruned_tokens),
+                    provider_attempt,
+                    provider_request_id,
+                );
+                result.canonical_messages = Some(current);
+                return Ok(result);
+            }
+        }
         let targets = [
             budget.retained_tail_tokens,
             budget.strict_retained_tail_tokens,

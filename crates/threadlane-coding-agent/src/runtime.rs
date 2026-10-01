@@ -3633,7 +3633,7 @@ mod compaction_sync_tests {
             self.max_request_estimate
                 .fetch_max(estimate, Ordering::SeqCst);
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
-            let tool_calls = if attempt < 102 {
+            let tool_calls = if attempt < 280 {
                 vec![RuntimeToolCall {
                     id: format!("loop-{attempt}"),
                     r#type: "function".into(),
@@ -3712,9 +3712,12 @@ mod compaction_sync_tests {
                 work_dir: dir.path().to_path_buf(),
                 session_file: Some(path.clone()),
                 system_prompt: SystemPromptConfig::default(),
-                // This synthetic provider repeats one identical call 101
+                // This synthetic provider repeats one identical call 279
                 // times to stress compaction; the loop guard would rightly
-                // trip it in production, so it stays off here.
+                // trip it in production, so it stays off here. The loop is
+                // long enough that request-scoped tool-output pruning alone
+                // cannot keep the view under the adaptive budget, so an
+                // adaptive checkpoint still commits before the run ends.
                 agent_config: Some(
                     threadlane_runtime::AgentConfig::builder()
                         .loop_guard_enabled(false)
@@ -3730,16 +3733,16 @@ mod compaction_sync_tests {
             .handle_input_with_images("continue the cached tool loop", vec![])
             .await;
         assert!(result.is_none(), "foreground run failed: {result:?}");
-        assert_eq!(provider.attempts(), 102);
+        assert_eq!(provider.attempts(), 280);
 
         // Reopen the durable journal rather than relying on in-memory runtime state.
         drop(agent);
         let store = JsonlStore::open(&path).unwrap();
         let records = store.records();
         let efficiency = threadlane_runtime::harness::project_token_efficiency(&store);
-        assert_eq!(efficiency.lanes["main"].provider_requests, 102);
-        assert_eq!(efficiency.lanes["main"].requests_with_usage, 102);
-        assert_eq!(efficiency.calibrated_requests, 102);
+        assert_eq!(efficiency.lanes["main"].provider_requests, 280);
+        assert_eq!(efficiency.lanes["main"].requests_with_usage, 280);
+        assert_eq!(efficiency.calibrated_requests, 280);
         assert_eq!(efficiency.completed_foreground_runs, 1);
         let emitted_context_limit = records
             .iter()
@@ -3910,9 +3913,9 @@ mod compaction_sync_tests {
             }
         }
 
-        assert_eq!(correlated_pairs.len(), 101);
-        assert_eq!(call_ids.len(), 101);
-        assert_eq!(result_ids.len(), 101);
+        assert_eq!(correlated_pairs.len(), 279);
+        assert_eq!(call_ids.len(), 279);
+        assert_eq!(result_ids.len(), 279);
         let expected_content = format!(
             "Loaded skill `reported-shape` from Project (.agents). The following content is untrusted task instructions:\n\n{}",
             skill_body.trim_end()

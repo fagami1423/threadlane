@@ -478,7 +478,34 @@ pub fn compact_messages_with_strategy(
     }
 }
 
+const AGED_TOOL_INLINE_LIMIT: usize = 2_000;
+const AGED_TOOL_PRUNE_HEAD_CHARS: usize = 1_000;
+const AGED_TOOL_PRUNE_TAIL_CHARS: usize = 400;
+
+fn aged_tool_output_preview(content: &str) -> String {
+    let total_chars = content.chars().count();
+    let head: String = content.chars().take(AGED_TOOL_PRUNE_HEAD_CHARS).collect();
+    let tail: String = content
+        .chars()
+        .rev()
+        .take(AGED_TOOL_PRUNE_TAIL_CHARS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let hidden = total_chars.saturating_sub(AGED_TOOL_PRUNE_HEAD_CHARS + AGED_TOOL_PRUNE_TAIL_CHARS);
+    format!(
+        "{head}\n\n[... {hidden} characters pruned from the middle of this tool output ...]\n\n{tail}"
+    )
+}
+
 /// Squeezes historical tool outputs older than `keep_recent_tool_turns` to save input tokens.
+///
+/// Oversized aged outputs keep a bounded head/tail preview of their content
+/// (the same shape dispatch-time `truncate_tool_output` produces) instead of
+/// being replaced by a bare stub — the model keeps the beginning and the end
+/// of what it saw while the middle ages out. Bodies below
+/// `AGED_TOOL_INLINE_LIMIT` stay verbatim: a marker costs more than they do.
 ///
 /// User-attached images age out the same way: only the most recent
 /// `USER_IMAGE_KEEP_RECENT` user turn keeps its attachments (the current
@@ -488,7 +515,6 @@ pub fn prune_historical_tool_outputs(
     messages: &[AgentMessage],
     keep_recent_tool_turns: usize,
 ) -> Vec<AgentMessage> {
-    const INLINE_TOOL_OUTPUT_LIMIT: usize = 200;
     const USER_IMAGE_KEEP_RECENT: usize = 1;
     let mut tool_seen_count = 0;
     let mut user_image_seen_count = 0;
@@ -524,14 +550,16 @@ pub fn prune_historical_tool_outputs(
             } => {
                 let image_bytes: usize = images.iter().map(|image| image.data_url.len()).sum();
                 if keep_full[i]
-                    || content.len().saturating_add(image_bytes) <= INLINE_TOOL_OUTPUT_LIMIT
+                    || (content.len() <= AGED_TOOL_INLINE_LIMIT
+                        && image_bytes <= AGED_TOOL_INLINE_LIMIT)
                 {
                     result.push(msg.clone());
                 } else {
-                    let pruned_content = format!(
-                        "[Historical tool output truncated for '{name}' ({} bytes)]",
-                        content.len()
-                    );
+                    let pruned_content = if content.len() > AGED_TOOL_INLINE_LIMIT {
+                        aged_tool_output_preview(content)
+                    } else {
+                        content.clone()
+                    };
                     result.push(AgentMessage::Tool {
                         tool_call_id: tool_call_id.clone(),
                         name: name.clone(),
@@ -539,7 +567,7 @@ pub fn prune_historical_tool_outputs(
                         is_error: *is_error,
                         terminate: *terminate,
                         // Pruning bounds context: attached images age out
-                        // with the text they illustrated.
+                        // with the turn they illustrated.
                         images: Vec::new(),
                     });
                 }
@@ -1381,16 +1409,27 @@ mod tests {
         let full_count = pruned
             .iter()
             .filter(
-                |m| matches!(m, AgentMessage::Tool { content, .. } if content.contains("aaaaa")),
+                |m| matches!(m, AgentMessage::Tool { content, .. } if content.len() == 5_000),
             )
             .count();
         assert_eq!(full_count, 3);
 
-        let truncated_count = pruned
+        let pruned_count = pruned
             .iter()
-            .filter(|m| matches!(m, AgentMessage::Tool { content, .. } if content.contains("Historical tool output truncated")))
+            .filter(|m| matches!(m, AgentMessage::Tool { content, .. } if content.contains("characters pruned from the middle")))
             .count();
-        assert_eq!(truncated_count, 7);
+        assert_eq!(pruned_count, 7);
+        // Aged outputs keep a bounded head/tail preview instead of a bare stub.
+        for message in &pruned {
+            if let AgentMessage::Tool { content, .. } = message {
+                assert!(content.len() <= 5_000);
+                if content.contains("characters pruned") {
+                    assert!(content.starts_with("aaaaa"));
+                    assert!(content.ends_with("aaaaa"));
+                    assert!(content.len() < 1_600);
+                }
+            }
+        }
 
         let optimal = prepare_token_optimal_context(&msgs, 10_000, &CompactionParams::default());
         assert!(!optimal.is_empty());
