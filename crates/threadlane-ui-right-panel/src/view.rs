@@ -47,6 +47,12 @@ pub struct RightPanelView {
     visible: bool,
     project: Option<PathBuf>,
     worktree_unavailable: bool,
+    /// Whether the attached daemon answered `supports_project_io` at the
+    /// last sync. Part of the sync key: a remote client's handshake can
+    /// still be in flight when the panel first syncs, and the capability
+    /// flipping true later must re-run the watch arm instead of leaving
+    /// the client-side `WorkspaceWatcher` in place.
+    project_io_supported: bool,
     tree_state: Entity<TreeState>,
     expanded_paths: HashSet<String>,
     review_tab: ReviewTab,
@@ -331,6 +337,7 @@ impl RightPanelView {
             visible: false,
             project: None,
             worktree_unavailable: false,
+            project_io_supported: false,
             tree_state,
             expanded_paths: HashSet::new(),
             review_tab: ReviewTab::Changes,
@@ -404,19 +411,27 @@ impl RightPanelView {
     }
 
     fn sync_project(&mut self, cx: &mut Context<Self>) {
-        let (project, worktree_unavailable) = {
+        let (project, worktree_unavailable, project_io_supported) = {
             let state = self.model.read(cx);
             let project = state.active_git_work_dir();
             let unavailable = state.active_work_dir.is_some()
                 && state.active_session_id.is_some()
                 && project.is_none();
-            (project, unavailable)
+            (
+                project,
+                unavailable,
+                state.daemon_client.supports_project_io(),
+            )
         };
-        if self.project == project && self.worktree_unavailable == worktree_unavailable {
+        if self.project == project
+            && self.worktree_unavailable == worktree_unavailable
+            && self.project_io_supported == project_io_supported
+        {
             return;
         }
         self.project = project.clone();
         self.worktree_unavailable = worktree_unavailable;
+        self.project_io_supported = project_io_supported;
         self.draft_pr_context_revision = self.draft_pr_context_revision.wrapping_add(1);
         self.tree_state
             .update(cx, |state, cx| state.set_items(Vec::new(), cx));
@@ -949,13 +964,18 @@ impl RightPanelView {
                     .await
                 })
                 .await;
-            if result.is_ok() {
-                let _ = this.update(cx, |this, cx| {
-                    this.saved_content = content;
-                    this.is_dirty = false;
-                    cx.notify();
-                });
-            }
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.saved_content = content;
+                        this.is_dirty = false;
+                    }
+                    Err(error) => {
+                        this.git_feedback = Some(format!("Save failed: {error}"));
+                    }
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -1184,14 +1204,17 @@ impl RightPanelView {
                         Err(error) => return (Err(error), false),
                     }
                 } else {
-                    threadlane_ui_state::project_io::diff_files(
+                    match threadlane_ui_state::project_io::diff_files(
                         &daemon_client,
                         &work_dir,
                         selected_paths.clone(),
                         threadlane_git::DiffOptions::default(),
                     )
                     .await
-                    .unwrap_or_default()
+                    {
+                        Ok(diff) => diff,
+                        Err(error) => return (Err(error), false),
+                    }
                 };
                 let diff_truncated = diff.chars().count() > 24_000;
                 let diff = if diff_truncated {

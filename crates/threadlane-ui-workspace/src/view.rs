@@ -1422,8 +1422,21 @@ impl WorkspaceView {
     fn spawn_git_status_refresh(&self, work_dir: PathBuf, cx: &App) {
         let tx = self.git_event_tx.clone();
         let client = self.model.read(cx).daemon_client.clone();
+        let executor = cx.background_executor().clone();
         cx.background_executor()
             .spawn(async move {
+                // A remote client's handshake can still be in flight when
+                // the first refresh fires — `supports_command_requests`
+                // stays false until the peer's protocol version lands, and
+                // a one-shot request would record that transient as the
+                // status error. Wait briefly for it to settle; a settled
+                // pre-3 daemon is not delayed (its version answers fast).
+                for _ in 0..10 {
+                    if client.supports_command_requests() {
+                        break;
+                    }
+                    executor.timer(std::time::Duration::from_millis(200)).await;
+                }
                 // `sync_remote` refreshes remote-tracking refs first; a
                 // failed fetch must not hide the local Git status
                 // (offline use is valid).

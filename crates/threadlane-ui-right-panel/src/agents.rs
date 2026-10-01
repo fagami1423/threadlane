@@ -23,21 +23,23 @@ async fn run_git_op(
     }
 }
 
-/// Whether the subagent worktree still exists on the daemon host. When the
-/// worktree sits outside the project root the confinement check cannot
-/// answer, so we assume present and let `git worktree` report honestly.
+/// Whether the subagent worktree still exists on the daemon host. The
+/// worktree's own parent dir anchors the confined existence probe — an
+/// isolated worktree lives under the *primary* checkout's `.threadlane`
+/// lane, so it is never under the session root when the active session
+/// itself runs from a linked worktree. On a transport failure we assume
+/// present and let `git worktree` report honestly.
 async fn worktree_present(
     client: &std::sync::Arc<dyn threadlane_client::DaemonClient>,
-    root: &std::path::Path,
     worktree: &std::path::Path,
 ) -> bool {
-    let Ok(relative) = worktree.strip_prefix(root) else {
+    let (Some(parent), Some(name)) = (worktree.parent(), worktree.file_name()) else {
         return true;
     };
     threadlane_ui_state::project_io::file_exists(
         client,
-        root,
-        relative.to_string_lossy().into_owned(),
+        parent,
+        name.to_string_lossy().into_owned(),
     )
     .await
     .unwrap_or(true)
@@ -687,7 +689,7 @@ impl AgentsPanel {
                                             return Err("Commit or stash parent changes before applying a subagent branch.".into());
                                         }
                                         let worktree_present =
-                                            worktree_present(&client, &root, &worktree).await;
+                                            worktree_present(&client, &worktree).await;
                                         if worktree_present
                                             && threadlane_ui_state::project_io::inspect(
                                                 &client, &worktree, false,
@@ -771,7 +773,7 @@ impl AgentsPanel {
                                             state.daemon_client.clone()
                                         });
                                         let task = cx.background_executor().spawn(async move {
-                                            if worktree_present(&client, &root, &worktree).await
+                                            if worktree_present(&client, &worktree).await
                                             {
                                                 run_git_op(
                                                     &client,

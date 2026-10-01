@@ -15,8 +15,8 @@ const TREE_MAX_DEPTH: usize = 6;
 const READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Resolve a client-supplied relative path against `root`, refusing any
-/// escape: absolute paths, `..`/`.` components, and (when the target
-/// exists) symlinks that resolve outside `root`.
+/// escape: absolute paths, `..`/`.` components, and symlinks that
+/// resolve outside `root`.
 pub fn resolve_project_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
     let rel_path = Path::new(relative);
     let mut parts = Vec::new();
@@ -31,10 +31,28 @@ pub fn resolve_project_path(root: &Path, relative: &str) -> Result<PathBuf, Stri
     }
     let candidate = parts.iter().collect::<PathBuf>();
     let joined = root.join(&candidate);
-    if let (Ok(real_root), Ok(real_joined)) =
-        (root.canonicalize(), joined.canonicalize())
-    {
-        if !real_joined.starts_with(&real_root) {
+    let real_root = root
+        .canonicalize()
+        .map_err(|error| format!("Project root does not resolve: {error}"))?;
+    // The target may not exist yet (a write creating a file), so
+    // canonicalize the deepest ancestor that does — a symlink anywhere
+    // above the missing tail still resolves to its real directory.
+    let mut ancestor = joined.clone();
+    let real_ancestor = loop {
+        if let Ok(real) = ancestor.canonicalize() {
+            break real;
+        }
+        if !ancestor.pop() {
+            return Err(format!("Path {relative:?} escapes the project root"));
+        }
+    };
+    if !real_ancestor.starts_with(&real_root) {
+        return Err(format!("Path {relative:?} escapes the project root"));
+    }
+    // A dangling symlink at the target is "missing" to canonicalize, but
+    // `fs::write` would follow it and create the outside file.
+    if let Ok(meta) = std::fs::symlink_metadata(&joined) {
+        if meta.file_type().is_symlink() && joined.canonicalize().is_err() {
             return Err(format!("Path {relative:?} escapes the project root"));
         }
     }
@@ -168,6 +186,24 @@ mod tests {
         assert!(resolve_project_path(dir.path(), "link.txt").is_err());
         assert!(read_project_file(dir.path(), "link.txt").is_err());
         assert!(project_file_exists(dir.path(), "link.txt").is_err());
+
+        // A symlinked directory cannot smuggle a not-yet-existing file
+        // outside the root: writes resolve through the deepest existing
+        // ancestor, not just an existing target.
+        let outside_dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside_dir.path(), dir.path().join("linkdir"))
+            .unwrap();
+        assert!(resolve_project_path(dir.path(), "linkdir/new.txt").is_err());
+        assert!(write_project_file(dir.path(), "linkdir/new.txt", "x").is_err());
+        assert!(!outside_dir.path().join("new.txt").exists());
+
+        // A dangling symlink to a missing outside target must not let a
+        // write create that file either.
+        let dangling_target = outside_dir.path().join("created.txt");
+        std::os::unix::fs::symlink(&dangling_target, dir.path().join("dangling.txt"))
+            .unwrap();
+        assert!(write_project_file(dir.path(), "dangling.txt", "x").is_err());
+        assert!(!dangling_target.exists());
     }
 
     #[test]

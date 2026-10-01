@@ -121,11 +121,18 @@ impl IssueStartDialog {
             // blocks the UI.
             let preflight_dir = work_dir.clone();
             let preflight = cx.background_executor().spawn(async move {
-                if !threadlane_ui_state::project_io::is_repo(&client, &preflight_dir)
+                match threadlane_ui_state::project_io::is_repo(&client, &preflight_dir)
                     .await
-                    .unwrap_or(false)
                 {
-                    return Err("GitHub issue work requires a Git repository".to_string());
+                    Err(error) => {
+                        return Err(format!("Could not check the repository: {error}"));
+                    }
+                    Ok(false) => {
+                        return Err(
+                            "GitHub issue work requires a Git repository".to_string()
+                        );
+                    }
+                    Ok(true) => {}
                 }
                 let status =
                     threadlane_ui_state::project_io::inspect(&client, &preflight_dir, false)
@@ -387,16 +394,21 @@ pub fn open_issue_start_dialog(
     // the client's disk, so the dialog opens once the daemon replies.
     cx.spawn(async move |cx| {
         let probe_dir = work_dir.clone();
-        let is_git = cx
+        // A failed probe is not "not a repository" — the dialog opens
+        // disabled with the probe error as the reason, so a retryable
+        // daemon failure isn't misreported as missing Git.
+        let is_git: Result<bool, String> = cx
             .background_executor()
             .spawn(async move {
-                threadlane_ui_state::project_io::is_repo(&client, &probe_dir)
-                    .await
-                    .unwrap_or(false)
+                threadlane_ui_state::project_io::is_repo(&client, &probe_dir).await
             })
             .await;
+        let (is_git, probe_error) = match is_git {
+            Ok(is_git) => (is_git, None),
+            Err(error) => (false, Some(format!("Could not check the repository: {error}"))),
+        };
         let _ = cx.update_window(window_handle, |_, window, cx| {
-            let confirmation = issue_start_confirmation(
+            let mut confirmation = issue_start_confirmation(
                 &issue,
                 &title,
                 &selected_model,
@@ -404,6 +416,9 @@ pub fn open_issue_start_dialog(
                 is_git,
                 has_linked_task,
             );
+            if let Some(reason) = probe_error {
+                confirmation.start_disabled_reason = Some(reason);
+            }
             let start_enabled = confirmation.start_enabled;
             let start_label = confirmation.start_label;
             let disabled_reason = confirmation.start_disabled_reason.clone();

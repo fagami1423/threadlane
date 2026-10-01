@@ -437,28 +437,24 @@ impl RemoteDaemon {
 
 }
 
-#[async_trait]
-impl DaemonClient for RemoteDaemon {
-    async fn command(&self, command: SessionCommand) -> Result<(), String> {
-        if !self.connected.load(Ordering::SeqCst) {
-            return Err("daemon is not connected".to_string());
-        }
-        self.command_tx
-            .send(OutboundMessage::Command(command))
-            .map_err(|_| "daemon connection driver is gone".to_string())
-    }
-
-    async fn command_request(
-        &self,
+impl RemoteDaemon {
+    /// Send a `CommandRequest` and wait out `COMMAND_REQUEST_TIMEOUT` for
+    /// the matching reply. Runs on whatever Tokio context the caller
+    /// supplies — `command_request` guarantees one exists.
+    async fn answer_request(
+        command_tx: &mpsc::UnboundedSender<OutboundMessage>,
+        pending_requests: &Arc<Mutex<HashMap<u64, PendingRequest>>>,
+        connected: &Arc<AtomicBool>,
+        protocol_version: &Arc<AtomicU64>,
         request: CommandRequest,
     ) -> Result<CommandResponse, String> {
-        if !self.connected.load(Ordering::SeqCst) {
+        if !connected.load(Ordering::SeqCst) {
             return Err("daemon is not connected".to_string());
         }
         // A pre-envelope daemon rejects the frame as an undecodable bare
         // command — the dispatch never runs and no reply ever comes, so
         // fail the request here instead of parking it on the timeout.
-        let peer_version = self.protocol_version.load(Ordering::SeqCst);
+        let peer_version = protocol_version.load(Ordering::SeqCst);
         if peer_version < COMMAND_REQUEST_PROTOCOL_VERSION {
             return Err(format!(
                 "daemon does not support command requests (protocol version {peer_version})"
@@ -472,8 +468,7 @@ impl DaemonClient for RemoteDaemon {
         let (tx, rx) = oneshot::channel();
         // A reused id would strand the earlier waiter on a reply meant for
         // the newer request — fail it immediately instead.
-        if let Some(displaced) = self
-            .pending_requests
+        if let Some(displaced) = pending_requests
             .lock()
             .expect("command waiters poisoned")
             .insert(
@@ -489,12 +484,8 @@ impl DaemonClient for RemoteDaemon {
                 .waiter
                 .send(Err(format!("request id {request_id} reused")));
         }
-        if self
-            .command_tx
-            .send(OutboundMessage::Request(request))
-            .is_err()
-        {
-            self.pending_requests
+        if command_tx.send(OutboundMessage::Request(request)).is_err() {
+            pending_requests
                 .lock()
                 .expect("command waiters poisoned")
                 .remove(&request_id);
@@ -505,13 +496,64 @@ impl DaemonClient for RemoteDaemon {
                 result.unwrap_or_else(|_| Err("daemon connection driver is gone".to_string()))
             }
             Err(_) => {
-                self.pending_requests
+                pending_requests
                     .lock()
                     .expect("command waiters poisoned")
                     .remove(&request_id);
                 Err(format!("daemon did not answer request {request_id}"))
             }
         }
+    }
+}
+
+#[async_trait]
+impl DaemonClient for RemoteDaemon {
+    async fn command(&self, command: SessionCommand) -> Result<(), String> {
+        if !self.connected.load(Ordering::SeqCst) {
+            return Err("daemon is not connected".to_string());
+        }
+        self.command_tx
+            .send(OutboundMessage::Command(command))
+            .map_err(|_| "daemon connection driver is gone".to_string())
+    }
+
+    async fn command_request(
+        &self,
+        request: CommandRequest,
+    ) -> Result<CommandResponse, String> {
+        // `tokio::time::timeout` needs a timer driver — GPUI's background
+        // executor has none and `answer_request` would panic inside it.
+        // Hop the request onto the shared Threadlane reactor when the
+        // caller's context lacks Tokio; the driver's Tokio context then
+        // serves the timeout.
+        if tokio::runtime::Handle::try_current().is_err() {
+            let executor = threadlane_daemon::chat::executor()?;
+            let command_tx = self.command_tx.clone();
+            let pending_requests = self.pending_requests.clone();
+            let connected = self.connected.clone();
+            let protocol_version = self.protocol_version.clone();
+            return executor
+                .spawn(async move {
+                    Self::answer_request(
+                        &command_tx,
+                        &pending_requests,
+                        &connected,
+                        &protocol_version,
+                        request,
+                    )
+                    .await
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("request driver failed: {error}")));
+        }
+        Self::answer_request(
+            &self.command_tx,
+            &self.pending_requests,
+            &self.connected,
+            &self.protocol_version,
+            request,
+        )
+        .await
     }
 
     fn supports_command_requests(&self) -> bool {

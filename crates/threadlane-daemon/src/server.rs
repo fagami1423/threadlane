@@ -108,6 +108,30 @@ fn note_terminal(command: &SessionCommand, owned: &mut std::collections::HashSet
     }
 }
 
+/// Track a connection's `WatchProject`/`UnwatchProject` calls per work
+/// dir so disconnect cleanup can release whatever it leaves behind —
+/// the daemon-side refcount would otherwise leak the notify watcher for
+/// every client that exits without unwatching.
+fn note_watch(
+    command: &SessionCommand,
+    owned: &mut std::collections::HashMap<std::path::PathBuf, usize>,
+) {
+    match command {
+        SessionCommand::WatchProject { work_dir } => {
+            *owned.entry(work_dir.clone()).or_insert(0) += 1;
+        }
+        SessionCommand::UnwatchProject { work_dir } => {
+            if let Some(count) = owned.get_mut(work_dir) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    owned.remove(work_dir);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// [`WIRE_PROTOCOL_VERSION`] as a header value — `from_static` needs a
 /// literal, so keep this in step with the constant. The const assert
 /// below fails the build when one moves without the other.
@@ -236,11 +260,46 @@ async fn serve_connection(
         }
     });
 
+    // `CommandRequest` envelopes dispatch on a per-connection FIFO worker
+    // so a long request — blocking Git work can take a while over a WAN —
+    // never stalls the socket reader: terminal input, prompt submission,
+    // and cancellation keep flowing while the request resolves. One
+    // worker preserves the ordering mutations rely on.
+    let (request_tx, mut request_rx) =
+        mpsc::unbounded_channel::<(u64, SessionCommand)>();
+    tokio::spawn({
+        let core = core.clone();
+        let reply_tx = reply_tx.clone();
+        async move {
+            while let Some((request_id, command)) = request_rx.recv().await {
+                let reply = CommandReply {
+                    request_id,
+                    result: core
+                        .dispatch_with_request_id(command, Some(request_id))
+                        .await,
+                };
+                match reply_frame(&reply) {
+                    Ok(frame) => {
+                        if reply_tx.send(frame).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "could not encode command reply");
+                    }
+                }
+            }
+        }
+    });
+
     // Terminals this connection opened but never closed. A crashed or
     // abruptly gone client can't deliver TerminalClose, so the connection
     // owns their cleanup — otherwise every leaked interactive shell and
-    // its worker threads would outlive the client indefinitely.
+    // its worker threads would outlive the client indefinitely. Watches
+    // get the same treatment: an `UnwatchProject` that never arrives
+    // would leak the daemon-side notify watcher and its refcount.
     let mut owned_terminals = std::collections::HashSet::<String>::new();
+    let mut owned_watches = std::collections::HashMap::<std::path::PathBuf, usize>::new();
     while let Some(message) = read.next().await {
         match message {
             Ok(Message::Text(text)) => {
@@ -252,28 +311,16 @@ async fn serve_connection(
                     serde_json::from_str::<CommandRequest>(&text)
                 {
                     note_terminal(&command, &mut owned_terminals);
-                    let reply = CommandReply {
-                        request_id,
-                        result: core
-                            .clone()
-                            .dispatch_with_request_id(command, Some(request_id))
-                            .await,
-                    };
-                    match reply_frame(&reply) {
-                        Ok(frame) => {
-                            if reply_tx.send(frame).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(%peer, %error, "could not encode command reply");
-                        }
+                    note_watch(&command, &mut owned_watches);
+                    if request_tx.send((request_id, command)).is_err() {
+                        break;
                     }
                     continue;
                 }
                 match serde_json::from_str::<SessionCommand>(&text) {
                     Ok(command) => {
                         note_terminal(&command, &mut owned_terminals);
+                        note_watch(&command, &mut owned_watches);
                         // Dispatch errors also reach this client as
                         // DaemonError events — no error frame shape needed.
                         if let Err(error) = core.clone().dispatch(command).await {
@@ -300,6 +347,19 @@ async fn serve_connection(
     }
     for terminal_id in owned_terminals {
         core.close_terminal(&terminal_id);
+    }
+    // Release leftover watches through the request queue so they run
+    // after any `WatchProject` dispatches already in flight — unwatching
+    // before them would leak the watcher those dispatches just started.
+    for (work_dir, count) in owned_watches {
+        for _ in 0..count {
+            let _ = request_tx.send((
+                0,
+                SessionCommand::UnwatchProject {
+                    work_dir: work_dir.clone(),
+                },
+            ));
+        }
     }
     Ok(())
 }

@@ -258,12 +258,12 @@ impl Editor {
         let task_project = project.clone();
         let client = self.model.read(cx).daemon_client.clone();
         let task = threadlane_provider::exec::get_runtime().spawn(async move {
-            threadlane_ui_state::project_io::is_repo(&client, &task_project)
-                .await
-                .unwrap_or(false)
+            threadlane_ui_state::project_io::is_repo(&client, &task_project).await
         });
         cx.spawn(async move |owner, cx| {
-            if let Ok(is_git) = task.await {
+            // A failed probe says nothing about the repo — keep the
+            // current worktree flag rather than falsing it on an error.
+            if let Ok(Ok(is_git)) = task.await {
                 let _ = owner.update(cx, |this, cx| {
                     if !this.closed && this.definition.project == project {
                         this.is_git = is_git;
