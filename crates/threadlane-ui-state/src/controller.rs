@@ -80,6 +80,7 @@ pub fn dispatch(state: &mut AppState, action: AppAction) {
                         text,
                         images,
                         session_id: None,
+                        work_dir: None,
                     });
             }
         }

@@ -12,6 +12,11 @@
 //! `seq` is the daemon's journal sequence; synthesized frames (undecodable
 //! commands, lag notices) carry `seq: 0`.
 //!
+//! The handshake response carries `x-threadlane-protocol`
+//! ([`PROTOCOL_VERSION_HEADER`]) so a client learns which wire features
+//! this daemon speaks before it risks a frame an older daemon would
+//! reject — the `CommandRequest` envelope is version-2 behavior.
+//!
 //! Auth today is a shared bearer token (`THREADLANE_DAEMON_TOKEN`) and the
 //! deployment is localhost-only by design. Binding beyond localhost needs a
 //! follow-up pairing flow (QR scan or entered pairing code that exchanges
@@ -30,7 +35,8 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 
 use threadlane_protocol::daemon::{
-    CommandReply, CommandRequest, SessionCommand, SessionEvent,
+    CommandReply, CommandRequest, SessionCommand, SessionEvent, PROTOCOL_VERSION_HEADER,
+    WIRE_PROTOCOL_VERSION,
 };
 
 use crate::core::DaemonCore;
@@ -102,6 +108,16 @@ fn note_terminal(command: &SessionCommand, owned: &mut std::collections::HashSet
     }
 }
 
+/// [`WIRE_PROTOCOL_VERSION`] as a header value — `from_static` needs a
+/// literal, so keep this in step with the constant. The const assert
+/// below fails the build when one moves without the other.
+const WIRE_PROTOCOL_VERSION_STR: &str = "2";
+
+const _: () = assert!(
+    WIRE_PROTOCOL_VERSION == 2,
+    "WIRE_PROTOCOL_VERSION_STR must match WIRE_PROTOCOL_VERSION"
+);
+
 /// The client's last-seen journal sequence from `?since=` on the connect
 /// URL; absent or unparsable means a full tail replay.
 fn since_param(request: &Request) -> u64 {
@@ -153,6 +169,16 @@ async fn serve_connection(
                 }
             }
             handshake_since.store(since_param(request), Ordering::SeqCst);
+            // Announce the wire protocol version so the client can gate
+            // versioned features (today: the CommandRequest envelope) on
+            // what this daemon actually understands.
+            let mut response = response;
+            response.headers_mut().insert(
+                PROTOCOL_VERSION_HEADER,
+                tokio_tungstenite::tungstenite::http::HeaderValue::from_static(
+                    WIRE_PROTOCOL_VERSION_STR,
+                ),
+            );
             Ok(response)
         },
     )

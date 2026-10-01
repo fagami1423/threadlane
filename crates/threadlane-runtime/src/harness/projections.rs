@@ -22,6 +22,11 @@ pub struct UiToolActivity {
     pub title: String,
     pub summary: String,
     pub detail: String,
+    /// Raw tool-call arguments JSON, preserved after the result lands in
+    /// `detail` so UI surfaces can render the call (command, file path,
+    /// edit payload) alongside its output.
+    #[serde(default)]
+    pub arguments: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +149,7 @@ pub fn project_chat_messages(agent_messages: &[AgentMessage]) -> Vec<UiChatMessa
                             summary,
                             title,
                             detail,
+                            arguments: call.function.arguments.clone(),
                         });
                     }
                 }
@@ -202,6 +208,7 @@ pub fn project_chat_messages(agent_messages: &[AgentMessage]) -> Vec<UiChatMessa
                     summary: tool_activity_summary(name, ""),
                     title: name.clone(),
                     detail: content.clone(),
+                    arguments: String::new(),
                 };
                 if result
                     .last()

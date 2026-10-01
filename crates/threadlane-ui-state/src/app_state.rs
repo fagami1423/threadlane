@@ -170,10 +170,12 @@ pub struct AppState {
     /// re-enter the stream as `SessionEvent::CommandResult` keyed by this
     /// caller-chosen id.
     next_command_request_id: u64,
-    /// Queued-message cancels that asked the daemon for the staged content
-    /// back (the composer take-back path): request_id → restore intent.
-    /// `drain_chat_stream` resolves them when the `CommandResult` lands.
-    pub(crate) pending_queued_restores: HashMap<u64, PendingQueuedRestore>,
+    /// Queued-message cancels awaiting the daemon's confirmation:
+    /// request_id → intent. `drain_chat_stream` resolves them when the
+    /// `CommandResult` reply (or the journaled `QueuedEntryCancelled`)
+    /// lands; the echo row stays until then so the UI never claims a
+    /// removal the peer may not have performed.
+    pub(crate) pending_queued_cancels: HashMap<u64, PendingQueuedCancel>,
     scheduler_handles: HashMap<PathBuf, SchedulerSupervisorHandle>,
     scheduler_results:
         HashMap<PathBuf, tokio::sync::mpsc::UnboundedReceiver<SchedulerSupervisorEvent>>,
@@ -206,14 +208,20 @@ pub struct AppState {
     automation_runs_restored: bool,
 }
 
-/// A queued-message cancel awaiting its `CommandResult` reply: which echo
-/// it belongs to, and whether the optimistic echo already put the staged
-/// text back in the composer (then the reply only needs to deliver the
-/// images the echo could not carry).
+/// A queued-message cancel awaiting its `CommandResult` reply (or the
+/// journaled `QueuedEntryCancelled`): which echo it belongs to, whether
+/// the staged content goes back into the composer (edit) or is discarded
+/// (plain remove), and whether the echo already put the staged text back
+/// in the composer (then the reply only needs to deliver the images the
+/// echo could not carry). `work_dir` pins the project that queued the
+/// message so the restored payload is scoped to `(work_dir, session_id)`,
+/// matching how composer drafts are keyed.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PendingQueuedRestore {
+pub(crate) struct PendingQueuedCancel {
     pub session_id: String,
+    pub work_dir: Option<PathBuf>,
     pub entry_id: String,
+    pub restore: bool,
     pub text_restored: bool,
 }
 
@@ -762,7 +770,7 @@ impl AppState {
             terminal_event_tx,
             pending_remote_deletes: HashMap::new(),
             next_command_request_id: 1,
-            pending_queued_restores: HashMap::new(),
+            pending_queued_cancels: HashMap::new(),
             scheduler_handles: HashMap::new(),
             scheduler_results: HashMap::new(),
             deferred_stream_events: HashMap::new(),
@@ -878,6 +886,67 @@ impl AppState {
 
     pub fn available_models(&self) -> &[threadlane_daemon::catalog::ModelOption] {
         &self.available_models
+    }
+
+    /// Test support: seed the model picker's catalog directly.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn test_set_available_models(
+        &mut self,
+        models: Vec<threadlane_daemon::catalog::ModelOption>,
+    ) {
+        self.available_models = models;
+    }
+
+    /// Test support: seed live ACP config options under the active session's
+    /// projection key, the slot `active_acp_config_options` reads first.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn test_set_acp_config_options(&mut self, options: Vec<AcpConfigOption>) {
+        if let Some(key) = self.active_session_projection_key() {
+            self.acp_config_options.insert(key, options);
+        }
+    }
+
+    /// Test support: put a worktree setup in flight for the active session
+    /// so model/agent mutations are refused.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn test_start_worktree_setup(&mut self) {
+        use threadlane_protocol::daemon::{SetupStage, WorktreeSetup};
+        let Some(session_id) = self.active_session_id.clone() else {
+            return;
+        };
+        self.worktree_setups.insert(
+            session_id.clone(),
+            WorktreeSetup {
+                project: self.active_work_dir.clone().unwrap_or_default(),
+                session_id,
+                session_file: PathBuf::new(),
+                worktree: PathBuf::new(),
+                base: String::new(),
+                stage: SetupStage::Creating,
+                branch: None,
+                error: None,
+                cancelled: Default::default(),
+                text: String::new(),
+                images: Vec::new(),
+                model: String::new(),
+                effort: ReasoningEffort::default(),
+                acp_config: Vec::new(),
+            },
+        );
+    }
+
+    /// Test support: read a pending New-task agent setting, the slot
+    /// `set_acp_config_option` writes when no session runtime exists yet.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn test_pending_acp_config(&self, agent_id: &str, config_id: &str) -> Option<String> {
+        self.pending_acp_config
+            .get(agent_id)?
+            .get(config_id)
+            .cloned()
     }
 
     pub fn start_automations(&mut self) -> tokio::sync::watch::Receiver<crate::automation::Projection> {
@@ -3724,6 +3793,7 @@ impl AppState {
                                 name, arguments,
                             )),
                             detail: arguments.clone(),
+                            arguments: arguments.clone(),
                             is_expanded: false,
                         };
                         if let Some(message) = subagent.messages.last_mut().filter(|message| {
@@ -4563,7 +4633,8 @@ impl AppState {
                                 category: "Working".into(),
                                 display_summary,
                                 title: name,
-                                detail: arguments,
+                                detail: arguments.clone(),
+                                arguments,
                                 is_expanded: false,
                             };
                             if let Some(message) =
@@ -4923,7 +4994,7 @@ impl AppState {
                             text,
                             images,
                         }) => {
-                            changed |= self.apply_queued_cancel_restore(
+                            changed |= self.settle_queued_cancel(
                                 request_id,
                                 &session_id,
                                 &entry_id,
@@ -4932,33 +5003,66 @@ impl AppState {
                             );
                         }
                         Ok(_) => {
-                            self.pending_queued_restores.remove(&request_id);
+                            self.pending_queued_cancels.remove(&request_id);
                         }
                         Err(error) => {
-                            self.pending_queued_restores.remove(&request_id);
+                            if let Some(pending) =
+                                self.pending_queued_cancels.remove(&request_id)
+                            {
+                                if error
+                                    == threadlane_coding_agent::scheduler::QUEUED_ENTRY_NOT_PENDING
+                                {
+                                    // Authoritative: the entry already
+                                    // left the queue — consumed into the
+                                    // running turn or cancelled by
+                                    // someone else — so the retained row
+                                    // is stale, not truthful. Reconcile
+                                    // it; the text already handed back
+                                    // for an edit stays in the composer.
+                                    self.remove_queued_echo(
+                                        &pending.session_id,
+                                        &pending.entry_id,
+                                    );
+                                    self.session_status =
+                                        Some(error.clone());
+                                } else {
+                                    // The echo was never removed — the
+                                    // row still truthfully shows the
+                                    // entry as queued.
+                                    self.session_status = Some(format!(
+                                        "Could not remove queued message: {error}"
+                                    ));
+                                }
+                                changed = true;
+                            }
                             tracing::warn!("daemon request {request_id} failed: {error}");
                         }
                     }
                 }
-                // Journal replay of a cancellation whose point-to-point
-                // reply was lost to a disconnect — resolves the parked
-                // intent the same way the reply would have.
+                // A queued entry left the daemon's queue: resolves a
+                // parked intent when its request_id is ours (the journal
+                // replay of a cancellation whose reply was lost to a
+                // disconnect), and drops the retained echo either way —
+                // including cancels issued by other clients.
                 SessionEvent::QueuedEntryCancelled {
                     session_id,
                     entry_id,
-                    request_id: Some(request_id),
+                    request_id,
                     text,
                     images,
                 } => {
-                    changed |= self.apply_queued_cancel_restore(
-                        request_id,
-                        &session_id,
-                        &entry_id,
-                        text,
-                        images,
-                    );
+                    if let Some(request_id) = request_id {
+                        changed |= self.settle_queued_cancel(
+                            request_id,
+                            &session_id,
+                            &entry_id,
+                            text,
+                            images,
+                        );
+                    } else {
+                        changed |= self.remove_queued_echo(&session_id, &entry_id);
+                    }
                 }
-                SessionEvent::QueuedEntryCancelled { .. } => {}
                 SessionEvent::ProjectChanged { .. } => {}
                 SessionEvent::SessionSnapshot {
                     session_id,
@@ -5142,6 +5246,10 @@ impl AppState {
 
     /// Drop a still-pending queued follow-up, returning its staged content and
     /// images so the caller can restore them to the composer or discard them.
+    ///
+    /// Remote mode waits for the daemon's confirmation before claiming the
+    /// removal: the echo row stays until the `CommandResult` reply or the
+    /// journaled `QueuedEntryCancelled` lands.
     pub fn cancel_queued_message(
         &mut self,
         entry_id: &str,
@@ -5152,13 +5260,25 @@ impl AppState {
     /// Cancel a queued follow-up to take its staged content back into the
     /// composer (the queued row's edit button). Remote mode issues a
     /// `CommandRequest` for the cancel: the staged text returns from the
-    /// optimistic echo immediately, and the reply's staged images land in
-    /// `requested_composer_inserts` when it arrives.
+    /// optimistic echo immediately, and the reply's staged content lands
+    /// in `requested_composer_inserts` when the removal is confirmed.
+    /// Against a pre-envelope daemon the request frame can never be
+    /// answered, so the edit degrades to a bare cancel — the entry leaves
+    /// the queue but its images are unrecoverable there.
     pub fn edit_queued_message(
         &mut self,
         entry_id: &str,
     ) -> Result<(String, Vec<ImageAttachment>), String> {
         self.cancel_queued_message_inner(entry_id, true)
+    }
+
+    /// True while a queued-message cancel for `entry_id` is awaiting the
+    /// daemon's confirmation — the row renders its unconfirmed state and
+    /// declines further steer/edit/remove actions until resolved.
+    pub fn queued_removal_pending(&self, session_id: &str, entry_id: &str) -> bool {
+        self.pending_queued_cancels
+            .values()
+            .any(|pending| pending.session_id == session_id && pending.entry_id == entry_id)
     }
 
     fn cancel_queued_message_inner(
@@ -5181,15 +5301,17 @@ impl AppState {
                 .find(|message| message.id == echo_id)
                 .map(|message| message.content.clone())
                 .unwrap_or_default();
-            if restore {
+            if self.daemon_client.supports_command_requests() {
                 let request_id = self.next_command_request_id;
                 self.next_command_request_id += 1;
-                self.pending_queued_restores.insert(
+                self.pending_queued_cancels.insert(
                     request_id,
-                    PendingQueuedRestore {
+                    PendingQueuedCancel {
                         session_id: session_id.clone(),
+                        work_dir: self.active_work_dir.clone(),
                         entry_id: entry_id.to_string(),
-                        text_restored: !staged_text.is_empty(),
+                        restore,
+                        text_restored: restore && !staged_text.is_empty(),
                     },
                 );
                 self.dispatch_command_request(CommandRequest {
@@ -5197,19 +5319,29 @@ impl AppState {
                     command: SessionCommand::CancelQueuedMessage {
                         session_id: session_id.clone(),
                         entry_id: entry_id.to_string(),
+                        work_dir: self.active_work_dir.clone(),
                     },
                 });
-            } else {
-                self.dispatch_command(SessionCommand::CancelQueuedMessage {
-                    session_id,
-                    entry_id: entry_id.to_string(),
-                });
+                // The echo stays until the reply or the journaled
+                // cancellation confirms the entry left the queue —
+                // claiming removal first is how a daemon that never
+                // dispatched the command left the UI lying (issue #349).
+                self.session_status = Some("Removing queued message…".into());
+                return Ok((staged_text, Vec::new()));
             }
-            let mut messages = (*self.messages).clone();
-            if messages.iter().any(|message| message.id == echo_id) {
-                messages.retain(|message| message.id != echo_id);
-                self.messages = messages.into();
-            }
+            // A pre-envelope daemon cannot decode a `CommandRequest` — the
+            // frame is rejected as undecodable and the dispatch never
+            // runs. The bare `CancelQueuedMessage` variant predates the
+            // envelope and still cancels there; it just cannot report the
+            // staged payload back (an edit keeps the echo's text, and the
+            // images are lost). Dispatch failures still surface as a
+            // broadcast `DaemonError`.
+            self.dispatch_command(SessionCommand::CancelQueuedMessage {
+                session_id,
+                entry_id: entry_id.to_string(),
+                work_dir: self.active_work_dir.clone(),
+            });
+            self.remove_queued_echo_by_id(&echo_id);
             self.session_status = Some("Queued message removed".into());
             return Ok((staged_text, Vec::new()));
         }
@@ -5225,13 +5357,34 @@ impl AppState {
         Ok(staged)
     }
 
+    /// Drop the optimistic `queued-user-{session}-{entry}` echo. The row
+    /// is retained across a pending cancel so the queue only stops
+    /// showing the entry once the daemon confirms it left.
+    fn remove_queued_echo_by_id(&mut self, echo_id: &str) -> bool {
+        if !self.messages.iter().any(|message| message.id == echo_id) {
+            return false;
+        }
+        let mut messages = (*self.messages).clone();
+        messages.retain(|message| message.id != echo_id);
+        self.messages = messages.into();
+        true
+    }
+
+    fn remove_queued_echo(&mut self, session_id: &str, entry_id: &str) -> bool {
+        self.remove_queued_echo_by_id(&format!("queued-user-{session_id}-{entry_id}"))
+    }
+
     /// Resolve a parked queued-cancel intent with the staged payload a
     /// `CommandResult` reply or a journaled `QueuedEntryCancelled` event
-    /// carried, queueing it as a composer insert scoped to the session
-    /// that queued the message: if another session is on screen the
-    /// insert waits for it to come back rather than landing in a foreign
-    /// draft.
-    fn apply_queued_cancel_restore(
+    /// carried: removes the retained echo and, for the edit path, queues
+    /// the content as a composer insert scoped to the session that queued
+    /// the message — if another session is on screen the insert waits for
+    /// it to come back rather than landing in a foreign draft.
+    ///
+    /// The echo goes away even when no intent matches (a cancel issued by
+    /// another client, or one whose intent already resolved): the event
+    /// is authoritative that the entry left the queue.
+    fn settle_queued_cancel(
         &mut self,
         request_id: u64,
         session_id: &str,
@@ -5239,23 +5392,39 @@ impl AppState {
         text: String,
         images: Vec<ImageAttachment>,
     ) -> bool {
-        let Some(pending) = self.pending_queued_restores.remove(&request_id) else {
-            return false;
-        };
-        if pending.session_id != session_id || pending.entry_id != entry_id {
-            return false;
-        }
-        self.requested_composer_inserts
-            .push(RequestedComposerInsert {
-                text: if pending.text_restored {
-                    String::new()
-                } else {
-                    text
-                },
-                images,
-                session_id: Some(session_id.to_string()),
+        let mut changed = self.remove_queued_echo(session_id, entry_id);
+        // A `QueuedEntryCancelled` may carry a request_id issued by a
+        // different client; only consume the intent when session and
+        // entry corroborate it is ours.
+        let matches = self
+            .pending_queued_cancels
+            .get(&request_id)
+            .is_some_and(|pending| {
+                pending.session_id == session_id && pending.entry_id == entry_id
             });
-        true
+        if !matches {
+            return changed;
+        }
+        let pending = self
+            .pending_queued_cancels
+            .remove(&request_id)
+            .expect("intent presence checked");
+        if pending.restore {
+            self.requested_composer_inserts
+                .push(RequestedComposerInsert {
+                    text: if pending.text_restored {
+                        String::new()
+                    } else {
+                        text
+                    },
+                    images,
+                    session_id: Some(session_id.to_string()),
+                    work_dir: pending.work_dir,
+                });
+        }
+        self.session_status = Some("Queued message removed".into());
+        changed = true;
+        changed
     }
 
     /// Re-route a still-pending queued follow-up into the live steer queue so
@@ -5539,6 +5708,7 @@ impl AppState {
                         text: setup.text,
                         images: setup.images,
                         session_id: None,
+                        work_dir: None,
                     });
                 return Ok(());
             }
