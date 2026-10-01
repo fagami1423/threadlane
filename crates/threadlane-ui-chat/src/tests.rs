@@ -1001,6 +1001,7 @@ fn grouped_tool_activities_borrows_in_order_and_hides_plan_updates() {
                 title: (*title).into(),
                 display_summary: String::new(),
                 detail: String::new(),
+                arguments: String::new(),
                 is_expanded: false,
             })
             .collect(),
@@ -1040,6 +1041,7 @@ fn progress_summary_never_reuses_a_previous_turns_tool() {
         title: "read_file".into(),
         display_summary: "Read README.md".into(),
         detail: "Old turn output".into(),
+        arguments: String::new(),
         is_expanded: false,
     });
     let mut messages = vec![activity.clone(), user];
@@ -1079,6 +1081,7 @@ fn transcript_rows_group_consecutive_tool_only_messages() {
                 title: "read_file".into(),
                 display_summary: String::new(),
                 detail: String::new(),
+                arguments: String::new(),
                 is_expanded: false,
             })
             .into_iter()
@@ -1821,6 +1824,7 @@ fn completed_activity_disclosure_renders_interactive_tool_rows(cx: &mut gpui::Te
                 title: "read_file".into(),
                 display_summary: "Read source file".into(),
                 detail: "Large source file line\n".repeat(250),
+                arguments: String::new(),
                 is_expanded: false,
             }],
             streaming: false,
@@ -1934,6 +1938,7 @@ fn transcript_disclosure_badges_are_not_vertically_clipped(cx: &mut gpui::TestAp
                         title: "read_file".into(),
                         display_summary: "Read source file".into(),
                         detail: "Source content".into(),
+                        arguments: String::new(),
                         is_expanded: false,
                     })
                     .collect(),
@@ -3128,6 +3133,7 @@ fn conversation_find_matches_message_rows_not_occurrences_or_hidden_payloads() {
         title: "read_file".into(),
         display_summary: "needle".into(),
         detail: "needle".into(),
+        arguments: String::new(),
         is_expanded: false,
     });
     let mut reasoning = find_message("reasoning", MessageRole::Assistant, "");
@@ -3719,6 +3725,7 @@ fn conversation_find_same_count_row_replacement_is_reachable(cx: &mut gpui::Test
                 title: "read_file".into(),
                 display_summary: String::new(),
                 detail: String::new(),
+                arguments: String::new(),
                 is_expanded: false,
             });
             let before = vec![

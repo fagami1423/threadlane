@@ -817,6 +817,7 @@ impl ActiveSession {
                                 title: name.clone(),
                                 display_summary: String::new(),
                                 detail: String::new(),
+                                arguments: String::new(),
                                 is_expanded: false,
                             },
                         );
