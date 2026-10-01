@@ -6,6 +6,7 @@ description = "Durable UI state for the Threadlane desktop app: AppState, sessio
 
 [dependencies]
 async-trait = { workspace = true, optional = true }
+chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 robius-open.workspace = true

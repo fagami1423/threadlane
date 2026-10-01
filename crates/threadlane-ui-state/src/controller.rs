@@ -54,6 +54,27 @@ pub fn dispatch(state: &mut AppState, action: AppAction) {
                 state.session_status = Some(error);
             }
         }
+        AppAction::SnoozeSession {
+            work_dir,
+            session_id,
+            duration_secs,
+        } => {
+            if let Err(error) = state.snooze_session(&work_dir, &session_id, duration_secs) {
+                state.session_status = Some(error);
+            }
+        }
+        AppAction::UnsnoozeSession {
+            work_dir,
+            session_id,
+        } => {
+            state.unsnooze_session(&work_dir, &session_id);
+        }
+        AppAction::RetrySnoozeSave {
+            work_dir,
+            session_id,
+        } => {
+            state.retry_snooze_save(&work_dir, &session_id);
+        }
         AppAction::BeginNewTask => state.begin_new_task(),
         AppAction::SelectDraftProject(path) => state.select_draft_project(path),
         AppAction::SelectWorkMode(mode) => state.set_work_mode(mode),

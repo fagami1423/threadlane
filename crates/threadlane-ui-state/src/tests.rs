@@ -5563,3 +5563,196 @@ fn journaled_cancel_from_another_client_drops_the_echo() {
             .all(|message| message.id != "queued-user-sess-1-entry-1")
     );
 }
+
+// ---- session snooze ---------------------------------------------------------
+
+fn snooze_confirm_writes(state: &mut AppState, work_dir: &Path, session_id: &str) {
+    for _ in 0..200 {
+        state.drain_chat_stream(Vec::new());
+        if state
+            .session_snooze(work_dir, session_id)
+            .is_some_and(|snooze| !snooze.pending)
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("snooze write was never confirmed");
+}
+
+fn settled_project_session(name: &str) -> (tempfile::TempDir, PathBuf, SessionInfo) {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    let session_file = project.join(".threadlane/sessions/session.jsonl");
+    let mut session = test_session("session", &session_file);
+    session.title = name.into();
+    session.work_dir = project.clone();
+    session.runtime_work_dir = project.clone();
+    session.completion_summary = SessionCompletionSummary::Latest(run_completion(3));
+    (temp, project, session)
+}
+
+fn state_with_session(session: &SessionInfo) -> AppState {
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.projects.push(ProjectInfo {
+        name: "project".into(),
+        work_dir: session.work_dir.clone(),
+        sessions: vec![session.clone()],
+        is_expanded: true,
+    });
+    state
+}
+
+#[test]
+fn snooze_records_deadline_and_stays_pending_until_confirmed() {
+    let (_temp, project, session) = settled_project_session("session");
+    let mut state = state_with_session(&session);
+
+    state
+        .snooze_session(&project, "session", 3_600)
+        .expect("settled session is eligible");
+    let snooze = state
+        .session_snooze(&project, "session")
+        .expect("record exists");
+    assert!(snooze.pending, "unconfirmed write never hides");
+    assert!(!snooze.save_failed);
+    let now = crate::session_snooze::unix_now();
+    assert!(snooze.wake_at >= now + 3_590 && snooze.wake_at <= now + 3_600);
+
+    snooze_confirm_writes(&mut state, &project, "session");
+    let snooze = state.session_snooze(&project, "session").unwrap();
+    assert!(!snooze.pending);
+    assert!(
+        project.join(".threadlane/session_snooze.json").exists(),
+        "confirmed write persists the snooze file"
+    );
+}
+
+#[test]
+fn snooze_eligibility_gates_unsettled_and_remote_sessions() {
+    let (_temp, project, session) = settled_project_session("session");
+    let mut state = state_with_session(&session);
+
+    // Loading state is not snoozable.
+    let mut unknown = session.clone();
+    unknown.completion_summary = SessionCompletionSummary::Unknown;
+    let reason = state.session_snooze_eligibility(&unknown).unwrap_err();
+    assert!(reason.contains("loading"), "{reason}");
+
+    // A generating runtime reports Working and blocks snooze.
+    let runtime = state.ensure_session_runtime(project.clone(), session.session_file.clone());
+    runtime.begin_generation().unwrap();
+    let reason = state.session_snooze_eligibility(&session).unwrap_err();
+    assert!(reason.contains("working"), "{reason}");
+    assert!(state
+        .snooze_session(&project, "session", 3_600)
+        .is_err());
+    drop(runtime);
+
+    // Remote daemon mode is local-only for this release.
+    let mut remote = state_with_session(&session);
+    remote.daemon_remote = true;
+    let reason = remote.session_snooze_eligibility(&session).unwrap_err();
+    assert!(reason.contains("local"), "{reason}");
+
+    // Unknown project/session identity is refused outright.
+    assert!(state
+        .snooze_session(&project, "nobody", 3_600)
+        .is_err());
+}
+
+#[test]
+fn unsnooze_returns_immediately_even_before_the_write_confirms() {
+    let (_temp, project, session) = settled_project_session("session");
+    let mut state = state_with_session(&session);
+
+    state.snooze_session(&project, "session", 3_600).unwrap();
+    assert!(state.session_snooze(&project, "session").is_some());
+
+    state.unsnooze_session(&project, "session");
+    assert!(state.session_snooze(&project, "session").is_none());
+    // Unsnooze does not resurrect through the write pipeline: let the
+    // submitted delete flush and confirm, then the row stays un-snoozed.
+    for _ in 0..200 {
+        state.drain_chat_stream(Vec::new());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(state.session_snooze(&project, "session").is_none());
+}
+
+#[test]
+fn a_newer_completion_or_attention_ends_the_snooze() {
+    let (_temp, project, session) = settled_project_session("session");
+    let mut state = state_with_session(&session);
+
+    state.snooze_session(&project, "session", 3_600).unwrap();
+    snooze_confirm_writes(&mut state, &project, "session");
+
+    // A completion newer than the captured baseline ends the snooze.
+    let mut newer = session.clone();
+    newer.completion_summary = SessionCompletionSummary::Latest(run_completion(9));
+    assert!(state.apply_session_refresh(project.clone(), vec![newer], 0));
+    assert!(state.session_snooze(&project, "session").is_none());
+}
+
+#[test]
+fn transient_discovery_absence_never_drops_the_record() {
+    let (_temp, project, session) = settled_project_session("session");
+    let mut state = state_with_session(&session);
+
+    state.snooze_session(&project, "session", 3_600).unwrap();
+    snooze_confirm_writes(&mut state, &project, "session");
+
+    // Discovery briefly returning nothing must not unsnooze — only
+    // confirmed archive/delete prunes the record.
+    assert!(state.apply_session_refresh(project.clone(), Vec::new(), 0));
+    assert!(state.session_snooze(&project, "session").is_some());
+}
+
+#[test]
+fn an_expired_record_never_hides_and_reconcile_cleans_up() {
+    let (_temp, project, session) = settled_project_session("session");
+    let mut state = state_with_session(&session);
+
+    // Duration zero lands an already-past deadline: the row is never
+    // hidden (fail-open) and reconcile drops the record.
+    state.snooze_session(&project, "session", 0).unwrap();
+    assert!(state.session_snooze(&project, "session").is_none());
+    assert!(!state.session_snooze_entries().is_empty());
+    assert!(state.reconcile_session_snoozes());
+    assert!(state.session_snooze_entries().is_empty());
+}
+
+#[test]
+fn a_failed_save_keeps_the_row_visible_and_reports_an_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    let session_file = project.join(".threadlane/sessions/session.jsonl");
+    let mut session = test_session("session", &session_file);
+    session.work_dir = project.clone();
+    session.runtime_work_dir = project.clone();
+    session.completion_summary = SessionCompletionSummary::Latest(run_completion(3));
+    std::fs::create_dir_all(&project).unwrap();
+    // A regular file where the store directory belongs makes every write
+    // fail — the record stays pending and the app reports one error.
+    std::fs::write(project.join(".threadlane"), "not a directory").unwrap();
+
+    let mut state = state_with_session(&session);
+    state.snooze_session(&project, "session", 3_600).unwrap();
+
+    let mut saw_failure = false;
+    for _ in 0..200 {
+        state.drain_chat_stream(Vec::new());
+        if state
+            .session_snooze(&project, "session")
+            .is_some_and(|snooze| snooze.pending && snooze.save_failed)
+        {
+            saw_failure = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(saw_failure, "save failure must surface on the row");
+    let status = state.session_status.clone().unwrap_or_default();
+    assert!(status.contains("snooze"), "{status}");
+}
