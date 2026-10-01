@@ -6,16 +6,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use threadlane_acp::AcpConfigOption;
 use threadlane_protocol::{
     AgentEvent, ImageAttachment, OrchestratorMode, ReasoningEffort, SessionPlan,
-    SubagentProgressUpdate, TokenUsage,
+    SubagentProgressUpdate,
 };
 use threadlane_runtime::harness::{EventPayload, HarnessEvent, JsonlStore, SessionStore};
 
-use crate::agent_events::{ChatAgentUpdate, adapt_agent_event};
 use threadlane_coding_agent::controller::{
     SchedulerSupervisorEvent, SchedulerSupervisorHandle, SessionRuntime,
 };
 use threadlane_project::load_project_registry;
 
+#[cfg(test)]
+use threadlane_protocol::TokenUsage;
 use crate::discovery::*;
 use crate::projection::*;
 use crate::session_snooze::{unix_now, SessionSnooze, SnoozeRecord};
@@ -46,26 +47,16 @@ pub fn close_work_needs_refresh(current: &[String], disclosed: &[String]) -> boo
 }
 
 pub struct AppState {
+    pub client: threadlane_client::ClientState,
     pub automation_service: Option<Arc<crate::automation::AutomationService>>,
     pub automations: crate::automation::Projection,
-    pub projects: Vec<ProjectInfo>,
-    pub active_work_dir: Option<PathBuf>,
-    pub active_session_id: Option<String>,
     pub is_new_task: bool,
     pub draft_work_mode: WorkMode,
     pub draft_worktree_base: Option<String>,
     pub draft_worktree_bases: Vec<String>,
     worktree_setups: HashMap<String, crate::worktree_setup::WorktreeSetup>,
-    /// Presentation-only sidebar filter. `None` keeps the flat list scoped to all projects.
-    pub sidebar_project_filter: Option<PathBuf>,
-    pub search_query: String,
-    pub pinned_sessions: HashSet<(PathBuf, String)>,
-    pub messages: Arc<Vec<ChatMessageInfo>>,
     pub(crate) available_models: Vec<threadlane_daemon::catalog::ModelOption>,
-    pub active_plan: SessionPlan,
-    pub is_generating: bool,
     composer_text: String,
-    pub session_status: Option<String>,
     /// Bumped whenever an out-of-band mutation (issue create/close, label
     /// edit) changes GitHub list contents. The GitHub view observes this
     /// and refetches; dialogs cannot reach the view entity directly.
@@ -74,8 +65,6 @@ pub struct AppState {
     /// The chat view drains these into the composer input on its next model
     /// observation, preserving whatever the user already typed.
     pub requested_composer_inserts: Vec<RequestedComposerInsert>,
-    pending_composer_messages: HashMap<String, PendingComposerMessage>,
-    session_token_usage: HashMap<SessionProjectionKey, TokenUsage>,
     trajectory_by_session: HashMap<SessionProjectionKey, Vec<TrajectoryEntry>>,
     subagents_by_session: HashMap<SessionProjectionKey, Vec<SubagentActivityInfo>>,
     trajectory_revision: u64,
@@ -83,11 +72,8 @@ pub struct AppState {
     diagnostics_revision: u64,
     diagnostics_by_session:
         HashMap<SessionProjectionKey, threadlane_runtime::harness::SessionDiagnostics>,
-    session_metrics: HashMap<SessionProjectionKey, SessionMetricsInfo>,
     token_efficiency_by_session:
         HashMap<SessionProjectionKey, threadlane_runtime::harness::TokenEfficiencyReport>,
-    context_windows: HashMap<SessionProjectionKey, ContextWindowInfo>,
-    run_timings: HashMap<SessionProjectionKey, RunTiming>,
     /// Settings each ACP session's agent exposes, keyed by session id.
     ///
     /// Keyed by session rather than by model id because two sessions on the
@@ -102,8 +88,6 @@ pub struct AppState {
     /// next runtime before its first turn.
     pending_acp_config: HashMap<String, HashMap<String, String>>,
     stashed_prompts: HashMap<String, String>,
-    pub pending_permissions: HashMap<String, threadlane_protocol::PermissionRequest>,
-    pub pending_questions: HashMap<String, threadlane_protocol::QuestionRequest>,
     pub pending_hydrations: Vec<SessionHydrationRequest>,
     in_flight_hydrations: HashMap<SessionProjectionKey, usize>,
     pub git_statuses: HashMap<PathBuf, threadlane_git::GitStatus>,
@@ -216,6 +200,16 @@ pub struct AppState {
     automation_runs_restored: bool,
 }
 
+// Existing desktop feature APIs retain field access while the session views move.
+// The fields live only in ClientState; desktop services remain in AppState.
+impl std::ops::Deref for AppState {
+    type Target = threadlane_client::ClientState;
+    fn deref(&self) -> &Self::Target { &self.client }
+}
+impl std::ops::DerefMut for AppState {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.client }
+}
+
 /// A queued-message cancel awaiting its `CommandResult` reply (or the
 /// journaled `QueuedEntryCancelled`): which echo it belongs to, whether
 /// the staged content goes back into the composer (edit) or is discarded
@@ -284,7 +278,7 @@ fn load_pinned_sessions_from_dir(work_dir: &Path, pins: &mut HashSet<(PathBuf, S
 
 impl AppState {
     pub(crate) fn load_pinned_sessions(&mut self, work_dir: &Path) {
-        load_pinned_sessions_from_dir(work_dir, &mut self.pinned_sessions);
+        load_pinned_sessions_from_dir(work_dir, &mut self.client.pinned_sessions);
     }
 
     pub fn toggle_pinned_session(
@@ -293,15 +287,15 @@ impl AppState {
         session_id: String,
     ) -> Result<(), String> {
         let key = (work_dir.clone(), session_id.clone());
-        let is_currently_pinned = self.pinned_sessions.contains(&key);
+        let is_currently_pinned = self.client.pinned_sessions.contains(&key);
         let project_pinned: Vec<&str> = if is_currently_pinned {
-            self.pinned_sessions
+            self.client.pinned_sessions
                 .iter()
                 .filter(|(w, id)| *w == work_dir && id.as_str() != session_id)
                 .map(|(_, id)| id.as_str())
                 .collect()
         } else {
-            self.pinned_sessions
+            self.client.pinned_sessions
                 .iter()
                 .filter(|(w, _)| *w == work_dir)
                 .map(|(_, id)| id.as_str())
@@ -312,15 +306,15 @@ impl AppState {
         persist_pinned_sessions(&work_dir, &project_pinned)?;
 
         if is_currently_pinned {
-            self.pinned_sessions.remove(&key);
+            self.client.pinned_sessions.remove(&key);
         } else {
-            self.pinned_sessions.insert(key);
+            self.client.pinned_sessions.insert(key);
         }
         Ok(())
     }
 
     pub fn is_session_pinned(&self, work_dir: &Path, session_id: &str) -> bool {
-        self.pinned_sessions
+        self.client.pinned_sessions
             .contains(&(work_dir.to_path_buf(), session_id.to_string()))
     }
 
@@ -411,7 +405,7 @@ impl AppState {
         let Some((key, token)) = self.presented_completion.clone() else {
             return false;
         };
-        if self.active_session_id.as_deref() != Some(key.session_id.as_str()) {
+        if self.client.active_session_id.as_deref() != Some(key.session_id.as_str()) {
             return false;
         }
         let Some(session) = self.active_session_info() else {
@@ -483,7 +477,7 @@ impl AppState {
     }
 
     fn session_for_store_key(&self, key: &Path, session_id: &str) -> Option<&SessionInfo> {
-        self.projects
+        self.client.projects
             .iter()
             .flat_map(|project| project.sessions.iter())
             .find(|session| {
@@ -573,8 +567,7 @@ impl AppState {
         session_id: &str,
         duration_secs: u64,
     ) -> Result<(), String> {
-        let session = self
-            .projects
+        let session = self.client.projects
             .iter()
             .flat_map(|project| project.sessions.iter())
             .find(|session| session.id == session_id && session.work_dir == work_dir)
@@ -712,7 +705,7 @@ impl AppState {
                 crate::session_snooze::SnoozeWriteOutcome::Failed => {
                     if !self.session_snooze_save_failed {
                         self.session_snooze_save_failed = true;
-                        self.session_status = Some(
+                        self.client.session_status = Some(
                             "Could not save snooze — the session stays visible. Retry from its actions menu."
                                 .into(),
                         );
@@ -745,7 +738,7 @@ impl AppState {
     /// Canonical project dir owning `session_file` — the sessions list when
     /// known, else the `.threadlane/sessions/<file>` parent chain.
     fn session_work_dir_for_file(&self, session_file: &Path) -> Option<PathBuf> {
-        self.projects
+        self.client.projects
             .iter()
             .flat_map(|project| project.sessions.iter())
             .find(|session| session.session_file == session_file)
@@ -784,12 +777,11 @@ impl AppState {
     }
 
     pub fn active_git_work_dir(&self) -> Option<PathBuf> {
-        let work_dir = self.active_work_dir.as_ref()?;
-        let Some(session_id) = self.active_session_id.as_ref() else {
+        let work_dir = self.client.active_work_dir.as_ref()?;
+        let Some(session_id) = self.client.active_session_id.as_ref() else {
             return Some(work_dir.clone());
         };
-        let session = self
-            .projects
+        let session = self.client.projects
             .iter()
             .find(|project| project.work_dir == *work_dir)
             .and_then(|project| {
@@ -811,12 +803,12 @@ impl AppState {
             return false;
         }
         let (Some(work_dir), Some(session_id)) = (
-            self.active_work_dir.as_ref(),
-            self.active_session_id.as_ref(),
+            self.client.active_work_dir.as_ref(),
+            self.client.active_session_id.as_ref(),
         ) else {
             return false;
         };
-        self.projects
+        self.client.projects
             .iter()
             .find(|project| project.work_dir == *work_dir)
             .and_then(|project| {
@@ -834,7 +826,7 @@ impl AppState {
     /// per-session checkout from `active_git_work_dir` is only the cwd for
     /// newly created shells.
     pub fn terminal_group_key(&self) -> Option<PathBuf> {
-        self.active_work_dir.clone()
+        self.client.active_work_dir.clone()
     }
 
     pub(crate) fn load_from_registry(registry_projects: Vec<AttachedProject>) -> Self {
@@ -1021,37 +1013,31 @@ impl AppState {
             .unwrap_or_default();
 
         let mut state = Self {
-            projects: project_infos,
-            active_work_dir,
+            client: threadlane_client::ClientState {
+                projects: project_infos,
+                active_work_dir,
+                active_session_id: active_session_id.clone(),
+                pinned_sessions,
+                messages: Arc::new(messages),
+                session_status,
+                ..Default::default()
+            },
             is_new_task: active_session_id.is_none(),
             draft_work_mode: WorkMode::Local,
             draft_worktree_base: None,
             draft_worktree_bases: Vec::new(),
             worktree_setups: HashMap::new(),
-            active_session_id,
-            sidebar_project_filter: None,
-            search_query: String::new(),
-            pinned_sessions,
-            messages: Arc::new(messages),
             available_models,
-            active_plan: SessionPlan::default(),
-            is_generating: false,
             composer_text: String::new(),
-            session_status,
             github_list_revision: 0,
             requested_composer_inserts: Vec::new(),
-            pending_composer_messages: HashMap::new(),
-            session_token_usage: HashMap::new(),
             trajectory_by_session: HashMap::new(),
             subagents_by_session: HashMap::new(),
             trajectory_revision: 0,
             trajectory_epoch: 0,
             diagnostics_revision: 0,
             diagnostics_by_session: HashMap::new(),
-            session_metrics: HashMap::new(),
             token_efficiency_by_session: HashMap::new(),
-            context_windows: HashMap::new(),
-            run_timings: HashMap::new(),
             acp_config_options: HashMap::new(),
             pending_acp_config: HashMap::new(),
             stashed_prompts: HashMap::new(),
@@ -1100,8 +1086,6 @@ impl AppState {
             session_seen_save_failed: false,
             session_snooze_save_failed: false,
             automation_runs_restored: false,
-            pending_permissions: HashMap::new(),
-            pending_questions: HashMap::new(),
             pending_hydrations: Vec::new(),
             in_flight_hydrations: HashMap::new(),
             git_statuses: HashMap::new(),
@@ -1175,12 +1159,12 @@ impl AppState {
                     runtime.status(),
                     threadlane_coding_agent::controller::SessionStatus::Working
                 );
-            let session = self.projects.iter().flat_map(|project| &project.sessions).find(|session| session.session_file == *session_file);
+            let session = self.client.projects.iter().flat_map(|project| &project.sessions).find(|session| session.session_file == *session_file);
             let session_id = session.map(|session| session.id.as_str());
-            let permission = session_id.is_some_and(|id| self.pending_permissions.contains_key(id));
-            let question = session_id.is_some_and(|id| self.pending_questions.contains_key(id));
+            let permission = session_id.is_some_and(|id| self.client.pending_permissions.contains_key(id));
+            let question = session_id.is_some_and(|id| self.client.pending_questions.contains_key(id));
             if !active && !permission && !question { continue; }
-            let project = session.and_then(|session| self.projects.iter().find(|project| project.sessions.iter().any(|item| item.session_file == session.session_file)));
+            let project = session.and_then(|session| self.client.projects.iter().find(|project| project.sessions.iter().any(|item| item.session_file == session.session_file)));
             work.push(ActiveCloseWork {
                 identity: session_file.display().to_string(),
                 title: session.map(|session| if session.title.trim().is_empty() { "Untitled session".into() } else { session.title.clone() }).unwrap_or_else(|| "Active session".into()),
@@ -1192,11 +1176,11 @@ impl AppState {
         for run in &self.automations.snapshot.runs {
             let Some(status) = active_automation_status(run.status) else { continue; };
             if run.session_file.as_ref().is_some_and(|file| session_files.contains(file)) { continue; }
-            let session = run.session_file.as_ref().and_then(|file| self.projects.iter().flat_map(|project| &project.sessions).find(|session| session.session_file == *file));
+            let session = run.session_file.as_ref().and_then(|file| self.client.projects.iter().flat_map(|project| &project.sessions).find(|session| session.session_file == *file));
             work.push(ActiveCloseWork {
                 identity: run.session_file.as_ref().map(|file| file.display().to_string()).unwrap_or_else(|| format!("automation:{}", run.id)),
                 title: session.map(|session| session.title.clone()).filter(|title| !title.trim().is_empty()).unwrap_or_else(|| run.definition.name.clone()),
-                project: self.projects.iter().find(|project| project.work_dir == run.definition.project).map(|project| project.name.clone()).unwrap_or_else(|| run.definition.project.display().to_string()),
+                project: self.client.projects.iter().find(|project| project.work_dir == run.definition.project).map(|project| project.name.clone()).unwrap_or_else(|| run.definition.project.display().to_string()),
                 status: status.into(),
             });
         }
@@ -1204,7 +1188,7 @@ impl AppState {
         work
     }
     pub(crate) fn messages_mut(&mut self) -> &mut Vec<ChatMessageInfo> {
-        Arc::make_mut(&mut self.messages)
+        Arc::make_mut(&mut self.client.messages)
     }
 
     pub fn available_models(&self) -> &[threadlane_daemon::catalog::ModelOption] {
@@ -1237,13 +1221,13 @@ impl AppState {
     #[doc(hidden)]
     pub fn test_start_worktree_setup(&mut self) {
         use threadlane_protocol::daemon::{SetupStage, WorktreeSetup};
-        let Some(session_id) = self.active_session_id.clone() else {
+        let Some(session_id) = self.client.active_session_id.clone() else {
             return;
         };
         self.worktree_setups.insert(
             session_id.clone(),
             WorktreeSetup {
-                project: self.active_work_dir.clone().unwrap_or_default(),
+                project: self.client.active_work_dir.clone().unwrap_or_default(),
                 session_id,
                 session_file: PathBuf::new(),
                 worktree: PathBuf::new(),
@@ -1293,13 +1277,13 @@ impl AppState {
 
     pub fn apply_automation_projection(&mut self, projection: crate::automation::Projection) {
         for (session, old) in &self.automations.permissions {
-            if !projection.permissions.contains_key(session) && self.pending_permissions.get(session).is_some_and(|p| p.id == old.id) {
-                self.pending_permissions.remove(session);
+            if !projection.permissions.contains_key(session) && self.client.pending_permissions.get(session).is_some_and(|p| p.id == old.id) {
+                self.client.pending_permissions.remove(session);
             }
         }
         for (session, old) in &self.automations.questions {
-            if !projection.questions.contains_key(session) && self.pending_questions.get(session).is_some_and(|q| q.id == old.id) {
-                self.pending_questions.remove(session);
+            if !projection.questions.contains_key(session) && self.client.pending_questions.get(session).is_some_and(|q| q.id == old.id) {
+                self.client.pending_questions.remove(session);
             }
         }
         if let Some(runtime) = &projection.active_runtime {
@@ -1342,15 +1326,15 @@ impl AppState {
         for (project, session_id) in to_register {
             self.register_session_seen(&project, &session_id);
         }
-        self.pending_permissions.extend(projection.permissions.clone());
-        self.pending_questions.extend(projection.questions.clone());
+        self.client.pending_permissions.extend(projection.permissions.clone());
+        self.client.pending_questions.extend(projection.questions.clone());
         self.automations = projection;
     }
 
     pub fn open_automation_run(&mut self, id: &str) -> Result<(), String> {
         let run = self.automations.snapshot.runs.iter().find(|r| r.id == id).cloned().ok_or("Run no longer exists")?;
         if run.session_file.as_ref().is_none_or(|path| !path.exists()) { return Err("This run has no chat yet".into()); }
-        let project = self.projects.iter_mut().find(|p| p.work_dir == run.definition.project).ok_or("Attach this run's project to open its chat")?;
+        let project = self.client.projects.iter_mut().find(|p| p.work_dir == run.definition.project).ok_or("Attach this run's project to open its chat")?;
         project.sessions = discover_session_stubs_in_project(&project.work_dir);
         self.select_session(run.definition.project, run.session_id);
         self.workspace_page = WorkspacePage::Chat;
@@ -1359,7 +1343,7 @@ impl AppState {
 
     pub fn refresh_available_models(&mut self) {
         self.available_models =
-            threadlane_daemon::catalog::available_models_for_project(self.active_work_dir.as_deref());
+            threadlane_daemon::catalog::available_models_for_project(self.client.active_work_dir.as_deref());
         if self.selected_model.is_empty() {
             self.selected_model = self
                 .available_models
@@ -1374,7 +1358,7 @@ impl AppState {
         self.reasoning_effort = threadlane_provider::model_registry::effective_effort(
             &self.selected_model,
             self.reasoning_effort,
-            self.active_work_dir.as_deref(),
+            self.client.active_work_dir.as_deref(),
         );
     }
 
@@ -1387,11 +1371,11 @@ impl AppState {
     #[cfg(test)]
     fn current_session_token_usage(&self) -> TokenUsage {
         if let Some(key) = self.active_session_projection_key() {
-            if let Some(usage) = self.session_token_usage.get(&key) {
+            if let Some(usage) = self.client.session_token_usage.get(&key) {
                 return usage.clone();
             }
         }
-        let chars: usize = self.messages.iter().map(|m| m.content.len()).sum();
+        let chars: usize = self.client.messages.iter().map(|m| m.content.len()).sum();
         let approx_tokens = (chars / 4) as u32;
         TokenUsage {
             total_tokens: approx_tokens,
@@ -1503,7 +1487,7 @@ impl AppState {
 
     pub(crate) fn set_selected_model(&mut self, model: String) {
         if self.active_worktree_setup().is_some() {
-            self.session_status =
+            self.client.session_status =
                 Some("Cancel worktree setup before changing agent settings".into());
             return;
         }
@@ -1513,7 +1497,7 @@ impl AppState {
         if self.daemon_remote {
             self.selected_model = model.clone();
             self.dispatch_command(SessionCommand::SetModel {
-                session_id: self.active_session_id.clone().unwrap_or_default(),
+                session_id: self.client.active_session_id.clone().unwrap_or_default(),
                 model,
             });
             return;
@@ -1523,7 +1507,7 @@ impl AppState {
                 return;
             }
             if runtime.is_generating() {
-                self.session_status = Some("Stop the current turn before changing models".into());
+                self.client.session_status = Some("Stop the current turn before changing models".into());
                 return;
             }
             let result = if let Some(error) = runtime.harness_error() {
@@ -1536,7 +1520,7 @@ impl AppState {
                 Err("Agent settings are still loading. Try changing models again shortly.".into())
             };
             if let Err(error) = result {
-                self.session_status = Some(format!("Could not switch models: {error}"));
+                self.client.session_status = Some(format!("Could not switch models: {error}"));
                 return;
             }
             self.drop_session_runtime(&runtime.session_file);
@@ -1546,11 +1530,11 @@ impl AppState {
         self.selected_model = model.clone();
         self.set_reasoning_effort(self.reasoning_effort);
         self.auth_status_msg = Some(format!("Model switched to {model}"));
-        if self.session_status.as_deref().is_some_and(|status| {
+        if self.client.session_status.as_deref().is_some_and(|status| {
             status == "Stop the current turn before changing models"
                 || status.starts_with("Could not switch models:")
         }) {
-            self.session_status = None;
+            self.client.session_status = None;
         }
         if let Some(key) = self.active_session_projection_key() {
             self.acp_config_options.remove(&key);
@@ -1563,19 +1547,19 @@ impl AppState {
 
     pub fn set_reasoning_effort(&mut self, effort: ReasoningEffort) {
         if self.active_worktree_setup().is_some() {
-            self.session_status =
+            self.client.session_status =
                 Some("Cancel worktree setup before changing agent settings".into());
             return;
         }
         let effort = threadlane_provider::model_registry::effective_effort(
             &self.selected_model,
             effort,
-            self.active_work_dir.as_deref(),
+            self.client.active_work_dir.as_deref(),
         );
         if self.daemon_remote {
             self.reasoning_effort = effort;
             self.dispatch_command(SessionCommand::SetReasoningEffort {
-                session_id: self.active_session_id.clone().unwrap_or_default(),
+                session_id: self.client.active_session_id.clone().unwrap_or_default(),
                 effort,
             });
             return;
@@ -1584,7 +1568,7 @@ impl AppState {
             if runtime.is_generating() {
                 if self.reasoning_effort != effort {
                     self.reasoning_effort = effort;
-                    self.session_status =
+                    self.client.session_status =
                         Some("Reasoning effort changed; it will apply to the next turn".into());
                 }
                 return;
@@ -1598,7 +1582,7 @@ impl AppState {
                     .into())
             };
             if let Err(error) = result {
-                self.session_status = Some(format!("Could not switch reasoning effort: {error}"));
+                self.client.session_status = Some(format!("Could not switch reasoning effort: {error}"));
                 return;
             }
             self.drop_session_runtime(&runtime.session_file);
@@ -1615,11 +1599,11 @@ impl AppState {
     /// new mode; mirrors `set_selected_model`.
     pub fn set_orchestrator_mode(&mut self, mode: OrchestratorMode) {
         if self.active_worktree_setup().is_some() {
-            self.session_status =
+            self.client.session_status =
                 Some("Cancel worktree setup before changing agent settings".into());
             return;
         }
-        let Some(work_dir) = self.active_work_dir.clone() else {
+        let Some(work_dir) = self.client.active_work_dir.clone() else {
             return;
         };
         if self.orchestrator_mode == mode {
@@ -1630,7 +1614,7 @@ impl AppState {
             // With a live session the daemon persists the setting and
             // rebuilds the runtime; without one it stays as the draft
             // default and is saved with the next write.
-            if let Some(session_id) = self.active_session_id.clone() {
+            if let Some(session_id) = self.client.active_session_id.clone() {
                 self.dispatch_command(SessionCommand::SetOrchestratorMode { session_id, mode });
             } else {
                 let mut settings = threadlane_project::subagent_settings::load(&work_dir);
@@ -1642,13 +1626,13 @@ impl AppState {
         let mut settings = threadlane_project::subagent_settings::load(&work_dir);
         settings.orchestrator_mode = mode;
         if let Err(error) = threadlane_project::subagent_settings::save(&work_dir, &settings) {
-            self.session_status = Some(format!("Could not switch mode: {error}"));
+            self.client.session_status = Some(format!("Could not switch mode: {error}"));
             return;
         }
         self.orchestrator_mode = mode;
         // Rebuild only a live runtime; a missing one is constructed on
         // demand from the saved settings by hydration or the next prompt.
-        let Some(session_id) = self.active_session_id.clone() else {
+        let Some(session_id) = self.client.active_session_id.clone() else {
             return;
         };
         let session_file = self.session_file(&work_dir, &session_id);
@@ -1656,7 +1640,7 @@ impl AppState {
             return;
         };
         if runtime.is_generating() {
-            self.session_status = Some("Mode changed; it will apply to the next turn".into());
+            self.client.session_status = Some("Mode changed; it will apply to the next turn".into());
             return;
         }
         self.drop_session_runtime(&session_file);
@@ -1667,7 +1651,7 @@ impl AppState {
     /// settings. Called after session or project switches so the composer
     /// dropdown never shows a stale project's mode.
     fn refresh_orchestrator_mode(&mut self) {
-        if let Some(work_dir) = self.active_work_dir.as_deref() {
+        if let Some(work_dir) = self.client.active_work_dir.as_deref() {
             self.orchestrator_mode =
                 threadlane_project::subagent_settings::load(work_dir).orchestrator_mode;
         }
@@ -1723,11 +1707,10 @@ impl AppState {
                 self.load_pinned_sessions(&session.work_dir);
             }
         }
-        let active_project = self.active_work_dir.as_ref() == Some(&work_dir);
-        let active_session_id = self.active_session_id.clone();
+        let active_project = self.client.active_work_dir.as_ref() == Some(&work_dir);
+        let active_session_id = self.client.active_session_id.clone();
         let selected_session_missing = {
-            let Some(project) = self
-                .projects
+            let Some(project) = self.client.projects
                 .iter_mut()
                 .find(|project| project.work_dir == work_dir)
             else {
@@ -1740,7 +1723,7 @@ impl AppState {
                 })
         };
         if selected_session_missing {
-            self.active_session_id = None;
+            self.client.active_session_id = None;
         }
         // Discovery may confirm a newer completion or a resumed state
         // that ends a snooze recorded before the app was last open.
@@ -1758,10 +1741,9 @@ impl AppState {
     /// result captured before the new checkout is discarded by
     /// `apply_session_refresh`.
     pub(crate) fn recreate_active_worktree(&mut self) -> Result<(), String> {
-        let work_dir = self.active_work_dir.clone().ok_or("No active project")?;
-        let session_id = self.active_session_id.clone().ok_or("No active session")?;
-        let session = self
-            .projects
+        let work_dir = self.client.active_work_dir.clone().ok_or("No active project")?;
+        let session_id = self.client.active_session_id.clone().ok_or("No active session")?;
+        let session = self.client.projects
             .iter()
             .find(|project| project.work_dir == work_dir)
             .and_then(|project| {
@@ -1810,8 +1792,7 @@ impl AppState {
         // `discover_sessions_in_project_cached`) so the follow-up refresh
         // cannot reuse the stale unavailable entry either.
         self.session_refresh_generation = self.session_refresh_generation.wrapping_add(1);
-        if let Some(project) = self
-            .projects
+        if let Some(project) = self.client.projects
             .iter_mut()
             .find(|project| project.work_dir == work_dir)
         {
@@ -1822,14 +1803,14 @@ impl AppState {
         }
         self.select_session(work_dir.clone(), session_id);
         self.request_session_refresh(&work_dir);
-        self.session_status = None;
+        self.client.session_status = None;
         Ok(())
     }
 
     fn refresh_active_session(&mut self) {
         if let (Some(work_dir), Some(session_id)) = (
-            &self.active_work_dir.clone(),
-            &self.active_session_id.clone(),
+            &self.client.active_work_dir.clone(),
+            &self.client.active_session_id.clone(),
         ) {
             let session_file = self.session_file(work_dir, session_id);
             let is_generating = self
@@ -1850,8 +1831,8 @@ impl AppState {
 
     pub(crate) fn begin_new_task(&mut self) {
         self.workspace_page = WorkspacePage::Chat;
-        if let Some(project_work_dir) = self.active_session_id.as_ref().and_then(|session_id| {
-            self.projects.iter().find_map(|project| {
+        if let Some(project_work_dir) = self.client.active_session_id.as_ref().and_then(|session_id| {
+            self.client.projects.iter().find_map(|project| {
                 project
                     .sessions
                     .iter()
@@ -1859,20 +1840,19 @@ impl AppState {
                     .then(|| project.work_dir.clone())
             })
         }) {
-            self.active_work_dir = Some(project_work_dir);
+            self.client.active_work_dir = Some(project_work_dir);
         }
-        self.active_session_id = None;
+        self.client.active_session_id = None;
         self.is_new_task = true;
         self.draft_work_mode = WorkMode::Local;
         self.draft_worktree_base = None;
         self.draft_worktree_bases.clear();
-        self.messages = Arc::new(Vec::new());
-        self.active_plan = SessionPlan::default();
-        self.is_generating = false;
-        self.session_status = None;
-        if self.active_work_dir.is_none() {
-            self.active_work_dir = self
-                .projects
+        self.client.messages = Arc::new(Vec::new());
+        self.client.active_plan = SessionPlan::default();
+        self.client.is_generating = false;
+        self.client.session_status = None;
+        if self.client.active_work_dir.is_none() {
+            self.client.active_work_dir = self.client.projects
                 .first()
                 .map(|project| project.work_dir.clone());
         }
@@ -1882,7 +1862,7 @@ impl AppState {
     pub fn set_work_mode(&mut self, mode: WorkMode) {
         self.draft_work_mode = mode;
         if mode == WorkMode::Worktree {
-            let Some(project) = self.active_work_dir.clone() else {
+            let Some(project) = self.client.active_work_dir.clone() else {
                 return;
             };
             if self.daemon_remote {
@@ -1914,14 +1894,14 @@ impl AppState {
                         let _ = tx.send(SessionEvent::WorktreeBases { project, result });
                     });
                 }
-                Err(error) => self.session_status = Some(error),
+                Err(error) => self.client.session_status = Some(error),
             }
         }
     }
 
     pub(crate) fn set_sidebar_project_filter(&mut self, work_dir: Option<PathBuf>) {
-        self.sidebar_project_filter = work_dir.filter(|candidate| {
-            self.projects
+        self.client.sidebar_project_filter = work_dir.filter(|candidate| {
+            self.client.projects
                 .iter()
                 .any(|project| project.work_dir == *candidate)
         });
@@ -1934,21 +1914,20 @@ impl AppState {
     }
 
     pub(crate) fn select_draft_project(&mut self, work_dir: PathBuf) {
-        if self
-            .projects
+        if self.client.projects
             .iter()
             .any(|project| project.work_dir == work_dir)
         {
-            self.active_work_dir = Some(work_dir.clone());
-            self.active_session_id = None;
+            self.client.active_work_dir = Some(work_dir.clone());
+            self.client.active_session_id = None;
             self.is_new_task = true;
             self.draft_work_mode = WorkMode::Local;
             self.draft_worktree_base = None;
             self.draft_worktree_bases.clear();
-            self.messages = Arc::new(Vec::new());
-            self.active_plan = SessionPlan::default();
-            self.is_generating = false;
-            self.session_status = None;
+            self.client.messages = Arc::new(Vec::new());
+            self.client.active_plan = SessionPlan::default();
+            self.client.is_generating = false;
+            self.client.session_status = None;
             self.persist_project_selection(&work_dir, None);
             self.refresh_available_models();
             self.refresh_orchestrator_mode();
@@ -1967,21 +1946,21 @@ impl AppState {
         let path = match threadlane_tools::validate_path_in_workspace(&relative_path, &root) {
             Ok(path) => path,
             Err(error) => {
-                self.session_status = Some(error);
+                self.client.session_status = Some(error);
                 return;
             }
         };
         let canonical_root = match root.canonicalize() {
             Ok(root) => root,
             Err(error) => {
-                self.session_status = Some(format!("Invalid workspace root: {error}"));
+                self.client.session_status = Some(format!("Invalid workspace root: {error}"));
                 return;
             }
         };
         let relative = match path.strip_prefix(canonical_root) {
             Ok(relative) => relative,
             Err(error) => {
-                self.session_status = Some(format!("File is outside the workspace: {error}"));
+                self.client.session_status = Some(format!("File is outside the workspace: {error}"));
                 return;
             }
         };
@@ -2023,8 +2002,7 @@ impl AppState {
         persist_selection: bool,
     ) {
         self.workspace_page = WorkspacePage::Chat;
-        let session = self
-            .projects
+        let session = self.client.projects
             .iter()
             .find(|project| project.work_dir == work_dir)
             .and_then(|project| {
@@ -2039,12 +2017,11 @@ impl AppState {
         let runtime_work_dir = session
             .map(|session| session.runtime_work_dir.clone())
             .unwrap_or_else(|| work_dir.clone());
-        self.active_work_dir = Some(work_dir.clone());
-        self.active_session_id = Some(session_id.clone());
+        self.client.active_work_dir = Some(work_dir.clone());
+        self.client.active_session_id = Some(session_id.clone());
         self.is_new_task = false;
         self.refresh_orchestrator_mode();
-        let project_work_dir = self
-            .projects
+        let project_work_dir = self.client.projects
             .iter()
             .find(|project| {
                 project
@@ -2058,16 +2035,16 @@ impl AppState {
             self.persist_project_selection(project_work_dir, Some(&session_id));
         }
         self.refresh_available_models();
-        self.messages = Arc::new(Vec::new());
-        self.active_plan = SessionPlan::default();
+        self.client.messages = Arc::new(Vec::new());
+        self.client.active_plan = SessionPlan::default();
         // Switching to a session that is still generating must keep the
         // generating state: hydration preserves in-flight streaming rows only
         // while it is set, and the composer stays gated on it.
-        self.is_generating = self
+        self.client.is_generating = self
             .daemon_core
             .runtime_for_file(&session_file)
             .is_some_and(|runtime| runtime.is_generating());
-        self.session_status = Some("Loading session…".into());
+        self.client.session_status = Some("Loading session…".into());
         if !self.worktree_setups.contains_key(&session_id) {
             if let Some(setup) = self
                 .active_session_info()
@@ -2077,7 +2054,7 @@ impl AppState {
             }
         }
         if let Some(setup) = self.worktree_setups.get(&session_id) {
-            self.is_generating = setup.error.is_none();
+            self.client.is_generating = setup.error.is_none();
             let text = if setup.images.is_empty() {
                 setup.text.clone()
             } else {
@@ -2087,9 +2064,9 @@ impl AppState {
                     setup.images.len()
                 )
             };
-            let pending_id = format!("pending-user-{session_id}-{}", self.messages.len());
+            let pending_id = format!("pending-user-{session_id}-{}", self.client.messages.len());
             self.push_optimistic_follow_up(&session_id, text, pending_id);
-            self.session_status = None;
+            self.client.session_status = None;
             return;
         }
         let request = SessionHydrationRequest {
@@ -2118,8 +2095,7 @@ impl AppState {
         session_id: String,
     ) -> Result<impl FnOnce() -> Result<(String, Vec<SessionInfo>), String> + Send + 'static, String>
     {
-        let source = self
-            .projects
+        let source = self.client.projects
             .iter()
             .find(|project| project.work_dir == work_dir)
             .and_then(|project| {
@@ -2200,8 +2176,7 @@ impl AppState {
         id: String,
         sessions: Vec<SessionInfo>,
     ) {
-        let Some(project) = self
-            .projects
+        let Some(project) = self.client.projects
             .iter_mut()
             .find(|project| project.work_dir == work_dir)
         else {
@@ -2487,10 +2462,10 @@ impl AppState {
         request_id: &str,
         decision: threadlane_permission::PermissionDecision,
     ) -> bool {
-        let Some(session_id) = self.active_session_id.clone() else {
+        let Some(session_id) = self.client.active_session_id.clone() else {
             return false;
         };
-        let Some(request) = self.pending_permissions.get(&session_id) else {
+        let Some(request) = self.client.pending_permissions.get(&session_id) else {
             return false;
         };
         if request.id != request_id
@@ -2505,7 +2480,7 @@ impl AppState {
         {
             return false;
         }
-        let Some(work_dir) = self.active_work_dir.clone() else {
+        let Some(work_dir) = self.client.active_work_dir.clone() else {
             return false;
         };
         let session_file = self.session_file(&work_dir, &session_id);
@@ -2524,7 +2499,7 @@ impl AppState {
                 .is_some_and(|runtime| runtime.resolve_permission(request_id, decision))
         };
         if resolved {
-            self.pending_permissions.remove(&session_id);
+            self.client.pending_permissions.remove(&session_id);
             if let Some(service) = &self.automation_service { service.resolved(session_id.clone(), request_id.into()); }
         }
         resolved
@@ -2536,10 +2511,10 @@ impl AppState {
     /// request stays pending until the user answers or dismisses, so the
     /// turn blocks waiting instead of silently continuing on a guess.
     pub fn resolve_active_question(&mut self, request_id: &str) -> bool {
-        let Some(session_id) = self.active_session_id.clone() else {
+        let Some(session_id) = self.client.active_session_id.clone() else {
             return false;
         };
-        let Some(work_dir) = self.active_work_dir.clone() else {
+        let Some(work_dir) = self.client.active_work_dir.clone() else {
             return false;
         };
         let session_file = self.session_file(&work_dir, &session_id);
@@ -2556,7 +2531,7 @@ impl AppState {
                 .is_some_and(|runtime| runtime.resolve_question(request_id, answer))
         };
         if resolved {
-            self.pending_questions.remove(&session_id);
+            self.client.pop_question(&session_id);
             if let Some(service) = &self.automation_service { service.resolved(session_id.clone(), request_id.into()); }
         }
         resolved
@@ -2569,10 +2544,10 @@ impl AppState {
         request_id: &str,
         answer: threadlane_protocol::QuestionAnswer,
     ) -> bool {
-        let Some(session_id) = self.active_session_id.clone() else {
+        let Some(session_id) = self.client.active_session_id.clone() else {
             return false;
         };
-        let Some(work_dir) = self.active_work_dir.clone() else {
+        let Some(work_dir) = self.client.active_work_dir.clone() else {
             return false;
         };
         let session_file = self.session_file(&work_dir, &session_id);
@@ -2588,14 +2563,14 @@ impl AppState {
                 .is_some_and(|runtime| runtime.resolve_question(request_id, answer))
         };
         if resolved {
-            self.pending_questions.remove(&session_id);
+            self.client.pop_question(&session_id);
             if let Some(service) = &self.automation_service { service.resolved(session_id.clone(), request_id.into()); }
         }
         resolved
     }
 
     fn session_file(&self, work_dir: &Path, session_id: &str) -> PathBuf {
-        self.projects
+        self.client.projects
             .iter()
             .flat_map(|project| project.sessions.iter())
             .find(|session| {
@@ -2607,7 +2582,7 @@ impl AppState {
     }
 
     fn session_runtime_work_dir(&self, work_dir: &Path, session_id: &str) -> PathBuf {
-        self.projects
+        self.client.projects
             .iter()
             .find(|project| project.work_dir == work_dir)
             .and_then(|project| {
@@ -2625,8 +2600,7 @@ impl AppState {
     }
 
     fn session_worktree_path(&self, work_dir: &Path, session_id: &str) -> Option<PathBuf> {
-        if let Some(path) = self
-            .projects
+        if let Some(path) = self.client.projects
             .iter()
             .find(|project| project.work_dir == work_dir)
             .and_then(|project| {
@@ -2678,8 +2652,8 @@ impl AppState {
     }
 
     fn active_session_projection_key(&self) -> Option<SessionProjectionKey> {
-        let work_dir = self.active_work_dir.as_deref()?;
-        let session_id = self.active_session_id.as_deref()?;
+        let work_dir = self.client.active_work_dir.as_deref()?;
+        let session_id = self.client.active_session_id.as_deref()?;
         Some(self.session_projection_key(work_dir, session_id))
     }
 
@@ -2697,9 +2671,9 @@ impl AppState {
             .is_some_and(|key| self.in_flight_hydrations.contains_key(&key))
     }
     pub fn active_session_info(&self) -> Option<&SessionInfo> {
-        let work_dir = self.active_work_dir.as_ref()?;
-        let session_id = self.active_session_id.as_deref()?;
-        self.projects
+        let work_dir = self.client.active_work_dir.as_ref()?;
+        let session_id = self.client.active_session_id.as_deref()?;
+        self.client.projects
             .iter()
             .find(|project| &project.work_dir == work_dir)
             .and_then(|project| {
@@ -2742,10 +2716,10 @@ impl AppState {
     fn finish_session_removal(&mut self, work_dir: &Path, session_id: &str) {
         let session_file = self.session_file(work_dir, session_id);
         self.drop_session_runtime(&session_file);
-        self.pending_permissions.remove(session_id);
-        self.pending_questions.remove(session_id);
+        self.client.pending_permissions.remove(session_id);
+        self.client.pending_questions.remove(session_id);
         self.deferred_stream_events.remove(session_id);
-        self.pending_composer_messages.remove(session_id);
+        self.client.pending_composer_messages.remove(session_id);
         if self.presented_completion
             .as_ref()
             .is_some_and(|(key, _)| key.session_id == session_id)
@@ -2760,11 +2734,10 @@ impl AppState {
             self.flush_session_snooze(work_dir);
         }
         let pin_key = (work_dir.to_path_buf(), session_id.to_string());
-        let was_pinned = self.pinned_sessions.contains(&pin_key);
+        let was_pinned = self.client.pinned_sessions.contains(&pin_key);
         let mut pin_error = None;
         if was_pinned {
-            let project_pinned: Vec<&str> = self
-                .pinned_sessions
+            let project_pinned: Vec<&str> = self.client.pinned_sessions
                 .iter()
                 .filter(|(w, id)| *w == work_dir && id.as_str() != session_id)
                 .map(|(_, id)| id.as_str())
@@ -2773,15 +2746,14 @@ impl AppState {
                 tracing::warn!("failed to update pinned sessions during removal: {error}");
                 pin_error = Some(error);
             } else {
-                self.pinned_sessions.remove(&pin_key);
+                self.client.pinned_sessions.remove(&pin_key);
             }
         }
         self.acp_config_options
             .remove(&Self::projection_key(session_id, &session_file));
         let sessions = discover_sessions_in_project(work_dir);
         self.baseline_session_seen(&sessions);
-        if let Some(project) = self
-            .projects
+        if let Some(project) = self.client.projects
             .iter_mut()
             .find(|project| project.work_dir == work_dir)
         {
@@ -2789,25 +2761,24 @@ impl AppState {
             self.load_pinned_sessions(work_dir);
         }
 
-        let removed_active = self.active_work_dir.as_deref() == Some(work_dir)
-            && self.active_session_id.as_deref() == Some(session_id);
+        let removed_active = self.client.active_work_dir.as_deref() == Some(work_dir)
+            && self.client.active_session_id.as_deref() == Some(session_id);
         if !removed_active {
             if let Some(error) = pin_error {
-                self.session_status = Some(format!("Failed to update pinned sessions: {error}"));
+                self.client.session_status = Some(format!("Failed to update pinned sessions: {error}"));
             }
             return;
         }
 
-        self.active_session_id = None;
+        self.client.active_session_id = None;
         self.is_new_task = true;
-        self.messages = Arc::new(Vec::new());
-        self.active_plan = SessionPlan::default();
-        self.is_generating = false;
-        self.session_status = pin_error
+        self.client.messages = Arc::new(Vec::new());
+        self.client.active_plan = SessionPlan::default();
+        self.client.is_generating = false;
+        self.client.session_status = pin_error
             .as_ref()
             .map(|error| format!("Failed to update pinned sessions: {error}"));
-        let next_session = self
-            .projects
+        let next_session = self.client.projects
             .iter()
             .flat_map(|project| project.sessions.iter())
             .next()
@@ -2815,7 +2786,7 @@ impl AppState {
         if let Some((next_work_dir, next_session_id)) = next_session {
             let _ = self.select_session(next_work_dir, next_session_id);
             if let Some(error) = pin_error {
-                self.session_status = Some(format!("Failed to update pinned sessions: {error}"));
+                self.client.session_status = Some(format!("Failed to update pinned sessions: {error}"));
             }
         }
     }
@@ -2839,7 +2810,7 @@ impl AppState {
         if branch.is_empty() {
             return None;
         }
-        self.projects
+        self.client.projects
             .iter()
             .flat_map(|project| &project.sessions)
             .filter(|session| {
@@ -2850,8 +2821,8 @@ impl AppState {
                     }
             })
             .min_by_key(|session| {
-                let active = self.active_work_dir.as_ref() == Some(&session.work_dir)
-                    && self.active_session_id.as_deref() == Some(session.id.as_str());
+                let active = self.client.active_work_dir.as_ref() == Some(&session.work_dir)
+                    && self.client.active_session_id.as_deref() == Some(session.id.as_str());
                 (!session.worktree_available, !active)
             })
     }
@@ -2948,9 +2919,9 @@ impl AppState {
             {
                 return None;
             }
-            if self.active_session_id.as_deref() == Some(&session_id) {
-                self.is_generating = true;
-                self.session_status = Some("Working…".into());
+            if self.client.active_session_id.as_deref() == Some(&session_id) {
+                self.client.is_generating = true;
+                self.client.session_status = Some("Working…".into());
             }
         }
         self.pr_review_tracking
@@ -2960,7 +2931,7 @@ impl AppState {
                 tracing::warn!("failed to persist PR review tracking: {error}");
             }
         }
-        let echo_id = format!("pr-review-{session_id}-{}", self.messages.len());
+        let echo_id = format!("pr-review-{session_id}-{}", self.client.messages.len());
         self.push_optimistic_follow_up(&session_id, prompt.clone(), echo_id);
         Some(prompt)
     }
@@ -2992,8 +2963,8 @@ impl AppState {
         }
         let work_dir = session.work_dir.clone();
         let session_id = session.id.clone();
-        if self.active_work_dir.as_ref() != Some(&work_dir)
-            || self.active_session_id.as_deref() != Some(session_id.as_str())
+        if self.client.active_work_dir.as_ref() != Some(&work_dir)
+            || self.client.active_session_id.as_deref() != Some(session_id.as_str())
         {
             self.select_session(work_dir.clone(), session_id);
         }
@@ -3027,8 +2998,8 @@ impl AppState {
         }
         let runtime = self.daemon_core.runtime_for_file(&session.session_file);
         let runtime_status = runtime.as_ref().map(|runtime| runtime.status());
-        let is_active = self.active_work_dir.as_ref() == Some(&session.work_dir)
-            && self.active_session_id.as_deref() == Some(session.id.as_str());
+        let is_active = self.client.active_work_dir.as_ref() == Some(&session.work_dir)
+            && self.client.active_session_id.as_deref() == Some(session.id.as_str());
         let git_status = self
             .git_statuses
             .get(&session.runtime_work_dir)
@@ -3090,19 +3061,19 @@ impl AppState {
                 })
             });
         derive_session_attention(
-            self.pending_permissions.contains_key(&session.id)
-                || self.pending_questions.contains_key(&session.id)
+            self.client.pending_permissions.contains_key(&session.id)
+                || self.client.pending_questions.contains_key(&session.id)
                 || deferred_failure,
             &session.health,
             runtime_status.as_ref(),
             runtime.is_some_and(|runtime| runtime.is_generating())
-                || (is_active && self.is_generating),
+                || (is_active && self.client.is_generating),
             ready_work,
         )
     }
 
     pub(crate) fn toggle_project_expanded(&mut self, work_dir: &Path) {
-        if let Some(proj) = self.projects.iter_mut().find(|p| p.work_dir == work_dir) {
+        if let Some(proj) = self.client.projects.iter_mut().find(|p| p.work_dir == work_dir) {
             proj.is_expanded = !proj.is_expanded;
         }
     }
@@ -3150,8 +3121,7 @@ impl AppState {
                 self.load_pinned_sessions(&session.work_dir);
             }
         }
-        if let Some(project) = self
-            .projects
+        if let Some(project) = self.client.projects
             .iter_mut()
             .find(|project| project.work_dir == canonical)
         {
@@ -3159,7 +3129,7 @@ impl AppState {
             project.sessions = discovered_sessions;
             project.is_expanded = true;
         } else {
-            self.projects.push(ProjectInfo {
+            self.client.projects.push(ProjectInfo {
                 name: record.name,
                 sessions: discovered_sessions,
                 work_dir: canonical.clone(),
@@ -3171,13 +3141,13 @@ impl AppState {
         if let Some(session_id) = session_to_restore {
             self.select_session(canonical, session_id);
         } else {
-            self.active_work_dir = Some(canonical);
-            self.active_session_id = None;
+            self.client.active_work_dir = Some(canonical);
+            self.client.active_session_id = None;
             self.is_new_task = true;
-            self.messages = Arc::new(Vec::new());
-            self.active_plan = SessionPlan::default();
-            self.is_generating = false;
-            self.session_status = None;
+            self.client.messages = Arc::new(Vec::new());
+            self.client.active_plan = SessionPlan::default();
+            self.client.is_generating = false;
+            self.client.session_status = None;
             self.refresh_available_models();
             self.refresh_orchestrator_mode();
         }
@@ -3185,7 +3155,7 @@ impl AppState {
     }
 
     pub fn active_worktree_setup(&self) -> Option<&crate::worktree_setup::WorktreeSetup> {
-        self.active_session_id
+        self.client.active_session_id
             .as_ref()
             .and_then(|id| self.worktree_setups.get(id))
     }
@@ -3196,8 +3166,7 @@ impl AppState {
         images: Vec<ImageAttachment>,
     ) -> Result<(), String> {
         use crate::worktree_setup::{SetupStage, WorktreeSetup};
-        let project = self
-            .active_work_dir
+        let project = self.client.active_work_dir
             .clone()
             .ok_or("Select a project first")?;
         let base = self
@@ -3251,7 +3220,7 @@ impl AppState {
             );
             crate::worktree_setup::start(setup.clone(), options, self.stream_tx.clone())?;
         }
-        if let Some(info) = self.projects.iter_mut().find(|p| p.work_dir == project) {
+        if let Some(info) = self.client.projects.iter_mut().find(|p| p.work_dir == project) {
             info.sessions.insert(
                 0,
                 SessionInfo {
@@ -3295,7 +3264,7 @@ impl AppState {
                 setup: setup.clone(),
             });
             self.worktree_setups.insert(setup.session_id.clone(), setup);
-            self.is_generating = true;
+            self.client.is_generating = true;
             return;
         }
         let options = coding_agent_options(
@@ -3308,9 +3277,9 @@ impl AppState {
         match crate::worktree_setup::start(setup.clone(), options, self.stream_tx.clone()) {
             Ok(()) => {
                 self.worktree_setups.insert(setup.session_id.clone(), setup);
-                self.is_generating = true;
+                self.client.is_generating = true;
             }
-            Err(error) => self.session_status = Some(error),
+            Err(error) => self.client.session_status = Some(error),
         }
     }
 
@@ -3319,8 +3288,7 @@ impl AppState {
         self.worktree_setups.remove(&setup.session_id);
         match crate::worktree_setup::cleanup_cancelled(setup) {
             Ok(()) => {
-                if let Some(project) = self
-                    .projects
+                if let Some(project) = self.client.projects
                     .iter_mut()
                     .find(|p| p.work_dir == setup.project)
                 {
@@ -3328,7 +3296,7 @@ impl AppState {
                 }
             }
             Err(error) => {
-                self.session_status = Some(format!("Could not clean up cancelled setup: {error}"));
+                self.client.session_status = Some(format!("Could not clean up cancelled setup: {error}"));
             }
         }
         self.request_session_refresh(&setup.project);
@@ -3342,21 +3310,20 @@ impl AppState {
         let Some(setup) = self.worktree_setups.get(id).cloned() else {
             return;
         };
-        let active = self.active_session_id.as_deref() == Some(id);
+        let active = self.client.active_session_id.as_deref() == Some(id);
         if setup.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             drop(result);
             // Free the runtime parked by the producer before it was claimed.
             let _ = crate::runtimes::take_prepared_runtime(id);
             if active {
-                self.is_generating = false;
-                self.session_status = Some("Worktree setup cancelled".into());
+                self.client.is_generating = false;
+                self.client.session_status = Some("Worktree setup cancelled".into());
             }
             self.cleanup_cancelled_worktree(&setup);
             return;
         }
         let result = result.and_then(|session| {
-            if let Some(project) = self
-                .projects
+            if let Some(project) = self.client.projects
                 .iter_mut()
                 .find(|p| p.work_dir == setup.project)
             {
@@ -3401,8 +3368,8 @@ impl AppState {
                 crate::worktree_setup::clear_request(&setup);
                 self.worktree_setups.remove(id);
                 if active {
-                    self.is_generating = true;
-                    self.session_status = Some("Working…".into());
+                    self.client.is_generating = true;
+                    self.client.session_status = Some("Working…".into());
                 }
                 self.request_session_refresh(&setup.project);
             }
@@ -3411,15 +3378,15 @@ impl AppState {
                     setup.error = Some(error);
                 }
                 if active {
-                    self.is_generating = false;
-                    self.session_status = None;
+                    self.client.is_generating = false;
+                    self.client.session_status = None;
                 }
             }
         }
     }
 
     fn create_new_session(&mut self) -> Result<String, String> {
-        let Some(work_dir) = self.active_work_dir.clone() else {
+        let Some(work_dir) = self.client.active_work_dir.clone() else {
             return Err("No active project directory".into());
         };
         let sessions_dir = work_dir.join(".threadlane/sessions");
@@ -3445,8 +3412,7 @@ impl AppState {
 
         let sessions = discover_sessions_in_project(&work_dir);
         self.baseline_session_seen(&sessions);
-        if let Some(project) = self
-            .projects
+        if let Some(project) = self.client.projects
             .iter_mut()
             .find(|project| project.work_dir == work_dir)
         {
@@ -3537,8 +3503,7 @@ impl AppState {
         {
             return Err("GitHub issue work requires an initial commit".into());
         }
-        if !self
-            .projects
+        if !self.client.projects
             .iter()
             .any(|project| project.work_dir == work_dir)
         {
@@ -3631,8 +3596,7 @@ impl AppState {
 
         let sessions = discover_sessions_in_project(&work_dir);
         self.baseline_session_seen(&sessions);
-        if let Some(project) = self
-            .projects
+        if let Some(project) = self.client.projects
             .iter_mut()
             .find(|project| project.work_dir == work_dir)
         {
@@ -3677,8 +3641,7 @@ impl AppState {
             }
             let sessions = discover_sessions_in_project(&work_dir);
             self.baseline_session_seen(&sessions);
-            if let Some(project) = self
-                .projects
+            if let Some(project) = self.client.projects
                 .iter_mut()
                 .find(|project| project.work_dir == work_dir)
             {
@@ -3711,17 +3674,17 @@ impl AppState {
         self.subagents_by_session
             .insert(key.clone(), result.subagents);
         self.trajectory_revision = self.trajectory_revision.wrapping_add(1);
-        self.session_metrics.insert(key.clone(), result.metrics);
+        self.client.session_metrics.insert(key.clone(), result.metrics);
         if let Some(token_efficiency) = result.token_efficiency {
             self.token_efficiency_by_session
                 .insert(key.clone(), token_efficiency);
         }
         if let Some(context_window) = result.context_window {
-            self.context_windows.insert(key.clone(), context_window);
+            self.client.context_windows.insert(key.clone(), context_window);
         } else {
-            self.context_windows.remove(&key);
+            self.client.context_windows.remove(&key);
         }
-        self.session_token_usage.insert(key, result.token_usage);
+        self.client.session_token_usage.insert(key, result.token_usage);
         Ok(())
     }
 
@@ -3745,12 +3708,11 @@ impl AppState {
             // that initial, still-empty projection is applied. Once the
             // durable transcript contains the prompt, the pending row is
             // naturally replaced by the persisted message.
-            let optimistic_messages: Vec<_> = self
-                .messages
+            let optimistic_messages: Vec<_> = self.client.messages
                 .iter()
                 .filter(|message| {
                     ((message.id.starts_with("pending-user-") && message.role == MessageRole::User)
-                        || (self.is_generating
+                        || (self.client.is_generating
                             && message.id.starts_with("streaming-")
                             && message.role == MessageRole::Assistant))
                         && !messages.iter().any(|hydrated| {
@@ -3760,7 +3722,7 @@ impl AppState {
                 .cloned()
                 .collect();
             messages.extend(optimistic_messages);
-            self.messages = Arc::new(messages);
+            self.client.messages = Arc::new(messages);
             // Only a successfully applied load may carry its captured token —
             // failed loads retain the marker, and the later full projection
             // can never acknowledge a newer token it observed afterward.
@@ -3848,7 +3810,7 @@ impl AppState {
             return;
         }
         let key = Self::projection_key(session_id, session_file);
-        self.active_plan = result.plan;
+        self.client.active_plan = result.plan;
         self.apply_run_timing(&key, result.run_timing);
         // Hydration snapshots lag live execution: the file is parsed in the
         // background while tool/subagent events keep arriving, and deferred
@@ -3882,17 +3844,17 @@ impl AppState {
             self.diagnostics_by_session.insert(key.clone(), diagnostics);
             self.diagnostics_revision = self.diagnostics_revision.wrapping_add(1);
         }
-        self.session_metrics.insert(key.clone(), result.metrics);
+        self.client.session_metrics.insert(key.clone(), result.metrics);
         if let Some(token_efficiency) = result.token_efficiency {
             self.token_efficiency_by_session
                 .insert(key.clone(), token_efficiency);
         }
         if let Some(context_window) = result.context_window {
-            self.context_windows.insert(key.clone(), context_window);
+            self.client.context_windows.insert(key.clone(), context_window);
         } else {
-            self.context_windows.remove(&key);
+            self.client.context_windows.remove(&key);
         }
-        self.session_token_usage.insert(key, result.token_usage);
+        self.client.session_token_usage.insert(key, result.token_usage);
     }
 
     /// Applies a daemon wire snapshot (attach mid-run: snapshot first, live
@@ -4485,8 +4447,7 @@ impl AppState {
     }
 
     pub fn session_trajectory(&self, session_id: &str) -> &[TrajectoryEntry] {
-        let key = self
-            .active_work_dir
+        let key = self.client.active_work_dir
             .as_deref()
             .map(|work_dir| self.session_projection_key(work_dir, session_id));
         key.as_ref()
@@ -4509,7 +4470,7 @@ impl AppState {
 
     pub fn active_session_metrics(&self) -> SessionMetricsInfo {
         self.active_session_projection_key()
-            .and_then(|key| self.session_metrics.get(&key))
+            .and_then(|key| self.client.session_metrics.get(&key))
             .cloned()
             .unwrap_or_default()
     }
@@ -4529,7 +4490,7 @@ impl AppState {
             return;
         }
         if self.daemon_remote {
-            if let Some(session_id) = self.active_session_id.clone() {
+            if let Some(session_id) = self.client.active_session_id.clone() {
                 self.dispatch_command(SessionCommand::LoadAcpConfigOptions { session_id });
             }
             return;
@@ -4549,12 +4510,12 @@ impl AppState {
     /// Applies one of the selected external agent's settings.
     pub(crate) fn set_acp_config_option(&mut self, config_id: String, value: String) {
         if self.active_worktree_setup().is_some() {
-            self.session_status =
+            self.client.session_status =
                 Some("Cancel worktree setup before changing agent settings".into());
             return;
         }
         if self.daemon_remote {
-            if let Some(session_id) = self.active_session_id.clone() {
+            if let Some(session_id) = self.client.active_session_id.clone() {
                 self.dispatch_command(SessionCommand::SetAcpConfigOption {
                     session_id,
                     config_id,
@@ -4572,7 +4533,7 @@ impl AppState {
             let Some(agent_id) =
                 threadlane_acp_engine::acp_agent_id(&self.selected_model).map(str::to_string)
             else {
-                self.session_status = Some("Open a session before changing agent settings".into());
+                self.client.session_status = Some("Open a session before changing agent settings".into());
                 return;
             };
             // Refuse values the agent does not offer when the cache knows
@@ -4584,7 +4545,7 @@ impl AppState {
                     .find(|option| option.id == config_id)
                     .is_some_and(|option| option.has_choice(&value));
                 if !known {
-                    self.session_status = Some(format!("This agent does not offer '{value}'"));
+                    self.client.session_status = Some(format!("This agent does not offer '{value}'"));
                     return;
                 }
             }
@@ -4592,12 +4553,11 @@ impl AppState {
                 .entry(agent_id)
                 .or_default()
                 .insert(config_id, value);
-            if self
-                .session_status
+            if self.client.session_status
                 .as_deref()
                 .is_some_and(|status| status == "Open a session before changing agent settings")
             {
-                self.session_status = None;
+                self.client.session_status = None;
             }
             return;
         };
@@ -4610,7 +4570,7 @@ impl AppState {
             value.clone(),
             self.stream_tx.clone(),
         ) {
-            self.session_status = Some(error);
+            self.client.session_status = Some(error);
             return;
         }
         // A live session now owns the setting; drop any New-task pending for
@@ -4643,8 +4603,8 @@ impl AppState {
         if self.active_worktree_setup().is_some() {
             return None;
         }
-        let work_dir = self.active_work_dir.clone()?;
-        let session_id = self.active_session_id.clone()?;
+        let work_dir = self.client.active_work_dir.clone()?;
+        let session_id = self.client.active_session_id.clone()?;
         let session_file = self.session_file(&work_dir, &session_id);
         let runtime_work_dir = self.session_runtime_work_dir(&work_dir, &session_id);
         let runtime = self.ensure_session_runtime(runtime_work_dir, session_file);
@@ -4693,7 +4653,7 @@ impl AppState {
 
     pub fn active_context_window(&self) -> Option<&ContextWindowInfo> {
         self.active_session_projection_key()
-            .and_then(|key| self.context_windows.get(&key))
+            .and_then(|key| self.client.context_windows.get(&key))
     }
 
     pub fn active_run_elapsed_seconds(&self) -> Option<u64> {
@@ -4701,14 +4661,14 @@ impl AppState {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?;
-        self.run_timings
+        self.client.run_timings
             .get(&key)?
-            .elapsed_seconds(u64::try_from(now.as_millis()).ok()?, self.is_generating)
+            .elapsed_seconds(u64::try_from(now.as_millis()).ok()?, self.client.is_generating)
     }
 
     fn apply_run_timing(&mut self, key: &SessionProjectionKey, timing: Option<RunTiming>) {
         let Some(mut timing) = timing else { return };
-        if let Some(current) = self.run_timings.get(key) {
+        if let Some(current) = self.client.run_timings.get(key) {
             if timing.source_seq < current.source_seq {
                 return;
             }
@@ -4716,7 +4676,7 @@ impl AppState {
             // after the user has submitted another prompt.
             timing.suppressed = current.suppressed && timing.start_seq <= current.start_seq;
         }
-        self.run_timings.insert(key.clone(), timing);
+        self.client.run_timings.insert(key.clone(), timing);
     }
 
     /// Applies a durable runtime event to the session projection.
@@ -4785,7 +4745,7 @@ impl AppState {
                     }
                     if !self.session_seen_save_failed {
                         self.session_seen_save_failed = true;
-                        self.session_status = Some(
+                        self.client.session_status = Some(
                             "Could not save read state — the New result marker may return after restart."
                                 .into(),
                         );
@@ -4810,8 +4770,7 @@ impl AppState {
         for session_file in scheduler_files {
             if let Some(receiver) = self.scheduler_results.get_mut(&session_file) {
                 while let Ok(update) = receiver.try_recv() {
-                    let session_id = self
-                        .projects
+                    let session_id = self.client.projects
                         .iter()
                         .flat_map(|project| project.sessions.iter())
                         .find(|session| session.session_file == session_file)
@@ -4836,7 +4795,7 @@ impl AppState {
                 }
             }
         }
-        let active_session_id = self.active_session_id.clone();
+        let active_session_id = self.client.active_session_id.clone();
         let deferred = active_session_id
             .as_ref()
             .and_then(|session_id| self.deferred_stream_events.remove(session_id))
@@ -4847,7 +4806,7 @@ impl AppState {
         for event in deferred.chain(events) {
             match event {
                 SessionEvent::WorktreeBases { project, result } => {
-                    if self.is_new_task && self.active_work_dir.as_ref() == Some(&project) {
+                    if self.is_new_task && self.client.active_work_dir.as_ref() == Some(&project) {
                         match result {
                             Ok((default, branches)) => {
                                 if !self
@@ -4860,7 +4819,7 @@ impl AppState {
                                 self.draft_worktree_bases = branches;
                             }
                             Err(error) => {
-                                self.session_status =
+                                self.client.session_status =
                                     Some(format!("Could not load base branches: {error}"))
                             }
                         }
@@ -4885,7 +4844,7 @@ impl AppState {
                     changed = true;
                 }
                 SessionEvent::Agent { session_id, event }
-                    if self.active_session_id.as_deref() == Some(&session_id) =>
+                    if self.client.active_session_id.as_deref() == Some(&session_id) =>
                 {
                     if matches!(&event, AgentEvent::AgentStart) {
                         if let Some(key) = self.active_session_projection_key() {
@@ -4897,22 +4856,13 @@ impl AppState {
                             });
                         }
                     }
-                    if matches!(&event, AgentEvent::TurnStart { .. }) {
-                        if let Some(message) = self
-                            .messages_mut()
-                            .last_mut()
-                            .filter(|message| message.role == MessageRole::Assistant)
-                        {
-                            message.streaming = false;
-                        }
-                    }
                     self.record_trajectory(&session_id, &event);
                     self.record_subagent_activity(&event);
                     // Metrics are best-effort: an event without a projection
                     // key (session switched mid-pump) still flows through
                     // the updates below, it just skips usage accounting.
                     if let Some(key) = self.active_session_projection_key() {
-                        let metrics = self.session_metrics.entry(key.clone()).or_default();
+                        let metrics = self.client.session_metrics.entry(key.clone()).or_default();
                         match &event {
                             AgentEvent::AgentStart | AgentEvent::SubagentStarted { .. } => {
                                 metrics.turns = metrics.turns.saturating_add(1)
@@ -4930,199 +4880,7 @@ impl AppState {
                             _ => {}
                         }
                     }
-                    match adapt_agent_event(event) {
-                        ChatAgentUpdate::TextDelta(delta) => {
-                            changed = true;
-                            if let Some(message) =
-                                self.messages_mut().last_mut().filter(|message| {
-                                    let id = message.id.as_str();
-                                    let stream_id = id.strip_prefix("streaming-");
-                                    message.role == MessageRole::Assistant
-                                        && stream_id.is_some_and(|stream_id| {
-                                            stream_id
-                                                .strip_prefix(session_id.as_str())
-                                                .is_some_and(|suffix| suffix.starts_with('-'))
-                                        })
-                                        && message.tool_activities.is_empty()
-                                })
-                            {
-                                message.content.push_str(&delta);
-                            } else {
-                                let new_len = self.messages.len();
-                                self.messages_mut().push(ChatMessageInfo {
-                                    id: format!("streaming-{session_id}-{new_len}"),
-                                    role: MessageRole::Assistant,
-                                    content: delta,
-                                    tool_activities: Vec::new(),
-                                    streaming: true,
-                                    reasoning_content: None,
-                                    reasoning_expanded: false,
-                                });
-                            }
-                        }
-                        ChatAgentUpdate::ReasoningDelta(delta) => {
-                            changed = true;
-                            if let Some(message) = self
-                                .messages_mut()
-                                .last_mut()
-                                .filter(|m| m.role == MessageRole::Assistant && m.streaming)
-                            {
-                                match &mut message.reasoning_content {
-                                    Some(content) => content.push_str(&delta),
-                                    None => message.reasoning_content = Some(delta),
-                                }
-                            } else {
-                                let segment = self.messages.len();
-                                self.messages_mut().push(ChatMessageInfo {
-                                    id: format!("streaming-{session_id}-{segment}"),
-                                    role: MessageRole::Assistant,
-                                    content: String::new(),
-                                    tool_activities: Vec::new(),
-                                    streaming: true,
-                                    reasoning_content: Some(delta),
-                                    reasoning_expanded: false,
-                                });
-                            }
-                        }
-                        ChatAgentUpdate::ToolStarted {
-                            tool_call_id,
-                            name,
-                            arguments,
-                        } => {
-                            changed = true;
-                            let summary = tool_activity_summary(&name, &arguments);
-                            let display_summary = tool_activity_display_summary(&summary);
-                            let activity = ToolActivityInfo {
-                                id: tool_call_id,
-                                category: "Working".into(),
-                                display_summary,
-                                title: name,
-                                detail: arguments.clone(),
-                                arguments,
-                                is_expanded: false,
-                            };
-                            if let Some(message) =
-                                self.messages_mut().last_mut().filter(|message| {
-                                    message.role == MessageRole::Assistant
-                                        && message.content.is_empty()
-                                })
-                            {
-                                message.tool_activities.push(activity);
-                            } else {
-                                let new_len = self.messages.len();
-                                self.messages_mut().push(ChatMessageInfo {
-                                    id: format!("streaming-{session_id}-{new_len}"),
-                                    role: MessageRole::Assistant,
-                                    content: String::new(),
-                                    tool_activities: vec![activity],
-                                    streaming: true,
-                                    reasoning_content: None,
-                                    reasoning_expanded: false,
-                                });
-                            }
-                        }
-                        ChatAgentUpdate::ToolUpdated {
-                            tool_call_id,
-                            partial_result,
-                        } => {
-                            changed = true;
-                            if let Some(activity) = self
-                                .messages_mut()
-                                .iter_mut()
-                                .rev()
-                                .flat_map(|message| message.tool_activities.iter_mut().rev())
-                                .find(|activity| activity.id == tool_call_id)
-                            {
-                                activity.detail = partial_result;
-                            }
-                        }
-                        ChatAgentUpdate::ToolFinished {
-                            tool_call_id,
-                            content,
-                            is_error,
-                        } => {
-                            changed = true;
-                            if let Some(activity) = self
-                                .messages_mut()
-                                .iter_mut()
-                                .rev()
-                                .flat_map(|message| message.tool_activities.iter_mut().rev())
-                                .find(|activity| activity.id == tool_call_id)
-                            {
-                                activity.category = if is_error {
-                                    "Error".into()
-                                } else {
-                                    "Completed".into()
-                                };
-                                activity.detail = content;
-                            }
-                        }
-                        ChatAgentUpdate::PlanUpdated(plan) => {
-                            changed = true;
-                            self.active_plan = plan;
-                        }
-                        ChatAgentUpdate::Usage(usage) => {
-                            // Best-effort like the metrics above: usage
-                            // without a projection key is dropped, never
-                            // panicked on.
-                            if let Some(key) = self.active_session_projection_key() {
-                                let entry =
-                                    self.session_token_usage.entry(key.clone()).or_default();
-                                entry.accumulate(&usage);
-                            }
-                        }
-                        ChatAgentUpdate::PermissionRequested(request) => {
-                            changed = true;
-                            self.pending_permissions.insert(session_id.clone(), request);
-                        }
-                        ChatAgentUpdate::QuestionRequested(request) => {
-                            changed = true;
-                            let summary = request
-                                .questions
-                                .iter()
-                                .map(|item| {
-                                    let options = if item.options.is_empty() {
-                                        String::new()
-                                    } else {
-                                        format!(" [{}]", item.options.join(" / "))
-                                    };
-                                    format!("• {}: {}{}", item.header, item.question, options)
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            self.messages_mut().push(ChatMessageInfo {
-                                id: format!("question-notice-{}", request.id),
-                                role: MessageRole::System,
-                                content: format!(
-                                    "The model asked a question — answer it below so the run can continue.\n{summary}"
-                                ),
-                                tool_activities: Vec::new(),
-                                streaming: false,
-                                reasoning_content: None,
-                                reasoning_expanded: false,
-                            });
-                            // Keep the request pending until the user answers
-                            // or dismisses it in the question card. Never
-                            // auto-resolve: the turn must block on the answer.
-                            self.pending_questions
-                                .insert(session_id.clone(), request.clone());
-                        }
-                        ChatAgentUpdate::Error(error) => {
-                            changed = true;
-                            self.messages_mut().push(ChatMessageInfo {
-                                id: format!("stream-error-{session_id}"),
-                                role: MessageRole::Error,
-                                content: error.clone(),
-                                tool_activities: Vec::new(),
-                                streaming: false,
-                                reasoning_content: None,
-                                reasoning_expanded: false,
-                            });
-                            self.is_generating = false;
-                            self.session_status = Some(error);
-                        }
-                        ChatAgentUpdate::Ignore => {}
-                    }
+                    changed |= self.client.apply_agent_event(&session_id, event);
                 }
                 SessionEvent::Scheduled {
                     session_id,
@@ -5151,14 +4909,14 @@ impl AppState {
                         continue;
                     }
                     changed = true;
-                    self.is_generating = false;
+                    self.client.is_generating = false;
                     let successful = !matches!(&result, Some(Err(_)));
                     let (role, content) = match result {
                         Some(Ok(content)) => (MessageRole::Assistant, content),
                         Some(Err(error)) => (MessageRole::Error, error),
                         None => (MessageRole::System, "Scheduled work completed".into()),
                     };
-                    let message_id = format!("scheduled-{}", self.messages.len());
+                    let message_id = format!("scheduled-{}", self.client.messages.len());
                     let status = if role == MessageRole::Error {
                         content.clone()
                     } else {
@@ -5173,7 +4931,7 @@ impl AppState {
                         reasoning_content: None,
                         reasoning_expanded: false,
                     });
-                    self.session_status = Some(status);
+                    self.client.session_status = Some(status);
                     // A successful scheduled completion must also capture its
                     // presented-completion token via a real transcript load;
                     // the inline append above cannot acknowledge the marker.
@@ -5193,9 +4951,10 @@ impl AppState {
                     session_id,
                     session_file,
                 } => {
-                    self.pending_permissions.remove(&session_id);
-                    self.pending_questions.remove(&session_id);
-                    if self.active_session_id.as_deref() != Some(&session_id) {
+                    self.client.pending_permissions.remove(&session_id);
+                    self.client.pending_questions.remove(&session_id);
+                    self.client.queued_questions.remove(&session_id);
+                    if self.client.active_session_id.as_deref() != Some(&session_id) {
                         changed = true;
                         // A background completion must still reach the
                         // sidebar's New result marker; the deferred event
@@ -5213,7 +4972,7 @@ impl AppState {
                         continue;
                     }
                     changed = true;
-                    self.is_generating = false;
+                    self.client.is_generating = false;
                     if let Some(subagents) = self.active_subagents_mut() {
                         for subagent in subagents.iter_mut().filter(|subagent| {
                             matches!(
@@ -5231,7 +4990,7 @@ impl AppState {
                             }
                         }
                     }
-                    self.session_status = Some("Reconciling session…".into());
+                    self.client.session_status = Some("Reconciling session…".into());
                     self.pending_hydrations.push(SessionHydrationRequest {
                         session_id: session_id.clone(),
                         session_file: session_file.clone(),
@@ -5290,7 +5049,7 @@ impl AppState {
                                 .insert(config_id, value);
                         }
                         if is_active {
-                            self.session_status = Some(error);
+                            self.client.session_status = Some(error);
                             changed = true;
                         }
                         continue;
@@ -5318,7 +5077,7 @@ impl AppState {
                     {
                         self.request_session_refresh(work_dir);
                     }
-                    if self.active_session_id.as_deref() == Some(&session_id) {
+                    if self.client.active_session_id.as_deref() == Some(&session_id) {
                         changed = true;
                         self.refresh_active_session();
                     }
@@ -5326,7 +5085,7 @@ impl AppState {
                 SessionEvent::Agent { session_id, event } => {
                     match &event {
                         AgentEvent::PermissionRequested { request } => {
-                            self.pending_permissions
+                            self.client.pending_permissions
                                 .insert(session_id.clone(), request.clone());
                             changed = true;
                         }
@@ -5387,13 +5146,13 @@ impl AppState {
                                         &pending.session_id,
                                         &pending.entry_id,
                                     );
-                                    self.session_status =
+                                    self.client.session_status =
                                         Some(error.clone());
                                 } else {
                                     // The echo was never removed — the
                                     // row still truthfully shows the
                                     // entry as queued.
-                                    self.session_status = Some(format!(
+                                    self.client.session_status = Some(format!(
                                         "Could not remove queued message: {error}"
                                     ));
                                 }
@@ -5445,7 +5204,7 @@ impl AppState {
                     tracing::warn!("daemon error: {message}");
                     // Dispatch failures surface here — the command path has
                     // no return channel on the wire.
-                    self.session_status = Some(format!("Daemon: {message}"));
+                    self.client.session_status = Some(format!("Daemon: {message}"));
                     changed = true;
                 }
                 SessionEvent::SessionRemoved {
@@ -5479,10 +5238,10 @@ impl AppState {
         // Bound de-duplication to requests and activities still observable in
         // state; completed/evicted activities must not leak one key forever.
         let mut visible = HashSet::new();
-        for id in self.pending_permissions.keys() {
+        for id in self.client.pending_permissions.keys() {
             visible.insert(format!("permission:{id}"));
         }
-        for message in self.messages.iter() {
+        for message in self.client.messages.iter() {
             for activity in message.tool_activities.iter() {
                 if activity.title.starts_with("computer_") {
                     visible.insert(format!("tool:{}", activity.id));
@@ -5491,7 +5250,7 @@ impl AppState {
         }
         self.mirror_seen.retain(|key| visible.contains(key));
 
-        for (id, request) in &self.pending_permissions {
+        for (id, request) in &self.client.pending_permissions {
             if request.capability == "computer"
                 && self.mirror_seen.insert(format!("permission:{id}"))
             {
@@ -5499,7 +5258,7 @@ impl AppState {
             }
         }
         let mut fresh = false;
-        for message in self.messages.iter() {
+        for message in self.client.messages.iter() {
             for activity in message.tool_activities.iter() {
                 if activity.title.starts_with("computer_")
                     && self.mirror_seen.insert(format!("tool:{}", activity.id))
@@ -5512,9 +5271,9 @@ impl AppState {
     }
 
     pub fn active_pending_composer_message(&self) -> Option<&str> {
-        self.active_session_id
+        self.client.active_session_id
             .as_ref()
-            .and_then(|session_id| self.pending_composer_messages.get(session_id))
+            .and_then(|session_id| self.client.pending_composer_messages.get(session_id))
             .map(|message| message.text.as_str())
     }
 
@@ -5527,14 +5286,13 @@ impl AppState {
         if text.is_empty() {
             return Ok(());
         }
-        let session_id = self
-            .active_session_id
+        let session_id = self.client.active_session_id
             .clone()
             .ok_or_else(|| "No active session".to_string())?;
-        if !self.is_generating {
+        if !self.client.is_generating {
             return Err("The session is no longer generating".into());
         }
-        self.pending_composer_messages
+        self.client.pending_composer_messages
             .insert(session_id, PendingComposerMessage { text, images });
         Ok(())
     }
@@ -5542,23 +5300,21 @@ impl AppState {
     pub(crate) fn queue_pending_message(&mut self) -> Result<(), String> {
         if self.daemon_remote {
             let (text, images, session_id) = {
-                let session_id = self
-                    .active_session_id
+                let session_id = self.client.active_session_id
                     .clone()
                     .ok_or_else(|| "No active session".to_string())?;
-                let pending = self
-                    .pending_composer_messages
+                let pending = self.client.pending_composer_messages
                     .get(&session_id)
                     .cloned()
                     .ok_or_else(|| "No pending composer message".to_string())?;
                 (pending.text, pending.images, session_id)
             };
-            self.pending_composer_messages.remove(&session_id);
+            self.client.pending_composer_messages.remove(&session_id);
             // The daemon queues a follow-up itself when the session is still
             // generating (SubmitPrompt's generating branch).
             self.dispatch_command(SessionCommand::SubmitPrompt {
                 session_id: session_id.clone(),
-                work_dir: self.active_work_dir.clone().unwrap_or_default(),
+                work_dir: self.client.active_work_dir.clone().unwrap_or_default(),
                 text: text.clone(),
                 images,
                 effort: Some(self.reasoning_effort),
@@ -5566,53 +5322,51 @@ impl AppState {
                 model: Some(self.selected_model.clone()),
             });
             self.push_optimistic_follow_up(&session_id, text, format!("queued-user-{session_id}"));
-            self.session_status = Some("Message queued…".into());
+            self.client.session_status = Some("Message queued…".into());
             return Ok(());
         }
         let (runtime, session_id, text, images) = self.pending_runtime_message()?;
         let entry_id = runtime
             .work_handle
             .try_queue_follow_up_with_images(text.clone(), images)?;
-        self.pending_composer_messages.remove(&session_id);
+        self.client.pending_composer_messages.remove(&session_id);
         let echo_id = format!("queued-user-{session_id}-{entry_id}");
         self.push_optimistic_follow_up(&session_id, text, echo_id);
-        self.session_status = Some("Message queued…".into());
+        self.client.session_status = Some("Message queued…".into());
         Ok(())
     }
 
     pub(crate) fn steer_pending_message(&mut self) -> Result<(), String> {
         if self.daemon_remote {
             let (text, images, session_id) = {
-                let session_id = self
-                    .active_session_id
+                let session_id = self.client.active_session_id
                     .clone()
                     .ok_or_else(|| "No active session".to_string())?;
-                let pending = self
-                    .pending_composer_messages
+                let pending = self.client.pending_composer_messages
                     .get(&session_id)
                     .cloned()
                     .ok_or_else(|| "No pending composer message".to_string())?;
                 (pending.text, pending.images, session_id)
             };
-            self.pending_composer_messages.remove(&session_id);
+            self.client.pending_composer_messages.remove(&session_id);
             self.dispatch_command(SessionCommand::SteerMessage {
                 session_id: session_id.clone(),
                 text: text.clone(),
                 images,
             });
-            let echo_id = format!("steered-user-{session_id}-{}", self.messages.len());
+            let echo_id = format!("steered-user-{session_id}-{}", self.client.messages.len());
             self.push_optimistic_follow_up(&session_id, text, echo_id);
-            self.session_status = Some("Steering current turn…".into());
+            self.client.session_status = Some("Steering current turn…".into());
             return Ok(());
         }
         let (runtime, session_id, text, images) = self.pending_runtime_message()?;
         runtime
             .work_handle
             .queue_steer_with_images(text.clone(), images)?;
-        self.pending_composer_messages.remove(&session_id);
-        let echo_id = format!("steered-user-{session_id}-{}", self.messages.len());
+        self.client.pending_composer_messages.remove(&session_id);
+        let echo_id = format!("steered-user-{session_id}-{}", self.client.messages.len());
         self.push_optimistic_follow_up(&session_id, text, echo_id);
-        self.session_status = Some("Steering current turn…".into());
+        self.client.session_status = Some("Steering current turn…".into());
         Ok(())
     }
 
@@ -5659,16 +5413,14 @@ impl AppState {
         restore: bool,
     ) -> Result<(String, Vec<ImageAttachment>), String> {
         if self.daemon_remote {
-            let session_id = self
-                .active_session_id
+            let session_id = self.client.active_session_id
                 .clone()
                 .ok_or_else(|| "No active session".to_string())?;
             let echo_id = format!("queued-user-{session_id}-{entry_id}");
             // The staged text comes back from the optimistic echo now; the
             // echo holds no images, so a restore asks the daemon's reply
             // for the full staged content.
-            let staged_text = self
-                .messages
+            let staged_text = self.client.messages
                 .iter()
                 .find(|message| message.id == echo_id)
                 .map(|message| message.content.clone())
@@ -5681,7 +5433,7 @@ impl AppState {
                     request_id,
                     PendingQueuedCancel {
                         session_id: session_id.clone(),
-                        work_dir: self.active_work_dir.clone(),
+                        work_dir: self.client.active_work_dir.clone(),
                         entry_id: entry_id.to_string(),
                         restore,
                         text_restored: restore && !staged_text.is_empty(),
@@ -5692,14 +5444,14 @@ impl AppState {
                     command: SessionCommand::CancelQueuedMessage {
                         session_id: session_id.clone(),
                         entry_id: entry_id.to_string(),
-                        work_dir: self.active_work_dir.clone(),
+                        work_dir: self.client.active_work_dir.clone(),
                     },
                 });
                 // The echo stays until the reply or the journaled
                 // cancellation confirms the entry left the queue —
                 // claiming removal first is how a daemon that never
                 // dispatched the command left the UI lying (issue #349).
-                self.session_status = Some("Removing queued message…".into());
+                self.client.session_status = Some("Removing queued message…".into());
                 return Ok((staged_text, Vec::new()));
             }
             // A pre-envelope daemon cannot decode a `CommandRequest` — the
@@ -5712,21 +5464,21 @@ impl AppState {
             self.dispatch_command(SessionCommand::CancelQueuedMessage {
                 session_id,
                 entry_id: entry_id.to_string(),
-                work_dir: self.active_work_dir.clone(),
+                work_dir: self.client.active_work_dir.clone(),
             });
             self.remove_queued_echo_by_id(&echo_id);
-            self.session_status = Some("Queued message removed".into());
+            self.client.session_status = Some("Queued message removed".into());
             return Ok((staged_text, Vec::new()));
         }
         let (runtime, session_id) = self.active_runtime()?;
         let staged = runtime.work_handle.cancel_queued_entry(entry_id)?;
         let echo_id = format!("queued-user-{session_id}-{entry_id}");
-        let mut messages = (*self.messages).clone();
+        let mut messages = (*self.client.messages).clone();
         if messages.iter().any(|message| message.id == echo_id) {
             messages.retain(|message| message.id != echo_id);
-            self.messages = messages.into();
+            self.client.messages = messages.into();
         }
-        self.session_status = Some("Queued message removed".into());
+        self.client.session_status = Some("Queued message removed".into());
         Ok(staged)
     }
 
@@ -5734,12 +5486,12 @@ impl AppState {
     /// is retained across a pending cancel so the queue only stops
     /// showing the entry once the daemon confirms it left.
     fn remove_queued_echo_by_id(&mut self, echo_id: &str) -> bool {
-        if !self.messages.iter().any(|message| message.id == echo_id) {
+        if !self.client.messages.iter().any(|message| message.id == echo_id) {
             return false;
         }
-        let mut messages = (*self.messages).clone();
+        let mut messages = (*self.client.messages).clone();
         messages.retain(|message| message.id != echo_id);
-        self.messages = messages.into();
+        self.client.messages = messages.into();
         true
     }
 
@@ -5795,7 +5547,7 @@ impl AppState {
                     work_dir: pending.work_dir,
                 });
         }
-        self.session_status = Some("Queued message removed".into());
+        self.client.session_status = Some("Queued message removed".into());
         changed = true;
         changed
     }
@@ -5804,8 +5556,7 @@ impl AppState {
     /// it reaches the model during the current turn instead of after it.
     pub fn steer_queued_message(&mut self, entry_id: &str) -> Result<(), String> {
         if self.daemon_remote {
-            let session_id = self
-                .active_session_id
+            let session_id = self.client.active_session_id
                 .clone()
                 .ok_or_else(|| "No active session".to_string())?;
             self.dispatch_command(SessionCommand::SteerQueuedMessage {
@@ -5813,39 +5564,37 @@ impl AppState {
                 entry_id: entry_id.to_string(),
             });
             let queued_id = format!("queued-user-{session_id}-{entry_id}");
-            let mut messages = (*self.messages).clone();
+            let mut messages = (*self.client.messages).clone();
             if let Some(message) = messages.iter_mut().find(|message| message.id == queued_id) {
                 message.id = format!("steered-user-{session_id}-{entry_id}");
-                self.messages = messages.into();
+                self.client.messages = messages.into();
             }
-            self.session_status = Some("Steering current turn…".into());
+            self.client.session_status = Some("Steering current turn…".into());
             return Ok(());
         }
         let (runtime, session_id) = self.active_runtime()?;
         runtime.work_handle.steer_queued_entry(entry_id)?;
         let queued_id = format!("queued-user-{session_id}-{entry_id}");
-        let mut messages = (*self.messages).clone();
+        let mut messages = (*self.client.messages).clone();
         if let Some(message) = messages.iter_mut().find(|message| message.id == queued_id) {
             message.id = format!("steered-user-{session_id}-{entry_id}");
-            self.messages = messages.into();
+            self.client.messages = messages.into();
         }
-        self.session_status = Some("Steering current turn…".into());
+        self.client.session_status = Some("Steering current turn…".into());
         Ok(())
     }
 
     pub(crate) fn dismiss_pending_message(&mut self) {
-        if let Some(session_id) = self.active_session_id.as_ref() {
-            self.pending_composer_messages.remove(session_id);
+        if let Some(session_id) = self.client.active_session_id.as_ref() {
+            self.client.pending_composer_messages.remove(session_id);
         }
     }
 
     fn active_runtime(&self) -> Result<(Arc<SessionRuntime>, String), String> {
-        let session_id = self
-            .active_session_id
+        let session_id = self.client.active_session_id
             .clone()
             .ok_or_else(|| "No active session".to_string())?;
-        let work_dir = self
-            .active_work_dir
+        let work_dir = self.client.active_work_dir
             .as_ref()
             .ok_or_else(|| "No active project".to_string())?;
         let session_file = self.session_file(work_dir, &session_id);
@@ -5860,8 +5609,7 @@ impl AppState {
         &self,
     ) -> Result<(Arc<SessionRuntime>, String, String, Vec<ImageAttachment>), String> {
         let (runtime, session_id) = self.active_runtime()?;
-        let pending = self
-            .pending_composer_messages
+        let pending = self.client.pending_composer_messages
             .get(&session_id)
             .cloned()
             .ok_or_else(|| "No pending composer message".to_string())?;
@@ -5875,15 +5623,15 @@ impl AppState {
     fn bind_queued_echo(&mut self, session_id: &str, entry_id: &str) {
         let pending_id = format!("queued-user-{session_id}");
         let bound_id = format!("queued-user-{session_id}-{entry_id}");
-        let mut messages = (*self.messages).clone();
+        let mut messages = (*self.client.messages).clone();
         if let Some(message) = messages.iter_mut().find(|message| message.id == pending_id) {
             message.id = bound_id;
-            self.messages = messages.into();
+            self.client.messages = messages.into();
         }
     }
 
     fn push_optimistic_follow_up(&mut self, session_id: &str, text: String, id: String) {
-        if self.active_session_id.as_deref() == Some(session_id) {
+        if self.client.active_session_id.as_deref() == Some(session_id) {
             self.messages_mut().push(ChatMessageInfo {
                 id,
                 role: MessageRole::User,
@@ -5913,15 +5661,15 @@ impl AppState {
         if self.active_worktree_setup().is_some() {
             return Err("Finish or cancel worktree setup before sending another message".into());
         }
-        if self.active_session_id.is_none() && self.draft_work_mode == WorkMode::Worktree {
+        if self.client.active_session_id.is_none() && self.draft_work_mode == WorkMode::Worktree {
             return self.start_worktree_task(text, images);
         }
-        if self.active_session_id.is_none() || self.active_work_dir.is_none() {
+        if self.client.active_session_id.is_none() || self.client.active_work_dir.is_none() {
             self.create_new_session()?;
         }
 
         let (work_dir, session_id) =
-            match (self.active_work_dir.clone(), self.active_session_id.clone()) {
+            match (self.client.active_work_dir.clone(), self.client.active_session_id.clone()) {
                 (Some(w), Some(s)) => (w, s),
                 _ => return Err("Failed to ensure active session".into()),
             };
@@ -6026,7 +5774,7 @@ impl AppState {
 
         // Present the accepted prompt immediately. CodingAgent owns durable
         // persistence; writing it directly here would duplicate it.
-        let new_len = self.messages.len();
+        let new_len = self.client.messages.len();
         self.messages_mut().push(ChatMessageInfo {
             id: format!("pending-user-{session_id}-{new_len}"),
             role: MessageRole::User,
@@ -6037,11 +5785,11 @@ impl AppState {
             reasoning_expanded: false,
         });
 
-        self.is_generating = true;
-        self.session_status = Some("Working…".into());
+        self.client.is_generating = true;
+        self.client.session_status = Some("Working…".into());
         if let Some(timing) = self
             .active_session_projection_key()
-            .and_then(|key| self.run_timings.get_mut(&key))
+            .and_then(|key| self.client.run_timings.get_mut(&key))
         {
             timing.suppressed = true;
         }
@@ -6053,7 +5801,7 @@ impl AppState {
     }
 
     pub(crate) fn cancel_generation(&mut self) -> Result<(), String> {
-        if let Some(id) = self.active_session_id.clone() {
+        if let Some(id) = self.client.active_session_id.clone() {
             if let Some(setup) = self.worktree_setups.remove(&id) {
                 if self.daemon_remote {
                     self.dispatch_command(SessionCommand::CancelWorktreeSetup {
@@ -6069,7 +5817,7 @@ impl AppState {
                 if setup.error.is_none() {
                     self.worktree_setups.insert(id, setup.clone());
                 }
-                self.is_generating = false;
+                self.client.is_generating = false;
                 self.begin_new_task();
                 self.draft_worktree_base = Some(setup.base.clone());
                 self.set_work_mode(WorkMode::Worktree);
@@ -6087,8 +5835,8 @@ impl AppState {
             }
         }
         let (Some(work_dir), Some(session_id)) = (
-            self.active_work_dir.as_ref(),
-            self.active_session_id.as_ref(),
+            self.client.active_work_dir.as_ref(),
+            self.client.active_session_id.as_ref(),
         ) else {
             return Ok(());
         };
@@ -6096,8 +5844,8 @@ impl AppState {
             self.dispatch_command(SessionCommand::CancelRun {
                 session_id: session_id.clone(),
             });
-            self.is_generating = false;
-            self.session_status = Some("Generation cancelled".into());
+            self.client.is_generating = false;
+            self.client.session_status = Some("Generation cancelled".into());
             return Ok(());
         }
         let session_file = self.session_file(work_dir, session_id);
@@ -6105,8 +5853,8 @@ impl AppState {
             return Ok(());
         };
         crate::chat::cancel_prompt(runtime, session_id.clone(), self.stream_tx.clone())?;
-        self.is_generating = false;
-        self.session_status = Some("Generation cancelled".into());
+        self.client.is_generating = false;
+        self.client.session_status = Some("Generation cancelled".into());
         Ok(())
     }
 }

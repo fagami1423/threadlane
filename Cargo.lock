@@ -8656,6 +8656,7 @@ dependencies = [
  "tempfile",
  "threadlane-acp",
  "threadlane-acp-engine",
+ "threadlane-client",
  "threadlane-coding-agent",
  "threadlane-computer",
  "threadlane-daemon",
@@ -8666,6 +8667,7 @@ dependencies = [
  "threadlane-tools",
  "threadlane-ui-editor",
  "threadlane-ui-mirror",
+ "threadlane-ui-session",
  "threadlane-ui-state",
  "threadlane-ui-theme",
  "tokio",
@@ -8759,6 +8761,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "threadlane-ui-session"
+version = "0.1.0"
+dependencies = [
+ "gpui-component",
+ "gpui-kit-assets",
+ "gpui-pre",
+ "threadlane-protocol",
+ "threadlane-ui-theme",
+]
+
+[[package]]
 name = "threadlane-ui-settings"
 version = "0.1.0"
 dependencies = [
@@ -8794,6 +8807,7 @@ dependencies = [
  "threadlane-daemon",
  "threadlane-git",
  "threadlane-ui-pairing",
+ "threadlane-ui-session",
  "threadlane-ui-state",
  "threadlane-ui-theme",
  "threadlane-updater",

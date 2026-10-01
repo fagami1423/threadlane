@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use gpui::{div, px, rems, App, Div, Hsla, Pixels, SharedString, Styled};
+use gpui::{px, App, Hsla, Pixels, SharedString};
 use gpui_component::{ActiveTheme, Theme, ThemeConfig, ThemeMode, ThemeRegistry};
 use serde::{Deserialize, Serialize};
 
@@ -19,23 +19,9 @@ pub const WINDOW_CONTROLS_CLEARANCE: Pixels = px(48.0);
 /// Shared reading width for user messages, relative to the interface font size.
 pub const USER_BUBBLE_MAX_WIDTH: f32 = 40.0;
 
-/// Product message styling shared by desktop and mobile. Callers own content,
-/// alignment, and interactions; this container only owns the bubble surface.
-pub fn user_message_bubble(cx: &App) -> Div {
-    let theme = cx.theme();
-    div()
-        .min_w_0()
-        .max_w(rems(USER_BUBBLE_MAX_WIDTH))
-        .px_4()
-        .py_3()
-        .rounded_2xl()
-        .rounded_br_md()
-        .border_1()
-        .border_color(theme.border.opacity(0.22))
-        .bg(theme.secondary.opacity(0.85))
-        .text_sm()
-        .text_color(theme.secondary_foreground)
-}
+/// Shared maximum reading widths for session surfaces, in rem.
+pub const CHAT_CONTENT_MAX_WIDTH: f32 = 48.0;
+pub const QUESTION_CARD_MAX_WIDTH: f32 = 32.0;
 
 /// Dimming scrim behind modal overlays (permission details, dialogs).
 /// Defined once here so every overlay dims identically in any theme.

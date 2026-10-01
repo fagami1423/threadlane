@@ -418,8 +418,8 @@ impl ChatListView {
     }
 
     fn active_prompt_rail_index(&self, entries: &[PromptLandmark]) -> Option<usize> {
-        let top = self.transcript_list_state.logical_scroll_top().item_ix;
-        if self.transcript_list_state.is_following_tail() {
+        let top = self.transcript.list.logical_scroll_top().item_ix;
+        if self.transcript.list.is_following_tail() {
             entries.len().checked_sub(1)
         } else {
             Some(
@@ -661,15 +661,15 @@ impl ChatListView {
         };
         self.sync_transcript_rows(messages, generating, false);
         let row = landmark.row_index;
-        if !matches!(self.transcript_rows.get(row),
-            Some(TranscriptRow::Message(index)) if self.transcript_messages[*index].id == landmark.message_id)
+        if !matches!(self.transcript.rows.get(row),
+            Some(TranscriptRow::Message(index)) if self.transcript.messages[*index].id == landmark.message_id)
         {
             return;
         }
         self.outline_selected_id = Some(landmark.message_id);
         self.initial_scroll_frames = 0;
-        self.transcript_list_state.pause_following_tail();
-        self.transcript_list_state.scroll_to(ListOffset {
+        self.transcript.list.pause_following_tail();
+        self.transcript.list.scroll_to(ListOffset {
             item_ix: row,
             offset_in_item: px(0.),
         });

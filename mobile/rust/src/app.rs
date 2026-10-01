@@ -15,21 +15,20 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
     marker::{Marker, MarkerContent, MarkerLoadingStyle},
-    text::TextView,
     ActiveTheme, Disableable, Icon, Sizable,
 };
 use gpui_kit_assets::__private as kit_icons;
 
-use threadlane_protocol::daemon::{
-    ChatMessageInfo, MessageRole, PermissionDecision, ProjectInfo, SessionCommand, SessionEvent,
-    SessionHealth, SessionInfo,
-};
-use threadlane_protocol::events::AgentEvent;
-use threadlane_protocol::interaction::{
-    PermissionRequest, PermissionScope, QuestionAnswer, QuestionItemAnswer, QuestionRequest,
-};
 use crate::client::{MobileDaemon, MobileEvent};
 use crate::preferences;
+use threadlane_client::ClientState;
+use threadlane_protocol::daemon::{
+    ChatMessageInfo, MessageRole, PermissionDecision, SessionCommand, SessionEvent, SessionHealth,
+    SessionInfo,
+};
+use threadlane_protocol::interaction::{
+    PermissionRequest, QuestionAnswer, QuestionItemAnswer, QuestionRequest,
+};
 
 /// Deep links delivered by `set_deep_link_handler` on the UIKit thread.
 /// The view drains this on a short timer — the handler runs outside GPUI
@@ -54,13 +53,11 @@ fn restore_pairing() -> Option<(String, String, String)> {
         preferences::get_string(PREF_HOST),
         preferences::get_string(PREF_PORT),
     ) {
-        (Some(host), Some(port)) if !host.is_empty() && !port.is_empty() => {
-            Some((
-                host,
-                port,
-                preferences::get_string(PREF_TOKEN).unwrap_or_default(),
-            ))
-        }
+        (Some(host), Some(port)) if !host.is_empty() && !port.is_empty() => Some((
+            host,
+            port,
+            preferences::get_string(PREF_TOKEN).unwrap_or_default(),
+        )),
         _ => None,
     }
 }
@@ -89,13 +86,6 @@ fn question_key(request_id: &str, item_id: &str) -> String {
     format!("{request_id}\0{item_id}")
 }
 
-/// Whether the transcript is scrolled to (within a few px of) the bottom —
-/// only then do incoming messages drag the view down.
-fn scroll_pinned_bottom(handle: &ScrollHandle) -> bool {
-    let max = handle.max_offset().y;
-    max <= px(1.) || handle.offset().y + max <= px(32.)
-}
-
 #[derive(Clone, Copy, PartialEq)]
 enum Screen {
     Connect,
@@ -111,20 +101,15 @@ struct ActiveSession {
     work_dir: std::path::PathBuf,
     /// Needed by `DeleteSession` to archive the transcript.
     session_file: std::path::PathBuf,
-    messages: Vec<ChatMessageInfo>,
-    permission: Option<PermissionRequest>,
     /// Queued question requests; the front entry is rendered.
-    questions: Vec<QuestionRequest>,
     /// Toggled options per question item id, for the front request.
     answers: HashMap<String, Vec<String>>,
-    working: bool,
-    status: Option<String>,
-    scroll: ScrollHandle,
+    transcript: threadlane_ui_session::transcript::TranscriptState,
     confirm_delete: bool,
 }
 
 impl ActiveSession {
-    fn new(info: &SessionInfo) -> Self {
+    fn new(info: &SessionInfo, window: &Window) -> Self {
         Self {
             id: info.id.clone(),
             title: if info.title.trim().is_empty() {
@@ -134,23 +119,16 @@ impl ActiveSession {
             },
             work_dir: info.runtime_work_dir.clone(),
             session_file: info.session_file.clone(),
-            messages: Vec::new(),
-            permission: None,
-            questions: Vec::new(),
             answers: HashMap::new(),
-            working: matches!(info.health, SessionHealth::Working),
-            status: None,
-            scroll: ScrollHandle::new(),
+            transcript: threadlane_ui_session::transcript::TranscriptState::new(window),
             confirm_delete: false,
         }
     }
+}
 
-    fn pop_question(&mut self) {
-        if !self.questions.is_empty() {
-            self.questions.remove(0);
-        }
-        self.answers.clear();
-    }
+enum MobileSessionRow {
+    Project(String),
+    Session(SessionInfo),
 }
 
 /// Root view. One `MobileDaemon` drives all traffic; `screen` picks the
@@ -160,7 +138,7 @@ pub struct MobileApp {
     host: Entity<InputState>,
     port: Entity<InputState>,
     token: Entity<InputState>,
-    composer: Entity<InputState>,
+    composer: Entity<gpui_kit::component::input::TextareaState>,
     /// One custom-answer input per `allow_custom` question item, keyed by
     /// `question_key(request.id, item.id)` and created lazily on render.
     /// The keyboard subscription rides along so it drops with the input.
@@ -168,20 +146,18 @@ pub struct MobileApp {
     connect_error: Option<String>,
     /// Whether a persisted pairing exists — drives the Forget button.
     saved_pairing: bool,
+    sending: bool,
     daemon: Option<MobileDaemon>,
     /// Human-readable link state shown in the sessions header.
     link_state: String,
     /// Deep links already consumed, so reconnect flows don't re-apply them.
     seen_links: Vec<String>,
-    projects: Vec<ProjectInfo>,
+    client: ClientState,
+    markdown_states:
+        HashMap<(SharedString, String), threadlane_ui_session::markdown::MarkdownRenderState>,
     active: Option<ActiveSession>,
-    /// Pending permission requests keyed by session id — the wire has no
-    /// pending-permission field in `SessionSnapshot`, so requests that
-    /// arrive while another screen is shown must be retained here.
-    pending_permissions: HashMap<String, PermissionRequest>,
-    /// Same retention for question requests, which the snapshot also lacks.
-    pending_questions: HashMap<String, Vec<QuestionRequest>>,
-    sessions_scroll: ScrollHandle,
+    sessions_list: ListState,
+    session_rows: Vec<MobileSessionRow>,
     _link_task: Task<()>,
     _pump: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -192,7 +168,13 @@ impl MobileApp {
         let host = cx.new(|cx| InputState::new(window, cx).placeholder("192.168.x.x"));
         let port = cx.new(|cx| InputState::new(window, cx).placeholder("port"));
         let token = cx.new(|cx| InputState::new(window, cx).placeholder("pairing token"));
-        let composer = cx.new(|cx| InputState::new(window, cx).placeholder("Message"));
+        let composer = cx.new(|cx| {
+            gpui_kit::component::input::TextareaState::new(window, cx)
+                .placeholder("Message")
+                .auto_grow(1, 8)
+                .submit_on_enter(true)
+                .soft_wrap(true)
+        });
         let mut subscriptions = [&host, &port, &token]
             .iter()
             .map(|input| {
@@ -266,14 +248,15 @@ impl MobileApp {
             question_inputs: HashMap::new(),
             connect_error: None,
             saved_pairing,
+            sending: false,
             daemon: None,
             link_state: "Disconnected".to_string(),
             seen_links: Vec::new(),
-            projects: Vec::new(),
+            client: ClientState::default(),
+            markdown_states: HashMap::new(),
             active: None,
-            pending_permissions: HashMap::new(),
-            pending_questions: HashMap::new(),
-            sessions_scroll: ScrollHandle::new(),
+            sessions_list: ListState::new(0, ListAlignment::Top, window.rem_size() * 4.5),
+            session_rows: Vec::new(),
             _link_task: link_task,
             _pump: None,
             _subscriptions: subscriptions,
@@ -287,7 +270,7 @@ impl MobileApp {
                 .update(cx, |input, cx| input.set_value(saved_port, window, cx));
             app.token
                 .update(cx, |input, cx| input.set_value(saved_token, window, cx));
-            app.connect_now(cx);
+            app.connect_now(window, cx);
         }
         app
     }
@@ -313,11 +296,10 @@ impl MobileApp {
         // A link that redirects to a different endpoint but carries no token
         // must not inherit the credential saved for another host — the Bearer
         // token is only valid for the endpoint it was paired with.
-        let endpoint_changed = query("host").is_some_and(|host| {
-            host != self.host.read(cx).value().trim().to_owned()
-        }) || query("port").is_some_and(|port| {
-            port != self.port.read(cx).value().trim().to_owned()
-        });
+        let endpoint_changed = query("host")
+            .is_some_and(|host| host != self.host.read(cx).value().trim().to_owned())
+            || query("port")
+                .is_some_and(|port| port != self.port.read(cx).value().trim().to_owned());
         if endpoint_changed && query("token").is_none() {
             self.token
                 .update(cx, |input, cx| input.set_value("", window, cx));
@@ -334,10 +316,10 @@ impl MobileApp {
             self.token
                 .update(cx, |input, cx| input.set_value(token, window, cx));
         }
-        self.connect_now(cx);
+        self.connect_now(window, cx);
     }
 
-    fn connect_now(&mut self, cx: &mut Context<Self>) {
+    fn connect_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let host = self.host.read(cx).value().trim().to_owned();
         let port = self.port.read(cx).value().trim().to_owned();
         let token = self.token.read(cx).value().trim().to_owned();
@@ -349,23 +331,30 @@ impl MobileApp {
         }
         let url = format!("ws://{host}:{port}");
         let token = (!token.is_empty()).then_some(token);
-        let daemon = MobileDaemon::connect(url, token);
+        let daemon = match MobileDaemon::connect(url, token) {
+            Ok(daemon) => daemon,
+            Err(error) => {
+                self.connect_error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
         self.link_state = "Connecting…".to_string();
         self.connect_error = None;
-        self.projects.clear();
+        self.client.projects.clear();
         self.active = None;
         self.daemon = Some(daemon);
         self.screen = Screen::Sessions;
 
         // Pump the wire onto the view until the daemon is dropped.
         let mut events = self.daemon.as_mut().and_then(|daemon| daemon.take_events());
-        self._pump = Some(cx.spawn(async move |this, cx| {
+        self._pump = Some(cx.spawn_in(window, async move |this, cx| {
             let Some(events) = events.as_mut() else {
                 return;
             };
             while let Some(event) = events.recv().await {
                 if this
-                    .update(cx, |this, cx| this.apply_event(event, cx))
+                    .update_in(cx, |this, window, cx| this.apply_event(event, window, cx))
                     .is_err()
                 {
                     return;
@@ -380,10 +369,12 @@ impl MobileApp {
         // driver's reconnect loop.
         self.daemon = None;
         self._pump = None;
-        self.projects.clear();
+        self.sending = false;
+        self.client.projects.clear();
         self.active = None;
-        self.pending_permissions.clear();
-        self.pending_questions.clear();
+        self.client.pending_permissions.clear();
+        self.client.pending_questions.clear();
+        self.client.queued_questions.clear();
         self.link_state = "Disconnected".to_string();
         self.screen = Screen::Connect;
         cx.notify();
@@ -400,27 +391,37 @@ impl MobileApp {
         cx.notify();
     }
 
-    fn open_session(&mut self, info: &SessionInfo, cx: &mut Context<Self>) {
+    fn open_session(&mut self, info: &SessionInfo, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(daemon) = &self.daemon {
             daemon.send(SessionCommand::GetSessionSnapshot {
                 session_id: info.id.clone(),
             });
         }
-        let mut active = ActiveSession::new(info);
-        // Recover permission/question requests that arrived before the
-        // session was opened — snapshots do not carry them.
-        active.permission = self.pending_permissions.remove(&info.id);
-        if let Some(questions) = self.pending_questions.remove(&info.id) {
-            active.questions = questions;
-        }
-        self.active = Some(active);
+        self.markdown_states.clear();
+        self.client.select_session(info);
+        let key = (
+            self.client.active_work_dir.clone(),
+            self.client.active_session_id.clone(),
+        );
+        let draft = self.client.composer_drafts.remove(&key).unwrap_or_default();
+        self.composer
+            .update(cx, |input, cx| input.set_value(draft.text, window, cx));
+        self.active = Some(ActiveSession::new(info, window));
         self.screen = Screen::Session;
         cx.notify();
     }
 
-    fn apply_event(&mut self, event: MobileEvent, cx: &mut Context<Self>) {
+    fn apply_event(&mut self, event: MobileEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             MobileEvent::Connected => {
+                if let Some(daemon) = &self.daemon {
+                    daemon.send(SessionCommand::GetProjects);
+                    if let Some(active) = &self.active {
+                        daemon.send(SessionCommand::GetSessionSnapshot {
+                            session_id: active.id.clone(),
+                        });
+                    }
+                }
                 self.link_state = "Live".to_string();
                 self.connect_error = None;
                 // Remember the pairing so the next launch reconnects.
@@ -430,6 +431,9 @@ impl MobileApp {
                 store_pairing(&host, &port, &token);
                 self.saved_pairing = true;
             }
+            MobileEvent::Connecting => {
+                self.link_state = "Connecting…".into();
+            }
             MobileEvent::Reconnecting => {
                 self.link_state = "Reconnecting…".to_string();
             }
@@ -438,125 +442,144 @@ impl MobileApp {
                 self.connect_error = Some(error);
                 self.screen = Screen::Connect;
             }
+            MobileEvent::CommandResult { command, result } => match result {
+                Ok(()) => match command {
+                    SessionCommand::SubmitPrompt {
+                        session_id, text, ..
+                    } => {
+                        self.sending = false;
+                        let accepted_id =
+                            format!("sent-user-{session_id}-{}", self.client.messages.len());
+                        if let Some(message) = self
+                            .client
+                            .messages_mut()
+                            .iter_mut()
+                            .find(|m| m.id == format!("pending-user-{session_id}"))
+                        {
+                            message.id = accepted_id;
+                        }
+                        let key = (
+                            self.client
+                                .projects
+                                .iter()
+                                .find(|p| p.sessions.iter().any(|s| s.id == session_id))
+                                .map(|p| p.work_dir.clone()),
+                            Some(session_id.clone()),
+                        );
+                        if self.client.active_session_id.as_deref() == Some(&session_id)
+                            && self.composer.read(cx).value().trim() == text
+                        {
+                            self.composer
+                                .update(cx, |input, cx| input.set_value("", window, cx));
+                        }
+                        if self
+                            .client
+                            .composer_drafts
+                            .get(&key)
+                            .is_some_and(|d| d.text.trim() == text)
+                        {
+                            self.client.composer_drafts.remove(&key);
+                        }
+                    }
+                    SessionCommand::AnswerPermission {
+                        session_id,
+                        request_id,
+                        ..
+                    } => {
+                        if self
+                            .client
+                            .pending_permissions
+                            .get(&session_id)
+                            .is_some_and(|r| r.id == request_id)
+                        {
+                            self.client.pending_permissions.remove(&session_id);
+                        }
+                    }
+                    SessionCommand::AnswerQuestion { session_id, answer } => {
+                        if self
+                            .client
+                            .pending_questions
+                            .get(&session_id)
+                            .is_some_and(|r| r.id == answer.request_id)
+                        {
+                            self.client.pop_question(&session_id);
+                        }
+                        let prefix = format!("{}\0", answer.request_id);
+                        if let Some(active) = &mut self.active {
+                            if active.id == session_id {
+                                active.answers.retain(|key, _| !key.starts_with(&prefix));
+                            }
+                        }
+                        self.question_inputs
+                            .retain(|key, _| !key.starts_with(&prefix));
+                    }
+                    _ => {}
+                },
+                Err(error) => {
+                    self.sending = false;
+                    if let SessionCommand::SubmitPrompt { session_id, .. } = &command {
+                        self.client
+                            .messages_mut()
+                            .retain(|m| m.id != format!("pending-user-{session_id}"));
+                        if let Some(active) = &mut self.active {
+                            active.transcript.sync(
+                                self.client.messages.clone(),
+                                self.client.is_generating,
+                                false,
+                                true,
+                            );
+                        }
+                    }
+                    self.client.session_status = Some(error);
+                }
+            },
             MobileEvent::Event(event) => self.apply_session_event(event, cx),
         }
         cx.notify();
     }
 
     fn apply_session_event(&mut self, event: SessionEvent, cx: &mut Context<Self>) {
-        match event {
-            SessionEvent::ProjectChanged { project } => {
-                if project.is_expanded {
-                    match self
-                        .projects
-                        .iter_mut()
-                        .find(|entry| entry.work_dir == project.work_dir)
-                    {
-                        Some(entry) => *entry = project,
-                        None => self.projects.push(project),
-                    }
-                } else {
-                    self.projects
-                        .retain(|entry| entry.work_dir != project.work_dir);
+        let projects_changed = matches!(
+            event,
+            SessionEvent::ProjectChanged { .. } | SessionEvent::SessionRemoved { .. }
+        );
+        let commands = self.client.apply_event(event);
+        if projects_changed {
+            self.refresh_session_rows();
+        }
+        if let Some(daemon) = &self.daemon {
+            for command in commands {
+                daemon.send(command);
+            }
+        }
+        if self.client.active_session_id.is_none() && self.active.is_some() {
+            self.active = None;
+            self.screen = Screen::Sessions;
+        }
+        if let Some(active) = &mut self.active {
+            if let Some(info) = self
+                .client
+                .projects
+                .iter()
+                .flat_map(|p| &p.sessions)
+                .find(|s| s.id == active.id)
+            {
+                if !info.title.trim().is_empty() {
+                    active.title = info.title.clone();
                 }
             }
-            SessionEvent::SessionSnapshot {
-                session_id,
-                snapshot,
-            } => {
-                if let Some(active) = self.active.as_mut().filter(|a| a.id == session_id) {
-                    let pinned = scroll_pinned_bottom(&active.scroll);
-                    active.title = if snapshot.session.title.trim().is_empty() {
-                        active.title.clone()
-                    } else {
-                        snapshot.session.title.clone()
-                    };
-                    active.messages = snapshot.messages;
-                    active.status = None;
-                    if pinned {
-                        active.scroll.scroll_to_bottom();
-                    }
-                }
-            }
-            SessionEvent::Agent { session_id, event } => {
-                // Requests for a session that is not open are stashed — they
-                // badge its row and are recovered when it is opened.
-                let is_open = self
-                    .active
-                    .as_ref()
-                    .is_some_and(|active| active.id == session_id);
-                if !is_open {
-                    if let AgentEvent::PermissionRequested { request } = &event {
-                        self.pending_permissions
-                            .insert(session_id.clone(), request.clone());
-                    }
-                    if let AgentEvent::QuestionRequested { request } = &event {
-                        self.pending_questions
-                            .entry(session_id.clone())
-                            .or_default()
-                            .push(request.clone());
-                    }
-                }
-                if let Some(active) = self.active.as_mut().filter(|a| a.id == session_id) {
-                    let pinned = scroll_pinned_bottom(&active.scroll);
-                    active.apply_agent_event(&event);
-                    if pinned {
-                        active.scroll.scroll_to_bottom();
-                    }
-                }
-            }
-            SessionEvent::Finished { session_id, .. } => {
-                if let Some(active) = self.active.as_mut().filter(|a| a.id == session_id) {
-                    active.working = false;
-                    active.status = None;
-                    for message in active.messages.iter_mut() {
-                        message.streaming = false;
-                    }
-                }
-                // Snapshot refresh pulls in the finalized transcript and
-                // updated title/health.
-                if let Some(daemon) = &self.daemon {
-                    daemon.send(SessionCommand::GetSessionSnapshot { session_id });
-                }
-            }
-            SessionEvent::TitleGenerated { session_id, .. } => {
-                if let Some(daemon) = &self.daemon {
-                    daemon.send(SessionCommand::GetSessionSnapshot { session_id });
-                }
-            }
-            SessionEvent::SessionRemoved { session_id, .. } => {
-                self.pending_permissions.remove(&session_id);
-                self.pending_questions.remove(&session_id);
-                for project in self.projects.iter_mut() {
-                    project.sessions.retain(|session| session.id != session_id);
-                }
-                if self.active.as_ref().is_some_and(|a| a.id == session_id) {
-                    self.active = None;
-                    self.screen = Screen::Sessions;
-                }
-            }
-            SessionEvent::DaemonError {
-                session_id,
-                message,
-            } => {
-                if let Some(active) = self
-                    .active
-                    .as_mut()
-                    .filter(|a| Some(a.id.as_str()) == session_id.as_deref())
-                {
-                    active.status = Some(message);
-                } else {
-                    self.connect_error = Some(message);
-                }
-            }
-            _ => {}
+            active.transcript.sync(
+                self.client.messages.clone(),
+                self.client.is_generating,
+                false,
+                true,
+            );
         }
         cx.notify();
     }
 
-    /// Send the composer text: `SteerMessage` mid-run so it reaches the
-    /// model during the current turn, `SubmitPrompt` otherwise.
-    fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Submit normally; the daemon queues a prompt while a turn is running.
+    fn submit_composer(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().trim().to_owned();
         if text.is_empty() {
             return;
@@ -571,47 +594,48 @@ impl MobileApp {
             .as_ref()
             .is_some_and(|daemon| daemon.is_connected());
         if !connected {
-            active.status = Some("Not connected — message was not sent".to_string());
+            self.client.session_status = Some("Not connected — message was not sent".to_string());
             cx.notify();
             return;
         }
         let session_id = active.id.clone();
-        let command = if active.working {
-            SessionCommand::SteerMessage {
-                session_id,
-                text: text.clone(),
-                images: Vec::new(),
-            }
-        } else {
-            SessionCommand::SubmitPrompt {
-                session_id,
-                work_dir: active.work_dir.clone(),
-                text: text.clone(),
-                images: Vec::new(),
-                // Keep the effort the daemon already holds — mobile has no
-                // effort picker, so it must not re-seed a default.
-                effort: None,
-                acp_config: Vec::new(),
-                model: None,
-            }
+        if self.sending {
+            return;
+        }
+        let command = SessionCommand::SubmitPrompt {
+            session_id,
+            work_dir: active.work_dir.clone(),
+            text,
+            images: Vec::new(),
+            effort: None,
+            acp_config: Vec::new(),
+            model: None,
         };
         if let Some(daemon) = &self.daemon {
-            daemon.send(command);
+            let echo_id = format!("pending-user-{}", active.id);
+            let draft = match &command {
+                SessionCommand::SubmitPrompt { text, .. } => text.clone(),
+                _ => unreachable!(),
+            };
+            self.client.messages_mut().push(ChatMessageInfo {
+                id: echo_id,
+                role: MessageRole::User,
+                content: draft,
+                tool_activities: Vec::new(),
+                streaming: false,
+                reasoning_content: None,
+                reasoning_expanded: false,
+            });
+            active.transcript.sync(
+                self.client.messages.clone(),
+                self.client.is_generating,
+                false,
+                false,
+            );
+            active.transcript.list.scroll_to_end();
+            daemon.request(command);
+            self.sending = true;
         }
-        // Optimistic echo — the daemon does not replay user prompts; the
-        // next `SessionSnapshot` replaces it with the persisted row.
-        active.messages.push(ChatMessageInfo {
-            id: format!("queued-user-{}-{}", active.id, active.messages.len()),
-            role: MessageRole::User,
-            content: text,
-            tool_activities: Vec::new(),
-            streaming: false,
-            reasoning_content: None,
-            reasoning_expanded: false,
-        });
-        self.composer
-            .update(cx, |input, cx| input.set_value("", window, cx));
-        active.scroll.scroll_to_bottom();
         cx.notify();
     }
 
@@ -619,7 +643,7 @@ impl MobileApp {
         let Some(active) = &mut self.active else {
             return;
         };
-        let Some(request) = active.permission.clone() else {
+        let Some(request) = self.client.pending_permissions.get(&active.id).cloned() else {
             return;
         };
         // Commands queued while the socket is down are drained without
@@ -629,14 +653,12 @@ impl MobileApp {
             .as_ref()
             .is_some_and(|daemon| daemon.is_connected());
         if !connected {
-            active.status = Some("Not connected — answer was not sent".to_string());
+            self.client.session_status = Some("Not connected — answer was not sent".to_string());
             cx.notify();
             return;
         }
-        active.permission = None;
-        self.pending_permissions.remove(&active.id);
         if let Some(daemon) = &self.daemon {
-            daemon.send(SessionCommand::AnswerPermission {
+            daemon.request(SessionCommand::AnswerPermission {
                 session_id: active.id.clone(),
                 request_id: request.id,
                 decision,
@@ -662,7 +684,7 @@ impl MobileApp {
         let Some(active) = &mut self.active else {
             return;
         };
-        let Some(request) = active.questions.first().cloned() else {
+        let Some(request) = self.client.pending_questions.get(&active.id).cloned() else {
             return;
         };
         let connected = self
@@ -670,7 +692,7 @@ impl MobileApp {
             .as_ref()
             .is_some_and(|daemon| daemon.is_connected());
         if !connected {
-            active.status = Some("Not connected — answer was not sent".to_string());
+            self.client.session_status = Some("Not connected — answer was not sent".to_string());
             cx.notify();
             return;
         }
@@ -712,14 +734,8 @@ impl MobileApp {
         {
             return;
         }
-        active.pop_question();
-        // Drop selections and inputs for the answered request.
-        let prefix = format!("{}\0", request.id);
-        active.answers.retain(|key, _| !key.starts_with(&prefix));
-        self.question_inputs
-            .retain(|key, _| !key.starts_with(&prefix));
         if let Some(daemon) = &self.daemon {
-            daemon.send(SessionCommand::AnswerQuestion {
+            daemon.request(SessionCommand::AnswerQuestion {
                 session_id: active.id.clone(),
                 answer,
             });
@@ -750,7 +766,7 @@ impl MobileApp {
             .as_ref()
             .is_some_and(|daemon| daemon.is_connected());
         if !connected {
-            active.status = Some("Not connected".to_string());
+            self.client.session_status = Some("Not connected".to_string());
             cx.notify();
             return;
         }
@@ -762,100 +778,8 @@ impl MobileApp {
             });
         }
         active.confirm_delete = false;
-        active.status = Some("Archiving session…".to_string());
+        self.client.session_status = Some("Archiving session…".to_string());
         cx.notify();
-    }
-}
-
-impl ActiveSession {
-    /// Fold one agent event into the rendered transcript. Streaming text
-    /// lands on a synthetic trailing message; `MessageEnd` finalizes it.
-    fn apply_agent_event(&mut self, event: &AgentEvent) {
-        match event {
-            AgentEvent::AgentStart => self.working = true,
-            AgentEvent::AgentEnd { .. } => self.working = false,
-            AgentEvent::MessageStart { role } => {
-                let role = match role.as_str() {
-                    "user" => MessageRole::User,
-                    "system" => MessageRole::System,
-                    "error" => MessageRole::Error,
-                    _ => MessageRole::Assistant,
-                };
-                self.messages.push(ChatMessageInfo {
-                    id: format!("live-{}", self.messages.len()),
-                    role,
-                    content: String::new(),
-                    tool_activities: Vec::new(),
-                    streaming: true,
-                    reasoning_content: None,
-                    reasoning_expanded: false,
-                });
-            }
-            AgentEvent::MessageUpdate {
-                text_delta,
-                reasoning_delta,
-                tool_call_name,
-            } => {
-                let message = self
-                    .messages
-                    .iter_mut()
-                    .rev()
-                    .find(|message| message.streaming);
-                if let Some(message) = message {
-                    if let Some(delta) = text_delta {
-                        message.content.push_str(delta);
-                    }
-                    if let Some(delta) = reasoning_delta {
-                        let reasoning = message.reasoning_content.get_or_insert_with(String::new);
-                        reasoning.push_str(delta);
-                    }
-                    if let Some(name) = tool_call_name {
-                        message.tool_activities.push(
-                            threadlane_protocol::daemon::ToolActivityInfo {
-                                id: format!("tool-{}", message.tool_activities.len()),
-                                category: "tool".to_string(),
-                                title: name.clone(),
-                                display_summary: String::new(),
-                                detail: String::new(),
-                                arguments: String::new(),
-                                is_expanded: false,
-                            },
-                        );
-                    }
-                }
-            }
-            AgentEvent::MessageEnd { .. } => {
-                if let Some(message) = self
-                    .messages
-                    .iter_mut()
-                    .rev()
-                    .find(|message| message.streaming)
-                {
-                    message.streaming = false;
-                }
-            }
-            AgentEvent::ToolExecutionStart { name, .. } => {
-                self.status = Some(format!("Running {name}…"));
-            }
-            AgentEvent::ToolExecutionEnd { name, .. } => {
-                if self.status.as_deref() == Some(format!("Running {name}…").as_str()) {
-                    self.status = None;
-                }
-            }
-            AgentEvent::PermissionRequested { request } => {
-                self.permission = Some(request.clone());
-            }
-            AgentEvent::QuestionRequested { request } => {
-                self.questions.push(request.clone());
-            }
-            AgentEvent::AgentError { error } => {
-                self.status = Some(error.clone());
-            }
-            AgentEvent::FusionUpdate { message, .. } => {
-                self.status = Some(message.clone());
-            }
-            _ => {}
-        }
     }
 }
 
@@ -965,7 +889,7 @@ impl MobileApp {
                     .label("Connect")
                     .w_full()
                     .disabled(self.link_state == "Connecting…")
-                    .on_click(cx.listener(|this, _, _, cx| this.connect_now(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.connect_now(window, cx))),
             )
             .when(self.saved_pairing, |this| {
                 this.child(
@@ -1026,144 +950,128 @@ impl MobileApp {
                             .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx))),
                     ),
             )
-            .child(
+            .child(div().id("sessions").flex_1().min_h_0().w_full().child(
+                threadlane_ui_session::session_list(
+                    self.sessions_list.clone(),
+                    cx.processor(Self::render_session_row),
+                ),
+            ))
+    }
+
+    fn refresh_session_rows(&mut self) {
+        self.session_rows = self
+            .client
+            .projects
+            .iter()
+            .flat_map(|project| {
+                std::iter::once(MobileSessionRow::Project(project.name.clone())).chain(
+                    project
+                        .sessions
+                        .iter()
+                        .cloned()
+                        .map(MobileSessionRow::Session),
+                )
+            })
+            .collect();
+        self.sessions_list.reset(self.session_rows.len());
+    }
+
+    fn render_session_row(
+        &mut self,
+        ix: usize,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match self.session_rows.get(ix) {
+            Some(MobileSessionRow::Project(name)) => div()
+                .px_3()
+                .pt_4()
+                .pb_2()
+                .text_sm()
+                .font_bold()
+                .text_color(cx.theme().muted_foreground)
+                .child(name.clone())
+                .into_any_element(),
+            Some(MobileSessionRow::Session(session)) => {
+                let info = session.clone();
+                let needs_you = self.client.pending_permissions.contains_key(&session.id)
+                    || self.client.pending_questions.contains_key(&session.id);
+                let attention = if needs_you {
+                    threadlane_protocol::daemon::SessionAttention::NeedsYou
+                } else if matches!(session.health, SessionHealth::Working) {
+                    threadlane_protocol::daemon::SessionAttention::Working
+                } else {
+                    threadlane_protocol::daemon::SessionAttention::Idle
+                };
+                let identity = threadlane_ui_session::session_identity(session);
                 div()
-                    .id("sessions")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.sessions_scroll)
+                    .px_3()
                     .child(
-                        div()
-                            .p_3()
-                            .flex()
-                            .flex_col()
-                            .gap_4()
-                            .when(self.projects.is_empty(), |this| {
-                                this.child(
-                                    div()
-                                        .py_8()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(if self.link_state == "Live" {
-                                            "No projects attached on the desktop yet."
-                                        } else {
-                                            "Connecting to the desktop…"
-                                        }),
-                                )
-                            })
-                            .children(self.projects.iter().map(|project| {
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
+                        threadlane_ui_session::session_card(&session.id, false, cx)
+                            .aria_label(format!("{}, {}", identity.title, attention.label()))
+                            .child(
+                                Button::new(format!("session-{}", session.id))
+                                    .ghost()
+                                    .h_auto()
+                                    .min_h_16()
+                                    .py_3()
+                                    .w_full()
                                     .child(
                                         div()
-                                            .text_sm()
-                                            .font_bold()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(project.name.clone()),
-                                    )
-                                    .children(project.sessions.iter().map(|session| {
-                                        let info = session.clone();
-                                        // Key rows by session id — a
-                                        // per-project index collides across
-                                        // projects and shifts on reorder.
-                                        let needs_you =
-                                            self.pending_permissions.contains_key(&session.id)
-                                                || self.pending_questions.contains_key(&session.id);
-                                        let working =
-                                            matches!(session.health, SessionHealth::Working);
-                                        Button::new(format!("session-{}", session.id))
-                                            .outline()
-                                            .h_auto()
-                                            .min_h_16()
-                                            .py_3()
+                                            .flex()
+                                            .flex_col()
+                                            .items_start()
+                                            .gap_1()
                                             .w_full()
                                             .child(
                                                 div()
                                                     .flex()
-                                                    .flex_col()
-                                                    .items_start()
-                                                    .gap_1()
+                                                    .items_center()
+                                                    .gap_2()
                                                     .w_full()
                                                     .child(
                                                         div()
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap_2()
-                                                            .w_full()
-                                                            .child(
-                                                                div()
-                                                                    .flex_1()
-                                                                    .min_w_0()
-                                                                    .truncate()
-                                                                    .child(
-                                                                        if session.title.trim().is_empty() {
-                                                                            "Untitled session".to_string()
-                                                                        } else {
-                                                                            session.title.clone()
-                                                                        },
-                                                                    ),
-                                                            )
-                                                            .when(needs_you, |this| {
-                                                                this.child(
-                                                                    div()
-                                                                        .flex()
-                                                                        .items_center()
-                                                                        .gap_1()
-                                                                        .text_xs()
-                                                                        .text_color(
-                                                                            cx.theme().warning,
-                                                                        )
-                                                                        .child(
-                                                                            icon(
-                                                                                kit_icons::BellDot
-                                                                                    .1,
-                                                                            )
-                                                                            .xsmall()
-                                                                            .text_color(
-                                                                                cx.theme().warning,
-                                                                            ),
-                                                                        )
-                                                                        .child("Needs you"),
-                                                                )
-                                                            })
-                                                            .when(working && !needs_you, |this| {
-                                                                this.child(
-                                                                    div()
-                                                                        .text_xs()
-                                                                        .text_color(
-                                                                            cx.theme().accent,
-                                                                        )
-                                                                        .child("Working"),
-                                                                )
-                                                            }),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(cx.theme().muted_foreground)
+                                                            .flex_1()
+                                                            .min_w_0()
                                                             .truncate()
-                                                            .child(format!(
-                                                                "{}{}",
-                                                                session.git_branch.as_deref()
-                                                                    .unwrap_or("Local"),
-                                                                if session.is_worktree {
-                                                                    " · worktree"
-                                                                } else {
-                                                                    ""
-                                                                },
-                                                            )),
+                                                            .child(identity.title),
+                                                    )
+                                                    .children(
+                                                        threadlane_ui_session::session_attention(
+                                                            &session.id,
+                                                            attention,
+                                                            cx,
+                                                        ),
                                                     ),
                                             )
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.open_session(&info, cx);
-                                            }))
-                                    }))
-                            })),
-                    ),
-            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .truncate()
+                                                    .child(format!(
+                                                        "{}{}",
+                                                        session
+                                                            .git_branch
+                                                            .as_deref()
+                                                            .unwrap_or("Local"),
+                                                        if session.is_worktree {
+                                                            " · worktree"
+                                                        } else {
+                                                            ""
+                                                        }
+                                                    )),
+                                            ),
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_session(&info, window, cx)
+                                    })),
+                            ),
+                    )
+                    .into_any_element()
+            }
+            None => div().into_any_element(),
+        }
     }
 
     fn render_session(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1171,14 +1079,12 @@ impl MobileApp {
             return div().size_full().bg(cx.theme().background);
         };
         let title = active.title.clone();
-        let working = active.working;
-        let status = active.status.clone();
-        let messages = active.messages.clone();
-        let permission = active.permission.clone();
-        let question = active.questions.first().cloned();
+        let working = self.client.is_generating;
+        let status = self.client.session_status.clone();
+        let permission = self.client.pending_permissions.get(&active.id).cloned();
+        let question = self.client.pending_questions.get(&active.id).cloned();
         let confirm_delete = active.confirm_delete;
         let composer_empty = self.composer.read(cx).value().trim().is_empty();
-        let scroll = active.scroll.clone();
 
         div()
             .size_full()
@@ -1203,19 +1109,18 @@ impl MobileApp {
                             .icon(icon(kit_icons::ArrowLeft.1))
                             .label("Back")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                // Snapshots don't carry pending requests, so
-                                // stash them back — the card and its row badge
-                                // must survive a Back-and-return round trip.
-                                if let Some(active) = this.active.take() {
-                                    if let Some(permission) = active.permission {
-                                        this.pending_permissions
-                                            .insert(active.id.clone(), permission);
-                                    }
-                                    if !active.questions.is_empty() {
-                                        this.pending_questions
-                                            .insert(active.id.clone(), active.questions);
-                                    }
-                                }
+                                let key = (
+                                    this.client.active_work_dir.clone(),
+                                    this.client.active_session_id.clone(),
+                                );
+                                this.client.composer_drafts.insert(
+                                    key,
+                                    threadlane_client::ComposerDraft {
+                                        text: this.composer.read(cx).value().to_string(),
+                                        images: Vec::new(),
+                                    },
+                                );
+                                this.active = None;
                                 this.screen = Screen::Sessions;
                                 cx.notify();
                             })),
@@ -1294,45 +1199,12 @@ impl MobileApp {
                         ),
                 )
             })
-            .child(
-                div()
-                    .id("transcript")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&scroll)
-                    .child(
-                        div()
-                            .p_3()
-                            .flex()
-                            .flex_col()
-                            .gap_4()
-                            .when(messages.is_empty(), |this| {
-                                this.child(
-                                    div()
-                                        .py_8()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child("No messages yet."),
-                                )
-                            })
-                            .children(
-                                messages
-                                    .iter()
-                                    .map(|message| self.render_message(message, cx)),
-                            )
-                            .when(working, |this| {
-                                this.child(
-                                    Marker::new()
-                                        .id("session-working")
-                                        .role(Role::Status)
-                                        .loading(true)
-                                        .with_loading_style(MarkerLoadingStyle::Shimmer)
-                                        .content(MarkerContent::new().text("Working…")),
-                                )
-                            }),
-                    ),
-            )
+            .child(div().id("transcript").flex_1().min_h_0().w_full().child(
+                threadlane_ui_session::transcript_list(
+                    &self.active.as_ref().unwrap().transcript,
+                    cx.processor(Self::render_transcript_row),
+                ),
+            ))
             .when_some(permission, |this, permission| {
                 this.child(self.render_permission(&permission, cx))
             })
@@ -1340,95 +1212,211 @@ impl MobileApp {
                 this.child(self.render_question(&question, window, cx))
             })
             .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Input::new(&self.composer).large().aria_label("Message")),
-                    )
-                    .child(
-                        Button::new("send")
-                            .primary()
-                            .size_11()
-                            .icon(icon(kit_icons::SendHorizontal.1))
-                            .accessibility_label(if working {
-                                "Steer the running turn"
-                            } else {
-                                "Send message"
-                            })
-                            .disabled(composer_empty)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.submit_composer(window, cx)),
+                div().flex_none().w_full().px_3().mb_3().child(
+                    threadlane_ui_session::composer_surface(cx)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(threadlane_ui_session::composer_input(&self.composer)),
+                        )
+                        .child(
+                            div().flex().justify_end().child(
+                                Button::new("send")
+                                    .primary()
+                                    .size_11()
+                                    .icon(icon(kit_icons::SendHorizontal.1))
+                                    .accessibility_label(if working {
+                                        "Queue for next turn"
+                                    } else {
+                                        "Send message"
+                                    })
+                                    .disabled(
+                                        composer_empty
+                                            || self.sending
+                                            || !self
+                                                .daemon
+                                                .as_ref()
+                                                .is_some_and(|d| d.is_connected()),
+                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.submit_composer(window, cx)
+                                    })),
                             ),
-                    ),
+                        ),
+                ),
             )
     }
 
-    fn render_message(&self, message: &ChatMessageInfo, cx: &Context<Self>) -> AnyElement {
+    fn render_transcript_row(
+        &mut self,
+        ix: usize,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use threadlane_ui_session::transcript::TranscriptRow;
+        let Some(active) = &self.active else {
+            return div().into_any_element();
+        };
+        let messages = active.transcript.messages.clone();
+        match active.transcript.rows.get(ix).cloned() {
+            Some(TranscriptRow::Message(index)) => messages
+                .get(index)
+                .map(|m| self.render_message(m, cx))
+                .unwrap_or_else(|| div().into_any_element()),
+            Some(TranscriptRow::Activities(range)) => div()
+                .flex()
+                .flex_col()
+                .children(messages[range].iter().map(|m| self.render_message(m, cx)))
+                .into_any_element(),
+            Some(TranscriptRow::Working) => div()
+                .px_5()
+                .child(
+                    Marker::new()
+                        .id("session-working")
+                        .role(Role::Status)
+                        .loading(true)
+                        .with_loading_style(MarkerLoadingStyle::Shimmer)
+                        .content(MarkerContent::new().text("Working…")),
+                )
+                .into_any_element(),
+            None => div().into_any_element(),
+        }
+    }
+
+    fn render_message(&mut self, message: &ChatMessageInfo, cx: &mut Context<Self>) -> AnyElement {
         let is_user = message.role == MessageRole::User;
+        let namespace =
+            SharedString::from(self.client.active_session_id.clone().unwrap_or_default());
+        let state = threadlane_ui_session::markdown::markdown_state(
+            &mut self.markdown_states,
+            namespace,
+            message.id.clone(),
+            &message.content,
+            cx,
+        );
+        let reasoning = message
+            .reasoning_content
+            .as_ref()
+            .filter(|text| !text.trim().is_empty())
+            .map(|reasoning| {
+                let detail = message.reasoning_expanded.then(|| {
+                    if message.streaming {
+                        threadlane_ui_session::reasoning_detail(cx)
+                            .child(reasoning.clone())
+                            .into_any_element()
+                    } else {
+                        let namespace = SharedString::from(
+                            self.client.active_session_id.clone().unwrap_or_default(),
+                        );
+                        let markdown = threadlane_ui_session::markdown::markdown_state(
+                            &mut self.markdown_states,
+                            namespace,
+                            format!("reasoning-{}", message.id),
+                            reasoning,
+                            cx,
+                        );
+                        threadlane_ui_session::reasoning_detail(cx)
+                            .child(threadlane_ui_session::markdown::markdown_view(
+                                &markdown,
+                                |_, _| {},
+                            ))
+                            .into_any_element()
+                    }
+                });
+                let owner = cx.entity().downgrade();
+                let id = message.id.clone();
+                threadlane_ui_session::reasoning_card(
+                    message,
+                    detail,
+                    true,
+                    move |_, cx| {
+                        let _ = owner.update(cx, |this, cx| {
+                            if let Some(message) =
+                                this.client.messages_mut().iter_mut().find(|m| m.id == id)
+                            {
+                                message.reasoning_expanded = !message.reasoning_expanded;
+                            }
+                            if let Some(active) = &mut this.active {
+                                active.transcript.list.pause_following_tail();
+                                active.transcript.sync(
+                                    this.client.messages.clone(),
+                                    this.client.is_generating,
+                                    false,
+                                    true,
+                                );
+                            }
+                            cx.notify();
+                        });
+                    },
+                    cx,
+                )
+            });
+        let tools = message
+            .tool_activities
+            .iter()
+            .map(|tool| {
+                let detail = tool.is_expanded.then(|| {
+                    threadlane_ui_session::tool_detail(cx)
+                        .child(tool.detail.clone())
+                        .into_any_element()
+                });
+                let owner = cx.entity().downgrade();
+                let id = tool.id.clone();
+                threadlane_ui_session::tool_activity(
+                    tool,
+                    !tool.detail.trim().is_empty(),
+                    detail,
+                    true,
+                    move |_, cx| {
+                        let _ = owner.update(cx, |this, cx| {
+                            if let Some(tool) = this
+                                .client
+                                .messages_mut()
+                                .iter_mut()
+                                .flat_map(|m| &mut m.tool_activities)
+                                .find(|tool| tool.id == id)
+                            {
+                                tool.is_expanded = !tool.is_expanded;
+                            }
+                            if let Some(active) = &mut this.active {
+                                active.transcript.list.pause_following_tail();
+                                active.transcript.sync(
+                                    this.client.messages.clone(),
+                                    this.client.is_generating,
+                                    false,
+                                    true,
+                                );
+                            }
+                            cx.notify();
+                        });
+                    },
+                    cx,
+                )
+            })
+            .collect::<Vec<_>>();
         let body = div()
             .text_sm()
             .line_height(relative(1.5))
-            .when(!message.content.is_empty(), |this| {
-                if is_user {
-                    this.child(message.content.clone())
-                } else {
-                    // Assistant/system text is markdown — same renderer as
-                    // the desktop chat surface.
-                    this.child(
-                        TextView::markdown(format!("msg-{}", message.id), message.content.clone())
-                            .selectable(true),
-                    )
-                }
+            .children(reasoning)
+            .when(!message.content.is_empty(), |el| {
+                el.child(threadlane_ui_session::markdown::markdown_view(
+                    &state,
+                    |_, _| {},
+                ))
             })
             .when(message.streaming && message.content.is_empty(), |this| {
                 this.text_color(cx.theme().muted_foreground).child("…")
             })
-            .children(message.reasoning_content.as_ref().map(|reasoning| {
-                div()
-                    .mt_2()
-                    .pt_2()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(reasoning.clone())
-            }))
-            .children(message.tool_activities.iter().map(|tool| {
-                div()
-                    .mt_1()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(
-                        icon(kit_icons::Wrench.1)
-                            .xsmall()
-                            .text_color(cx.theme().muted_foreground),
-                    )
-                    .child(tool.title.clone())
-            }));
+            .children(tools);
         if is_user {
-            div()
-                .w_full()
-                .flex()
-                .justify_end()
-                .child(
-                    threadlane_ui_theme::user_message_bubble(cx).child(body),
-                )
+            threadlane_ui_session::message_row(MessageRole::User)
+                .child(threadlane_ui_session::user_message_bubble(cx).child(body))
                 .into_any_element()
         } else {
-            div().w_full().child(body).into_any_element()
+            threadlane_ui_session::message_row(message.role.clone())
+                .child(body)
+                .into_any_element()
         }
     }
 
@@ -1437,68 +1425,28 @@ impl MobileApp {
         request: &PermissionRequest,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let mut allow_buttons = Vec::new();
-        for (index, scope) in request.scopes.iter().enumerate() {
-            let (label, decision) = match scope {
-                PermissionScope::Once => ("Allow once", PermissionDecision::AllowOnce),
-                PermissionScope::Session => ("Allow session", PermissionDecision::AllowSession),
-                PermissionScope::Always => ("Allow always", PermissionDecision::AllowAlways),
-            };
-            allow_buttons.push(
-                Button::new(("permission-allow", index))
-                    .primary()
-                    .small()
-                    .label(label)
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.answer_permission(decision, cx)),
-                    ),
-            );
-        }
-        div()
-            .flex_none()
-            .p_3()
-            .border_t_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().muted.opacity(0.3))
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        icon(kit_icons::ShieldAlert.1)
-                            .xsmall()
-                            .text_color(cx.theme().warning),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_bold()
-                            .child(format!("{}: {}", request.capability, request.title)),
-                    ),
-            )
-            .when(!request.detail.is_empty(), |this| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(request.detail.clone()),
-                )
-            })
-            .child(
-                div().flex().gap_2().children(allow_buttons).child(
-                    Button::new("permission-deny")
-                        .danger()
-                        .small()
-                        .label("Deny")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.answer_permission(PermissionDecision::Deny, cx)
-                        })),
-                ),
-            )
+        let owner = cx.entity().downgrade();
+        let connected = self.daemon.as_ref().is_some_and(|d| d.is_connected());
+        threadlane_ui_session::permission_card(
+            request,
+            true,
+            connected,
+            None,
+            move |request_id, decision, _, cx| {
+                let _ = owner.update(cx, |this, cx| {
+                    if this
+                        .client
+                        .active_session_id
+                        .as_ref()
+                        .and_then(|id| this.client.pending_permissions.get(id))
+                        .is_some_and(|r| r.id == request_id)
+                    {
+                        this.answer_permission(decision, cx);
+                    }
+                });
+            },
+            cx,
+        )
     }
 
     /// The front question request: option toggles per item, one custom-answer
@@ -1518,17 +1466,14 @@ impl MobileApp {
         for item in request.questions.iter().filter(|item| item.allow_custom) {
             let key = question_key(&request.id, &item.id);
             if !self.question_inputs.contains_key(&key) {
-                let input =
-                    cx.new(|cx| InputState::new(window, cx).placeholder("Custom answer (optional)…"));
-                let subscription = cx.subscribe_in(
-                    &input,
-                    window,
-                    |_, _, event, _, _| match event {
+                let input = cx
+                    .new(|cx| InputState::new(window, cx).placeholder("Custom answer (optional)…"));
+                let subscription =
+                    cx.subscribe_in(&input, window, |_, _, event, _, _| match event {
                         InputEvent::Focus => gpui_mobile::show_keyboard(),
                         InputEvent::Blur => gpui_mobile::hide_keyboard(),
                         _ => {}
-                    },
-                );
+                    });
                 self.question_inputs.insert(key, (input, subscription));
             }
         }
@@ -1539,58 +1484,21 @@ impl MobileApp {
         let mut items = Vec::new();
         for item in &request.questions {
             let key = question_key(&request.id, &item.id);
-            let mut card = div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .when(!item.header.is_empty(), |this| {
-                    this.child(
-                        div()
-                            .text_xs()
-                            .font_bold()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(item.header.clone()),
-                    )
-                })
-                .child(div().text_sm().child(item.question.clone()))
-                .child(div().flex().flex_wrap().gap_2().children(
-                    item.options.iter().enumerate().map(|(index, option)| {
-                        let selected = answers
-                            .get(&key)
-                            .is_some_and(|picked| picked.iter().any(|o| o == option));
-                        let key = key.clone();
-                        let option = option.clone();
-                        let mut button = Button::new(format!("qopt-{}-{index}", item.id))
-                            .small()
-                            .label(option.clone());
-                        button = if selected {
-                            button.primary()
-                        } else {
-                            button.outline()
-                        };
-                        button.on_click(cx.listener(move |this, _, _, cx| {
-                            this.toggle_question_option(&key, &option, cx)
-                        }))
-                    }),
-                ));
-            if item.allow_custom {
-                if let Some((input, _)) = self.question_inputs.get(&key) {
-                    card = card.child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("Or write your own"),
-                            )
-                            .child(Input::new(input).aria_label("Custom answer")),
-                    );
-                }
-            }
-            items.push(card);
+            let owner = cx.entity().downgrade();
+            let option_key = key.clone();
+            items.push(threadlane_ui_session::question_item(
+                &request.id,
+                item,
+                answers.get(&key).map(Vec::as_slice).unwrap_or_default(),
+                self.question_inputs.get(&key).map(|(input, _)| input),
+                true,
+                move |value, _, cx| {
+                    let _ = owner.update(cx, |this, cx| {
+                        this.toggle_question_option(&option_key, value, cx)
+                    });
+                },
+                cx,
+            ));
         }
         // Sending with zero selections and zero custom text resolves an empty
         // answer (indistinguishable from a real one downstream), so Submit
@@ -1604,16 +1512,13 @@ impl MobileApp {
                 .is_some_and(|(input, _)| !input.read(cx).value().trim().is_empty());
             selected || custom
         });
-        let remaining = active.questions.len() - 1;
-        div()
+        let remaining = self
+            .client
+            .queued_questions
+            .get(&active.id)
+            .map_or(0, Vec::len);
+        threadlane_ui_session::question_surface(cx)
             .flex_none()
-            .p_3()
-            .border_t_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().muted.opacity(0.3))
-            .flex()
-            .flex_col()
-            .gap_3()
             .child(
                 div()
                     .flex()
@@ -1654,18 +1559,16 @@ impl MobileApp {
                             .small()
                             .label("Submit")
                             .disabled(!has_answer)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.answer_question(false, cx)
-                            })),
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.answer_question(false, cx)),
+                            ),
                     )
                     .child(
                         Button::new("question-dismiss")
                             .ghost()
                             .small()
                             .label("Dismiss")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.answer_question(true, cx)
-                            })),
+                            .on_click(cx.listener(|this, _, _, cx| this.answer_question(true, cx))),
                     ),
             )
             .into_any_element()

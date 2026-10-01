@@ -30,6 +30,14 @@ use threadlane_protocol::daemon::{
 
 use crate::DaemonClient;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnectionState {
+    Connecting,
+    Connected,
+    Reconnecting,
+    Failed(String),
+}
+
 /// First reconnect delay; doubles per failed dial up to
 /// [`RECONNECT_BACKOFF_MAX`].
 const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
@@ -79,6 +87,9 @@ struct WireFrame {
 /// A [`DaemonClient`] that attaches to a remote `threadlane-daemon` over
 /// WebSocket.
 pub struct RemoteDaemon {
+    executor: Option<tokio::runtime::Handle>,
+    connection: tokio::sync::watch::Sender<ConnectionState>,
+    driver: Mutex<Option<tokio::task::AbortHandle>>,
     /// Commands awaiting/in-flight to the server; the driver drains it.
     command_tx: mpsc::UnboundedSender<OutboundMessage>,
     /// Replies awaited by live `command_request` calls, keyed by
@@ -115,10 +126,78 @@ impl RemoteDaemon {
     /// hosts (the token, and everything it protects, would cross the wire
     /// readable); use `wss://` there. The refusal lands as a `DaemonError`
     /// on the first `subscribe()` receiver.
+    #[cfg(feature = "local")]
     pub fn connect(url: impl Into<String>, token: Option<String>) -> Arc<Self> {
+        // Preserve the desktop reactor and its startup behavior.
+        let executor = threadlane_daemon::chat::executor().map(|runtime| runtime.handle().clone());
+        Self::start(url.into(), token, executor, false)
+    }
+
+    pub fn connect_with_runtime(
+        url: impl Into<String>,
+        token: Option<String>,
+        executor: tokio::runtime::Handle,
+    ) -> Arc<Self> {
+        Self::start(url.into(), token, Ok(executor), false)
+    }
+
+    /// Explicit opt-in for the existing token-protected LAN pairing listener.
+    /// Only literal private/link-local/loopback IPs or localhost are accepted.
+    /// Ordinary remote connections retain the TLS policy.
+    pub fn connect_pairing(
+        url: impl Into<String>,
+        token: String,
+        executor: tokio::runtime::Handle,
+    ) -> Result<Arc<Self>, String> {
         let url = url.into();
+        Self::validate_pairing(&url, &token)?;
+        Ok(Self::start(url, Some(token), Ok(executor), true))
+    }
+
+    fn validate_pairing(url: &str, token: &str) -> Result<(), String> {
+        if token.trim().is_empty() {
+            return Err("pairing requires a token".into());
+        }
+        format!("Bearer {token}")
+            .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
+            .map_err(|_| "invalid pairing token")?;
+        let request = url
+            .to_owned()
+            .into_client_request()
+            .map_err(|_| "invalid pairing URL")?;
+        let uri = request.uri();
+        let local = uri.host().is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| match ip {
+                        std::net::IpAddr::V4(ip) => {
+                            ip.is_loopback() || ip.is_private() || ip.is_link_local()
+                        }
+                        std::net::IpAddr::V6(ip) => {
+                            ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+                        }
+                    })
+        });
+        if uri.scheme_str() != Some("ws") || !local {
+            return Err("pairing requires a local network ws:// address".into());
+        }
+        Ok(())
+    }
+
+    fn start(
+        url: String,
+        token: Option<String>,
+        executor: Result<tokio::runtime::Handle, String>,
+        pairing: bool,
+    ) -> Arc<Self> {
+        let (connection, _) = tokio::sync::watch::channel(ConnectionState::Connecting);
         let (command_tx, command_rx) = mpsc::unbounded_channel::<OutboundMessage>();
         let client = Arc::new(Self {
+            executor: executor.as_ref().ok().cloned(),
+            connection,
+            driver: Mutex::new(None),
             command_tx,
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             subscribers: Arc::new(Mutex::new(Vec::new())),
@@ -127,32 +206,60 @@ impl RemoteDaemon {
             last_seq: Arc::new(AtomicU64::new(0)),
             protocol_version: Arc::new(AtomicU64::new(0)),
         });
-        if let Some(error) = Self::transport_policy_error(&url, &token) {
+        if let Some(error) = (!pairing)
+            .then(|| Self::transport_policy_error(&url, &token))
+            .flatten()
+        {
+            client
+                .connection
+                .send_replace(ConnectionState::Failed(error.clone()));
             client.push_startup_error(error);
             return client;
         }
+        let executor = match executor {
+            Ok(executor) => executor,
+            Err(error) => {
+                client
+                    .connection
+                    .send_replace(ConnectionState::Failed(error.clone()));
+                client.push_startup_error(error);
+                return client;
+            }
+        };
         let subscribers = client.subscribers.clone();
         let pending_requests = client.pending_requests.clone();
         let connected = client.connected.clone();
         let last_seq = client.last_seq.clone();
         let protocol_version = client.protocol_version.clone();
-        threadlane_daemon::chat::executor()
-            .map(|executor| {
-                executor.spawn(Self::drive(
-                    url,
-                    token,
-                    command_rx,
-                    subscribers,
-                    pending_requests,
-                    connected,
-                    last_seq,
-                    protocol_version,
-                ));
-            })
-            .unwrap_or_else(|error| {
-                client.push_startup_error(format!("daemon event executor unavailable: {error}"));
-            });
+        let driver = executor.spawn(Self::drive(
+            url,
+            token,
+            command_rx,
+            subscribers,
+            pending_requests,
+            connected,
+            last_seq,
+            protocol_version,
+            client.connection.clone(),
+        ));
+        *client.driver.lock().expect("connection driver poisoned") = Some(driver.abort_handle());
         client
+    }
+
+    /// Enqueue a command in caller order, failing immediately while offline.
+    pub fn send(&self, command: SessionCommand) -> Result<(), String> {
+        if !self.connected.load(Ordering::SeqCst) {
+            return Err("daemon is not connected".to_string());
+        }
+        self.command_tx
+            .send(OutboundMessage::Command(command))
+            .map_err(|_| "daemon connection driver is gone".to_string())
+    }
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
+    }
+    pub fn subscribe_connection(&self) -> tokio::sync::watch::Receiver<ConnectionState> {
+        self.connection.subscribe()
     }
 
     /// Transport rules enforced before any dial: a token may only cross a
@@ -167,15 +274,13 @@ impl RemoteDaemon {
         };
         let uri = request.uri();
         let plaintext = matches!(uri.scheme_str(), Some("ws") | Some("http"));
-        let loopback = uri
-            .host()
-            .is_some_and(|host| {
-                host == "localhost"
-                    || host.ends_with(".localhost")
-                    || host
-                        .parse::<std::net::IpAddr>()
-                        .is_ok_and(|ip| ip.is_loopback())
-            });
+        let loopback = uri.host().is_some_and(|host| {
+            host == "localhost"
+                || host.ends_with(".localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        });
         (plaintext && !loopback).then(|| {
             format!(
                 "refusing {url}: a bearer token may not cross a plaintext \
@@ -201,8 +306,26 @@ impl RemoteDaemon {
         if since == 0 {
             return url.to_string();
         }
-        let separator = if url.contains('?') { '&' } else { '?' };
-        format!("{url}{separator}since={since}")
+        let mut uri = url
+            .into_client_request()
+            .expect("validated daemon URL")
+            .uri()
+            .clone()
+            .into_parts();
+        let path = uri
+            .path_and_query
+            .as_ref()
+            .map(|path| path.as_str())
+            .unwrap_or("/");
+        let separator = if path.contains('?') { '&' } else { '?' };
+        uri.path_and_query = Some(
+            format!("{path}{separator}since={since}")
+                .parse()
+                .expect("valid resume cursor"),
+        );
+        tokio_tungstenite::tungstenite::http::Uri::from_parts(uri)
+            .expect("valid daemon URI")
+            .to_string()
     }
 
     /// One connection/reconnect loop running for the client's lifetime.
@@ -217,6 +340,7 @@ impl RemoteDaemon {
         connected: Arc<AtomicBool>,
         last_seq: Arc<AtomicU64>,
         protocol_version: Arc<AtomicU64>,
+        connection: tokio::sync::watch::Sender<ConnectionState>,
     ) {
         let mut was_connected = false;
         let mut backoff = RECONNECT_BACKOFF_INITIAL;
@@ -227,6 +351,7 @@ impl RemoteDaemon {
             if was_connected {
                 was_connected = false;
                 connected.store(false, Ordering::SeqCst);
+                connection.send_replace(ConnectionState::Reconnecting);
                 // A queued SubmitPrompt firing minutes late is worse than a
                 // dropped command: fail them all and let the user resend.
                 let mut dropped = 0usize;
@@ -234,12 +359,15 @@ impl RemoteDaemon {
                     dropped += 1;
                 }
                 if dropped > 0 {
-                    Self::fanout(&subscribers, SessionEvent::DaemonError {
-                        session_id: None,
-                        message: format!(
-                            "daemon connection dropped {dropped} queued command(s)"
-                        ),
-                    });
+                    Self::fanout(
+                        &subscribers,
+                        SessionEvent::DaemonError {
+                            session_id: None,
+                            message: format!(
+                                "daemon connection dropped {dropped} queued command(s)"
+                            ),
+                        },
+                    );
                 }
                 // Requests queued behind the drain or already on the
                 // dead socket can never be answered — resolve their
@@ -248,33 +376,38 @@ impl RemoteDaemon {
                 // the daemon journals: the journaled event can still
                 // arrive on the reconnect's tail replay, so they get
                 // one reconnect to recover it.
-                let mut pending = pending_requests
-                    .lock()
-                    .expect("command waiters poisoned");
+                let mut pending = pending_requests.lock().expect("command waiters poisoned");
                 let drained = std::mem::take(&mut *pending);
                 for (request_id, mut waiter) in drained {
                     if waiter.replayable && !waiter.survived_disconnect {
                         waiter.survived_disconnect = true;
                         pending.insert(request_id, waiter);
                     } else {
-                        let _ =
-                            waiter.waiter.send(Err("daemon connection lost".to_string()));
+                        let _ = waiter
+                            .waiter
+                            .send(Err("daemon connection lost".to_string()));
                     }
                 }
                 drop(pending);
-                Self::fanout(&subscribers, SessionEvent::DaemonError {
-                    session_id: None,
-                    message: "daemon connection lost; reconnecting".to_string(),
-                });
+                Self::fanout(
+                    &subscribers,
+                    SessionEvent::DaemonError {
+                        session_id: None,
+                        message: "daemon connection lost; reconnecting".to_string(),
+                    },
+                );
             }
             let dial_url = Self::dial_url(&url, &last_seq);
             let mut request = match dial_url.clone().into_client_request() {
                 Ok(request) => request,
                 Err(error) => {
-                    Self::fanout(&subscribers, SessionEvent::DaemonError {
-                        session_id: None,
-                        message: format!("invalid daemon url {dial_url}: {error}"),
-                    });
+                    Self::fanout(
+                        &subscribers,
+                        SessionEvent::DaemonError {
+                            session_id: None,
+                            message: format!("invalid daemon url {dial_url}: {error}"),
+                        },
+                    );
                     return;
                 }
             };
@@ -286,24 +419,27 @@ impl RemoteDaemon {
                         request.headers_mut().insert("Authorization", header);
                     }
                     Err(error) => {
-                        Self::fanout(&subscribers, SessionEvent::DaemonError {
-                            session_id: None,
-                            message: format!("could not build auth header: {error}"),
-                        });
+                        Self::fanout(
+                            &subscribers,
+                            SessionEvent::DaemonError {
+                                session_id: None,
+                                message: format!("could not build auth header: {error}"),
+                            },
+                        );
                         return;
                     }
                 }
             }
-            let (mut socket, response) =
-                match tokio_tungstenite::connect_async(request).await {
-                    Ok(pair) => pair,
-                    Err(error) => {
-                        tracing::warn!("daemon connect to {dial_url} failed: {error}");
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
-                        continue;
-                    }
-                };
+            let (mut socket, response) = match tokio_tungstenite::connect_async(request).await {
+                Ok(pair) => pair,
+                Err(error) => {
+                    connection.send_replace(ConnectionState::Reconnecting);
+                    tracing::warn!("daemon connect to {dial_url} failed: {error}");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                    continue;
+                }
+            };
             // Capability handshake: the daemon announces its wire protocol
             // version in a response header; absent means a pre-versioned
             // daemon that cannot decode the CommandRequest envelope.
@@ -317,6 +453,7 @@ impl RemoteDaemon {
             was_connected = true;
             backoff = RECONNECT_BACKOFF_INITIAL;
             connected.store(true, Ordering::SeqCst);
+            connection.send_replace(ConnectionState::Connected);
             // Server replays the journal tail newer than `?since=` first,
             // then live events — the same attach semantics LocalDaemon's
             // subscribe() exposes.
@@ -360,9 +497,8 @@ impl RemoteDaemon {
                                                 let _ = waiter.waiter.send(reply.result);
                                             }
                                         } else if let Some(event) = frame.event {
-                                            if frame.seq > 0 {
-                                                last_seq.fetch_max(frame.seq, Ordering::SeqCst);
-                                            }
+                                            if frame.seq > 0 && frame.seq <= last_seq.load(Ordering::SeqCst) { continue; }
+                                            if frame.seq > 0 { last_seq.store(frame.seq, Ordering::SeqCst); }
                                             // The journaled cancellation
                                             // answers a parked requester
                                             // the way its lost reply
@@ -434,7 +570,6 @@ impl RemoteDaemon {
         // the fanout list.
         subscribers.retain(|tx| tx.send(event.clone()).is_ok());
     }
-
 }
 
 impl RemoteDaemon {
@@ -461,10 +596,7 @@ impl RemoteDaemon {
             ));
         }
         let request_id = request.request_id;
-        let replayable = matches!(
-            request.command,
-            SessionCommand::CancelQueuedMessage { .. }
-        );
+        let replayable = matches!(request.command, SessionCommand::CancelQueuedMessage { .. });
         let (tx, rx) = oneshot::channel();
         // A reused id would strand the earlier waiter on a reply meant for
         // the newer request — fail it immediately instead.
@@ -509,25 +641,20 @@ impl RemoteDaemon {
 #[async_trait]
 impl DaemonClient for RemoteDaemon {
     async fn command(&self, command: SessionCommand) -> Result<(), String> {
-        if !self.connected.load(Ordering::SeqCst) {
-            return Err("daemon is not connected".to_string());
-        }
-        self.command_tx
-            .send(OutboundMessage::Command(command))
-            .map_err(|_| "daemon connection driver is gone".to_string())
+        self.send(command)
     }
 
-    async fn command_request(
-        &self,
-        request: CommandRequest,
-    ) -> Result<CommandResponse, String> {
+    async fn command_request(&self, request: CommandRequest) -> Result<CommandResponse, String> {
         // `tokio::time::timeout` needs a timer driver — GPUI's background
         // executor has none and `answer_request` would panic inside it.
         // Hop the request onto the shared Threadlane reactor when the
         // caller's context lacks Tokio; the driver's Tokio context then
         // serves the timeout.
         if tokio::runtime::Handle::try_current().is_err() {
-            let executor = threadlane_daemon::chat::executor()?;
+            let executor = self
+                .executor
+                .clone()
+                .ok_or("daemon event executor unavailable")?;
             let command_tx = self.command_tx.clone();
             let pending_requests = self.pending_requests.clone();
             let connected = self.connected.clone();
@@ -583,5 +710,150 @@ impl DaemonClient for RemoteDaemon {
             .expect("daemon subscribers poisoned")
             .push(tx);
         rx
+    }
+}
+
+impl Drop for RemoteDaemon {
+    fn drop(&mut self) {
+        if let Ok(driver) = self.driver.get_mut() {
+            if let Some(driver) = driver.take() {
+                driver.abort();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn pairing_is_explicit_and_confined_to_token_protected_local_addresses() {
+        for address in [
+            "ws://127.0.0.1:8080",
+            "ws://192.168.1.10:8080",
+            "ws://10.0.0.1:8080",
+            "ws://[::1]:8080",
+        ] {
+            assert!(
+                RemoteDaemon::validate_pairing(address, "token").is_ok(),
+                "{address}"
+            );
+        }
+        for address in [
+            "ws://8.8.8.8:8080",
+            "ws://example.com:8080",
+            "wss://192.168.1.10:8080",
+        ] {
+            assert!(
+                RemoteDaemon::validate_pairing(address, "token").is_err(),
+                "{address}"
+            );
+        }
+        assert!(RemoteDaemon::validate_pairing("ws://127.0.0.1:8080", "").is_err());
+        assert!(RemoteDaemon::transport_policy_error(
+            "ws://192.168.1.10:8080",
+            &Some("token".into())
+        )
+        .is_some());
+        assert!(RemoteDaemon::transport_policy_error(
+            "wss://example.com:8080",
+            &Some("token".into())
+        )
+        .is_none());
+    }
+    #[tokio::test]
+    async fn reconnect_replay_is_deduplicated_and_requests_are_acknowledged() {
+        use threadlane_protocol::AgentEvent;
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_hdr_async(
+                    socket,
+                    move |request: &Request, mut response: Response| {
+                        if attempt == 1 {
+                            assert!(request
+                                .uri()
+                                .query()
+                                .unwrap_or_default()
+                                .contains("since=1"));
+                        }
+                        response
+                            .headers_mut()
+                            .insert(PROTOCOL_VERSION_HEADER, "3".parse().unwrap());
+                        Ok(response)
+                    },
+                )
+                .await
+                .unwrap();
+                for seq in 1..=attempt + 1 {
+                    let event = SessionEvent::Agent {
+                        session_id: "session".into(),
+                        event: AgentEvent::MessageUpdate {
+                            text_delta: Some(seq.to_string()),
+                            reasoning_delta: None,
+                            tool_call_name: None,
+                        },
+                    };
+                    socket
+                        .send(Message::Text(
+                            serde_json::json!({"seq":seq,"event":event})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+                if attempt == 1 {
+                    let frame = socket.next().await.unwrap().unwrap().into_text().unwrap();
+                    let request: CommandRequest = serde_json::from_str(&frame).unwrap();
+                    assert!(matches!(request.command, SessionCommand::GetProjects));
+                    let reply = CommandReply {
+                        request_id: request.request_id,
+                        result: Ok(CommandResponse::Ack),
+                    };
+                    socket
+                        .send(Message::Text(
+                            serde_json::json!({"response":reply}).to_string().into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+                socket.close(None).await.unwrap();
+            }
+        });
+        let client = RemoteDaemon::connect_with_runtime(
+            format!("ws://{address}"),
+            None,
+            tokio::runtime::Handle::current(),
+        );
+        let mut events = client.subscribe();
+        let received = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut text = String::new();
+            while text.len() < 2 {
+                if let Some(SessionEvent::Agent {
+                    event:
+                        AgentEvent::MessageUpdate {
+                            text_delta: Some(delta),
+                            ..
+                        },
+                    ..
+                }) = events.recv().await
+                {
+                    text.push_str(&delta);
+                }
+            }
+            text
+        })
+        .await
+        .unwrap();
+        assert_eq!(received, "12");
+        assert!(matches!(
+            client.request(SessionCommand::GetProjects).await,
+            Ok(CommandResponse::Ack)
+        ));
+        server.await.unwrap();
     }
 }

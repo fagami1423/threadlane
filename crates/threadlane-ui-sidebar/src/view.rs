@@ -634,35 +634,7 @@ fn sidebar_session_fingerprint(
     hasher.finish()
 }
 
-struct SidebarSessionIdentity {
-    title: String,
-    tooltip: String,
-}
-
-fn sidebar_session_identity(session: &SessionInfo) -> SidebarSessionIdentity {
-    let Some(issue) = session.github_issue.as_ref() else {
-        return SidebarSessionIdentity {
-            title: session.title.clone(),
-            tooltip: session.title.clone(),
-        };
-    };
-    let prefix = format!("#{}", issue.number);
-    let title = session.title.trim();
-    let issue_title = title
-        .strip_prefix(&prefix)
-        .filter(|rest| rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace))
-        .map(str::trim_start)
-        .unwrap_or(title);
-    let title = if issue_title.is_empty() {
-        prefix.clone()
-    } else {
-        format!("{prefix} {issue_title}")
-    };
-    SidebarSessionIdentity {
-        tooltip: format!("{}/{}\n{}", issue.owner, issue.repo, title),
-        title,
-    }
-}
+use threadlane_ui_session::session_identity as sidebar_session_identity;
 
 /// Hash of every piece of `AppState` the sidebar renders. Streaming deltas
 /// mutate messages, plans, and usage without touching any of these fields, so
@@ -1370,66 +1342,7 @@ impl SidebarView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme().colors;
-        let status_indicator = match attention {
-            SessionAttention::NeedsYou => Some(
-                div()
-                    .debug_selector({
-                        let id = session.id.clone();
-                        move || format!("session-attention-{id}")
-                    })
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_1()
-                    .px_1p5()
-                    .py(rems(0.125))
-                    .rounded_full()
-                    .bg(theme.warning.opacity(0.12))
-                    .text_color(theme.warning)
-                    .child(div().size(rems(0.3125)).rounded_full().bg(theme.warning))
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(attention.label()),
-                    )
-                    .into_any_element(),
-            ),
-            SessionAttention::Working => Some(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_1()
-                    .px_1p5()
-                    .py(rems(0.125))
-                    .rounded_full()
-                    .bg(theme.info.opacity(0.1))
-                    .text_color(theme.foreground)
-                    .child(Spinner::new().xsmall().color(theme.info))
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(attention.label()),
-                    )
-                    .into_any_element(),
-            ),
-            SessionAttention::Ready => Some(
-                div()
-                    .flex_none()
-                    .px_1p5()
-                    .py(rems(0.125))
-                    .rounded_full()
-                    .bg(theme.muted.opacity(0.35))
-                    .text_xs()
-                    .font_medium()
-                    .text_color(theme.muted_foreground.opacity(0.9))
-                    .child(attention.label())
-                    .into_any_element(),
-            ),
-            SessionAttention::Idle => None,
-        };
+        let status_indicator = threadlane_ui_session::session_attention(&session.id, attention, cx);
 
 
         let title_color = if is_active {
@@ -1875,53 +1788,9 @@ impl SidebarView {
             );
         }
 
-        let (bg_color, border_color) = if is_active {
-            (
-                theme.sidebar_accent,
-                theme.primary.opacity(0.28),
-            )
-        } else {
-            (
-                gpui::transparent_black(),
-                gpui::transparent_black(),
-            )
-        };
-
-        div()
-            .id(SharedString::from(format!("session-card-{}", session.id)))
-            .group("session-card")
+        threadlane_ui_session::session_card(&session.id, is_active, cx)
             .tooltip(move |window, cx| Tooltip::new(session_tooltip.clone()).build(window, cx))
-            .role(Role::ListItem)
             .aria_label(session_row_label.clone())
-            .relative()
-            .flex()
-            .items_stretch()
-            .w_full()
-            .my(rems(0.1875))
-            .rounded_xl()
-            .bg(bg_color)
-            .border_1()
-            .border_color(border_color)
-            .when(is_active, |this| {
-                this.shadow_sm()
-                    .child(
-                        div()
-                            .absolute()
-                            .left_1()
-                            .top(rems(0.5))
-                            .bottom(rems(0.5))
-                            .w(px(2.0))
-                            .rounded_full()
-                            .bg(theme.primary.opacity(0.9)),
-                    )
-            })
-            .hover(|style| {
-                style.bg(if is_active {
-                    theme.sidebar_accent
-                } else {
-                    theme.list_hover.opacity(0.7)
-                })
-            })
             .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
                 let work_dir = work_dir.clone();
                 let session_id = session_id.clone();
@@ -3351,27 +3220,7 @@ impl SidebarView {
                 .into_any_element();
         }
 
-        div()
-            .relative()
-            .size_full()
-            .pt_2()
-            .child(
-                list(
-                    self.history_list_state.clone(),
-                    cx.processor(Self::render_history_row),
-                )
-                .size_full()
-                .pb_3()
-                .with_sizing_behavior(ListSizingBehavior::Auto),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .child(gpui_component::scroll::Scrollbar::vertical(
-                        &self.history_list_state,
-                    )),
-            )
+        threadlane_ui_session::session_list(self.history_list_state.clone(), cx.processor(Self::render_history_row))
             .into_any_element()
     }
 }
