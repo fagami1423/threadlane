@@ -122,6 +122,18 @@ pub enum SessionCommand {
     /// Refresh the provider/model catalog (live discovery merged into the
     /// picker). `work_dir` scopes project-level model overrides.
     RefreshCatalog { work_dir: Option<PathBuf> },
+    /// Open a daemon-hosted PTY: an interactive shell in `cwd` at
+    /// `cols`×`rows`. `terminal_id` is client-chosen and unique per spawn;
+    /// output, resize notices, and exit lifecycle stream back as
+    /// `SessionEvent::TerminalEvent` frames carrying the same id.
+    TerminalOpen {
+        terminal_id: String,
+        cwd: PathBuf,
+        cols: u16,
+        rows: u16,
+    },
+    /// Kill and release a daemon-hosted PTY.
+    TerminalClose { terminal_id: String },
     /// Forward keyboard input to a daemon-owned PTY.
     TerminalInput { terminal_id: String, data: String },
     /// Resize a daemon-owned PTY.
@@ -130,6 +142,19 @@ pub enum SessionCommand {
         cols: u16,
         rows: u16,
     },
+    /// Steer the session's live turn: the message reaches the model during
+    /// the current turn instead of queueing behind it.
+    SteerMessage {
+        session_id: String,
+        text: String,
+        #[serde(default)]
+        images: Vec<ImageAttachment>,
+    },
+    /// Re-route a still-pending queued follow-up into the live steer queue
+    /// so it reaches the model during the current turn instead of after it.
+    SteerQueuedMessage { session_id: String, entry_id: String },
+    /// Drop a still-pending queued input.
+    CancelQueuedMessage { session_id: String, entry_id: String },
     /// Request a project snapshot; answered by `SessionEvent::ProjectChanged`.
     GetProjectState { work_dir: PathBuf },
     /// Request a session snapshot; answered by `SessionEvent::SessionSnapshot`.
@@ -200,11 +225,15 @@ pub enum SessionEvent {
         /// Restores a New-task picker selection when applying it failed.
         failed_config: Option<(String, String)>,
     },
-    /// Output or lifecycle event from a daemon-owned PTY.
-    TerminalEvent {
-        session_id: String,
-        event: TerminalEvent,
-    },
+    /// Output or lifecycle event from a daemon-hosted PTY. Routing is by
+    /// the `terminal_id` inside the event — terminals belong to the host,
+    /// not to a session.
+    TerminalEvent { event: TerminalEvent },
+    /// `SubmitPrompt` landed mid-turn and the daemon queued the text as a
+    /// follow-up: `entry_id` is the durable queue entry a remote client
+    /// binds to its optimistic `queued-user-{session}` echo so the row's
+    /// steer/edit/remove controls become usable.
+    FollowUpQueued { session_id: String, entry_id: String },
     /// A project snapshot or delta. Sent on attach and whenever the project's
     /// session list changes (new session, title update, health transition).
     ProjectChanged { project: ProjectInfo },
@@ -257,6 +286,13 @@ pub enum TerminalEvent {
     Exited {
         terminal_id: String,
         exit_code: Option<i32>,
+    },
+    /// A `Terminal*` command failed before producing output (e.g. the
+    /// requested cwd or the shell does not exist). Scoped to the terminal
+    /// so only the owning view learns about it.
+    Failed {
+        terminal_id: String,
+        message: String,
     },
 }
 
@@ -706,10 +742,36 @@ mod tests {
                     }),
                 },
             },
+            SessionCommand::TerminalOpen {
+                terminal_id: "pty_1".into(),
+                cwd: PathBuf::from("/repo"),
+                cols: 80,
+                rows: 24,
+            },
+            SessionCommand::TerminalInput {
+                terminal_id: "pty_1".into(),
+                data: "ls\n".into(),
+            },
             SessionCommand::TerminalResize {
                 terminal_id: "pty_1".into(),
                 cols: 80,
                 rows: 24,
+            },
+            SessionCommand::TerminalClose {
+                terminal_id: "pty_1".into(),
+            },
+            SessionCommand::SteerMessage {
+                session_id: "sess_1".into(),
+                text: "stop that".into(),
+                images: vec![],
+            },
+            SessionCommand::SteerQueuedMessage {
+                session_id: "sess_1".into(),
+                entry_id: "entry-1".into(),
+            },
+            SessionCommand::CancelQueuedMessage {
+                session_id: "sess_1".into(),
+                entry_id: "entry-1".into(),
             },
             SessionCommand::GetProjectState {
                 work_dir: PathBuf::from("/repo"),
@@ -801,11 +863,20 @@ mod tests {
                 failed_config: Some(("model".into(), "auto".into())),
             },
             SessionEvent::TerminalEvent {
-                session_id: "sess_1".into(),
                 event: TerminalEvent::Output {
                     terminal_id: "pty_1".into(),
                     data: "$ ".into(),
                 },
+            },
+            SessionEvent::TerminalEvent {
+                event: TerminalEvent::Failed {
+                    terminal_id: "pty_1".into(),
+                    message: "could not spawn shell".into(),
+                },
+            },
+            SessionEvent::FollowUpQueued {
+                session_id: "sess_1".into(),
+                entry_id: "entry-1".into(),
             },
             SessionEvent::ProjectChanged {
                 project: ProjectInfo {

@@ -7,6 +7,12 @@
 //! Errors travel as `DaemonError` events, so no error frame shape exists.
 //! `seq` is the daemon's journal sequence; synthesized frames (undecodable
 //! commands, lag notices) carry `seq: 0`.
+//!
+//! Auth today is a shared bearer token (`THREADLANE_DAEMON_TOKEN`) and the
+//! deployment is localhost-only by design. Binding beyond localhost needs a
+//! follow-up pairing flow (QR scan or entered pairing code that exchanges
+//! for a per-client credential) — a shared static token is not a safe
+//! network-exposed auth scheme.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -151,11 +157,25 @@ async fn serve_connection(
         }
     });
 
+    // Terminals this connection opened but never closed. A crashed or
+    // abruptly gone client can't deliver TerminalClose, so the connection
+    // owns their cleanup — otherwise every leaked interactive shell and
+    // its worker threads would outlive the client indefinitely.
+    let mut owned_terminals = std::collections::HashSet::<String>::new();
     while let Some(message) = read.next().await {
         match message {
             Ok(Message::Text(text)) => {
                 match serde_json::from_str::<SessionCommand>(&text) {
                     Ok(command) => {
+                        match &command {
+                            SessionCommand::TerminalOpen { terminal_id, .. } => {
+                                owned_terminals.insert(terminal_id.clone());
+                            }
+                            SessionCommand::TerminalClose { terminal_id } => {
+                                owned_terminals.remove(terminal_id);
+                            }
+                            _ => {}
+                        }
                         // Dispatch errors also reach this client as
                         // DaemonError events — no error frame shape needed.
                         if let Err(error) = core.clone().dispatch(command).await {
@@ -179,6 +199,9 @@ async fn serve_connection(
             // stream; any that surface here are safe to ignore.
             Ok(_) => {}
         }
+    }
+    for terminal_id in owned_terminals {
+        core.close_terminal(&terminal_id);
     }
     Ok(())
 }

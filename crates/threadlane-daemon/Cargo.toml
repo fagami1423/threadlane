@@ -12,6 +12,7 @@ tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 futures.workspace = true
+portable-pty.workspace = true
 tokio-tungstenite.workspace = true
 threadlane-acp.workspace = true
 threadlane-acp-engine.workspace = true

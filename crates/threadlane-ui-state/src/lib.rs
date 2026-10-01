@@ -17,7 +17,7 @@ pub mod types;
 #[cfg(any(test, feature = "test-support"))]
 mod test_support;
 
-pub use app_state::{close_work_needs_refresh, ActiveCloseWork, AppState};
+pub use app_state::{close_work_needs_refresh, ActiveCloseWork, AppState, TerminalBus};
 pub use session_seen::{SessionSeenStore, SessionSeenWriter};
 pub use threadlane_daemon::{
     agent_events, automation, chat, discovery, events, projection, provider_auth, runtimes,

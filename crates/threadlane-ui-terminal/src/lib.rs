@@ -132,6 +132,75 @@ impl Drop for PtySession {
     }
 }
 
+/// The I/O half of a hosted terminal: input and resize travel toward the
+/// shell; dropping it ends the shell. Raw output flows into the parser
+/// channel the backend was handed at spawn, so every implementation shares
+/// this crate's emulator and rendering.
+pub trait TerminalIo: Send {
+    fn write(&self, bytes: &[u8]);
+    fn resize(&self, rows: u16, cols: u16);
+}
+
+impl TerminalIo for PtySession {
+    fn write(&self, bytes: &[u8]) {
+        PtySession::write(self, bytes);
+    }
+
+    fn resize(&self, rows: u16, cols: u16) {
+        PtySession::resize(self, rows, cols);
+    }
+}
+
+/// Lifecycle channel a `TerminalBackend` reports on — kept opaque so the
+/// view's internal `PtyEvent` and frame types stay private.
+#[derive(Clone)]
+pub struct TerminalEventSink(tokio::sync::mpsc::UnboundedSender<PtyEvent>);
+
+impl TerminalEventSink {
+    /// The shell exited or its byte stream ended.
+    pub fn closed(&self) {
+        let _ = self.0.send(PtyEvent::Closed);
+    }
+
+    /// A transport-level failure worth surfacing in the terminal.
+    pub fn error(&self, message: String) {
+        let _ = self.0.send(PtyEvent::Error(message));
+    }
+}
+
+/// How a `TerminalView` obtains a shell. `LocalTerminalBackend` spawns a
+/// PTY on this machine; another implementation can drive a daemon-hosted
+/// PTY over the wire so terminals belong to the remote host.
+pub trait TerminalBackend: Send + Sync {
+    fn spawn(
+        &self,
+        cwd: &std::path::Path,
+        rows: u16,
+        cols: u16,
+        output_tx: mpsc::SyncSender<Vec<u8>>,
+        sink: TerminalEventSink,
+    ) -> Result<Box<dyn TerminalIo>, String>;
+}
+
+/// Spawns a shell on the host this process runs on (the default).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LocalTerminalBackend;
+
+impl TerminalBackend for LocalTerminalBackend {
+    fn spawn(
+        &self,
+        cwd: &std::path::Path,
+        rows: u16,
+        cols: u16,
+        output_tx: mpsc::SyncSender<Vec<u8>>,
+        sink: TerminalEventSink,
+    ) -> Result<Box<dyn TerminalIo>, String> {
+        spawn_shell(&cwd.to_path_buf(), rows, cols, output_tx, sink.0)
+            .map(|session| Box::new(session) as Box<dyn TerminalIo>)
+            .map_err(|error| error.to_string())
+    }
+}
+
 enum PtyEvent {
     Frame(TerminalFrame),
     Closed,
@@ -671,7 +740,8 @@ pub struct TerminalView {
     focus_handle: FocusHandle,
     screen: vt100::Screen,
     parser_command_tx: Option<mpsc::Sender<ParserCommand>>,
-    session: Option<PtySession>,
+    session: Option<Box<dyn TerminalIo>>,
+    backend: Arc<dyn TerminalBackend>,
     event_tx: tokio::sync::mpsc::UnboundedSender<PtyEvent>,
     status: Option<String>,
     rows: u16,
@@ -697,7 +767,17 @@ pub struct TerminalView {
 
 impl TerminalView {
     pub fn new(project: PathBuf, cx: &mut Context<Self>) -> Self {
-        Self::new_with_start(project, cx, true)
+        Self::new_with_backend(project, Arc::new(LocalTerminalBackend), cx)
+    }
+
+    /// Same as `new` with an explicit shell provider: a remote backend runs
+    /// the terminal's PTY on the daemon host instead of this machine.
+    pub fn new_with_backend(
+        project: PathBuf,
+        backend: Arc<dyn TerminalBackend>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_start(project, backend, cx, true)
     }
 
     /// Same as `new` minus the real PTY: tests construct selection and
@@ -705,10 +785,15 @@ impl TerminalView {
     /// test scheduler's deterministic-thread guard.
     #[cfg(test)]
     fn new_for_test(project: PathBuf, cx: &mut Context<Self>) -> Self {
-        Self::new_with_start(project, cx, false)
+        Self::new_with_start(project, Arc::new(LocalTerminalBackend), cx, false)
     }
 
-    fn new_with_start(project: PathBuf, cx: &mut Context<Self>, autostart: bool) -> Self {
+    fn new_with_start(
+        project: PathBuf,
+        backend: Arc<dyn TerminalBackend>,
+        cx: &mut Context<Self>,
+        autostart: bool,
+    ) -> Self {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         cx.spawn(async move |this, cx| loop {
             let wake = next_terminal_wake(
@@ -758,6 +843,7 @@ impl TerminalView {
                 .clone(),
             parser_command_tx: None,
             session: None,
+            backend,
             event_tx,
             status: None,
             rows: DEFAULT_ROWS,
@@ -783,7 +869,7 @@ impl TerminalView {
         terminal
     }
 
-    /// Sends raw input bytes into the terminal PTY.
+    /// Sends raw input bytes into the terminal's shell.
     pub fn send_input(&self, input: &str) {
         if let Some(session) = &self.session {
             session.write(input.as_bytes());
@@ -906,15 +992,15 @@ impl TerminalView {
         let result = start_parser_worker(self.rows, self.cols, self.event_tx.clone())
             .map_err(|e| e.to_string())
             .and_then(|(output_tx, command_tx)| {
-                spawn_shell(
-                    &self.project,
-                    self.rows,
-                    self.cols,
-                    output_tx,
-                    self.event_tx.clone(),
-                )
-                .map_err(|e| e.to_string())
-                .map(|session| (session, command_tx))
+                self.backend
+                    .spawn(
+                        &self.project,
+                        self.rows,
+                        self.cols,
+                        output_tx,
+                        TerminalEventSink(self.event_tx.clone()),
+                    )
+                    .map(|session| (session, command_tx))
             });
         match result {
             Ok((session, command_tx)) => {

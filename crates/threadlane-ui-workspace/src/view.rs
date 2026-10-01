@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -814,10 +815,21 @@ impl WorkspaceView {
     /// cap, so extending a whitespace drag into real text or output
     /// scrolling under a static selection still re-renders.
     fn new_terminal_with_tracking(
+        &self,
         cwd: PathBuf,
         cx: &mut Context<Self>,
     ) -> (Entity<TerminalView>, Vec<Subscription>) {
-        let terminal = cx.new(|cx| TerminalView::new(cwd, cx));
+        // A remote daemon owns terminals: the PTY runs on the host over the
+        // wire. Local mode keeps the in-process PTY backend.
+        let backend = self.model.read(cx).daemon_remote.then(|| {
+            Arc::new(crate::remote_terminal::RemoteTerminalBackend::new(
+                self.model.read(cx).terminal_bus(),
+            ))
+        });
+        let terminal = cx.new(|cx| match backend {
+            Some(backend) => TerminalView::new_with_backend(cwd, backend, cx),
+            None => TerminalView::new(cwd, cx),
+        });
         let mut last_availability = None;
         let subscription = cx.observe(&terminal, move |_, terminal, cx| {
             let availability = terminal
@@ -1010,7 +1022,7 @@ impl WorkspaceView {
             .get(group_key)
             .is_none_or(|group| group.tabs.is_empty())
         {
-            let (terminal, subscription) = Self::new_terminal_with_tracking(cwd.clone(), cx);
+            let (terminal, subscription) = self.new_terminal_with_tracking(cwd.clone(), cx);
             self.terminal_subscriptions.extend(subscription);
             let group = self
                 .terminal_groups
@@ -1037,7 +1049,7 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (terminal, subscription) = Self::new_terminal_with_tracking(cwd, cx);
+        let (terminal, subscription) = self.new_terminal_with_tracking(cwd, cx);
         self.terminal_subscriptions.extend(subscription);
         terminal.read(cx).focus_handle(cx).focus(window, cx);
         let group = self
@@ -1058,7 +1070,7 @@ impl WorkspaceView {
         work_dir: PathBuf,
         cx: &mut Context<Self>,
     ) {
-        let (terminal, subscription) = Self::new_terminal_with_tracking(work_dir, cx);
+        let (terminal, subscription) = self.new_terminal_with_tracking(work_dir, cx);
         self.terminal_subscriptions.extend(subscription);
         let group = self.get_or_create_terminal_group(&project, cx);
         group.tabs.push(terminal);
@@ -1070,7 +1082,7 @@ impl WorkspaceView {
         if self.fallback_terminal.is_none() {
             let project =
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let (terminal, subscription) = Self::new_terminal_with_tracking(project, cx);
+            let (terminal, subscription) = self.new_terminal_with_tracking(project, cx);
             self.terminal_subscriptions.extend(subscription);
             self.fallback_terminal = Some(terminal);
         }
@@ -1119,27 +1131,34 @@ impl WorkspaceView {
                 self.model.read(cx).terminal_group_key().as_ref() == Some(project)
             })
             .unwrap_or_else(|| project.clone());
-        if let Some(group) = self.terminal_groups.get_mut(project) {
-            if tab >= group.tabs.len() {
-                return;
-            }
-            if group.tabs.len() > 1 {
-                group.tabs.remove(tab);
-                if tab < group.active_tab {
-                    group.active_tab -= 1;
-                } else if tab == group.active_tab {
-                    group.active_tab = group.active_tab.min(group.tabs.len() - 1);
+        let needs_replacement = match self.terminal_groups.get_mut(project) {
+            Some(group) if tab < group.tabs.len() => {
+                if group.tabs.len() > 1 {
+                    group.tabs.remove(tab);
+                    if tab < group.active_tab {
+                        group.active_tab -= 1;
+                    } else if tab == group.active_tab {
+                        group.active_tab = group.active_tab.min(group.tabs.len() - 1);
+                    }
+                    false
+                } else {
+                    true
                 }
-            } else {
-                let (terminal, subscription) =
-                    Self::new_terminal_with_tracking(replacement_cwd.clone(), cx);
-                self.terminal_subscriptions.extend(subscription);
+            }
+            Some(_) => return,
+            None => return,
+        };
+        if needs_replacement {
+            let (terminal, subscription) =
+                self.new_terminal_with_tracking(replacement_cwd.clone(), cx);
+            self.terminal_subscriptions.extend(subscription);
+            if let Some(group) = self.terminal_groups.get_mut(project) {
                 group.tabs = vec![terminal];
                 group.active_tab = 0;
-                self.bottom_panel_visible = false;
             }
-            cx.notify();
+            self.bottom_panel_visible = false;
         }
+        cx.notify();
     }
 
     fn close_other_terminal_tabs(
