@@ -877,27 +877,31 @@ impl MobileApp {
     }
 
     fn render_connect(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut header = div()
+        let mut brand = div().flex().items_center().gap_3();
+        if let Some(logo) = threadlane_ui_theme::bundled_icon("icons/threadlane.svg") {
+            brand = brand.child(logo.large().text_color(cx.theme().foreground));
+        }
+        let header = div()
+            .flex_none()
             .flex()
             .flex_col()
             .gap_2()
-            .pt_8()
-            .child(div().text_xl().font_bold().child("Threadlane"));
-        if let Some(logo) = threadlane_ui_theme::bundled_icon("icons/threadlane.svg") {
-            header = header.child(logo.with_size(px(44.)).text_color(cx.theme().accent));
-        }
-        header = header.child(
-            div()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(
-                    "Run your desktop sessions from your phone. Scan the QR code \
-                     in the desktop app (sidebar → Share with mobile) \
-                     or enter the pairing details below.",
-                ),
-        );
+            .pt_4()
+            .child(brand.child(div().text_xl().font_bold().child("Threadlane")))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "Run your desktop sessions from your phone. Scan the QR code \
+                         in the desktop app (sidebar → Share with mobile) \
+                         or enter the pairing details below.",
+                    ),
+            );
         div()
+            .id("pairing")
             .size_full()
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .bg(cx.theme().background)
@@ -907,6 +911,7 @@ impl MobileApp {
             .child(header)
             .child(
                 div()
+                    .flex_none()
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -921,7 +926,7 @@ impl MobileApp {
                                     .text_color(cx.theme().muted_foreground)
                                     .child("Host"),
                             )
-                            .child(Input::new(&self.host).aria_label("Daemon host")),
+                            .child(Input::new(&self.host).large().aria_label("Desktop host")),
                     )
                     .child(
                         div()
@@ -934,7 +939,7 @@ impl MobileApp {
                                     .text_color(cx.theme().muted_foreground)
                                     .child("Port"),
                             )
-                            .child(Input::new(&self.port).aria_label("Daemon port")),
+                            .child(Input::new(&self.port).large().aria_label("Desktop port")),
                     )
                     .child(
                         div()
@@ -947,7 +952,7 @@ impl MobileApp {
                                     .text_color(cx.theme().muted_foreground)
                                     .child("Token"),
                             )
-                            .child(Input::new(&self.token).aria_label("Pairing token")),
+                            .child(Input::new(&self.token).large().aria_label("Pairing token")),
                     ),
             )
             .when_some(self.connect_error.clone(), |this, error| {
@@ -956,6 +961,7 @@ impl MobileApp {
             .child(
                 Button::new("connect")
                     .primary()
+                    .h_11()
                     .label("Connect")
                     .w_full()
                     .disabled(self.link_state == "Connecting…")
@@ -966,6 +972,7 @@ impl MobileApp {
                     Button::new("forget-pairing")
                         .ghost()
                         .small()
+                        .h_11()
                         .label("Forget saved pairing")
                         .w_full()
                         .on_click(
@@ -1015,7 +1022,7 @@ impl MobileApp {
                         Button::new("disconnect")
                             .ghost()
                             .label("Disconnect")
-                            .small()
+                            .h_11()
                             .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx))),
                     ),
             )
@@ -1069,6 +1076,9 @@ impl MobileApp {
                                             matches!(session.health, SessionHealth::Working);
                                         Button::new(format!("session-{}", session.id))
                                             .outline()
+                                            .h_auto()
+                                            .min_h_16()
+                                            .py_3()
                                             .w_full()
                                             .child(
                                                 div()
@@ -1083,13 +1093,19 @@ impl MobileApp {
                                                             .items_center()
                                                             .gap_2()
                                                             .w_full()
-                                                            .child(div().child(
-                                                                if session.title.trim().is_empty() {
-                                                                    "Untitled session".to_string()
-                                                                } else {
-                                                                    session.title.clone()
-                                                                },
-                                                            ))
+                                                            .child(
+                                                                div()
+                                                                    .flex_1()
+                                                                    .min_w_0()
+                                                                    .truncate()
+                                                                    .child(
+                                                                        if session.title.trim().is_empty() {
+                                                                            "Untitled session".to_string()
+                                                                        } else {
+                                                                            session.title.clone()
+                                                                        },
+                                                                    ),
+                                                            )
                                                             .when(needs_you, |this| {
                                                                 this.child(
                                                                     div()
@@ -1128,9 +1144,11 @@ impl MobileApp {
                                                         div()
                                                             .text_xs()
                                                             .text_color(cx.theme().muted_foreground)
+                                                            .truncate()
                                                             .child(format!(
                                                                 "{}{}",
-                                                                session.runtime_work_dir.display(),
+                                                                session.git_branch.as_deref()
+                                                                    .unwrap_or("Local"),
                                                                 if session.is_worktree {
                                                                     " · worktree"
                                                                 } else {
@@ -1181,7 +1199,7 @@ impl MobileApp {
                     .child(
                         Button::new("back")
                             .ghost()
-                            .small()
+                            .h_11()
                             .icon(icon(kit_icons::ArrowLeft.1))
                             .label("Back")
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -1206,7 +1224,7 @@ impl MobileApp {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .child(div().font_bold().child(title))
+                            .child(div().font_bold().truncate().child(title))
                             .when_some(status, |this, status| {
                                 this.child(
                                     div()
@@ -1220,7 +1238,7 @@ impl MobileApp {
                         this.child(
                             Button::new("cancel-run")
                                 .danger()
-                                .small()
+                                .h_11()
                                 .label("Stop")
                                 .on_click(cx.listener(|this, _, _, cx| this.cancel_run(cx))),
                         )
@@ -1228,9 +1246,10 @@ impl MobileApp {
                     .child(
                         Button::new("delete-session")
                             .ghost()
-                            .small()
-                            .icon(icon(kit_icons::Trash.1).text_color(cx.theme().muted_foreground))
+                            .size_11()
+                            .icon(threadlane_ui_theme::bundled_icon("icons/archive.svg").unwrap())
                             .accessibility_label("Archive session")
+                            .tooltip("Archive session")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(active) = &mut this.active {
                                     active.confirm_delete = !active.confirm_delete;
@@ -1334,11 +1353,12 @@ impl MobileApp {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .child(Input::new(&self.composer).aria_label("Message")),
+                            .child(Input::new(&self.composer).large().aria_label("Message")),
                     )
                     .child(
                         Button::new("send")
                             .primary()
+                            .size_11()
                             .icon(icon(kit_icons::SendHorizontal.1))
                             .accessibility_label(if working {
                                 "Steer the running turn"
@@ -1404,19 +1424,7 @@ impl MobileApp {
                 .flex()
                 .justify_end()
                 .child(
-                    div()
-                        .min_w_0()
-                        .max_w(rems(40.))
-                        .px_4()
-                        .py_3()
-                        .rounded_2xl()
-                        .rounded_br_md()
-                        .border_1()
-                        .border_color(cx.theme().border.opacity(0.22))
-                        .bg(cx.theme().secondary.opacity(0.85))
-                        .text_sm()
-                        .text_color(cx.theme().secondary_foreground)
-                        .child(body),
+                    threadlane_ui_theme::user_message_bubble(cx).child(body),
                 )
                 .into_any_element()
         } else {
