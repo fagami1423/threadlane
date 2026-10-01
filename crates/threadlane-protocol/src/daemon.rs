@@ -45,10 +45,17 @@ use crate::events::{AgentEvent, SubagentIsolation};
 /// inbound, `{"seq", "event"}` frames outbound. A daemon that sends no
 /// header is version 1 — it cannot decode a [`CommandRequest`] envelope
 /// (it rejects the frame as an undecodable command and never dispatches
-/// it), so clients must gate request/reply calls on version ≥ 2.
-/// Version 2 adds the `CommandRequest`/`CommandReply` pair and the
-/// journaled [`SessionEvent::QueuedEntryCancelled`].
+/// it), so clients must gate request/reply calls on
+/// [`COMMAND_REQUEST_PROTOCOL_VERSION`]. Version 2 adds the
+/// `CommandRequest`/`CommandReply` pair and the journaled
+/// [`SessionEvent::QueuedEntryCancelled`].
 pub const WIRE_PROTOCOL_VERSION: u64 = 2;
+
+/// The lowest protocol version able to decode a [`CommandRequest`]
+/// envelope. Gate request/reply calls on this constant, not on
+/// [`WIRE_PROTOCOL_VERSION`] itself: when this build's version advances
+/// past 2, older-but-still-capable daemons must keep qualifying.
+pub const COMMAND_REQUEST_PROTOCOL_VERSION: u64 = 2;
 
 /// The handshake response header carrying [`WIRE_PROTOCOL_VERSION`].
 /// Absent on pre-2 daemons, which is exactly how a client learns it is
@@ -331,8 +338,9 @@ pub struct CommandRequest {
 /// Payload a [`CommandRequest`] resolves to. `Ack` is the reply for
 /// commands that carry no return value — the payload-carrying variants
 /// are the point of the request/reply channel. Only a peer advertising
-/// [`WIRE_PROTOCOL_VERSION`] ≥ 2 can decode the envelope; on a version-1
-/// daemon the frame is rejected as an undecodable command.
+/// a protocol version of at least [`COMMAND_REQUEST_PROTOCOL_VERSION`]
+/// can decode the envelope; on a version-1 daemon the frame is rejected
+/// as an undecodable command.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CommandResponse {

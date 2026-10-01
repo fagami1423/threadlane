@@ -5397,6 +5397,37 @@ fn remote_queued_cancel_error_keeps_the_row() {
 }
 
 #[test]
+fn remote_queued_cancel_not_pending_drops_the_stale_row() {
+    let mut state = queued_state();
+
+    state
+        .cancel_queued_message("entry-1")
+        .expect("remote cancel succeeds");
+    assert!(state.queued_removal_pending("sess-1", "entry-1"));
+
+    // The scheduler consumed the entry between the row rendering and the
+    // cancel landing: "no longer pending" is authoritative that it left
+    // the queue, so the retained echo is reconciled, not kept.
+    let changed = state.drain_chat_stream(vec![SessionEvent::CommandResult {
+        request_id: 1,
+        result: Err(threadlane_coding_agent::scheduler::QUEUED_ENTRY_NOT_PENDING
+            .to_string()),
+    }]);
+    assert!(changed);
+    assert!(state.pending_queued_cancels.is_empty());
+    assert!(
+        state
+            .messages
+            .iter()
+            .all(|message| message.id != "queued-user-sess-1-entry-1")
+    );
+    assert_eq!(
+        state.session_status.as_deref(),
+        Some("Queued message is no longer pending")
+    );
+}
+
+#[test]
 fn remote_edit_queued_message_falls_back_to_bare_command_on_v1_daemon() {
     let client = Arc::new(RecordingDaemonClient::default());
     let mut state = queued_state();

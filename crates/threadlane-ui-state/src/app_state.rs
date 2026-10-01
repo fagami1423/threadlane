@@ -4940,13 +4940,33 @@ impl AppState {
                             self.pending_queued_cancels.remove(&request_id);
                         }
                         Err(error) => {
-                            // The echo was never removed — the row still
-                            // truthfully shows the entry as queued. Drop
-                            // the intent and say why it stayed.
-                            if self.pending_queued_cancels.remove(&request_id).is_some() {
-                                self.session_status = Some(format!(
-                                    "Could not remove queued message: {error}"
-                                ));
+                            if let Some(pending) =
+                                self.pending_queued_cancels.remove(&request_id)
+                            {
+                                if error
+                                    == threadlane_coding_agent::scheduler::QUEUED_ENTRY_NOT_PENDING
+                                {
+                                    // Authoritative: the entry already
+                                    // left the queue — consumed into the
+                                    // running turn or cancelled by
+                                    // someone else — so the retained row
+                                    // is stale, not truthful. Reconcile
+                                    // it; the text already handed back
+                                    // for an edit stays in the composer.
+                                    self.remove_queued_echo(
+                                        &pending.session_id,
+                                        &pending.entry_id,
+                                    );
+                                    self.session_status =
+                                        Some(error.clone());
+                                } else {
+                                    // The echo was never removed — the
+                                    // row still truthfully shows the
+                                    // entry as queued.
+                                    self.session_status = Some(format!(
+                                        "Could not remove queued message: {error}"
+                                    ));
+                                }
                                 changed = true;
                             }
                             tracing::warn!("daemon request {request_id} failed: {error}");

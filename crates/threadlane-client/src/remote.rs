@@ -25,7 +25,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use threadlane_protocol::daemon::{
     CommandReply, CommandRequest, CommandResponse, SessionCommand, SessionEvent,
-    PROTOCOL_VERSION_HEADER, WIRE_PROTOCOL_VERSION,
+    COMMAND_REQUEST_PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
 };
 
 use crate::DaemonClient;
@@ -458,7 +458,7 @@ impl DaemonClient for RemoteDaemon {
         // command — the dispatch never runs and no reply ever comes, so
         // fail the request here instead of parking it on the timeout.
         let peer_version = self.protocol_version.load(Ordering::SeqCst);
-        if peer_version < WIRE_PROTOCOL_VERSION {
+        if peer_version < COMMAND_REQUEST_PROTOCOL_VERSION {
             return Err(format!(
                 "daemon does not support command requests (protocol version {peer_version})"
             ));
@@ -514,7 +514,7 @@ impl DaemonClient for RemoteDaemon {
     }
 
     fn supports_command_requests(&self) -> bool {
-        self.protocol_version.load(Ordering::SeqCst) >= WIRE_PROTOCOL_VERSION
+        self.protocol_version.load(Ordering::SeqCst) >= COMMAND_REQUEST_PROTOCOL_VERSION
     }
 
     fn subscribe(&self) -> mpsc::UnboundedReceiver<SessionEvent> {

@@ -23,6 +23,14 @@ use threadlane_runtime::AgentRuntime;
 use threadlane_runtime::harness::QueueKind;
 use tokio::sync::Notify;
 
+/// The authoritative answer when a queued input can no longer be
+/// cancelled: the entry already left the queue — consumed by the
+/// scheduler into the running turn, or cancelled by someone else. The
+/// daemon relays this verbatim as the `CommandRequest` error, and
+/// clients reconcile their optimistic row against it (the entry is
+/// definitely gone — drop it, never keep showing it as queued).
+pub const QUEUED_ENTRY_NOT_PENDING: &str = "Queued message is no longer pending";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentWork {
     DurableQueueWake {
@@ -324,7 +332,7 @@ impl CodingAgentWorkHandle {
         if let Some(path) = self.session_file.as_deref() {
             let mut harness = CodingSessionHarness::open(path)?;
             let Some((_queue, message)) = harness.unbound_queue_entry(entry_id)? else {
-                return Err("Queued message is no longer pending".into());
+                return Err(QUEUED_ENTRY_NOT_PENDING.into());
             };
             harness.cancel_unbound_entry(entry_id)?;
             self.scheduler.take_pending(entry_id);
@@ -337,9 +345,9 @@ impl CodingAgentWorkHandle {
                 ) => Ok((content, images)),
                 Some(work) => {
                     self.scheduler.schedule(work);
-                    Err("Queued message is no longer pending".into())
+                    Err(QUEUED_ENTRY_NOT_PENDING.into())
                 }
-                None => Err("Queued message is no longer pending".into()),
+                None => Err(QUEUED_ENTRY_NOT_PENDING.into()),
             }
         }
     }
@@ -353,7 +361,7 @@ impl CodingAgentWorkHandle {
         if let Some(path) = self.session_file.as_deref() {
             let mut harness = CodingSessionHarness::open(path)?;
             let Some((_queue, message)) = harness.unbound_queue_entry(entry_id)? else {
-                return Err("Queued message is no longer pending".into());
+                return Err(QUEUED_ENTRY_NOT_PENDING.into());
             };
             let (content, images) = queued_message_parts(message)?;
             // Enqueue the steer first so an enqueue failure leaves the
@@ -386,9 +394,9 @@ impl CodingAgentWorkHandle {
                 }
                 Some(work) => {
                     self.scheduler.schedule(work);
-                    Err("Queued message is no longer pending".into())
+                    Err(QUEUED_ENTRY_NOT_PENDING.into())
                 }
-                None => Err("Queued message is no longer pending".into()),
+                None => Err(QUEUED_ENTRY_NOT_PENDING.into()),
             }
         }
     }
