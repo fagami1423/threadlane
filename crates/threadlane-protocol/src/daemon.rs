@@ -163,8 +163,16 @@ pub enum SessionCommand {
     SteerQueuedMessage { session_id: String, entry_id: String },
     /// Drop a still-pending queued input. Sent inside a [`CommandRequest`]
     /// the reply carries the entry's staged text and images as
-    /// `CommandResponse::CancelledQueuedMessage`.
-    CancelQueuedMessage { session_id: String, entry_id: String },
+    /// `CommandResponse::CancelledQueuedMessage`. `work_dir` pins the
+    /// project the session belongs to: when present the daemon resolves
+    /// the runtime only inside that project, so a same-named session in
+    /// another project cannot be cancelled in its place.
+    CancelQueuedMessage {
+        session_id: String,
+        entry_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        work_dir: Option<PathBuf>,
+    },
     /// Request the full attached-project list; answered by one
     /// `SessionEvent::ProjectChanged` per attached project. A freshly
     /// attached thin client sends this instead of relying on the bounded
@@ -855,6 +863,7 @@ mod tests {
             SessionCommand::CancelQueuedMessage {
                 session_id: "sess_1".into(),
                 entry_id: "entry-1".into(),
+                work_dir: Some(PathBuf::from("/repo")),
             },
             SessionCommand::GetProjectState {
                 work_dir: PathBuf::from("/repo"),
@@ -1032,6 +1041,7 @@ mod tests {
             command: SessionCommand::CancelQueuedMessage {
                 session_id: "sess_1".into(),
                 entry_id: "entry-1".into(),
+                work_dir: None,
             },
         };
         let json = serde_json::to_string(&request).expect("request serializes");

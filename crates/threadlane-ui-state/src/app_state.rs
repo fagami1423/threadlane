@@ -5201,12 +5201,14 @@ impl AppState {
                     command: SessionCommand::CancelQueuedMessage {
                         session_id: session_id.clone(),
                         entry_id: entry_id.to_string(),
+                        work_dir: self.active_work_dir.clone(),
                     },
                 });
             } else {
                 self.dispatch_command(SessionCommand::CancelQueuedMessage {
                     session_id,
                     entry_id: entry_id.to_string(),
+                    work_dir: self.active_work_dir.clone(),
                 });
             }
             let mut messages = (*self.messages).clone();
