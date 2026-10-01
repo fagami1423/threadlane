@@ -6,7 +6,6 @@
 //! address bar, multiple tabs, and a click-to-annotate picker whose picks land
 //! in the chat composer.
 
-use base64::Engine as _;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};

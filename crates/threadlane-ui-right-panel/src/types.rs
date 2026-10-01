@@ -150,8 +150,6 @@ impl Surface {
 pub enum GitAction {
     Commit,
     CommitAndPush,
-    CommitAmend,
-    CommitAmendAndPush,
     StageFile(String),
     UnstageFile(String),
     StageFiles(Vec<String>),
@@ -160,7 +158,6 @@ pub enum GitAction {
         message: Option<String>,
         include_untracked: bool,
     },
-    LoadLastCommitMessage,
     Push,
     Pull,
     Fetch,
@@ -314,9 +311,5 @@ pub enum PanelEvent {
         project: PathBuf,
         index: usize,
         files: Vec<GitFile>,
-    },
-    LastCommitMessageLoaded {
-        project: PathBuf,
-        result: Result<String, String>,
     },
 }

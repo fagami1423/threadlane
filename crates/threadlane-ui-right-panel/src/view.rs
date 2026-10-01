@@ -59,7 +59,6 @@ pub struct RightPanelView {
     review_selection_initialized: bool,
     review_filter_input: Entity<InputState>,
     review_view_mode: ReviewViewMode,
-    commit_amend: bool,
     stash_dialog_open: bool,
     stash_message_input: Entity<InputState>,
     stash_include_untracked: bool,
@@ -315,7 +314,6 @@ impl RightPanelView {
             review_selection_initialized: false,
             review_filter_input,
             review_view_mode: ReviewViewMode::List,
-            commit_amend: false,
             stash_dialog_open: false,
             stash_message_input,
             stash_include_untracked: true,
@@ -439,7 +437,6 @@ impl RightPanelView {
         self.open_review(cx);
         self.close_document(cx);
         self.review_tab = ReviewTab::Changes;
-        self.commit_amend = false;
         self.commit_message_input
             .update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
@@ -986,22 +983,6 @@ impl RightPanelView {
                     self.stash_files = Some((index, files));
                 }
             }
-            PanelEvent::LastCommitMessageLoaded { project, result } => {
-                self.git_busy = false;
-                if self.project.as_ref() == Some(&project) {
-                    match result {
-                        Ok(message) => {
-                            self.generated_commit_message = Some(message);
-                            self.git_feedback = None;
-                        }
-                        Err(error) => {
-                            self.git_feedback = Some(error.clone());
-                            self.pending_git_notifications
-                                .push(Notification::error(error));
-                        }
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -1175,13 +1156,7 @@ impl RightPanelView {
                 return;
             }
         }
-        if matches!(
-            action,
-            GitAction::Commit
-                | GitAction::CommitAndPush
-                | GitAction::CommitAmend
-                | GitAction::CommitAmendAndPush
-        ) && message.is_empty()
+        if matches!(action, GitAction::Commit | GitAction::CommitAndPush) && message.is_empty()
         {
             self.git_feedback = Some("Enter a commit message first.".into());
             let notif = Notification::warning("Enter a commit message first");
@@ -1209,14 +1184,11 @@ impl RightPanelView {
         let feedback = match &action {
             GitAction::Commit => "Committing…".to_string(),
             GitAction::CommitAndPush => "Committing and pushing…".to_string(),
-            GitAction::CommitAmend => "Amending commit…".to_string(),
-            GitAction::CommitAmendAndPush => "Amending commit and pushing…".to_string(),
             GitAction::StageFile(p) => format!("Staging {p}…"),
             GitAction::UnstageFile(p) => format!("Unstaging {p}…"),
             GitAction::StageFiles(paths) => format!("Staging {} files…", paths.len()),
             GitAction::UnstageFiles(paths) => format!("Unstaging {} files…", paths.len()),
             GitAction::StashPush { .. } => "Stashing changes…".to_string(),
-            GitAction::LoadLastCommitMessage => "Loading commit message…".to_string(),
             GitAction::Push => "Pushing…".to_string(),
             GitAction::Pull => "Pulling from origin…".to_string(),
             GitAction::Fetch => "Fetching origin…".to_string(),
@@ -1246,15 +1218,6 @@ impl RightPanelView {
         self.git_feedback = Some(feedback);
         let tx = self.event_tx.clone();
         std::thread::spawn(move || {
-            if matches!(&action, GitAction::LoadLastCommitMessage) {
-                let result = threadlane_git::last_commit_message(&work_dir)
-                    .map_err(|error| error.to_string());
-                let _ = tx.send(PanelEvent::LastCommitMessageLoaded {
-                    project: work_dir,
-                    result,
-                });
-                return;
-            }
             let action_result = (|| {
                 let mut action_message = None;
                 match &action {
@@ -1358,35 +1321,6 @@ impl RightPanelView {
                         threadlane_git::ignore_extension(&work_dir, ext)
                             .map_err(|e| e.to_string())?;
                     }
-                    GitAction::CommitAmend | GitAction::CommitAmendAndPush => {
-                        let status =
-                            threadlane_git::inspect(&work_dir).map_err(|e| e.to_string())?;
-                        let selected_set: HashSet<&str> =
-                            selected_paths.iter().map(String::as_str).collect();
-                        if !selected_paths.is_empty() {
-                            for file in &status.files {
-                                if selected_set.contains(file.path.as_str()) {
-                                    threadlane_git::stage_file(&work_dir, &file.path)
-                                        .map_err(|e| e.to_string())?;
-                                } else {
-                                    let _ = threadlane_git::unstage_file(&work_dir, &file.path);
-                                }
-                            }
-                        }
-                        threadlane_git::commit_amend(&work_dir, &message)
-                            .map_err(|e| e.to_string())?;
-                        if matches!(&action, GitAction::CommitAmendAndPush) {
-                            threadlane_git::push(&work_dir).map_err(|e| e.to_string())?;
-                        }
-                        action_message = Some(
-                            if matches!(&action, GitAction::CommitAmendAndPush) {
-                                "Commit amended and pushed successfully"
-                            } else {
-                                "Commit amended successfully"
-                            }
-                            .to_string(),
-                        );
-                    }
                     GitAction::StageFile(path) => {
                         threadlane_git::stage_file(&work_dir, path).map_err(|e| e.to_string())?;
                         action_message = Some(format!("Staged {path}"));
@@ -1416,7 +1350,6 @@ impl RightPanelView {
                         .map_err(|e| e.to_string())?;
                         action_message = Some("Stashed changes successfully".to_string());
                     }
-                    GitAction::LoadLastCommitMessage => unreachable!(),
                 }
                 Ok(action_message)
             })();
@@ -2269,28 +2202,6 @@ impl RightPanelView {
         }
     }
 
-    fn apply_commit_prefix(&mut self, prefix: &str, cx: &mut Context<Self>) {
-        const PREFIXES: &[&str] = &["feat", "fix", "docs", "refactor", "test", "chore"];
-        let cur = self.commit_message_input.read(cx).value().to_string();
-        let trimmed = cur.trim_start();
-        let has_prefix = PREFIXES.iter().any(|p| {
-            trimmed.starts_with(&format!("{p}:")) || trimmed.starts_with(&format!("{p}("))
-        });
-        let new_val = if has_prefix {
-            if let Some((_, rest)) = trimmed.split_once(':') {
-                format!("{prefix}:{rest}")
-            } else {
-                format!("{prefix}: {trimmed}")
-            }
-        } else if trimmed.is_empty() {
-            format!("{prefix}: ")
-        } else {
-            format!("{prefix}: {trimmed}")
-        };
-        self.generated_commit_message = Some(new_val);
-        cx.notify();
-    }
-
     fn render_file_item(
         &self,
         file: &GitFile,
@@ -2317,7 +2228,6 @@ impl RightPanelView {
             .document_title
             .as_deref()
             .is_some_and(|title| title == format!("Review · {path}").as_str());
-        let (file_icon, file_icon_color) = file_type_icon(&path, &theme);
 
         let (status_color, status_bg) = match file.status_char() {
             'A' | '?' => (theme.success, theme.success.opacity(0.15)),
@@ -2327,15 +2237,16 @@ impl RightPanelView {
         };
 
         let row_id = SharedString::from(format!("review-file-{path}"));
-        div()
+        let row = div()
             .id(row_id)
             .debug_selector(|| "review-file-row".into())
+            .w_full()
+            .min_w_0()
             .h_8()
             .min_h_8()
             .max_h_8()
             .flex_shrink_0()
             .overflow_hidden()
-            .mx_2()
             .px_2()
             .rounded_md()
             .flex()
@@ -2354,18 +2265,6 @@ impl RightPanelView {
                 })
             })
             .focus(|row| row.border_color(theme.ring))
-            .child(
-                div()
-                    .flex_none()
-                    .size_5()
-                    .rounded_sm()
-                    .bg(file_icon_color.opacity(0.12))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(file_icon_color)
-                    .child(Icon::new(file_icon).size_3p5()),
-            )
             .child(
                 Checkbox::new(SharedString::from(format!("chk-{path}")))
                     .accessibility_label(format!("Select {path} for Git actions"))
@@ -2394,7 +2293,6 @@ impl RightPanelView {
                                     .debug_selector(|| "review-filename".into())
                                     .min_w(px(40.0))
                                     .max_w_full()
-                                    .flex_shrink_0()
                                     .truncate()
                                     .child(filename),
                             )
@@ -2404,6 +2302,7 @@ impl RightPanelView {
                                         .min_w_0()
                                         .flex_1()
                                         .truncate()
+                                        .text_ellipsis_start()
                                         .text_xs()
                                         .text_color(theme.muted_foreground)
                                         .child(directory),
@@ -2644,7 +2543,12 @@ impl RightPanelView {
                     }
                     menu
                 }
-            })
+            });
+        div()
+            .w_full()
+            .min_w_0()
+            .px_2()
+            .child(row)
             .into_any_element()
     }
 
@@ -3590,16 +3494,12 @@ impl RightPanelView {
                 .into_any_element()
         };
 
-        let commit_label = if self.commit_amend {
-            "Amend commit".to_string()
-        } else if selected_count > 0 && selected_count < total_files {
+        let commit_label = if selected_count > 0 && selected_count < total_files {
             format!("Commit {selected_count}")
         } else {
             "Commit".to_string()
         };
-        let commit_push_label = if self.commit_amend {
-            "Amend & push".to_string()
-        } else if selected_count > 0 && selected_count < total_files {
+        let commit_push_label = if selected_count > 0 && selected_count < total_files {
             format!("Commit {selected_count} & push")
         } else {
             "Commit & push".to_string()
@@ -3617,27 +3517,7 @@ impl RightPanelView {
         };
 
         let is_empty = commit_val.trim().is_empty();
-        let can_commit = if self.commit_amend {
-            !is_empty && !self.git_busy
-        } else {
-            !is_empty && selected_count > 0 && !self.git_busy
-        };
-
-        let conventional_chips = div().flex().items_center().gap_1().flex_wrap().children(
-            ["feat", "fix", "docs", "refactor", "test", "chore"]
-                .into_iter()
-                .map(|prefix| {
-                    let p = prefix.to_string();
-                    Button::new(SharedString::from(format!("chip-{prefix}")))
-                        .label(prefix)
-                        .ghost()
-                        .xsmall()
-                        .tooltip(format!("Prefix message with '{prefix}:'"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.apply_commit_prefix(&p, cx);
-                        }))
-                }),
-        );
+        let can_commit = !is_empty && selected_count > 0 && !self.git_busy;
 
         let commit_footer = div()
             .flex_none()
@@ -3683,39 +3563,7 @@ impl RightPanelView {
                                             format!("{subject_len}")
                                         }),
                                 )
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .child(
-                                        Checkbox::new("commit-amend-chk")
-                                            .checked(self.commit_amend)
-                                            .small()
-                                            .on_click(cx.listener(|this, checked, window, cx| {
-                                                this.commit_amend = *checked;
-                                                if this.commit_amend {
-                                                    let cur =
-                                                        this.commit_message_input.read(cx).value();
-                                                    if cur.trim().is_empty() {
-                                                        this.run_git_action(
-                                                            GitAction::LoadLastCommitMessage,
-                                                            window,
-                                                            cx,
-                                                        );
-                                                    }
-                                                }
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child("Amend"),
-                                    ),
-                            ),
+                            }),
                     )
                     .child(
                         div()
@@ -3758,7 +3606,6 @@ impl RightPanelView {
                             }),
                     ),
             )
-            .child(conventional_chips)
             .child(
                 div()
                     .px_2p5()
@@ -3787,21 +3634,13 @@ impl RightPanelView {
                             .small()
                             .flex_1()
                             .tooltip(if can_commit {
-                                if self.commit_amend {
-                                    "Amend the commit and push"
-                                } else {
-                                    "Commit the selected changes and push"
-                                }
+                                "Commit the selected changes and push"
                             } else {
                                 "Select files and write a message to commit"
                             })
                             .disabled(!can_commit)
                             .on_click(cx.listener(|this, _event, window, cx| {
-                                if this.commit_amend {
-                                    this.run_git_action(GitAction::CommitAmendAndPush, window, cx);
-                                } else {
-                                    this.run_git_action(GitAction::CommitAndPush, window, cx);
-                                }
+                                this.run_git_action(GitAction::CommitAndPush, window, cx);
                             })),
                     )
                     .child(
@@ -3810,21 +3649,13 @@ impl RightPanelView {
                             .outline()
                             .small()
                             .tooltip(if can_commit {
-                                if self.commit_amend {
-                                    "Amend the commit locally"
-                                } else {
-                                    "Commit the selected changes locally"
-                                }
+                                "Commit the selected changes locally"
                             } else {
                                 "Select files and write a message to commit"
                             })
                             .disabled(!can_commit)
                             .on_click(cx.listener(|this, _event, window, cx| {
-                                if this.commit_amend {
-                                    this.run_git_action(GitAction::CommitAmend, window, cx);
-                                } else {
-                                    this.run_git_action(GitAction::Commit, window, cx);
-                                }
+                                this.run_git_action(GitAction::Commit, window, cx);
                             })),
                     )
                     .when(can_push, |row| {
@@ -5862,29 +5693,6 @@ enum BrowserReply {
 const MAX_BROWSER_EVAL_CHARS: usize = 8_000;
 
 // Keep this aligned with the surface switches in the browser command handlers.
-/// Pick an icon and tint by file type (t3code ChangesView row style).
-fn file_type_icon(path: &str, theme: &gpui_component::theme::ThemeColor) -> (IconName, Hsla) {
-    let ext = Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase())
-        .unwrap_or_default();
-    match ext.as_str() {
-        "md" | "markdown" | "rst" | "adoc" | "txt" => (IconName::BookOpen, theme.warning),
-        "json" | "jsonc" | "toml" | "yaml" | "yml" | "ini" | "cfg" | "conf" | "xml"
-        | "lock" | "env" => (IconName::Settings, theme.muted_foreground),
-        "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd" => {
-            (IconName::SquareTerminal, theme.success)
-        }
-        "html" | "htm" | "css" | "scss" | "sass" | "less" => (IconName::Globe, theme.info),
-        "png" | "jpg" | "jpeg" | "gif" | "svg" | "ico" | "webp" | "bmp" | "avif" => {
-            (IconName::Frame, theme.info)
-        }
-        _ if ext.is_empty() => (IconName::File, theme.muted_foreground),
-        _ => (IconName::FileText, theme.link),
-    }
-}
-
 fn browser_command_reveals_surface(command: &threadlane_protocol::browser::BrowserCommand) -> bool {
     use threadlane_protocol::browser::{BrowserCommand, BrowserTabAction};
     matches!(command,
@@ -6329,8 +6137,8 @@ mod dialog_keyboard_tests {
 mod review_layout_tests {
     use super::RightPanelView;
     use gpui::{
-        AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, TestAppContext,
-        Window, div, px,
+        AppContext, Context, Entity, IntoElement, ListSizingBehavior, ParentElement, Render, Styled,
+        TestAppContext, Window, div, list, px,
     };
     use threadlane_git::GitFile;
     use threadlane_ui_state::AppState;
@@ -6341,10 +6149,16 @@ mod review_layout_tests {
     }
 
     impl Render for RowHost {
-        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            div().w(px(self.width)).child(
-                self.panel
-                    .update(cx, |panel, cx| panel.render_review_file_row(0, window, cx)),
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(self.width)).h(px(200.0)).child(
+                self.panel.update(cx, |panel, cx| {
+                    list(
+                        panel.review_files_list_state.clone(),
+                        cx.processor(RightPanelView::render_review_file_row),
+                    )
+                    .size_full()
+                    .with_sizing_behavior(ListSizingBehavior::Auto)
+                }),
             )
         }
     }
@@ -6361,6 +6175,9 @@ mod review_layout_tests {
                 file.additions = 1234;
                 file.deletions = 567;
                 panel.review_files = vec![file];
+                panel
+                    .review_files_list_state
+                    .reset_with_uniform_height(1, px(32.0));
             });
             RowHost {
                 panel,
@@ -6384,6 +6201,7 @@ mod review_layout_tests {
                 });
                 cx.update(|window, cx| window.draw(cx).clear(cx));
                 let row = cx.debug_bounds("review-file-row").expect("row rendered");
+                assert_eq!(row.size.width, px(width - 16.0), "rows must share the panel inset");
                 assert_eq!(row.size.height, px(32.0), "row height changed at {width}");
                 let filename = cx
                     .debug_bounds("review-filename")
@@ -6932,15 +6750,10 @@ mod environment_shortcut_tests {
                 panel.active_surface = Some(Surface::Review);
                 panel.review_tab = ReviewTab::History;
                 panel.document_title = Some("Review · changed.rs".into());
-                panel.commit_amend = true;
                 panel.open_commit(window, cx);
                 assert_eq!(panel.active_surface, Some(Surface::Review));
                 assert_eq!(panel.review_tab, ReviewTab::Changes);
                 assert!(panel.document_title.is_none());
-                assert!(
-                    !panel.commit_amend,
-                    "Commit must not inherit an earlier amend selection"
-                );
                 assert!(!panel.git_busy, "Opening the commit UI must not run Git");
                 assert!(panel
                     .commit_message_input
