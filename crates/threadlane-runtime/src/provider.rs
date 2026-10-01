@@ -784,23 +784,45 @@ mod normalize_tool_arguments_tests {
         assert_eq!(chat[2]["tool_call_id"], "call_1");
     }
 
+    /// A result unpaired with its declaring call is an orphaned turn that
+    /// `repair_interrupted_tool_turn` drops before conversion.
+    fn assistant_declaring(id: &str, name: &str) -> AgentMessage {
+        AgentMessage::Assistant {
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: id.into(),
+                r#type: "function".into(),
+                function: ToolCallFunction {
+                    name: name.into(),
+                    arguments: "{}".into(),
+                },
+                thought_signature: None,
+            }]),
+            stop_reason: None,
+            deferred_handle: None,
+        }
+    }
+
     #[test]
     fn tool_images_translate_to_provider_parts() {
         use threadlane_protocol::ImageAttachment;
-        let messages = vec![AgentMessage::Tool {
-            tool_call_id: "call-1".into(),
-            name: "computer_screenshot".into(),
-            content: "Screenshot saved.".into(),
-            is_error: false,
-            terminate: false,
-            images: vec![ImageAttachment {
-                display_name: "shot.jpg".into(),
-                data_url: "data:image/jpeg;base64,AAA".into(),
-            }],
-        }];
+        let messages = vec![
+            assistant_declaring("call-1", "computer_screenshot"),
+            AgentMessage::Tool {
+                tool_call_id: "call-1".into(),
+                name: "computer_screenshot".into(),
+                content: "Screenshot saved.".into(),
+                is_error: false,
+                terminate: false,
+                images: vec![ImageAttachment {
+                    display_name: "shot.jpg".into(),
+                    data_url: "data:image/jpeg;base64,AAA".into(),
+                }],
+            },
+        ];
 
         let chat = convert_to_llm(&messages);
-        let content = &chat[0]["content"];
+        let content = &chat[1]["content"];
         assert!(content.is_array(), "tool images must use parts array");
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "Screenshot saved.");
@@ -808,8 +830,8 @@ mod normalize_tool_arguments_tests {
         assert_eq!(content[1]["image_url"]["url"], "data:image/jpeg;base64,AAA");
 
         let (_, codex) = convert_to_codex_llm(&messages);
-        assert_eq!(codex[0]["type"], "function_call_output");
-        let output = &codex[0]["output"];
+        assert_eq!(codex[1]["type"], "function_call_output");
+        let output = &codex[1]["output"];
         assert!(output.is_array(), "codex output must be a mixed list");
         assert_eq!(output[0]["type"], "input_text");
         assert_eq!(output[1]["type"], "input_image");
@@ -818,17 +840,20 @@ mod normalize_tool_arguments_tests {
 
     #[test]
     fn tool_without_images_keeps_legacy_shapes() {
-        let messages = vec![AgentMessage::Tool {
-            tool_call_id: "call-1".into(),
-            name: "read_file".into(),
-            content: "contents".into(),
-            is_error: false,
-            terminate: false,
-            images: Vec::new(),
-        }];
+        let messages = vec![
+            assistant_declaring("call-1", "read_file"),
+            AgentMessage::Tool {
+                tool_call_id: "call-1".into(),
+                name: "read_file".into(),
+                content: "contents".into(),
+                is_error: false,
+                terminate: false,
+                images: Vec::new(),
+            },
+        ];
         let chat = convert_to_llm(&messages);
-        assert_eq!(chat[0]["content"], "contents");
+        assert_eq!(chat[1]["content"], "contents");
         let (_, codex) = convert_to_codex_llm(&messages);
-        assert_eq!(codex[0]["output"], "contents");
+        assert_eq!(codex[1]["output"], "contents");
     }
 }

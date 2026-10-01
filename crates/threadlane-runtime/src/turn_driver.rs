@@ -4,9 +4,9 @@
 //! recording, tool execution, and queue draining for an active turn sequence.
 
 use threadlane_compaction::{
-    compact_messages_to_token_budget, estimate_message_tokens, estimate_request_tokens,
-    is_context_overflow_error, provider_normalized_message, serialized_message,
-    should_auto_compact, CompactionParams,
+    compact_messages_to_token_budget, estimate_message_tokens_serialized,
+    estimate_request_tokens, is_context_overflow_error, provider_normalized_message,
+    serialized_message, should_auto_compact, CompactionParams,
 };
 use crate::config::AgentConfig;
 use threadlane_protocol::AgentEvent;
@@ -21,7 +21,7 @@ use crate::provider::{
 };
 use crate::tool_dispatcher::ToolDispatcher;
 use crate::types::{ToolExecutionMode, TurnState};
-use threadlane_protocol::{AgentMessage, TokenUsage};
+use threadlane_protocol::{AgentMessage, AgentToolDefinition, TokenUsage};
 use crate::utils::AbortOnDrop;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -367,6 +367,14 @@ impl<'a> TurnDriver<'a> {
             self.config.loop_pingpong_rounds,
             self.config.loop_error_limit,
         );
+        // Tool schemas rarely change between attempts; reuse the provider
+        // payloads and their serialized JSON while the definition set is
+        // unchanged instead of re-rendering them every iteration.
+        let mut tools_cache: Option<(
+            Vec<AgentToolDefinition>,
+            Vec<serde_json::Value>,
+            Option<String>,
+        )> = None;
 
         'turns: loop {
             turn_number += 1;
@@ -418,12 +426,26 @@ impl<'a> TurnDriver<'a> {
             };
             let overflow_recovery = std::mem::take(&mut overflow_recovery_pending);
             let tool_definitions = self.tool_dispatcher.configured_tool_definitions();
-            let provider_tools = tool_definitions
-                .iter()
-                .map(|tool| tool.to_chat_completions_tool())
-                .collect::<Vec<_>>();
-            let tool_schema_json = (!provider_tools.is_empty())
-                .then(|| serde_json::to_string(&provider_tools).unwrap_or_default());
+            let tool_count = tool_definitions.len();
+            let (provider_tools, tool_schema_json) = match tools_cache.take() {
+                Some((definitions, tools, schema)) if definitions == tool_definitions => {
+                    (tools, schema)
+                }
+                _ => {
+                    let tools = tool_definitions
+                        .iter()
+                        .map(|tool| tool.to_chat_completions_tool())
+                        .collect::<Vec<_>>();
+                    let schema = (!tools.is_empty())
+                        .then(|| serde_json::to_string(&tools).unwrap_or_default());
+                    (tools, schema)
+                }
+            };
+            tools_cache = Some((
+                tool_definitions,
+                provider_tools.clone(),
+                tool_schema_json.clone(),
+            ));
 
             let mut boundary_result: Option<ProviderBoundaryResult> = None;
             if let Some(preparer) = &self.provider_boundary_preparer {
@@ -439,11 +461,6 @@ impl<'a> TurnDriver<'a> {
                 .map_err(|error| format!("context preparation failed: {error}"));
                 match prepared {
                     Ok(prepared) => {
-                        self.turn.lock().await.messages = prepared
-                            .canonical_messages
-                            .as_ref()
-                            .unwrap_or(&prepared.messages)
-                            .clone();
                         boundary_result = Some(prepared);
                     }
                     Err(error) => {
@@ -471,8 +488,19 @@ impl<'a> TurnDriver<'a> {
             let (stream_tx, mut stream_rx) = mpsc::channel(100);
             let client = self.provider_client.clone();
             let payload_cache_key = self.prompt_cache_key.clone();
-            let mut request_messages = match boundary_result.as_ref() {
-                Some(prepared) => prepared.messages.clone(),
+            // Take the prepared request vector rather than cloning it; the
+            // canonical write-back clones once instead of copying the whole
+            // history a second time per attempt.
+            let mut request_messages = match boundary_result.as_mut() {
+                Some(prepared) => {
+                    let messages = std::mem::take(&mut prepared.messages);
+                    self.turn.lock().await.messages = prepared
+                        .canonical_messages
+                        .as_ref()
+                        .unwrap_or(&messages)
+                        .clone();
+                    messages
+                }
                 None => self.turn.lock().await.messages.clone(),
             };
             let memory_root = self.turn.lock().await.project_root.clone();
@@ -496,23 +524,27 @@ impl<'a> TurnDriver<'a> {
                 }
             };
 
-            let manifest_items = {
+            // One accounting pass over the request: the serialized bytes
+            // feed the digest and the token estimate for every manifest
+            // item, and their sum is the request-level estimate — no
+            // separate normalize + serialize sweep per attempt.
+            let (manifest_items, total_estimated_tokens) = {
+                let params = CompactionParams::from(&self.config);
                 let mut items = Vec::new();
+                let mut estimated_tokens = 0usize;
                 for (idx, message) in request_messages.iter().enumerate() {
                     let normalized = provider_normalized_message(message);
-                    let accounted_message = normalized.as_ref().unwrap_or(message);
+                    let accounted_message = normalized.as_deref().unwrap_or(message);
                     let serialized = serialized_message(accounted_message);
                     let digest = format!("{:x}", Sha256::digest(&serialized));
-                    let token_estimate = normalized
-                        .as_ref()
-                        .map(|message| {
-                            estimate_message_tokens(
-                                message,
-                                &CompactionParams::from(&self.config)
-                            )
-                                .min(u32::MAX as usize) as u32
+                    let estimate = normalized
+                        .as_deref()
+                        .map(|normalized| {
+                            estimate_message_tokens_serialized(normalized, &serialized, &params)
                         })
                         .unwrap_or(0);
+                    estimated_tokens = estimated_tokens.saturating_add(estimate);
+                    let token_estimate = estimate.min(u32::MAX as usize) as u32;
                     let reduced = boundary_result
                         .as_ref()
                         .and_then(|prepared| prepared.canonical_messages.as_ref())
@@ -555,10 +587,11 @@ impl<'a> TurnDriver<'a> {
                 if let Some(schema) = tool_schema_json.as_deref() {
                     let digest = format!("{:x}", Sha256::digest(schema.as_bytes()));
                     let token_estimate = schema.len().div_ceil(4).min(u32::MAX as usize) as u32;
+                    estimated_tokens = estimated_tokens.saturating_add(schema.len().div_ceil(4));
                     if let (Ok(role), Ok(digest_sha256), Ok(label)) = (
                         TraceString::new("tools"),
                         TraceString::new(digest),
-                        TraceString::new(format!("{} tools", tool_definitions.len())),
+                        TraceString::new(format!("{} tools", tool_count)),
                     ) {
                         items.push(ContextManifestItem {
                             position: items.len(),
@@ -572,15 +605,8 @@ impl<'a> TurnDriver<'a> {
                         });
                     }
                 }
-                items
+                (items, estimated_tokens.try_into().ok())
             };
-            let total_estimated_tokens = estimate_request_tokens(
-                &request_messages,
-                tool_schema_json.as_deref(),
-                &CompactionParams::from(&self.config),
-            )
-            .try_into()
-            .ok();
             let (context_limit, context_limit_is_estimate, compaction_generation) = boundary_result
                 .as_ref()
                 .map_or((None, false, 0), |prepared| {

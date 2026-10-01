@@ -362,12 +362,7 @@ impl CodingSessionHarness {
         if !is_local_path(requested_path) {
             return Ok(None);
         }
-        let Some(entry) = self
-            .store
-            .entries()
-            .iter()
-            .find(|entry| entry.id == source_entry_id)
-        else {
+        let Some(entry) = self.store.entry(source_entry_id) else {
             return Ok(None);
         };
         let (digest, path) = match &entry.message {

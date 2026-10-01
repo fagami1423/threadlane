@@ -102,12 +102,10 @@ impl CodingSessionHarness {
                     Some(run) => format!("v2-tool-result-{run}-{tool_call_id}"),
                     None => format!("v2-tool-result-{tool_call_id}"),
                 };
-                if entry_ids.contains(base.as_str())
-                    && !self
-                        .store
-                        .entries()
-                        .iter()
-                        .any(|entry| entry.id == base && entry.message == message)
+                if self
+                    .store
+                    .entry(&base)
+                    .is_some_and(|entry| entry.message != message)
                 {
                     let mut ordinal = 1u32;
                     loop {
@@ -126,12 +124,10 @@ impl CodingSessionHarness {
         // Tool completions are recorded both by the execution lifecycle and
         // by the model-visible transcript.  They may be separated by other
         // journal records, so checking only the last entry is insufficient.
-        if entry_ids.contains(id.as_str())
-            && self
-                .store
-                .entries()
-                .iter()
-                .any(|entry| entry.id == id && entry.message == message)
+        if self
+            .store
+            .entry(&id)
+            .is_some_and(|entry| entry.message == message)
         {
             return Ok(id);
         }
@@ -210,11 +206,7 @@ impl CodingSessionHarness {
                         result_entry_id,
                         ..
                     } if record_run == run_id
-                        && !self
-                            .store
-                            .entries()
-                            .iter()
-                            .any(|entry| entry.id == *result_entry_id) =>
+                        && self.store.entry(result_entry_id).is_none() =>
                     {
                         Some(result_entry_id.clone())
                     }
@@ -226,9 +218,8 @@ impl CodingSessionHarness {
         };
         if let Some(entry) = self
             .store
-            .entries()
-            .iter()
-            .find(|entry| entry.lane == lane && entry.id == id)
+            .entry(&id)
+            .filter(|entry| entry.lane == lane)
         {
             return Ok(entry.id.clone());
         }
@@ -313,12 +304,7 @@ impl CodingSessionHarness {
             else {
                 return None;
             };
-            (record_run_id == run_id
-                && !self
-                    .store
-                    .entries()
-                    .iter()
-                    .any(|entry| entry.id == *result_entry_id))
+            (record_run_id == run_id && self.store.entry(result_entry_id).is_none())
             .then(|| result_entry_id.clone())
         }) {
             return Ok(result_entry_id);

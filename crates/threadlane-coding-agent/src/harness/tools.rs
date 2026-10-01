@@ -12,39 +12,24 @@ impl CodingSessionHarness {
         effective_args: Value,
     ) -> Result<(), String> {
         self.ensure_fresh()?;
-        if self.store.records().iter().any(|record| {
-            matches!(record, HarnessRecord::ToolStarted {
-                run_id: record_run_id,
-                tool_call_id: record_call_id,
-                ..
-            } if record_run_id == run_id && record_call_id == tool_call_id)
-        }) {
+        if self.store.store().has_tool_started(run_id, tool_call_id) {
             return Ok(());
         }
-        let assistant = self
+        let (assistant_id, tool_index) = self
             .store
-            .entries()
-            .iter()
-            .rev()
-            .find(|entry| {
-                matches!(
-                    &entry.message,
-                    AgentMessage::Assistant { tool_calls: Some(calls), .. }
-                        if calls.iter().any(|call| call.id == tool_call_id)
-                )
+            .store()
+            .assistant_entry_for_call(None, tool_call_id)
+            .and_then(|assistant| match &assistant.message {
+                AgentMessage::Assistant {
+                    tool_calls: Some(calls),
+                    ..
+                } => calls
+                    .iter()
+                    .position(|call| call.id == tool_call_id)
+                    .map(|tool_index| (assistant.id.clone(), tool_index)),
+                _ => None,
             })
             .ok_or_else(|| format!("missing assistant entry for tool {tool_call_id}"))?;
-        let assistant_id = assistant.id.clone();
-        let tool_index = match &assistant.message {
-            AgentMessage::Assistant {
-                tool_calls: Some(calls),
-                ..
-            } => calls
-                .iter()
-                .position(|call| call.id == tool_call_id)
-                .ok_or_else(|| format!("tool {tool_call_id} is absent from assistant entry"))?,
-            _ => return Err("assistant entry has no tool calls".into()),
-        };
         self.store
             .start_tool_batch(
                 run_id,
@@ -79,13 +64,7 @@ impl CodingSessionHarness {
         effective_args: Value,
     ) -> Result<(), String> {
         self.ensure_fresh()?;
-        if self.store.records().iter().any(|record| {
-            matches!(record, HarnessRecord::ToolStarted {
-                run_id: record_run_id,
-                tool_call_id: record_call_id,
-                ..
-            } if record_run_id == run_id && record_call_id == tool_call_id)
-        }) {
+        if self.store.store().has_tool_started(run_id, tool_call_id) {
             return Ok(());
         }
         let result_entry_id = format!("subagent-result-{run_id}-{tool_call_id}");
@@ -97,28 +76,15 @@ impl CodingSessionHarness {
         // faults with "tool intent does not match assistant declaration".
         let declaring = self
             .store
-            .entries()
-            .iter()
-            .rev()
-            .find(|entry| {
-                entry.lane == lane
-                    && matches!(
-                        &entry.message,
-                        AgentMessage::Assistant { tool_calls: Some(calls), .. }
-                        if calls.iter().any(|call| call.id == tool_call_id)
-                    )
-            })
+            .store()
+            .assistant_entry_for_call(Some(lane), tool_call_id)
             .map(|entry| entry.id.clone());
         let assistant_entry_id = match declaring {
             Some(id) => id,
             None => match self
                 .store
-                .entries()
-                .iter()
-                .rev()
-                .find(|entry| {
-                    entry.lane == lane && matches!(entry.message, AgentMessage::Assistant { .. })
-                })
+                .store()
+                .last_assistant_entry(lane)
                 .map(|entry| entry.id.clone())
             {
                 Some(id) => id,
@@ -133,27 +99,29 @@ impl CodingSessionHarness {
                 }
             },
         };
-        let tool_index = match self.store.entries().iter().find(|entry| {
-            entry.id == assistant_entry_id
-                && matches!(
+        let declared_entry = self.store.store().entry(&assistant_entry_id);
+        let tool_index = match declared_entry {
+            Some(entry)
+                if matches!(
                     &entry.message,
                     AgentMessage::Assistant { tool_calls: Some(calls), .. }
-                    if calls.iter().any(|call| call.id == tool_call_id)
-                )
-        }) {
-            Some(entry) => match &entry.message {
-                AgentMessage::Assistant {
-                    tool_calls: Some(calls),
-                    ..
-                } => calls
-                    .iter()
-                    .position(|call| call.id == tool_call_id)
-                    .unwrap_or(0),
-                _ => 0,
-            },
+                        if calls.iter().any(|call| call.id == tool_call_id)
+                ) =>
+            {
+                match &entry.message {
+                    AgentMessage::Assistant {
+                        tool_calls: Some(calls),
+                        ..
+                    } => calls
+                        .iter()
+                        .position(|call| call.id == tool_call_id)
+                        .unwrap_or(0),
+                    _ => 0,
+                }
+            }
             // No declaring entry (synthesized empty assistant): keep the
             // count-based ordinal so sequential undeclared tools stay unique.
-            None => self
+            _ => self
                 .store
                 .records()
                 .iter()
@@ -327,9 +295,7 @@ impl CodingSessionHarness {
                 .expect("tool batch completeness was checked");
             let persisted_result = self
                 .store
-                .entries()
-                .iter()
-                .find(|entry| entry.id == *result_entry)
+                .entry(result_entry)
                 .and_then(|entry| match &entry.message {
                     AgentMessage::Tool {
                         content, is_error, ..
@@ -343,13 +309,7 @@ impl CodingSessionHarness {
                 threadlane_runtime::ToolReplaySafety::Safe => HarnessToolReplaySafety::Safe,
                 threadlane_runtime::ToolReplaySafety::Never => HarnessToolReplaySafety::Never,
             };
-            let started = self.store.records().iter().any(|record| {
-                matches!(record, HarnessRecord::ToolStarted {
-                    run_id: record_run_id,
-                    tool_call_id,
-                    ..
-                } if record_run_id == run_id && tool_call_id == &call.id)
-            });
+            let started = self.store.store().has_tool_started(run_id, &call.id);
             if !started {
                 self.store
                     .start_tool_batch(
