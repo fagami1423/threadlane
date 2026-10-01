@@ -108,6 +108,10 @@ impl TerminalManager {
             writer: Mutex::new(writer),
             child: Mutex::new(child),
         });
+        // Register before the pump threads so a shell that exits instantly
+        // still has an entry for the batcher to reap (and Exited to send);
+        // a spawn failure below removes the entry and drops the handle,
+        // killing the child.
         self.sessions
             .lock()
             .expect("terminals poisoned")
@@ -115,7 +119,8 @@ impl TerminalManager {
 
         // Reader: raw PTY bytes into a channel the batcher drains.
         let (chunk_tx, chunk_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        std::thread::Builder::new()
+        let sessions = self.sessions.clone();
+        if let Err(error) = std::thread::Builder::new()
             .name(format!("threadlane-daemon-pty-reader-{terminal_id}"))
             .spawn(move || {
                 let mut buffer = [0_u8; READ_CHUNK_BYTES];
@@ -130,18 +135,30 @@ impl TerminalManager {
                     }
                 }
             })
-            .map_err(|error| format!("could not spawn pty reader: {error}"))?;
+        {
+            sessions
+                .lock()
+                .expect("terminals poisoned")
+                .remove(terminal_id);
+            return Err(format!("could not spawn pty reader: {error}"));
+        }
 
         // Batcher: coalesce bursts into Output frames; on channel close the
         // shell ended — report Exited only when the entry is still ours
         // (a TerminalClose that already removed it skips the duplicate).
         let sessions = self.sessions.clone();
-        let terminal_id = terminal_id.to_string();
-        std::thread::Builder::new()
-            .name(format!("threadlane-daemon-pty-batch-{terminal_id}"))
+        let batch_id = terminal_id.to_string();
+        if let Err(error) = std::thread::Builder::new()
+            .name(format!("threadlane-daemon-pty-batch-{batch_id}"))
             .spawn(move || {
+                let terminal_id = batch_id;
+                // Holds an incomplete trailing UTF-8 sequence split by a
+                // frame boundary; a multibyte char must survive the split
+                // instead of becoming replacement chars in both frames.
+                let mut tail = Vec::new();
                 while let Ok(first) = chunk_rx.recv() {
-                    let mut data = first;
+                    let mut data = std::mem::take(&mut tail);
+                    data.extend_from_slice(&first);
                     let deadline = Instant::now() + OUTPUT_FLUSH_WINDOW;
                     while data.len() < OUTPUT_CHUNK_BYTES {
                         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -159,6 +176,14 @@ impl TerminalManager {
                             Err(_) => break,
                         }
                     }
+                    if let Err(error) = std::str::from_utf8(&data) {
+                        if error.error_len().is_none() {
+                            tail = data.split_off(error.valid_up_to());
+                        }
+                    }
+                    if data.is_empty() {
+                        continue;
+                    }
                     if ingest
                         .send(SessionEvent::TerminalEvent {
                             event: TerminalEvent::Output {
@@ -171,16 +196,26 @@ impl TerminalManager {
                         return;
                     }
                 }
+                if !tail.is_empty() {
+                    let _ = ingest.send(SessionEvent::TerminalEvent {
+                        event: TerminalEvent::Output {
+                            terminal_id: terminal_id.clone(),
+                            data: String::from_utf8_lossy(&tail).into_owned(),
+                        },
+                    });
+                }
                 let removed = {
                     let mut sessions = sessions.lock().expect("terminals poisoned");
                     sessions.remove(&terminal_id)
                 };
                 if let Some(handle) = removed {
+                    // EOF means the slave side closed — wait() returns once
+                    // the shell is reaped instead of racing try_wait.
                     let exit_code = handle
                         .child
                         .lock()
                         .ok()
-                        .and_then(|mut child| child.try_wait().ok().flatten())
+                        .and_then(|mut child| child.wait().ok())
                         .and_then(|status| {
                             status.signal().is_none().then(|| status.exit_code() as i32)
                         });
@@ -192,7 +227,13 @@ impl TerminalManager {
                     });
                 }
             })
-            .map_err(|error| format!("could not spawn pty output pump: {error}"))?;
+        {
+            self.sessions
+                .lock()
+                .expect("terminals poisoned")
+                .remove(terminal_id);
+            return Err(format!("could not spawn pty output pump: {error}"));
+        }
         Ok(())
     }
 

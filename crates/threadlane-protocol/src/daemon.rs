@@ -229,6 +229,11 @@ pub enum SessionEvent {
     /// the `terminal_id` inside the event — terminals belong to the host,
     /// not to a session.
     TerminalEvent { event: TerminalEvent },
+    /// `SubmitPrompt` landed mid-turn and the daemon queued the text as a
+    /// follow-up: `entry_id` is the durable queue entry a remote client
+    /// binds to its optimistic `queued-user-{session}` echo so the row's
+    /// steer/edit/remove controls become usable.
+    FollowUpQueued { session_id: String, entry_id: String },
     /// A project snapshot or delta. Sent on attach and whenever the project's
     /// session list changes (new session, title update, health transition).
     ProjectChanged { project: ProjectInfo },
@@ -281,6 +286,13 @@ pub enum TerminalEvent {
     Exited {
         terminal_id: String,
         exit_code: Option<i32>,
+    },
+    /// A `Terminal*` command failed before producing output (e.g. the
+    /// requested cwd or the shell does not exist). Scoped to the terminal
+    /// so only the owning view learns about it.
+    Failed {
+        terminal_id: String,
+        message: String,
     },
 }
 
@@ -855,6 +867,16 @@ mod tests {
                     terminal_id: "pty_1".into(),
                     data: "$ ".into(),
                 },
+            },
+            SessionEvent::TerminalEvent {
+                event: TerminalEvent::Failed {
+                    terminal_id: "pty_1".into(),
+                    message: "could not spawn shell".into(),
+                },
+            },
+            SessionEvent::FollowUpQueued {
+                session_id: "sess_1".into(),
+                entry_id: "entry-1".into(),
             },
             SessionEvent::ProjectChanged {
                 project: ProjectInfo {

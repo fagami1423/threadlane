@@ -4823,6 +4823,13 @@ impl AppState {
                 SessionEvent::TerminalEvent { event } => {
                     let _ = self.terminal_event_tx.send(event);
                 }
+                SessionEvent::FollowUpQueued {
+                    session_id,
+                    entry_id,
+                } => {
+                    self.bind_queued_echo(&session_id, &entry_id);
+                    changed = true;
+                }
                 SessionEvent::ProjectChanged { .. } => {}
                 SessionEvent::SessionSnapshot {
                     session_id,
@@ -5115,6 +5122,20 @@ impl AppState {
             .cloned()
             .ok_or_else(|| "No pending composer message".to_string())?;
         Ok((runtime, session_id, pending.text, pending.images))
+    }
+
+    /// Bind the daemon's durable queue entry id to the optimistic
+    /// `queued-user-{session}` echo: `queued_entry_id` only recognizes the
+    /// `{session}-{entry}` form, so until this lands the row renders no
+    /// steer/edit/remove controls.
+    fn bind_queued_echo(&mut self, session_id: &str, entry_id: &str) {
+        let pending_id = format!("queued-user-{session_id}");
+        let bound_id = format!("queued-user-{session_id}-{entry_id}");
+        let mut messages = (*self.messages).clone();
+        if let Some(message) = messages.iter_mut().find(|message| message.id == pending_id) {
+            message.id = bound_id;
+            self.messages = messages.into();
+        }
     }
 
     fn push_optimistic_follow_up(&mut self, session_id: &str, text: String, id: String) {

@@ -161,5 +161,81 @@ fn remote_terminal_lifecycle_round_trips() {
         // The shell exited normally rather than by signal; the code itself
         // is shell-dependent.
         assert!(exit_code.is_some());
+
+        // A rejected open surfaces scoped to the terminal id as Failed, so
+        // the owning view — not a global DaemonError — learns about it.
+        // A duplicate id is a deterministic rejection (a missing cwd is
+        // shell-dependent).
+        for cwd in [cwd.clone(), cwd.clone()] {
+            client
+                .command(SessionCommand::TerminalOpen {
+                    terminal_id: "test-terminal-dup".to_string(),
+                    cwd,
+                    cols: 80,
+                    rows: 24,
+                })
+                .await
+                .expect("terminal open command");
+        }
+        let event = next_event(&mut events, |event| {
+            matches!(
+                event,
+                SessionEvent::TerminalEvent {
+                    event: TerminalEvent::Failed { terminal_id, .. }
+                } if terminal_id == "test-terminal-dup"
+            )
+        })
+        .await;
+        let SessionEvent::TerminalEvent {
+            event: TerminalEvent::Failed { message, .. },
+        } = event
+        else {
+            unreachable!()
+        };
+        assert!(!message.is_empty());
+
+        // A client that vanishes without TerminalClose leaves no orphan:
+        // the server kills the PTY on disconnect and broadcasts Exited.
+        let orphan = RemoteDaemon::connect(format!("ws://{addr}"), None);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if orphan
+                .command(SessionCommand::TerminalOpen {
+                    terminal_id: "test-terminal-orphan".to_string(),
+                    cwd: cwd.clone(),
+                    cols: 80,
+                    rows: 24,
+                })
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "orphan client never connected to the daemon"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // First Output proves the server-side PTY exists before we cut it.
+        next_event(&mut events, |event| {
+            matches!(
+                event,
+                SessionEvent::TerminalEvent {
+                    event: TerminalEvent::Output { terminal_id, .. }
+                } if terminal_id == "test-terminal-orphan"
+            )
+        })
+        .await;
+        drop(orphan);
+        next_event(&mut events, |event| {
+            matches!(
+                event,
+                SessionEvent::TerminalEvent {
+                    event: TerminalEvent::Exited { terminal_id, .. }
+                } if terminal_id == "test-terminal-orphan"
+            )
+        })
+        .await;
     });
 }

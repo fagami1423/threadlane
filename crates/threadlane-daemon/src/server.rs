@@ -157,11 +157,25 @@ async fn serve_connection(
         }
     });
 
+    // Terminals this connection opened but never closed. A crashed or
+    // abruptly gone client can't deliver TerminalClose, so the connection
+    // owns their cleanup — otherwise every leaked interactive shell and
+    // its worker threads would outlive the client indefinitely.
+    let mut owned_terminals = std::collections::HashSet::<String>::new();
     while let Some(message) = read.next().await {
         match message {
             Ok(Message::Text(text)) => {
                 match serde_json::from_str::<SessionCommand>(&text) {
                     Ok(command) => {
+                        match &command {
+                            SessionCommand::TerminalOpen { terminal_id, .. } => {
+                                owned_terminals.insert(terminal_id.clone());
+                            }
+                            SessionCommand::TerminalClose { terminal_id } => {
+                                owned_terminals.remove(terminal_id);
+                            }
+                            _ => {}
+                        }
                         // Dispatch errors also reach this client as
                         // DaemonError events — no error frame shape needed.
                         if let Err(error) = core.clone().dispatch(command).await {
@@ -185,6 +199,9 @@ async fn serve_connection(
             // stream; any that surface here are safe to ignore.
             Ok(_) => {}
         }
+    }
+    for terminal_id in owned_terminals {
+        core.close_terminal(&terminal_id);
     }
     Ok(())
 }

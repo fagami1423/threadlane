@@ -9,6 +9,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::Mutex;
 
 use threadlane_protocol::daemon::{SessionCommand, TerminalEvent};
 use threadlane_ui_state::TerminalBus;
@@ -68,6 +69,14 @@ impl TerminalBackend for RemoteTerminalBackend {
                         sink.closed();
                         break;
                     }
+                    Ok(TerminalEvent::Failed {
+                        terminal_id,
+                        message,
+                    }) if terminal_id == wanted_id =>
+                    {
+                        sink.error(message);
+                        break;
+                    }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -83,6 +92,7 @@ impl TerminalBackend for RemoteTerminalBackend {
         Ok(Box::new(RemoteTerminalIo {
             terminal_id,
             bus: self.bus.clone(),
+            tail: Mutex::new(Vec::new()),
         }))
     }
 }
@@ -91,13 +101,28 @@ impl TerminalBackend for RemoteTerminalBackend {
 struct RemoteTerminalIo {
     terminal_id: String,
     bus: TerminalBus,
+    /// Incomplete trailing UTF-8 sequence held for the next write so a
+    /// multibyte char split across writes survives the String wire frame.
+    tail: Mutex<Vec<u8>>,
 }
 
 impl TerminalIo for RemoteTerminalIo {
     fn write(&self, bytes: &[u8]) {
+        let mut tail = self.tail.lock().expect("input tail poisoned");
+        let mut data = std::mem::take(&mut *tail);
+        data.extend_from_slice(bytes);
+        if let Err(error) = std::str::from_utf8(&data) {
+            if error.error_len().is_none() {
+                *tail = data.split_off(error.valid_up_to());
+            }
+        }
+        drop(tail);
+        if data.is_empty() {
+            return;
+        }
         self.bus.command(SessionCommand::TerminalInput {
             terminal_id: self.terminal_id.clone(),
-            data: String::from_utf8_lossy(bytes).into_owned(),
+            data: String::from_utf8_lossy(&data).into_owned(),
         });
     }
 

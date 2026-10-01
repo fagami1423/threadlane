@@ -289,6 +289,13 @@ impl DaemonCore {
             .map(|(_, runtime)| runtime.clone())
     }
 
+    /// Kill a hosted terminal whose owning client went away. Shares the
+    /// `TerminalClose` path: kill now, entry reaped on reader EOF so the
+    /// trailing `Exited` still orders after the last output.
+    pub(crate) fn close_terminal(&self, terminal_id: &str) {
+        self.terminals.close(terminal_id);
+    }
+
     /// Resolve `session_id` to a runtime, constructing one lazily when the
     /// session is known but idle. Construction goes through the shared
     /// blocking pool — wasmi needs real stacks.
@@ -406,12 +413,18 @@ impl DaemonCore {
                 *self.effort.write().expect("effort poisoned") = effort;
                 if runtime.is_generating() {
                     // Queue a follow-up rather than erroring — a busy turn
-                    // picks it up when it settles.
-                    runtime
+                    // picks it up when it settles. Remote clients get the
+                    // durable entry id through FollowUpQueued so their
+                    // optimistic echo can grow steer/cancel controls.
+                    let entry_id = runtime
                         .work_handle
                         .try_queue_follow_up_with_images(text, images)
-                        .map(|_| ())
-                        .map_err(|_| "session is busy and the follow-up queue is full".to_string())
+                        .map_err(|_| "session is busy and the follow-up queue is full".to_string())?;
+                    let _ = self.ingest_tx.send(SessionEvent::FollowUpQueued {
+                        session_id,
+                        entry_id,
+                    });
+                    Ok(())
                 } else {
                     crate::chat::execute_prompt(
                         runtime,
@@ -607,9 +620,23 @@ impl DaemonCore {
                 cwd,
                 cols,
                 rows,
-            } => self
+            } => match self
                 .terminals
-                .open(&terminal_id, &cwd, cols, rows, self.ingest_tx.clone()),
+                .open(&terminal_id, &cwd, cols, rows, self.ingest_tx.clone())
+            {
+                Ok(()) => Ok(()),
+                // Scope the failure to the owning terminal — a global
+                // DaemonError would leave the waiting view blank forever.
+                Err(message) => {
+                    let _ = self.ingest_tx.send(SessionEvent::TerminalEvent {
+                        event: TerminalEvent::Failed {
+                            terminal_id,
+                            message,
+                        },
+                    });
+                    Ok(())
+                }
+            },
             SessionCommand::TerminalClose { terminal_id } => {
                 self.terminals.close(&terminal_id);
                 Ok(())
