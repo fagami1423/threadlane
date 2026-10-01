@@ -1595,9 +1595,10 @@ mod tests {
     };
     use crate::harness::{
         AgentHarness, CompactionReason, ContextItemSource, ContextItemStatus, ContextManifestItem,
-        ContextSnapshot, ContextSnapshotLoadOutcome, HarnessEventHub, JsonlStore, Record, Reducer,
-        SessionStore, TraceString,
+        ContextSnapshot, ContextSnapshotLoadOutcome, EffectAction, HarnessEventHub, JsonlStore,
+        Record, Reducer, SessionStore, TraceString,
     };
+    use std::path::Path;
     use threadlane_protocol::AgentMessage;
 
     fn user_entry(id: &str, lane: &str) -> crate::harness::Entry {
@@ -2536,6 +2537,87 @@ mod tests {
             .unwrap();
         store.refresh().unwrap_err();
         super::FULL_RELOAD_COUNT.with(|count| assert_eq!(count.get(), 1));
+    }
+
+    fn legacy_pinned_store(path: &Path) -> JsonlStore {
+        let mut store = JsonlStore::open(path).unwrap();
+        store.append_entry(user_entry("first", "main")).unwrap();
+        store.append_entry(user_entry("second", "main")).unwrap();
+        use std::io::Write;
+        // Legacy writers can pin an older node via session_metadata; parsed
+        // last, it wins over the implicit latest-entry leaf.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(b"{\"type\":\"session_metadata\",\"active_node_id\":\"first\",\"title_attempted\":true}\n")
+            .unwrap();
+        JsonlStore::open(path).unwrap()
+    }
+
+    fn main_leaf(store: &JsonlStore) -> Option<String> {
+        store
+            .reduced_state()
+            .lanes
+            .iter()
+            .find(|lane| lane.name == "main")
+            .and_then(|lane| lane.leaf_id.clone())
+    }
+
+    /// The `active_node_id` pin is a whole-stream legacy rule: the first
+    /// `OperationStarted` must re-project the main leaf exactly as a fresh
+    /// build does, whether the operation lands via our atomic commit or a
+    /// foreign append folded through the tail path.
+    #[test]
+    fn first_v2_operation_unpins_legacy_active_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2-transition-atomic.jsonl");
+        let mut store = legacy_pinned_store(&path);
+        assert_eq!(main_leaf(&store).as_deref(), Some("first"));
+
+        store
+            .append_actions_atomically(&[EffectAction::AppendRecord {
+                id: "run-sub".into(),
+                record: Record::OperationStarted {
+                    id: "run-sub".into(),
+                    seq: store.next_sequence(),
+                    lane: "subagent".into(),
+                    timestamp: 1,
+                    wall_time_ms: None,
+                    source_leaf_id: Some("first".into()),
+                    intent: crate::harness::OperationIntent::Run,
+                },
+            }])
+            .unwrap();
+
+        assert_eq!(main_leaf(&store).as_deref(), Some("second"));
+        let reloaded = JsonlStore::open_read_only(&path).unwrap();
+        assert_eq!(store.reduced_state(), reloaded.reduced_state());
+    }
+
+    #[test]
+    fn foreign_v2_operation_unpins_legacy_active_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2-transition-tail.jsonl");
+        let mut store = legacy_pinned_store(&path);
+        let mut peer = JsonlStore::open(&path).unwrap();
+        assert_eq!(main_leaf(&store).as_deref(), Some("first"));
+
+        peer.append_record(Record::OperationStarted {
+            id: "run-peer".into(),
+            seq: peer.next_sequence(),
+            lane: "lane-2".into(),
+            timestamp: 1,
+            wall_time_ms: None,
+            source_leaf_id: Some("first".into()),
+            intent: crate::harness::OperationIntent::Run,
+        })
+        .unwrap();
+        store.refresh().unwrap();
+
+        assert_eq!(main_leaf(&store).as_deref(), Some("second"));
+        let reloaded = JsonlStore::open_read_only(&path).unwrap();
+        assert_eq!(store.reduced_state(), reloaded.reduced_state());
     }
 
     #[test]

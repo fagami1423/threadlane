@@ -226,9 +226,12 @@ impl ReductionContext {
                 });
             }
         }
-        ctx.has_v2_operation |= records
+        if records
             .iter()
-            .any(|record| matches!(record, Record::OperationStarted { .. }));
+            .any(|record| matches!(record, Record::OperationStarted { .. }))
+        {
+            ctx.enable_v2_operation_semantics();
+        }
 
         // Entry streaming applies leaves and auxiliary flags. Parent and lane
         // validity are checked afterwards against the complete entry set so
@@ -434,6 +437,27 @@ impl ReductionContext {
     /// main-lane entry append).
     pub(crate) fn set_preferred_leaf_main(&mut self, leaf: String) {
         self.preferred_leaf_main = Some(leaf);
+    }
+
+    /// Marks the stream as containing an `OperationStarted`. A full build
+    /// computes this flag across the whole stream before any entry commits,
+    /// so the legacy `active_node_id` pin never applies once one exists.
+    /// Incremental commits flip it mid-stream, where a pinned main leaf may
+    /// already be installed — re-project to what entry streaming alone
+    /// selects (the latest entry by sequence) so committed state equals a
+    /// rebuild of the same journal. Lane-moving records require an open
+    /// operation, so none can precede the first `OperationStarted` and the
+    /// latest entry is exactly the fresh-build leaf.
+    fn enable_v2_operation_semantics(&mut self) {
+        if self.has_v2_operation {
+            return;
+        }
+        self.has_v2_operation = true;
+        let latest = self
+            .lane_entries
+            .get("main")
+            .and_then(|ordered| ordered.last().map(|(_, id)| id.clone()));
+        self.edit_lane("main", |lane| lane.leaf_id = latest);
     }
 
     // ── Indexed lookups ───────────────────────────────────────────────
@@ -890,6 +914,12 @@ impl ReductionContext {
 
     /// Applies a validated record to the projected lane state and indexes.
     pub(crate) fn commit_record(&mut self, record: &Record) {
+        // A full build sees `has_v2_operation` before streaming anything, so
+        // the flag must flip before the arm below reads the (possibly
+        // legacy-pinned) leaf for its sequence comparisons.
+        if matches!(record, Record::OperationStarted { .. }) {
+            self.enable_v2_operation_semantics();
+        }
         let lane_name = record.lane().to_owned();
         match record {
             Record::OperationStarted {
@@ -917,7 +947,6 @@ impl ReductionContext {
                     .map(|(_, latest_id)| latest_id.clone());
                 let pending = self.scan_lane_pending(&lane_name, *seq);
 
-                self.has_v2_operation = true;
                 self.edit_lane(&lane_name, |lane| {
                     if let (Some(source_leaf_id), Some(source_seq)) =
                         (source_leaf_id.as_ref(), source_seq)
