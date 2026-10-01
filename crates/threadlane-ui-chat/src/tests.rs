@@ -34,6 +34,232 @@ fn composer_model_controls_fit_narrow_and_wide_panels(cx: &mut gpui::TestAppCont
     }
 }
 
+fn picker_model_option(
+    id: &str,
+    label: &str,
+    provider: threadlane_daemon::catalog::ModelProvider,
+) -> threadlane_daemon::catalog::ModelOption {
+    threadlane_daemon::catalog::ModelOption {
+        id: id.into(),
+        label: label.into(),
+        provider,
+    }
+}
+
+fn mount_chat_with_models<'a>(
+    models: Vec<threadlane_daemon::catalog::ModelOption>,
+    selected_model: &str,
+    cx: &'a mut gpui::TestAppContext,
+) -> (
+    gpui::Entity<super::ChatListView>,
+    gpui::Entity<threadlane_ui_state::AppState>,
+    &'a mut gpui::VisualTestContext,
+) {
+    use gpui::AppContext as _;
+
+    cx.update(gpui_component::init);
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::default();
+        state.test_set_available_models(models);
+        state.selected_model = selected_model.into();
+        state
+    });
+    let retained = model.clone();
+    let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let sink = holder.clone();
+    let (_root, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        *sink.borrow_mut() = Some(chat.clone());
+        gpui_component::Root::new(chat, window, cx)
+    });
+    let chat = holder.borrow().clone().expect("chat view mounted");
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    (chat, retained, cx)
+}
+
+fn open_model_picker(chat: &gpui::Entity<super::ChatListView>, cx: &mut gpui::VisualTestContext) {
+    let trigger = cx
+        .debug_bounds("composer-model-picker")
+        .expect("picker trigger is visible");
+    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    chat.read_with(cx, |chat, _| {
+        assert!(chat.model_picker_open.get(), "picker popup must open");
+    });
+}
+
+#[gpui::test]
+fn model_picker_search_commits_the_highlighted_row(cx: &mut gpui::TestAppContext) {
+    let (chat, model, cx) = mount_chat_with_models(
+        vec![
+            picker_model_option("gpt-5", "GPT-5", threadlane_daemon::catalog::ModelProvider::OpenAi),
+            picker_model_option(
+                "antigravity/gemini-3",
+                "Gemini 3",
+                threadlane_daemon::catalog::ModelProvider::Antigravity,
+            ),
+        ],
+        "gpt-5",
+        cx,
+    );
+    open_model_picker(&chat, cx);
+    cx.simulate_input("gemini");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    model.read_with(cx, |state, _| {
+        assert_eq!(state.selected_model, "antigravity/gemini-3");
+    });
+}
+
+#[gpui::test]
+fn model_picker_agent_choice_lands_on_the_selected_agent(cx: &mut gpui::TestAppContext) {
+    threadlane_daemon::catalog::test_set_cached_acp_config_options(
+        "deepseek",
+        vec![threadlane_acp::AcpConfigOption {
+            id: "model".into(),
+            name: "Model".into(),
+            description: None,
+            category: Some(threadlane_acp::ACP_CONFIG_CATEGORY_MODEL.to_string()),
+            current_value: serde_json::json!("deepseek-chat"),
+            options: vec![
+                threadlane_acp::AcpConfigOptionChoice {
+                    value: "deepseek-chat".into(),
+                    name: "Chat".into(),
+                    description: None,
+                },
+                threadlane_acp::AcpConfigOptionChoice {
+                    value: "deepseek-reasoner".into(),
+                    name: "Reasoner".into(),
+                    description: None,
+                },
+            ],
+        }],
+    );
+    let (chat, model, cx) = mount_chat_with_models(
+        vec![
+            picker_model_option(
+                "acp/claude",
+                "Claude",
+                threadlane_daemon::catalog::ModelProvider::Acp,
+            ),
+            picker_model_option(
+                "acp/deepseek",
+                "DeepSeek",
+                threadlane_daemon::catalog::ModelProvider::Acp,
+            ),
+        ],
+        "acp/claude",
+        cx,
+    );
+    open_model_picker(&chat, cx);
+    cx.simulate_input("deepseek reasoner");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    model.read_with(cx, |state, _| {
+        assert_eq!(state.selected_model, "acp/deepseek");
+        // The regression the issue calls out: the chosen model config must be
+        // applied to the newly selected agent, never to the previous one.
+        assert_eq!(
+            state.test_pending_acp_config("deepseek", "model").as_deref(),
+            Some("deepseek-reasoner")
+        );
+        assert_eq!(state.test_pending_acp_config("claude", "model"), None);
+    });
+}
+
+#[gpui::test]
+fn model_picker_stale_choice_reports_unavailable(cx: &mut gpui::TestAppContext) {
+    let (chat, model, cx) = mount_chat_with_models(
+        vec![
+            picker_model_option("gpt-5", "GPT-5", threadlane_daemon::catalog::ModelProvider::OpenAi),
+            picker_model_option(
+                "antigravity/gemini-3",
+                "Gemini 3",
+                threadlane_daemon::catalog::ModelProvider::Antigravity,
+            ),
+        ],
+        "gpt-5",
+        cx,
+    );
+    open_model_picker(&chat, cx);
+    cx.simulate_input("gemini");
+    cx.run_until_parked();
+    // Catalog changes while the snapshot is frozen: the remembered row must
+    // be revalidated instead of silently switching to a removed model.
+    model.update(cx, |state, _cx| {
+        state.test_set_available_models(vec![picker_model_option(
+            "gpt-5",
+            "GPT-5",
+            threadlane_daemon::catalog::ModelProvider::OpenAi,
+        )]);
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    model.read_with(cx, |state, _| {
+        assert_eq!(state.selected_model, "gpt-5", "stale row must not apply");
+        assert_eq!(
+            state.session_status.as_deref(),
+            Some(super::model_picker::STALE_CHOICE_MESSAGE)
+        );
+    });
+}
+
+#[gpui::test]
+fn model_picker_dismiss_restores_composer_and_empty_enter_is_consumed(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (chat, model, cx) = mount_chat_with_models(
+        vec![
+            picker_model_option("gpt-5", "GPT-5", threadlane_daemon::catalog::ModelProvider::OpenAi),
+        ],
+        "gpt-5",
+        cx,
+    );
+    chat.update_in(cx, |chat, window, cx| {
+        chat.input_state.update(cx, |input, cx| {
+            input.set_value("a draft", window, cx);
+        });
+        chat.focus_composer(window, cx);
+    });
+    cx.run_until_parked();
+    open_model_picker(&chat, cx);
+    // Typing lands in the search field, not the composer draft.
+    cx.simulate_input("no-such-model");
+    cx.run_until_parked();
+    // Enter on an empty result is consumed: it must not submit the draft.
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    model.read_with(cx, |state, _| {
+        assert!(state.messages.is_empty(), "picker Enter must not submit");
+        assert_eq!(state.selected_model, "gpt-5");
+    });
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(chat.input_state.read(cx).value().as_ref(), "a draft");
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    chat.read_with(cx, |chat, _| {
+        assert!(!chat.model_picker_open.get(), "Escape must dismiss the picker");
+    });
+    // Reopening starts a fresh search rather than retargeting the highlight.
+    let trigger = cx.debug_bounds("composer-model-picker").unwrap();
+    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    chat.read_with(cx, |chat, cx| {
+        let picker = chat.model_picker.as_ref().expect("picker state kept");
+        assert!(picker.read(cx).query(cx).is_empty());
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+}
+
 #[gpui::test]
 fn reasoning_menu_reports_open_and_escape_dismissal(cx: &mut gpui::TestAppContext) {
     use gpui::AppContext as _;

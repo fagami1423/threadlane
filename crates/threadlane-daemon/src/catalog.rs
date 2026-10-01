@@ -568,6 +568,36 @@ pub fn cached_acp_config_options(agent_id: &str) -> Vec<threadlane_acp::AcpConfi
         .unwrap_or_default()
 }
 
+/// Test support: seed one external agent's cached settings so pickers and
+/// pending New-task choices can exercise the advertised-choices path
+/// without spawning agents.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn test_set_cached_acp_config_options(
+    agent_id: &str,
+    options: Vec<threadlane_acp::AcpConfigOption>,
+) {
+    let Some(mut guard) = CACHED_ACP_MODELS
+        .get_or_init(|| std::sync::Mutex::new((std::time::Instant::now(), Vec::new())))
+        .lock()
+        .ok()
+    else {
+        return;
+    };
+    guard.0 = std::time::Instant::now();
+    match guard.1.iter_mut().find(|cached| cached.agent_id == agent_id) {
+        Some(cached) => {
+            cached.options = options;
+            cached.error = None;
+        }
+        None => guard.1.push(CachedAcpAgentModels {
+            agent_id: agent_id.to_string(),
+            options,
+            error: None,
+        }),
+    }
+}
+
 /// Latest background-validation error for one external agent, if the last
 /// refresh saw it fail. The picker shows this instead of silently omitting
 /// the agent's models; the models themselves keep coming from
