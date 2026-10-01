@@ -90,7 +90,6 @@ impl Render for PairingDialogView {
         let pairing = state.pairing.as_ref().map(|server| server.info().clone());
         let pairing_error = state.pairing_error.clone();
         let starting = self.starting;
-        drop(state);
 
         let mut content = v_flex().gap_3().text_sm();
         if let Some(info) = pairing {
