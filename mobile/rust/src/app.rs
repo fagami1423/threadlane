@@ -163,7 +163,8 @@ pub struct MobileApp {
     composer: Entity<InputState>,
     /// One custom-answer input per `allow_custom` question item, keyed by
     /// `question_key(request.id, item.id)` and created lazily on render.
-    question_inputs: HashMap<String, Entity<InputState>>,
+    /// The keyboard subscription rides along so it drops with the input.
+    question_inputs: HashMap<String, (Entity<InputState>, Subscription)>,
     connect_error: Option<String>,
     /// Whether a persisted pairing exists — drives the Forget button.
     saved_pairing: bool,
@@ -690,7 +691,7 @@ impl MobileApp {
                             custom_text: self
                                 .question_inputs
                                 .get(&key)
-                                .map(|input| input.read(cx).value().trim().to_string())
+                                .map(|(input, _)| input.read(cx).value().trim().to_string())
                                 .filter(|text| !text.is_empty()),
                         }
                     })
@@ -1519,8 +1520,7 @@ impl MobileApp {
                         _ => {}
                     },
                 );
-                self._subscriptions.push(subscription);
-                self.question_inputs.insert(key, input);
+                self.question_inputs.insert(key, (input, subscription));
             }
         }
         // Drop state for superseded requests so a new question starts clean.
@@ -1565,7 +1565,7 @@ impl MobileApp {
                     }),
                 ));
             if item.allow_custom {
-                if let Some(input) = self.question_inputs.get(&key) {
+                if let Some((input, _)) = self.question_inputs.get(&key) {
                     card = card.child(
                         div()
                             .flex()
@@ -1592,7 +1592,7 @@ impl MobileApp {
             let custom = self
                 .question_inputs
                 .get(&key)
-                .is_some_and(|input| !input.read(cx).value().trim().is_empty());
+                .is_some_and(|(input, _)| !input.read(cx).value().trim().is_empty());
             selected || custom
         });
         let remaining = active.questions.len() - 1;
