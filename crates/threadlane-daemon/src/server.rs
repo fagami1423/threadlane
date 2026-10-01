@@ -1,10 +1,14 @@
 //! WebSocket transport for [`DaemonCore`]: the standalone binary serves
 //! this, and tests drive the real protocol roundtrip through it.
 //!
-//! Framing: one bare `SessionCommand` JSON per inbound text frame;
-//! `{"seq": N, "event": SessionEvent}` frames outbound — the journal tail
-//! newer than the client's `?since=` cursor on attach, then live broadcast.
-//! Errors travel as `DaemonError` events, so no error frame shape exists.
+//! Framing: one bare `SessionCommand` JSON per inbound text frame, or a
+//! `{"request_id": N, "command": ...}` `CommandRequest` envelope when the
+//! client wants the dispatch result back. Outbound frames are
+//! `{"seq": N, "event": SessionEvent}` — the journal tail newer than the
+//! client's `?since=` cursor on attach, then live broadcast — plus
+//! `{"response": CommandReply}` replies sent only to the requesting
+//! connection and never journaled. Errors travel as `DaemonError` events
+//! (and as the reply's `Err`), so no error frame shape exists.
 //! `seq` is the daemon's journal sequence; synthesized frames (undecodable
 //! commands, lag notices) carry `seq: 0`.
 //!
@@ -24,7 +28,9 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 
-use threadlane_protocol::daemon::{SessionCommand, SessionEvent};
+use threadlane_protocol::daemon::{
+    CommandReply, CommandRequest, SessionCommand, SessionEvent,
+};
 
 use crate::core::DaemonCore;
 
@@ -51,6 +57,28 @@ pub async fn serve(listener: TcpListener, core: Arc<DaemonCore>, token: Option<S
 fn wire_frame(seq: u64, event: &SessionEvent) -> Result<Message, serde_json::Error> {
     serde_json::to_string(&serde_json::json!({ "seq": seq, "event": event }))
         .map(|text| Message::Text(text.into()))
+}
+
+/// The point-to-point reply to a `CommandRequest`: rides the connection's
+/// outbound channel but never the journal, so reconnects don't replay it.
+fn reply_frame(reply: &CommandReply) -> Result<Message, serde_json::Error> {
+    serde_json::to_string(&serde_json::json!({ "response": reply }))
+        .map(|text| Message::Text(text.into()))
+}
+
+/// Track the terminals a connection opens and closes so disconnect
+/// cleanup can kill whichever it leaves behind — including ones wrapped
+/// in a `CommandRequest` envelope.
+fn note_terminal(command: &SessionCommand, owned: &mut std::collections::HashSet<String>) {
+    match command {
+        SessionCommand::TerminalOpen { terminal_id, .. } => {
+            owned.insert(terminal_id.clone());
+        }
+        SessionCommand::TerminalClose { terminal_id } => {
+            owned.remove(terminal_id);
+        }
+        _ => {}
+    }
 }
 
 /// The client's last-seen journal sequence from `?since=` on the connect
@@ -119,6 +147,10 @@ async fn serve_connection(
     // an unbounded queue per stalled client.
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(256);
     let error_tx = out_tx.clone();
+    // Point-to-point command replies share the connection's ordered
+    // outbound channel; `out_tx` itself moves into the broadcast
+    // forwarder below.
+    let reply_tx = out_tx.clone();
     let (tail, mut broadcast_rx) =
         core.subscribe_with_tail(since.load(Ordering::SeqCst));
     for (seq, event) in tail {
@@ -165,17 +197,36 @@ async fn serve_connection(
     while let Some(message) = read.next().await {
         match message {
             Ok(Message::Text(text)) => {
+                // A `CommandRequest` envelope asks for the dispatch result
+                // back on this connection; bare commands stay
+                // fire-and-forget. The shapes are disjoint — a request has
+                // no top-level `type` tag.
+                if let Ok(CommandRequest { request_id, command }) =
+                    serde_json::from_str::<CommandRequest>(&text)
+                {
+                    note_terminal(&command, &mut owned_terminals);
+                    let reply = CommandReply {
+                        request_id,
+                        result: core
+                            .clone()
+                            .dispatch_with_request_id(command, Some(request_id))
+                            .await,
+                    };
+                    match reply_frame(&reply) {
+                        Ok(frame) => {
+                            if reply_tx.send(frame).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%peer, %error, "could not encode command reply");
+                        }
+                    }
+                    continue;
+                }
                 match serde_json::from_str::<SessionCommand>(&text) {
                     Ok(command) => {
-                        match &command {
-                            SessionCommand::TerminalOpen { terminal_id, .. } => {
-                                owned_terminals.insert(terminal_id.clone());
-                            }
-                            SessionCommand::TerminalClose { terminal_id } => {
-                                owned_terminals.remove(terminal_id);
-                            }
-                            _ => {}
-                        }
+                        note_terminal(&command, &mut owned_terminals);
                         // Dispatch errors also reach this client as
                         // DaemonError events — no error frame shape needed.
                         if let Err(error) = core.clone().dispatch(command).await {

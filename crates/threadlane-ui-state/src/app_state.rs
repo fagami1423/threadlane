@@ -161,6 +161,14 @@ pub struct AppState {
     /// pins, pending prompts) runs only on the ack — a rejected delete
     /// must leave that data intact when the session row returns.
     pending_remote_deletes: HashMap<String, PathBuf>,
+    /// Correlates the `CommandRequest`s this client issues: replies
+    /// re-enter the stream as `SessionEvent::CommandResult` keyed by this
+    /// caller-chosen id.
+    next_command_request_id: u64,
+    /// Queued-message cancels that asked the daemon for the staged content
+    /// back (the composer take-back path): request_id → restore intent.
+    /// `drain_chat_stream` resolves them when the `CommandResult` lands.
+    pub(crate) pending_queued_restores: HashMap<u64, PendingQueuedRestore>,
     scheduler_handles: HashMap<PathBuf, SchedulerSupervisorHandle>,
     scheduler_results:
         HashMap<PathBuf, tokio::sync::mpsc::UnboundedReceiver<SchedulerSupervisorEvent>>,
@@ -191,6 +199,17 @@ pub struct AppState {
     /// runs are restored history and must not be registered as new in-app
     /// sessions.
     automation_runs_restored: bool,
+}
+
+/// A queued-message cancel awaiting its `CommandResult` reply: which echo
+/// it belongs to, and whether the optimistic echo already put the staged
+/// text back in the composer (then the reply only needs to deliver the
+/// images the echo could not carry).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingQueuedRestore {
+    pub session_id: String,
+    pub entry_id: String,
+    pub text_restored: bool,
 }
 
 /// Handle terminal views use to reach daemon-hosted PTYs. `command()`
@@ -735,6 +754,8 @@ impl AppState {
             terminal_command_tx,
             terminal_event_tx,
             pending_remote_deletes: HashMap::new(),
+            next_command_request_id: 1,
+            pending_queued_restores: HashMap::new(),
             scheduler_handles: HashMap::new(),
             scheduler_results: HashMap::new(),
             deferred_stream_events: HashMap::new(),
@@ -3507,6 +3528,27 @@ impl AppState {
         }
     }
 
+    /// Sends a `CommandRequest` through the attached `DaemonClient` and
+    /// routes the reply back into the stream as `SessionEvent::CommandResult`,
+    /// so reply handling lives in `drain_chat_stream` like every other
+    /// daemon-sourced outcome. A send/transport failure synthesizes the
+    /// `Err` reply so any pending intent registered under `request_id`
+    /// still resolves.
+    fn dispatch_command_request(&self, request: CommandRequest) {
+        let client = self.daemon_client.clone();
+        let stream_tx = self.stream_tx.clone();
+        if let Ok(executor) = crate::chat::executor() {
+            executor.spawn(async move {
+                let request_id = request.request_id;
+                let result = client.command_request(request).await;
+                let _ = stream_tx.send(SessionEvent::CommandResult {
+                    request_id,
+                    result,
+                });
+            });
+        }
+    }
+
     fn record_subagent_activity(&mut self, event: &AgentEvent) {
         match event {
             AgentEvent::SubagentQueued {
@@ -4830,6 +4872,50 @@ impl AppState {
                     self.bind_queued_echo(&session_id, &entry_id);
                     changed = true;
                 }
+                SessionEvent::CommandResult { request_id, result } => {
+                    match result {
+                        Ok(CommandResponse::CancelledQueuedMessage {
+                            session_id,
+                            entry_id,
+                            text,
+                            images,
+                        }) => {
+                            changed |= self.apply_queued_cancel_restore(
+                                request_id,
+                                &session_id,
+                                &entry_id,
+                                text,
+                                images,
+                            );
+                        }
+                        Ok(_) => {
+                            self.pending_queued_restores.remove(&request_id);
+                        }
+                        Err(error) => {
+                            self.pending_queued_restores.remove(&request_id);
+                            tracing::warn!("daemon request {request_id} failed: {error}");
+                        }
+                    }
+                }
+                // Journal replay of a cancellation whose point-to-point
+                // reply was lost to a disconnect — resolves the parked
+                // intent the same way the reply would have.
+                SessionEvent::QueuedEntryCancelled {
+                    session_id,
+                    entry_id,
+                    request_id: Some(request_id),
+                    text,
+                    images,
+                } => {
+                    changed |= self.apply_queued_cancel_restore(
+                        request_id,
+                        &session_id,
+                        &entry_id,
+                        text,
+                        images,
+                    );
+                }
+                SessionEvent::QueuedEntryCancelled { .. } => {}
                 SessionEvent::ProjectChanged { .. } => {}
                 SessionEvent::SessionSnapshot {
                     session_id,
@@ -5017,25 +5103,65 @@ impl AppState {
         &mut self,
         entry_id: &str,
     ) -> Result<(String, Vec<ImageAttachment>), String> {
+        self.cancel_queued_message_inner(entry_id, false)
+    }
+
+    /// Cancel a queued follow-up to take its staged content back into the
+    /// composer (the queued row's edit button). Remote mode issues a
+    /// `CommandRequest` for the cancel: the staged text returns from the
+    /// optimistic echo immediately, and the reply's staged images land in
+    /// `requested_composer_inserts` when it arrives.
+    pub fn edit_queued_message(
+        &mut self,
+        entry_id: &str,
+    ) -> Result<(String, Vec<ImageAttachment>), String> {
+        self.cancel_queued_message_inner(entry_id, true)
+    }
+
+    fn cancel_queued_message_inner(
+        &mut self,
+        entry_id: &str,
+        restore: bool,
+    ) -> Result<(String, Vec<ImageAttachment>), String> {
         if self.daemon_remote {
             let session_id = self
                 .active_session_id
                 .clone()
                 .ok_or_else(|| "No active session".to_string())?;
             let echo_id = format!("queued-user-{session_id}-{entry_id}");
-            // Wire commands carry no response payload: the staged text comes
-            // back from the optimistic echo; staged images are not in it, so
-            // a remote cancel restores text only.
+            // The staged text comes back from the optimistic echo now; the
+            // echo holds no images, so a restore asks the daemon's reply
+            // for the full staged content.
             let staged_text = self
                 .messages
                 .iter()
                 .find(|message| message.id == echo_id)
                 .map(|message| message.content.clone())
                 .unwrap_or_default();
-            self.dispatch_command(SessionCommand::CancelQueuedMessage {
-                session_id,
-                entry_id: entry_id.to_string(),
-            });
+            if restore {
+                let request_id = self.next_command_request_id;
+                self.next_command_request_id += 1;
+                self.pending_queued_restores.insert(
+                    request_id,
+                    PendingQueuedRestore {
+                        session_id: session_id.clone(),
+                        entry_id: entry_id.to_string(),
+                        text_restored: !staged_text.is_empty(),
+                    },
+                );
+                self.dispatch_command_request(CommandRequest {
+                    request_id,
+                    command: SessionCommand::CancelQueuedMessage {
+                        session_id: session_id.clone(),
+                        entry_id: entry_id.to_string(),
+                    },
+                });
+            } else {
+                self.dispatch_command(SessionCommand::CancelQueuedMessage {
+                    session_id,
+                    entry_id: entry_id.to_string(),
+                });
+            }
             let mut messages = (*self.messages).clone();
             if messages.iter().any(|message| message.id == echo_id) {
                 messages.retain(|message| message.id != echo_id);
@@ -5054,6 +5180,39 @@ impl AppState {
         }
         self.session_status = Some("Queued message removed".into());
         Ok(staged)
+    }
+
+    /// Resolve a parked queued-cancel intent with the staged payload a
+    /// `CommandResult` reply or a journaled `QueuedEntryCancelled` event
+    /// carried, queueing it as a composer insert scoped to the session
+    /// that queued the message: if another session is on screen the
+    /// insert waits for it to come back rather than landing in a foreign
+    /// draft.
+    fn apply_queued_cancel_restore(
+        &mut self,
+        request_id: u64,
+        session_id: &str,
+        entry_id: &str,
+        text: String,
+        images: Vec<ImageAttachment>,
+    ) -> bool {
+        let Some(pending) = self.pending_queued_restores.remove(&request_id) else {
+            return false;
+        };
+        if pending.session_id != session_id || pending.entry_id != entry_id {
+            return false;
+        }
+        self.requested_composer_inserts
+            .push(RequestedComposerInsert {
+                text: if pending.text_restored {
+                    String::new()
+                } else {
+                    text
+                },
+                images,
+                session_id: Some(session_id.to_string()),
+            });
+        true
     }
 
     /// Re-route a still-pending queued follow-up into the live steer queue so
@@ -5336,6 +5495,7 @@ impl AppState {
                     .push(RequestedComposerInsert {
                         text: setup.text,
                         images: setup.images,
+                        session_id: None,
                     });
                 return Ok(());
             }

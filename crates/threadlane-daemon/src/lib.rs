@@ -31,10 +31,11 @@ pub use events::{next_event_batch, next_event_batch_capped};
 pub use terminal::TerminalManager;
 pub use types::{
     derive_session_attention, hash_session_identity, AttachedProject, ChatMessageInfo,
-    ContextWindowInfo, HydrationRuntimeOptions, MessageRole, PendingComposerMessage,
-    ProjectInfo, RunCompletionToken, RunTiming, SessionAttention, SessionCommand,
-    SessionCompletionSummary, SessionDiscoveryCache, SessionDiscoveryCacheEntry, SessionEvent,
-    SessionHealth, SessionHydrationRequest, SessionInfo, SessionMetricsInfo,
-    SessionProjectionKey, SessionProjectionResult, SessionSnapshot, SubagentActivityInfo,
-    SubagentActivityStatus, ToolActivityInfo, TrajectoryDiagnostics, TrajectoryEntry, WorkMode,
+    CommandReply, CommandRequest, CommandResponse, ContextWindowInfo, HydrationRuntimeOptions,
+    MessageRole, PendingComposerMessage, ProjectInfo, RunCompletionToken, RunTiming,
+    SessionAttention, SessionCommand, SessionCompletionSummary, SessionDiscoveryCache,
+    SessionDiscoveryCacheEntry, SessionEvent, SessionHealth, SessionHydrationRequest,
+    SessionInfo, SessionMetricsInfo, SessionProjectionKey, SessionProjectionResult,
+    SessionSnapshot, SubagentActivityInfo, SubagentActivityStatus, ToolActivityInfo,
+    TrajectoryDiagnostics, TrajectoryEntry, WorkMode,
 };

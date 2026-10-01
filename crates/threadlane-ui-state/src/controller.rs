@@ -76,7 +76,11 @@ pub fn dispatch(state: &mut AppState, action: AppAction) {
                 state.session_status = Some(error);
                 state
                     .requested_composer_inserts
-                    .push(crate::RequestedComposerInsert { text, images });
+                    .push(crate::RequestedComposerInsert {
+                        text,
+                        images,
+                        session_id: None,
+                    });
             }
         }
         AppAction::StageBusyMessage { text, images } => {

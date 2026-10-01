@@ -589,8 +589,18 @@ impl ChatListView {
             this.sync_composer_draft(window, cx);
             // Cross-surface composer inserts (browser annotations): append
             // without disturbing already-typed input or staged attachments.
+            // Session-scoped inserts wait for their session to be active.
             let inserts = model.update(cx, |state, _cx| {
-                std::mem::take(&mut state.requested_composer_inserts)
+                let active = state.active_session_id.clone();
+                let (ready, waiting): (Vec<_>, Vec<_>) =
+                    std::mem::take(&mut state.requested_composer_inserts)
+                        .into_iter()
+                        .partition(|insert| {
+                            insert.session_id.as_deref().is_none()
+                                || insert.session_id.as_deref() == active.as_deref()
+                        });
+                state.requested_composer_inserts = waiting;
+                ready
             });
             for insert in inserts {
                 if !insert.text.is_empty() || !insert.images.is_empty() {
@@ -5193,7 +5203,7 @@ impl ChatListView {
                                                             cx,
                                                             |state, cx| {
                                                                 let restored = state
-                                                                    .cancel_queued_message(
+                                                                    .edit_queued_message(
                                                                         &entry_id,
                                                                     )
                                                                     .map_err(|error| {

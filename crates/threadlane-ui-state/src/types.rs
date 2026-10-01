@@ -21,11 +21,15 @@ pub enum RequestedEditorTarget {
 
 /// Text (and optional images) another surface asked to append to the
 /// composer, e.g. a browser annotation. Applied by the chat view without
-/// disturbing already-typed input.
+/// disturbing already-typed input. `session_id` scopes the insert: `None`
+/// applies to whatever composer is on screen, `Some` is held until that
+/// session is active so a reply for one session never lands in another's
+/// draft.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequestedComposerInsert {
     pub text: String,
     pub images: Vec<ImageAttachment>,
+    pub session_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

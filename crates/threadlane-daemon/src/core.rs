@@ -27,8 +27,8 @@ use threadlane_coding_agent::controller::{
 };
 use threadlane_protocol::browser::BrowserBridge;
 use threadlane_protocol::daemon::{
-    ProjectInfo, SessionCommand, SessionEvent, SessionHydrationRequest, SessionInfo,
-    SessionSnapshot, TerminalEvent, WorktreeSetup,
+    CommandResponse, ProjectInfo, SessionCommand, SessionEvent, SessionHydrationRequest,
+    SessionInfo, SessionSnapshot, TerminalEvent, WorktreeSetup,
 };
 use threadlane_protocol::orchestration::ModelRoles;
 use threadlane_protocol::ReasoningEffort;
@@ -383,9 +383,25 @@ impl DaemonCore {
 
     /// Execute one [`SessionCommand`]. Errors are also surfaced to clients
     /// as `SessionEvent::DaemonError` so remote callers see failures the
-    /// transport cannot return.
-    pub async fn dispatch(self: &Arc<Self>, command: SessionCommand) -> Result<(), String> {
-        let result = self.dispatch_inner(command).await;
+    /// transport cannot return. The returned [`CommandResponse`] is what a
+    /// `CommandRequest` caller receives; fire-and-forget callers ignore it.
+    pub async fn dispatch(
+        self: &Arc<Self>,
+        command: SessionCommand,
+    ) -> Result<CommandResponse, String> {
+        self.dispatch_with_request_id(command, None).await
+    }
+
+    /// [`Self::dispatch`] for a `CommandRequest`: the caller's
+    /// `request_id` is recorded on the journaled
+    /// `SessionEvent::QueuedEntryCancelled` so a requester that lost its
+    /// reply to a disconnect can correlate the cancellation on replay.
+    pub async fn dispatch_with_request_id(
+        self: &Arc<Self>,
+        command: SessionCommand,
+        request_id: Option<u64>,
+    ) -> Result<CommandResponse, String> {
+        let result = self.dispatch_inner(command, request_id).await;
         if let Err(error) = &result {
             let _ = self.ingest_tx.send(SessionEvent::DaemonError {
                 session_id: None,
@@ -395,7 +411,50 @@ impl DaemonCore {
         result
     }
 
-    async fn dispatch_inner(self: &Arc<Self>, command: SessionCommand) -> Result<(), String> {
+    async fn dispatch_inner(
+        self: &Arc<Self>,
+        command: SessionCommand,
+        request_id: Option<u64>,
+    ) -> Result<CommandResponse, String> {
+        // The one command with a return payload short-circuits here; the
+        // rest are fire-and-forget effects that answer `Ack` to a request.
+        if let SessionCommand::CancelQueuedMessage {
+            session_id,
+            entry_id,
+        } = &command
+        {
+            let runtime = self
+                .runtime_for_session(session_id)
+                .ok_or_else(|| format!("no live runtime for session {session_id}"))?;
+            return runtime
+                .work_handle
+                .cancel_queued_entry(entry_id)
+                .map(|(text, images)| {
+                    // The point-to-point reply is gone for good when the
+                    // socket dies mid-flight; the journaled copy is how a
+                    // reconnected requester still recovers the payload —
+                    // and how every other client learns the entry left.
+                    let _ = self.ingest_tx.send(SessionEvent::QueuedEntryCancelled {
+                        session_id: session_id.clone(),
+                        entry_id: entry_id.clone(),
+                        request_id,
+                        text: text.clone(),
+                        images: images.clone(),
+                    });
+                    CommandResponse::CancelledQueuedMessage {
+                        session_id: session_id.clone(),
+                        entry_id: entry_id.clone(),
+                        text,
+                        images,
+                    }
+                });
+        }
+        self.dispatch_effect(command)
+            .await
+            .map(|_| CommandResponse::Ack)
+    }
+
+    async fn dispatch_effect(self: &Arc<Self>, command: SessionCommand) -> Result<(), String> {
         match command {
             SessionCommand::SubmitPrompt {
                 session_id,
@@ -673,17 +732,8 @@ impl DaemonCore {
                     .ok_or_else(|| format!("no live runtime for session {session_id}"))?;
                 runtime.work_handle.steer_queued_entry(&entry_id)
             }
-            SessionCommand::CancelQueuedMessage {
-                session_id,
-                entry_id,
-            } => {
-                let runtime = self
-                    .runtime_for_session(&session_id)
-                    .ok_or_else(|| format!("no live runtime for session {session_id}"))?;
-                runtime
-                    .work_handle
-                    .cancel_queued_entry(&entry_id)
-                    .map(|_| ())
+            SessionCommand::CancelQueuedMessage { .. } => {
+                unreachable!("payload commands are handled in dispatch_inner")
             }
             SessionCommand::GetProjectState { work_dir } => {
                 let sessions = crate::discovery::discover_sessions_in_project(&work_dir);

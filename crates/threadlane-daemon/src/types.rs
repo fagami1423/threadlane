@@ -16,9 +16,10 @@ use threadlane_coding_agent::controller::SessionRuntimeStatus;
 use threadlane_protocol::{SessionPlan, TokenUsage};
 
 pub use threadlane_protocol::daemon::{
-    ChatMessageInfo, ContextWindowInfo, GitHubIssueRef, HydrationRuntimeOptions, MessageRole,
-    PendingComposerMessage, PermissionDecision, ProjectInfo, RunCompletionToken, RunTiming,
-    SessionAttention, SessionCommand, SessionCompletionSummary, SessionEvent, SessionHealth,
+    ChatMessageInfo, CommandReply, CommandRequest, CommandResponse, ContextWindowInfo,
+    GitHubIssueRef, HydrationRuntimeOptions, MessageRole, PendingComposerMessage,
+    PermissionDecision, ProjectInfo, RunCompletionToken, RunTiming, SessionAttention,
+    SessionCommand, SessionCompletionSummary, SessionEvent, SessionHealth,
     SessionHydrationRequest, SessionInfo, SessionMetricsInfo, SessionProjectionKey,
     SessionSnapshot, SetupStage, SubagentActivityInfo, SubagentActivityStatus, TerminalEvent,
     ToolActivityInfo, TrajectoryDiagnostics, TrajectoryEntry, WorkMode, WorktreeSetup,
