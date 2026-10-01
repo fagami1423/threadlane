@@ -127,8 +127,9 @@ fn model_picker_search_commits_the_highlighted_row(cx: &mut gpui::TestAppContext
 
 #[gpui::test]
 fn model_picker_agent_choice_lands_on_the_selected_agent(cx: &mut gpui::TestAppContext) {
+    // The seeded cache is process-global, so use an id no other test claims.
     threadlane_daemon::catalog::test_set_cached_acp_config_options(
-        "deepseek",
+        "deepseek-picker",
         vec![threadlane_acp::AcpConfigOption {
             id: "model".into(),
             name: "Model".into(),
@@ -157,7 +158,7 @@ fn model_picker_agent_choice_lands_on_the_selected_agent(cx: &mut gpui::TestAppC
                 threadlane_daemon::catalog::ModelProvider::Acp,
             ),
             picker_model_option(
-                "acp/deepseek",
+                "acp/deepseek-picker",
                 "DeepSeek",
                 threadlane_daemon::catalog::ModelProvider::Acp,
             ),
@@ -171,11 +172,13 @@ fn model_picker_agent_choice_lands_on_the_selected_agent(cx: &mut gpui::TestAppC
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
     model.read_with(cx, |state, _| {
-        assert_eq!(state.selected_model, "acp/deepseek");
+        assert_eq!(state.selected_model, "acp/deepseek-picker");
         // The regression the issue calls out: the chosen model config must be
         // applied to the newly selected agent, never to the previous one.
         assert_eq!(
-            state.test_pending_acp_config("deepseek", "model").as_deref(),
+            state
+                .test_pending_acp_config("deepseek-picker", "model")
+                .as_deref(),
             Some("deepseek-reasoner")
         );
         assert_eq!(state.test_pending_acp_config("claude", "model"), None);
