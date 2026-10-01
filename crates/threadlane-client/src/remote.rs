@@ -34,12 +34,32 @@ use crate::DaemonClient;
 const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
 /// Longest delay between reconnect attempts.
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// Longest a `command_request` waits for its reply before the caller is
+/// failed — the reply and the journaled recovery both land far inside
+/// it, so expiry means the answer was never coming (a peer that does
+/// not speak the request envelope, a dropped frame).
+const COMMAND_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One outbound frame: a bare fire-and-forget command, or a request
 /// envelope the server answers with a `{"response": ...}` reply.
 enum OutboundMessage {
     Command(SessionCommand),
     Request(CommandRequest),
+}
+
+/// A `CommandRequest` awaiting its reply. `replayable` requests — ones
+/// whose outcome the daemon also journals (today `CancelQueuedMessage`,
+/// via `QueuedEntryCancelled`) — survive one disconnect: the reply dies
+/// with the socket, but the journaled copy still arrives on the
+/// reconnect's journal-tail replay and resolves the waiter.
+struct PendingRequest {
+    waiter: oneshot::Sender<Result<CommandResponse, String>>,
+    /// The reply alone is unrecoverable; a journaled event can still
+    /// answer the waiter on replay.
+    replayable: bool,
+    /// Already outlived one disconnect — a second one fails the waiter
+    /// like any other request.
+    survived_disconnect: bool,
 }
 
 /// Server-to-client frame: either the journal sequence the event was
@@ -61,9 +81,9 @@ pub struct RemoteDaemon {
     command_tx: mpsc::UnboundedSender<OutboundMessage>,
     /// Replies awaited by live `command_request` calls, keyed by
     /// `request_id`; the reader resolves each when its `response` frame
-    /// lands, and a reconnect fails them all.
-    pending_requests:
-        Arc<Mutex<HashMap<u64, oneshot::Sender<Result<CommandResponse, String>>>>>,
+    /// (or a journaled recovery event) lands, and a reconnect fails
+    /// them all except one-shot `replayable` survivors.
+    pending_requests: Arc<Mutex<HashMap<u64, PendingRequest>>>,
     /// Every `subscribe()` caller's channel; the reader task fans events out.
     subscribers: Arc<Mutex<Vec<mpsc::UnboundedSender<SessionEvent>>>>,
     /// Errors raised before any subscriber could exist (e.g. a refused
@@ -182,9 +202,7 @@ impl RemoteDaemon {
         token: Option<String>,
         mut command_rx: mpsc::UnboundedReceiver<OutboundMessage>,
         subscribers: Arc<Mutex<Vec<mpsc::UnboundedSender<SessionEvent>>>>,
-        pending_requests: Arc<
-            Mutex<HashMap<u64, oneshot::Sender<Result<CommandResponse, String>>>>,
-        >,
+        pending_requests: Arc<Mutex<HashMap<u64, PendingRequest>>>,
         connected: Arc<AtomicBool>,
         last_seq: Arc<AtomicU64>,
     ) {
@@ -211,16 +229,27 @@ impl RemoteDaemon {
                         ),
                     });
                 }
-                // Requests queued behind the drain or already on the dead
-                // socket can never be answered — resolve their waiters
-                // instead of parking callers on a reply that won't come.
-                for (_, waiter) in pending_requests
+                // Requests queued behind the drain or already on the
+                // dead socket can never be answered — resolve their
+                // waiters instead of parking callers on a reply that
+                // won't come. The exception is requests whose outcome
+                // the daemon journals: the journaled event can still
+                // arrive on the reconnect's tail replay, so they get
+                // one reconnect to recover it.
+                let mut pending = pending_requests
                     .lock()
-                    .expect("command waiters poisoned")
-                    .drain()
-                {
-                    let _ = waiter.send(Err("daemon connection lost".to_string()));
+                    .expect("command waiters poisoned");
+                let drained = std::mem::take(&mut *pending);
+                for (request_id, mut waiter) in drained {
+                    if waiter.replayable && !waiter.survived_disconnect {
+                        waiter.survived_disconnect = true;
+                        pending.insert(request_id, waiter);
+                    } else {
+                        let _ =
+                            waiter.waiter.send(Err("daemon connection lost".to_string()));
+                    }
                 }
+                drop(pending);
                 Self::fanout(&subscribers, SessionEvent::DaemonError {
                     session_id: None,
                     message: "daemon connection lost; reconnecting".to_string(),
@@ -306,11 +335,39 @@ impl RemoteDaemon {
                                                 .expect("command waiters poisoned")
                                                 .remove(&reply.request_id);
                                             if let Some(waiter) = waiter {
-                                                let _ = waiter.send(reply.result);
+                                                let _ = waiter.waiter.send(reply.result);
                                             }
                                         } else if let Some(event) = frame.event {
                                             if frame.seq > 0 {
                                                 last_seq.fetch_max(frame.seq, Ordering::SeqCst);
+                                            }
+                                            // The journaled cancellation
+                                            // answers a parked requester
+                                            // the way its lost reply
+                                            // would have — typically a
+                                            // reconnect's tail replay.
+                                            if let SessionEvent::QueuedEntryCancelled {
+                                                request_id: Some(request_id),
+                                                session_id,
+                                                entry_id,
+                                                text,
+                                                images,
+                                            } = &event
+                                            {
+                                                let waiter = pending_requests
+                                                    .lock()
+                                                    .expect("command waiters poisoned")
+                                                    .remove(request_id);
+                                                if let Some(waiter) = waiter {
+                                                    let _ = waiter.waiter.send(Ok(
+                                                        CommandResponse::CancelledQueuedMessage {
+                                                            session_id: session_id.clone(),
+                                                            entry_id: entry_id.clone(),
+                                                            text: text.clone(),
+                                                            images: images.clone(),
+                                                        },
+                                                    ));
+                                                }
                                             }
                                             Self::fanout(&subscribers, event);
                                         } else {
@@ -377,6 +434,10 @@ impl DaemonClient for RemoteDaemon {
             return Err("daemon is not connected".to_string());
         }
         let request_id = request.request_id;
+        let replayable = matches!(
+            request.command,
+            SessionCommand::CancelQueuedMessage { .. }
+        );
         let (tx, rx) = oneshot::channel();
         // A reused id would strand the earlier waiter on a reply meant for
         // the newer request — fail it immediately instead.
@@ -384,9 +445,18 @@ impl DaemonClient for RemoteDaemon {
             .pending_requests
             .lock()
             .expect("command waiters poisoned")
-            .insert(request_id, tx)
+            .insert(
+                request_id,
+                PendingRequest {
+                    waiter: tx,
+                    replayable,
+                    survived_disconnect: false,
+                },
+            )
         {
-            let _ = displaced.send(Err(format!("request id {request_id} reused")));
+            let _ = displaced
+                .waiter
+                .send(Err(format!("request id {request_id} reused")));
         }
         if self
             .command_tx
@@ -399,8 +469,18 @@ impl DaemonClient for RemoteDaemon {
                 .remove(&request_id);
             return Err("daemon connection driver is gone".to_string());
         }
-        rx.await
-            .unwrap_or_else(|_| Err("daemon connection driver is gone".to_string()))
+        match tokio::time::timeout(COMMAND_REQUEST_TIMEOUT, rx).await {
+            Ok(result) => {
+                result.unwrap_or_else(|_| Err("daemon connection driver is gone".to_string()))
+            }
+            Err(_) => {
+                self.pending_requests
+                    .lock()
+                    .expect("command waiters poisoned")
+                    .remove(&request_id);
+                Err(format!("daemon did not answer request {request_id}"))
+            }
+        }
     }
 
     fn subscribe(&self) -> mpsc::UnboundedReceiver<SessionEvent> {

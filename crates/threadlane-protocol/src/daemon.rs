@@ -273,6 +273,20 @@ pub enum SessionEvent {
         request_id: u64,
         result: Result<CommandResponse, String>,
     },
+    /// `CancelQueuedMessage` dropped the entry, carrying the same staged
+    /// payload a `CommandReply` would — journaled so a requester whose
+    /// reply was lost to a disconnect still resolves its request from the
+    /// replayed tail (`request_id` correlates it; `None` for
+    /// fire-and-forget cancels) and every client learns the entry is gone.
+    QueuedEntryCancelled {
+        session_id: String,
+        entry_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
+        text: String,
+        #[serde(default)]
+        images: Vec<ImageAttachment>,
+    },
 }
 
 /// A `SessionCommand` that expects a reply, sent as a
@@ -310,7 +324,10 @@ pub enum CommandResponse {
 
 /// The daemon's reply to a [`CommandRequest`]: one `{"response": ...}`
 /// frame on the requesting connection only — never journaled, so a
-/// `?since=` replay never re-delivers it.
+/// `?since=` replay never re-delivers it. A disconnect can therefore eat
+/// the reply to an already-executed command; payload commands pair the
+/// reply with a journaled [`SessionEvent::QueuedEntryCancelled`] the
+/// requester recovers from on reconnect.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommandReply {
     pub request_id: u64,
@@ -974,6 +991,23 @@ mod tests {
             SessionEvent::CommandResult {
                 request_id: 8,
                 result: Err("no live runtime".into()),
+            },
+            SessionEvent::QueuedEntryCancelled {
+                session_id: "sess_1".into(),
+                entry_id: "entry-1".into(),
+                request_id: Some(7),
+                text: "staged".into(),
+                images: vec![ImageAttachment {
+                    display_name: "shot.png".into(),
+                    data_url: "data:image/png;base64,AAAA".into(),
+                }],
+            },
+            SessionEvent::QueuedEntryCancelled {
+                session_id: "sess_1".into(),
+                entry_id: "entry-2".into(),
+                request_id: None,
+                text: String::new(),
+                images: Vec::new(),
             },
         ];
         for event in events {

@@ -4873,42 +4873,49 @@ impl AppState {
                     changed = true;
                 }
                 SessionEvent::CommandResult { request_id, result } => {
-                    if let Some(pending) = self.pending_queued_restores.remove(&request_id) {
-                        match result {
-                            Ok(CommandResponse::CancelledQueuedMessage {
-                                session_id,
-                                entry_id,
+                    match result {
+                        Ok(CommandResponse::CancelledQueuedMessage {
+                            session_id,
+                            entry_id,
+                            text,
+                            images,
+                        }) => {
+                            changed |= self.apply_queued_cancel_restore(
+                                request_id,
+                                &session_id,
+                                &entry_id,
                                 text,
                                 images,
-                            }) => {
-                                // Scoped to the session that queued the
-                                // message: if another session is on screen
-                                // the insert waits for it to come back
-                                // rather than landing in a foreign draft.
-                                if session_id == pending.session_id
-                                    && entry_id == pending.entry_id
-                                {
-                                    self.requested_composer_inserts.push(
-                                        RequestedComposerInsert {
-                                            text: if pending.text_restored {
-                                                String::new()
-                                            } else {
-                                                text
-                                            },
-                                            images,
-                                            session_id: Some(session_id),
-                                        },
-                                    );
-                                    changed = true;
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(error) => {
-                                tracing::warn!("daemon request {request_id} failed: {error}");
-                            }
+                            );
+                        }
+                        Ok(_) => {
+                            self.pending_queued_restores.remove(&request_id);
+                        }
+                        Err(error) => {
+                            self.pending_queued_restores.remove(&request_id);
+                            tracing::warn!("daemon request {request_id} failed: {error}");
                         }
                     }
                 }
+                // Journal replay of a cancellation whose point-to-point
+                // reply was lost to a disconnect — resolves the parked
+                // intent the same way the reply would have.
+                SessionEvent::QueuedEntryCancelled {
+                    session_id,
+                    entry_id,
+                    request_id: Some(request_id),
+                    text,
+                    images,
+                } => {
+                    changed |= self.apply_queued_cancel_restore(
+                        request_id,
+                        &session_id,
+                        &entry_id,
+                        text,
+                        images,
+                    );
+                }
+                SessionEvent::QueuedEntryCancelled { .. } => {}
                 SessionEvent::ProjectChanged { .. } => {}
                 SessionEvent::SessionSnapshot {
                     session_id,
@@ -5173,6 +5180,39 @@ impl AppState {
         }
         self.session_status = Some("Queued message removed".into());
         Ok(staged)
+    }
+
+    /// Resolve a parked queued-cancel intent with the staged payload a
+    /// `CommandResult` reply or a journaled `QueuedEntryCancelled` event
+    /// carried, queueing it as a composer insert scoped to the session
+    /// that queued the message: if another session is on screen the
+    /// insert waits for it to come back rather than landing in a foreign
+    /// draft.
+    fn apply_queued_cancel_restore(
+        &mut self,
+        request_id: u64,
+        session_id: &str,
+        entry_id: &str,
+        text: String,
+        images: Vec<ImageAttachment>,
+    ) -> bool {
+        let Some(pending) = self.pending_queued_restores.remove(&request_id) else {
+            return false;
+        };
+        if pending.session_id != session_id || pending.entry_id != entry_id {
+            return false;
+        }
+        self.requested_composer_inserts
+            .push(RequestedComposerInsert {
+                text: if pending.text_restored {
+                    String::new()
+                } else {
+                    text
+                },
+                images,
+                session_id: Some(session_id.to_string()),
+            });
+        true
     }
 
     /// Re-route a still-pending queued follow-up into the live steer queue so

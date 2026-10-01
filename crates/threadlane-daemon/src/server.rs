@@ -207,7 +207,10 @@ async fn serve_connection(
                     note_terminal(&command, &mut owned_terminals);
                     let reply = CommandReply {
                         request_id,
-                        result: core.clone().dispatch(command).await,
+                        result: core
+                            .clone()
+                            .dispatch_with_request_id(command, Some(request_id))
+                            .await,
                     };
                     match reply_frame(&reply) {
                         Ok(frame) => {

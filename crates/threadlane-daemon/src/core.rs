@@ -389,7 +389,19 @@ impl DaemonCore {
         self: &Arc<Self>,
         command: SessionCommand,
     ) -> Result<CommandResponse, String> {
-        let result = self.dispatch_inner(command).await;
+        self.dispatch_with_request_id(command, None).await
+    }
+
+    /// [`Self::dispatch`] for a `CommandRequest`: the caller's
+    /// `request_id` is recorded on the journaled
+    /// `SessionEvent::QueuedEntryCancelled` so a requester that lost its
+    /// reply to a disconnect can correlate the cancellation on replay.
+    pub async fn dispatch_with_request_id(
+        self: &Arc<Self>,
+        command: SessionCommand,
+        request_id: Option<u64>,
+    ) -> Result<CommandResponse, String> {
+        let result = self.dispatch_inner(command, request_id).await;
         if let Err(error) = &result {
             let _ = self.ingest_tx.send(SessionEvent::DaemonError {
                 session_id: None,
@@ -402,6 +414,7 @@ impl DaemonCore {
     async fn dispatch_inner(
         self: &Arc<Self>,
         command: SessionCommand,
+        request_id: Option<u64>,
     ) -> Result<CommandResponse, String> {
         // The one command with a return payload short-circuits here; the
         // rest are fire-and-forget effects that answer `Ack` to a request.
@@ -416,11 +429,24 @@ impl DaemonCore {
             return runtime
                 .work_handle
                 .cancel_queued_entry(entry_id)
-                .map(|(text, images)| CommandResponse::CancelledQueuedMessage {
-                    session_id: session_id.clone(),
-                    entry_id: entry_id.clone(),
-                    text,
-                    images,
+                .map(|(text, images)| {
+                    // The point-to-point reply is gone for good when the
+                    // socket dies mid-flight; the journaled copy is how a
+                    // reconnected requester still recovers the payload —
+                    // and how every other client learns the entry left.
+                    let _ = self.ingest_tx.send(SessionEvent::QueuedEntryCancelled {
+                        session_id: session_id.clone(),
+                        entry_id: entry_id.clone(),
+                        request_id,
+                        text: text.clone(),
+                        images: images.clone(),
+                    });
+                    CommandResponse::CancelledQueuedMessage {
+                        session_id: session_id.clone(),
+                        entry_id: entry_id.clone(),
+                        text,
+                        images,
+                    }
                 });
         }
         self.dispatch_effect(command)
