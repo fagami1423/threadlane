@@ -469,6 +469,8 @@ pub struct ChatListView {
     outline_open: bool,
     outline_focus: FocusHandle,
     outline_list_state: ListState,
+    prompt_rail_list_state: ListState,
+    prompt_rail_active_id: Option<String>,
     outline_landmarks: Vec<PromptLandmark>,
     /// Prompt landmarks memoized against the messages `Arc` + generation
     /// flag; holding the `Arc` itself makes pointer-equality invalidation
@@ -842,6 +844,8 @@ impl ChatListView {
             outline_open: false,
             outline_focus: cx.focus_handle(),
             outline_list_state: ListState::new(0, ListAlignment::Top, window.rem_size() * 20.0),
+            prompt_rail_list_state: ListState::new(0, ListAlignment::Top, window.rem_size()),
+            prompt_rail_active_id: None,
             outline_landmarks: Vec::new(),
             prompt_landmarks_cache: None,
             outline_focus_id: None,
@@ -1448,8 +1452,7 @@ impl ChatListView {
                     .children(status_badge),
             )
             .when(self.current_tab == CentralTab::Chat, |el| {
-                el.child(self.render_outline_popover(cx))
-                    .child(
+                el.child(
                     Button::new("conversation-find-open")
                         .debug_selector(|| "conversation-find-open".into())
                         .icon(IconName::Search)
@@ -6835,6 +6838,7 @@ impl Render for ChatListView {
             self.outline_open = false;
             self.outline_landmarks.clear();
             self.prompt_landmarks_cache = None;
+            self.prompt_rail_active_id = None;
             self.outline_focus_id = None;
             self.outline_selected_id = None;
             self.markdown_cache_namespace = session_key
@@ -6995,6 +6999,7 @@ impl Render for ChatListView {
                                                 .h_full()
                                                 .mx_auto()
                                                 .pt_3()
+                                                .pl_8()
                                                 .pb_6()
                                                 .with_sizing_behavior(ListSizingBehavior::Auto),
                                             )
@@ -7003,6 +7008,7 @@ impl Render for ChatListView {
                                                     &self.transcript_list_state,
                                                 ),
                                             ))
+                                            .child(self.render_prompt_rail(cx))
                                             .when(
                                                 !self.transcript_list_state.is_following_tail(),
                                                 |el| {

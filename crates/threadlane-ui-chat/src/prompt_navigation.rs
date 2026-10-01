@@ -369,6 +369,120 @@ impl ChatListView {
             .into_any_element()
     }
 
+    // ---- Prompt navigation rail -----------------------------------------
+
+    /// Compact, virtualized landmarks; the outline remains the keyboard
+    /// browser and exposes every excerpt when the conversation is long.
+    pub(super) fn render_prompt_rail(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let entries = self.prompt_landmark_entries(cx);
+        if entries.is_empty() {
+            return div().into_any_element();
+        }
+        if self.prompt_rail_list_state.item_count() != entries.len() {
+            self.prompt_rail_list_state.reset(entries.len());
+        }
+        if let Some(ix) = self.active_prompt_rail_index(&entries) {
+            let id = &entries[ix].message_id;
+            if self.prompt_rail_active_id.as_ref() != Some(id) {
+                self.prompt_rail_list_state.scroll_to_reveal_item(ix);
+                self.prompt_rail_active_id = Some(id.clone());
+            }
+        }
+        div()
+            .id("prompt-navigation-rail")
+            .debug_selector(|| "prompt-navigation-rail".into())
+            .absolute()
+            .left_0()
+            .top_0()
+            .bottom_0()
+            .w_8()
+            .py_3()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .items_center()
+            .child(
+                list(
+                    self.prompt_rail_list_state.clone(),
+                    cx.processor(Self::render_prompt_rail_tick),
+                )
+                .w_8()
+                .h(rems((entries.len() as f32 * 1.5).min(12.0)))
+                .max_h_full()
+                .min_h_0(),
+            )
+            .child(self.render_outline_popover(cx))
+            .into_any_element()
+    }
+
+    fn active_prompt_rail_index(&self, entries: &[PromptLandmark]) -> Option<usize> {
+        let top = self.transcript_list_state.logical_scroll_top().item_ix;
+        if self.transcript_list_state.is_following_tail() {
+            entries.len().checked_sub(1)
+        } else {
+            Some(
+                entries
+                    .partition_point(|entry| entry.row_index <= top)
+                    .saturating_sub(1),
+            )
+        }
+    }
+
+    fn render_prompt_rail_tick(
+        &mut self,
+        index: usize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let entries = self.prompt_landmark_entries(cx);
+        let Some(landmark) = entries.get(index) else {
+            return div().into_any_element();
+        };
+        let active = self.active_prompt_rail_index(&entries);
+        let selected = active == Some(index);
+        let theme = cx.theme().colors;
+        let id = landmark.message_id.clone();
+        let label = format!(
+            "Prompt {} · {}",
+            landmark.ordinal,
+            if landmark.excerpt.is_empty() {
+                "No text"
+            } else {
+                &landmark.excerpt
+            }
+        );
+        Button::new(SharedString::from(format!("prompt-rail-{id}")))
+            .debug_selector({
+                let id = id.clone();
+                move || format!("prompt-rail-{id}")
+            })
+            .ghost()
+            .small()
+            .w_8()
+            .h_6()
+            .accessibility_label(if selected {
+                format!("{label} · Current prompt")
+            } else {
+                label.clone()
+            })
+            .tooltip(label)
+            .tooltip_placement(gpui_component::Placement::Right)
+            .child(
+                div()
+                    .h_0p5()
+                    .rounded_full()
+                    .when(selected, |el| el.w_4().bg(theme.foreground))
+                    .when(!selected, |el| el.w_2().bg(theme.muted_foreground)),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.clear_conversation_find();
+                this.outline_focus_id = Some(id.clone());
+                this.activate_outline_prompt(window, cx);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
     // ---- Conversation outline --------------------------------------------
 
     /// Re-derive landmarks while the popover is open. Focus follows the
@@ -637,7 +751,7 @@ impl ChatListView {
             .into_any_element()
     }
 
-    /// The header trigger plus the bounded popover hosting the prompt
+    /// The rail trigger plus the bounded popover hosting the prompt
     /// landmark list.
     pub(super) fn render_outline_popover(
         &self,
@@ -666,7 +780,7 @@ impl ChatListView {
             .trigger(
                 Button::new("conversation-outline-open")
                     .debug_selector(|| "conversation-outline-open".into())
-                    .icon(IconName::SortAscending)
+                    .label("…")
                     .ghost()
                     .small()
                     .accessibility_label("Conversation outline")
@@ -713,8 +827,8 @@ impl ChatListView {
                     cx.stop_propagation();
                 },
             ))
-            .w(px(320.))
-            .h(px(300.))
+            .w_80()
+            .h(rems(18.75))
             .rounded_lg()
             .border_1()
             .border_color(theme.border)

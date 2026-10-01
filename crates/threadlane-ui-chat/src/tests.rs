@@ -4514,9 +4514,29 @@ fn conversation_outline_focuses_and_jumps_to_prompts(cx: &mut gpui::TestAppConte
     cx.update(|window, cx| window.draw(cx).clear(cx));
     chat.update(cx, |chat, _| chat.initial_scroll_frames = 0);
 
+    assert!(cx.debug_bounds("prompt-navigation-rail").is_some());
+    chat.read_with(cx, |chat, _| {
+        assert_eq!(chat.prompt_rail_active_id.as_deref(), Some("u3"));
+    });
+    let tick = cx.debug_bounds("prompt-rail-u1").expect("first prompt tick");
+    cx.simulate_click(tick.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(chat.outline_selected_id.as_deref(), Some("u1"));
+        assert_eq!(chat.prompt_rail_active_id.as_deref(), Some("u1"));
+        assert!(!chat.transcript_list_state.is_following_tail());
+        assert_eq!(chat.transcript_list_state.logical_scroll_top().item_ix, 0);
+        assert_eq!(chat.input_state.read(cx).value().as_ref(), "");
+    });
+    let latest = cx.debug_bounds("jump-to-latest").expect("return to latest");
+    cx.simulate_click(latest.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
     let trigger = cx
         .debug_bounds("conversation-outline-open")
-        .expect("outline command in the header");
+        .expect("outline command in the prompt rail");
     cx.simulate_click(trigger.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
