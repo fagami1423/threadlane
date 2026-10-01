@@ -591,6 +591,10 @@ pub struct ToolActivityInfo {
     pub title: String,
     pub display_summary: String,
     pub detail: String,
+    /// Raw tool-call arguments JSON, kept after `detail` is replaced by the
+    /// tool result so the chat surface can render the call itself.
+    #[serde(default)]
+    pub arguments: String,
     pub is_expanded: bool,
 }
 

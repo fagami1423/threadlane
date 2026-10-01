@@ -4419,6 +4419,7 @@ fn mirror_trigger_fires_once_per_computer_activity() {
             display_summary: "shot".into(),
             title: "computer_screenshot".into(),
             detail: String::new(),
+            arguments: String::new(),
             is_expanded: false,
         }],
         streaming: true,

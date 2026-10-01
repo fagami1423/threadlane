@@ -35,6 +35,7 @@ use threadlane_ui_state::{
 
 use super::composer::*;
 use super::context_meter::*;
+use super::tool_detail;
 use super::markdown::*;
 use super::trajectory::*;
 use super::transcript::*;
@@ -2241,9 +2242,11 @@ impl ChatListView {
             _ => theme.muted_foreground,
         };
         let model = self.model.clone();
+        let detail_model = self.model.clone();
         let transcript = self.transcript_list_state.clone();
         let tool_call_id = activity.id.clone();
-        let has_detail = !activity.detail.trim().is_empty();
+        let has_detail = !activity.detail.trim().is_empty()
+            || tool_detail::expandable(activity);
         let row_id = SharedString::from(activity.id.clone());
         let display_summary = activity.display_summary.clone();
         let is_error = activity.category == "Error";
@@ -2314,19 +2317,23 @@ impl ChatListView {
                     })),
             )
             .children(activity.is_expanded.then(|| {
-                div()
-                    .ml(rems(1.625))
-                    .mt_1()
-                    .p_2p5()
-                    .max_h(rems(15.0))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme.border.opacity(0.5))
-                    .bg(theme.title_bar)
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .overflow_y_scrollbar()
-                    .child(activity.detail.clone())
+                tool_detail::render_activity_detail_card(activity, &detail_model, cx)
+                    .unwrap_or_else(|| {
+                        div()
+                            .ml(rems(1.625))
+                            .mt_1()
+                            .p_2p5()
+                            .max_h(rems(15.0))
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(theme.border.opacity(0.5))
+                            .bg(theme.title_bar)
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .overflow_y_scrollbar()
+                            .child(activity.detail.clone())
+                            .into_any_element()
+                    })
             }))
     }
 

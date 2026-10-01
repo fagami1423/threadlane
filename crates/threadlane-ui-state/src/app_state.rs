@@ -3727,6 +3727,7 @@ impl AppState {
                                 name, arguments,
                             )),
                             detail: arguments.clone(),
+                            arguments: arguments.clone(),
                             is_expanded: false,
                         };
                         if let Some(message) = subagent.messages.last_mut().filter(|message| {
@@ -4566,7 +4567,8 @@ impl AppState {
                                 category: "Working".into(),
                                 display_summary,
                                 title: name,
-                                detail: arguments,
+                                detail: arguments.clone(),
+                                arguments,
                                 is_expanded: false,
                             };
                             if let Some(message) =
