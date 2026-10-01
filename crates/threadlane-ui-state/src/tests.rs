@@ -5118,6 +5118,7 @@ fn remote_edit_queued_message_restores_staged_images_via_command_result() {
 
     // The optimistic echo returns the staged text immediately; the echo
     // holds no images, so the staged images ride the request's reply.
+    // The row stays — the removal is not claimed until confirmed.
     let (text, images) = state
         .edit_queued_message("entry-1")
         .expect("remote edit succeeds");
@@ -5127,9 +5128,10 @@ fn remote_edit_queued_message_restores_staged_images_via_command_result() {
         state
             .messages
             .iter()
-            .all(|message| message.id != "queued-user-sess-1-entry-1")
+            .any(|message| message.id == "queued-user-sess-1-entry-1")
     );
-    assert_eq!(state.pending_queued_restores.len(), 1);
+    assert!(state.queued_removal_pending("sess-1", "entry-1"));
+    assert_eq!(state.pending_queued_cancels.len(), 1);
 
     let image = ImageAttachment {
         display_name: "shot.png".into(),
@@ -5145,7 +5147,14 @@ fn remote_edit_queued_message_restores_staged_images_via_command_result() {
         }),
     }]);
     assert!(changed);
-    assert!(state.pending_queued_restores.is_empty());
+    assert!(state.pending_queued_cancels.is_empty());
+    assert!(!state.queued_removal_pending("sess-1", "entry-1"));
+    assert!(
+        state
+            .messages
+            .iter()
+            .all(|message| message.id != "queued-user-sess-1-entry-1")
+    );
     let insert = state
         .requested_composer_inserts
         .last()
@@ -5193,7 +5202,7 @@ fn remote_edit_queued_message_reply_survives_a_session_switch() {
         }),
     }]);
     assert!(changed);
-    assert!(state.pending_queued_restores.is_empty());
+    assert!(state.pending_queued_cancels.is_empty());
     let insert = state
         .requested_composer_inserts
         .last()
@@ -5237,7 +5246,13 @@ fn remote_edit_queued_message_recovers_via_journaled_cancel_event() {
         images: vec![image.clone()],
     }]);
     assert!(changed);
-    assert!(state.pending_queued_restores.is_empty());
+    assert!(state.pending_queued_cancels.is_empty());
+    assert!(
+        state
+            .messages
+            .iter()
+            .all(|message| message.id != "queued-user-sess-1-entry-1")
+    );
     let insert = state
         .requested_composer_inserts
         .last()
@@ -5245,7 +5260,7 @@ fn remote_edit_queued_message_recovers_via_journaled_cancel_event() {
     assert_eq!(insert.images, vec![image]);
 
     // An uncorrelated event (fire-and-forget cancel from another client)
-    // resolves nothing.
+    // resolves nothing when no matching echo remains.
     assert!(!state.drain_chat_stream(vec![
         SessionEvent::QueuedEntryCancelled {
             session_id: "sess-1".into(),
@@ -5255,4 +5270,193 @@ fn remote_edit_queued_message_recovers_via_journaled_cancel_event() {
             images: Vec::new(),
         },
     ]));
+}
+
+/// A `DaemonClient` that answers capability probing like a pre-envelope
+/// daemon (or a still-connecting remote) and records what was sent, so
+/// tests can prove a bare command went out and no `CommandRequest` did.
+#[derive(Default)]
+struct RecordingDaemonClient {
+    commands: Mutex<Vec<SessionCommand>>,
+    requests: Mutex<Vec<CommandRequest>>,
+    supports_requests: bool,
+}
+
+#[async_trait::async_trait]
+impl threadlane_client::DaemonClient for RecordingDaemonClient {
+    async fn command(&self, command: SessionCommand) -> Result<(), String> {
+        self.commands.lock().unwrap().push(command);
+        Ok(())
+    }
+
+    async fn command_request(
+        &self,
+        request: CommandRequest,
+    ) -> Result<CommandResponse, String> {
+        self.requests.lock().unwrap().push(request);
+        Ok(CommandResponse::Ack)
+    }
+
+    fn supports_command_requests(&self) -> bool {
+        self.supports_requests
+    }
+
+    fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<SessionEvent> {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        rx
+    }
+}
+
+fn queued_echo(id: &str) -> ChatMessageInfo {
+    ChatMessageInfo {
+        id: id.into(),
+        role: MessageRole::User,
+        content: "draft text".into(),
+        tool_activities: Vec::new(),
+        streaming: false,
+        reasoning_content: None,
+        reasoning_expanded: false,
+    }
+}
+
+fn queued_state() -> AppState {
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.daemon_remote = true;
+    state.active_session_id = Some("sess-1".into());
+    state.messages = vec![queued_echo("queued-user-sess-1-entry-1")].into();
+    state
+}
+
+#[test]
+fn remote_cancel_queued_message_keeps_echo_until_confirmed() {
+    let mut state = queued_state();
+
+    state
+        .cancel_queued_message("entry-1")
+        .expect("remote cancel succeeds");
+    // The entry may still be queued on the peer: the row stays in a
+    // pending-removal state rather than claiming removal.
+    assert!(
+        state
+            .messages
+            .iter()
+            .any(|message| message.id == "queued-user-sess-1-entry-1")
+    );
+    assert!(state.queued_removal_pending("sess-1", "entry-1"));
+
+    let changed = state.drain_chat_stream(vec![SessionEvent::QueuedEntryCancelled {
+        session_id: "sess-1".into(),
+        entry_id: "entry-1".into(),
+        request_id: Some(1),
+        text: "draft text".into(),
+        images: Vec::new(),
+    }]);
+    assert!(changed);
+    assert!(state.pending_queued_cancels.is_empty());
+    assert!(!state.queued_removal_pending("sess-1", "entry-1"));
+    assert!(
+        state
+            .messages
+            .iter()
+            .all(|message| message.id != "queued-user-sess-1-entry-1")
+    );
+    // A plain remove discards the payload — nothing goes to the composer.
+    assert!(state.requested_composer_inserts.is_empty());
+    assert_eq!(
+        state.session_status.as_deref(),
+        Some("Queued message removed")
+    );
+}
+
+#[test]
+fn remote_queued_cancel_error_keeps_the_row() {
+    let mut state = queued_state();
+
+    state
+        .cancel_queued_message("entry-1")
+        .expect("remote cancel succeeds");
+
+    // A rejected request resolves the intent without touching the row —
+    // the entry genuinely remains queued, and the status says so.
+    let changed = state.drain_chat_stream(vec![SessionEvent::CommandResult {
+        request_id: 1,
+        result: Err("not queued".into()),
+    }]);
+    assert!(changed);
+    assert!(state.pending_queued_cancels.is_empty());
+    assert!(
+        state
+            .messages
+            .iter()
+            .any(|message| message.id == "queued-user-sess-1-entry-1")
+    );
+    assert_eq!(
+        state.session_status.as_deref(),
+        Some("Could not remove queued message: not queued")
+    );
+}
+
+#[test]
+fn remote_edit_queued_message_falls_back_to_bare_command_on_v1_daemon() {
+    let client = Arc::new(RecordingDaemonClient::default());
+    let mut state = queued_state();
+    state.daemon_client = client.clone();
+
+    // A version-1 daemon cannot decode the CommandRequest envelope; the
+    // edit degrades to the bare CancelQueuedMessage variant the older
+    // daemon still dispatches — the honest best available there.
+    let (text, images) = state
+        .edit_queued_message("entry-1")
+        .expect("remote edit succeeds");
+    assert_eq!(text, "draft text");
+    assert!(images.is_empty());
+    assert!(state.pending_queued_cancels.is_empty());
+    assert!(
+        state
+            .messages
+            .iter()
+            .all(|message| message.id != "queued-user-sess-1-entry-1")
+    );
+    assert_eq!(
+        state.session_status.as_deref(),
+        Some("Queued message removed")
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while client.commands.lock().unwrap().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "command not dispatched");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let commands = client.commands.lock().unwrap();
+    assert_eq!(commands.len(), 1);
+    assert!(matches!(
+        &commands[0],
+        SessionCommand::CancelQueuedMessage { session_id, entry_id }
+            if session_id == "sess-1" && entry_id == "entry-1"
+    ));
+    drop(commands);
+    assert!(client.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn journaled_cancel_from_another_client_drops_the_echo() {
+    let mut state = queued_state();
+
+    // A fire-and-forget cancel issued by another client carries no
+    // request_id of ours — the journaled event is still authoritative
+    // that the entry left the queue, so the retained echo goes away.
+    let changed = state.drain_chat_stream(vec![SessionEvent::QueuedEntryCancelled {
+        session_id: "sess-1".into(),
+        entry_id: "entry-1".into(),
+        request_id: None,
+        text: "draft text".into(),
+        images: Vec::new(),
+    }]);
+    assert!(changed);
+    assert!(
+        state
+            .messages
+            .iter()
+            .all(|message| message.id != "queued-user-sess-1-entry-1")
+    );
 }

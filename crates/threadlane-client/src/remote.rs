@@ -25,6 +25,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use threadlane_protocol::daemon::{
     CommandReply, CommandRequest, CommandResponse, SessionCommand, SessionEvent,
+    PROTOCOL_VERSION_HEADER, WIRE_PROTOCOL_VERSION,
 };
 
 use crate::DaemonClient;
@@ -95,6 +96,12 @@ pub struct RemoteDaemon {
     /// Highest journal sequence delivered so far; sent back as `?since=`
     /// on reconnect so the tail replay covers only the gap.
     last_seq: Arc<AtomicU64>,
+    /// The peer's wire protocol version from the last successful
+    /// handshake's `x-threadlane-protocol` header; 0 before the first
+    /// dial and 1 when a pre-versioned daemon sends no header. Updated
+    /// on every connect, so a rollback to an older daemon re-gates the
+    /// `CommandRequest` envelope.
+    protocol_version: Arc<AtomicU64>,
 }
 
 impl RemoteDaemon {
@@ -117,6 +124,7 @@ impl RemoteDaemon {
             startup_errors: Mutex::new(Vec::new()),
             connected: Arc::new(AtomicBool::new(false)),
             last_seq: Arc::new(AtomicU64::new(0)),
+            protocol_version: Arc::new(AtomicU64::new(0)),
         });
         if let Some(error) = Self::transport_policy_error(&url, &token) {
             client.push_startup_error(error);
@@ -126,6 +134,7 @@ impl RemoteDaemon {
         let pending_requests = client.pending_requests.clone();
         let connected = client.connected.clone();
         let last_seq = client.last_seq.clone();
+        let protocol_version = client.protocol_version.clone();
         threadlane_daemon::chat::executor()
             .map(|executor| {
                 executor.spawn(Self::drive(
@@ -136,6 +145,7 @@ impl RemoteDaemon {
                     pending_requests,
                     connected,
                     last_seq,
+                    protocol_version,
                 ));
             })
             .unwrap_or_else(|error| {
@@ -205,6 +215,7 @@ impl RemoteDaemon {
         pending_requests: Arc<Mutex<HashMap<u64, PendingRequest>>>,
         connected: Arc<AtomicBool>,
         last_seq: Arc<AtomicU64>,
+        protocol_version: Arc<AtomicU64>,
     ) {
         let mut was_connected = false;
         let mut backoff = RECONNECT_BACKOFF_INITIAL;
@@ -282,7 +293,7 @@ impl RemoteDaemon {
                     }
                 }
             }
-            let (mut socket, _response) =
+            let (mut socket, response) =
                 match tokio_tungstenite::connect_async(request).await {
                     Ok(pair) => pair,
                     Err(error) => {
@@ -292,6 +303,16 @@ impl RemoteDaemon {
                         continue;
                     }
                 };
+            // Capability handshake: the daemon announces its wire protocol
+            // version in a response header; absent means a pre-versioned
+            // daemon that cannot decode the CommandRequest envelope.
+            let peer_version = response
+                .headers()
+                .get(PROTOCOL_VERSION_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(1);
+            protocol_version.store(peer_version, Ordering::SeqCst);
             was_connected = true;
             backoff = RECONNECT_BACKOFF_INITIAL;
             connected.store(true, Ordering::SeqCst);
@@ -433,6 +454,15 @@ impl DaemonClient for RemoteDaemon {
         if !self.connected.load(Ordering::SeqCst) {
             return Err("daemon is not connected".to_string());
         }
+        // A pre-envelope daemon rejects the frame as an undecodable bare
+        // command — the dispatch never runs and no reply ever comes, so
+        // fail the request here instead of parking it on the timeout.
+        let peer_version = self.protocol_version.load(Ordering::SeqCst);
+        if peer_version < WIRE_PROTOCOL_VERSION {
+            return Err(format!(
+                "daemon does not support command requests (protocol version {peer_version})"
+            ));
+        }
         let request_id = request.request_id;
         let replayable = matches!(
             request.command,
@@ -481,6 +511,10 @@ impl DaemonClient for RemoteDaemon {
                 Err(format!("daemon did not answer request {request_id}"))
             }
         }
+    }
+
+    fn supports_command_requests(&self) -> bool {
+        self.protocol_version.load(Ordering::SeqCst) >= WIRE_PROTOCOL_VERSION
     }
 
     fn subscribe(&self) -> mpsc::UnboundedReceiver<SessionEvent> {

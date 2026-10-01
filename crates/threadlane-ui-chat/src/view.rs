@@ -5078,6 +5078,25 @@ impl ChatListView {
             .map(|message| (message.id.clone(), message.content.clone()))
             .collect();
         let queued_session_id = active_session_id.clone();
+        // Rows whose removal the daemon has not confirmed yet stay listed
+        // but show "Removing…" instead of their actions — the entry may
+        // still be queued on the peer, so it must not look actionable.
+        let queued_pending_removals: std::collections::HashSet<String> = match queued_session_id
+            .as_deref()
+        {
+            Some(session_id) => {
+                let state = self.model.read(cx);
+                queued_messages
+                    .iter()
+                    .filter_map(|(message_id, _)| {
+                        queued_entry_id(message_id, Some(session_id)).filter(|entry_id| {
+                            state.queued_removal_pending(session_id, entry_id)
+                        })
+                    })
+                    .collect()
+            }
+            None => std::collections::HashSet::new(),
+        };
         let queued_preview = (!queued_messages.is_empty()).then(|| {
             div()
                 .debug_selector(|| "queued-messages-panel".into())
@@ -5138,6 +5157,16 @@ impl ChatListView {
                                         .child(text),
                                 );
                             if let Some(entry_id) = entry_id {
+                                if queued_pending_removals.contains(&entry_id) {
+                                    row = row.child(
+                                        div()
+                                            .flex_none()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child("Removing…"),
+                                    );
+                                    return row;
+                                }
                                 let queued_steer_model = self.model.clone();
                                 let queued_edit_model = self.model.clone();
                                 let queued_remove_model = self.model.clone();

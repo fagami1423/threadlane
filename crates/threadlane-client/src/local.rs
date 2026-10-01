@@ -47,6 +47,11 @@ impl DaemonClient for LocalDaemon {
         self.core.clone().dispatch(request.command).await
     }
 
+    fn supports_command_requests(&self) -> bool {
+        // The in-process core is always this build's version.
+        true
+    }
+
     fn subscribe(&self) -> mpsc::UnboundedReceiver<SessionEvent> {
         // An in-process attach starts an empty cursor — the whole journal
         // tail replays (this client never reconnects, so dedupe by seq
