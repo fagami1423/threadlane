@@ -713,6 +713,11 @@ impl DaemonClient for RemoteDaemon {
         self.protocol_version.load(Ordering::SeqCst) >= PROJECT_IO_PROTOCOL_VERSION
     }
 
+    fn supports_github_automation(&self) -> bool {
+        self.protocol_version.load(Ordering::SeqCst)
+            >= threadlane_protocol::daemon::GITHUB_AUTOMATION_PROTOCOL_VERSION
+    }
+
     fn subscribe(&self) -> mpsc::UnboundedReceiver<SessionEvent> {
         let (tx, rx) = mpsc::unbounded_channel();
         // Errors raised before this receiver existed (transport policy,
