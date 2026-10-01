@@ -2,6 +2,7 @@ mod composer;
 mod context_meter;
 mod image_preview;
 mod markdown;
+mod model_picker;
 mod tool_detail;
 mod trajectory;
 mod trajectory_view;

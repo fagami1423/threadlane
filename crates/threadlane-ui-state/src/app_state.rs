@@ -888,6 +888,67 @@ impl AppState {
         &self.available_models
     }
 
+    /// Test support: seed the model picker's catalog directly.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn test_set_available_models(
+        &mut self,
+        models: Vec<threadlane_daemon::catalog::ModelOption>,
+    ) {
+        self.available_models = models;
+    }
+
+    /// Test support: seed live ACP config options under the active session's
+    /// projection key, the slot `active_acp_config_options` reads first.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn test_set_acp_config_options(&mut self, options: Vec<AcpConfigOption>) {
+        if let Some(key) = self.active_session_projection_key() {
+            self.acp_config_options.insert(key, options);
+        }
+    }
+
+    /// Test support: put a worktree setup in flight for the active session
+    /// so model/agent mutations are refused.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn test_start_worktree_setup(&mut self) {
+        use threadlane_protocol::daemon::{SetupStage, WorktreeSetup};
+        let Some(session_id) = self.active_session_id.clone() else {
+            return;
+        };
+        self.worktree_setups.insert(
+            session_id.clone(),
+            WorktreeSetup {
+                project: self.active_work_dir.clone().unwrap_or_default(),
+                session_id,
+                session_file: PathBuf::new(),
+                worktree: PathBuf::new(),
+                base: String::new(),
+                stage: SetupStage::Creating,
+                branch: None,
+                error: None,
+                cancelled: Default::default(),
+                text: String::new(),
+                images: Vec::new(),
+                model: String::new(),
+                effort: ReasoningEffort::default(),
+                acp_config: Vec::new(),
+            },
+        );
+    }
+
+    /// Test support: read a pending New-task agent setting, the slot
+    /// `set_acp_config_option` writes when no session runtime exists yet.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn test_pending_acp_config(&self, agent_id: &str, config_id: &str) -> Option<String> {
+        self.pending_acp_config
+            .get(agent_id)?
+            .get(config_id)
+            .cloned()
+    }
+
     pub fn start_automations(&mut self) -> tokio::sync::watch::Receiver<crate::automation::Projection> {
         let service = crate::automation::AutomationService::shared();
         let mut events = service.subscribe();
