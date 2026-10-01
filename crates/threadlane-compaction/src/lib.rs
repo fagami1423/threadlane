@@ -14,6 +14,7 @@ use threadlane_protocol::ImageAttachment;
 
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 // Checkpoint text helpers live in `threadlane-provider` (payload translation
 // needs them); re-exported here so existing paths keep working.
@@ -478,7 +479,37 @@ pub fn compact_messages_with_strategy(
     }
 }
 
+const AGED_TOOL_INLINE_LIMIT: usize = 2_000;
+const AGED_TOOL_PRUNE_HEAD_CHARS: usize = 1_000;
+const AGED_TOOL_PRUNE_TAIL_CHARS: usize = 400;
+
+fn aged_tool_output_preview(content: &str) -> String {
+    let total_chars = content.chars().count();
+    if total_chars <= AGED_TOOL_PRUNE_HEAD_CHARS + AGED_TOOL_PRUNE_TAIL_CHARS {
+        return content.to_string();
+    }
+    let head: String = content.chars().take(AGED_TOOL_PRUNE_HEAD_CHARS).collect();
+    let tail: String = content
+        .chars()
+        .rev()
+        .take(AGED_TOOL_PRUNE_TAIL_CHARS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let hidden = total_chars.saturating_sub(AGED_TOOL_PRUNE_HEAD_CHARS + AGED_TOOL_PRUNE_TAIL_CHARS);
+    format!(
+        "{head}\n\n[... {hidden} characters pruned from the middle of this tool output ...]\n\n{tail}"
+    )
+}
+
 /// Squeezes historical tool outputs older than `keep_recent_tool_turns` to save input tokens.
+///
+/// Oversized aged outputs keep a bounded head/tail preview of their content
+/// (the same shape dispatch-time `truncate_tool_output` produces) instead of
+/// being replaced by a bare stub — the model keeps the beginning and the end
+/// of what it saw while the middle ages out. Bodies below
+/// `AGED_TOOL_INLINE_LIMIT` stay verbatim: a marker costs more than they do.
 ///
 /// User-attached images age out the same way: only the most recent
 /// `USER_IMAGE_KEEP_RECENT` user turn keeps its attachments (the current
@@ -488,7 +519,19 @@ pub fn prune_historical_tool_outputs(
     messages: &[AgentMessage],
     keep_recent_tool_turns: usize,
 ) -> Vec<AgentMessage> {
-    const INLINE_TOOL_OUTPUT_LIMIT: usize = 200;
+    prune_historical_tool_outputs_preserving(messages, keep_recent_tool_turns, &HashSet::new())
+}
+
+/// Same squeeze as [`prune_historical_tool_outputs`], except tool results whose
+/// `tool_call_id` appears in `preserve_call_ids` always stay verbatim. Requests
+/// may carry earlier messages that reference those results by call id (e.g.
+/// "full content remains in earlier tool result X"), and previewing the anchor
+/// would leave the pointer pointing at an excerpt.
+pub fn prune_historical_tool_outputs_preserving(
+    messages: &[AgentMessage],
+    keep_recent_tool_turns: usize,
+    preserve_call_ids: &HashSet<&str>,
+) -> Vec<AgentMessage> {
     const USER_IMAGE_KEEP_RECENT: usize = 1;
     let mut tool_seen_count = 0;
     let mut user_image_seen_count = 0;
@@ -496,9 +539,11 @@ pub fn prune_historical_tool_outputs(
 
     let mut keep_full = vec![false; messages.len()];
     for (i, msg) in messages.iter().enumerate().rev() {
-        if matches!(msg, AgentMessage::Tool { .. }) {
+        if let AgentMessage::Tool { tool_call_id, .. } = msg {
             tool_seen_count += 1;
-            if tool_seen_count <= keep_recent_tool_turns {
+            if tool_seen_count <= keep_recent_tool_turns
+                || preserve_call_ids.contains(tool_call_id.as_str())
+            {
                 keep_full[i] = true;
             }
         } else if matches!(
@@ -523,15 +568,18 @@ pub fn prune_historical_tool_outputs(
                 images,
             } => {
                 let image_bytes: usize = images.iter().map(|image| image.data_url.len()).sum();
+                let content_chars = content.chars().count();
                 if keep_full[i]
-                    || content.len().saturating_add(image_bytes) <= INLINE_TOOL_OUTPUT_LIMIT
+                    || (content_chars <= AGED_TOOL_INLINE_LIMIT
+                        && image_bytes <= AGED_TOOL_INLINE_LIMIT)
                 {
                     result.push(msg.clone());
                 } else {
-                    let pruned_content = format!(
-                        "[Historical tool output truncated for '{name}' ({} bytes)]",
-                        content.len()
-                    );
+                    let pruned_content = if content_chars > AGED_TOOL_INLINE_LIMIT {
+                        aged_tool_output_preview(content)
+                    } else {
+                        content.clone()
+                    };
                     result.push(AgentMessage::Tool {
                         tool_call_id: tool_call_id.clone(),
                         name: name.clone(),
@@ -539,7 +587,7 @@ pub fn prune_historical_tool_outputs(
                         is_error: *is_error,
                         terminate: *terminate,
                         // Pruning bounds context: attached images age out
-                        // with the text they illustrated.
+                        // with the turn they illustrated.
                         images: Vec::new(),
                     });
                 }
@@ -1381,20 +1429,124 @@ mod tests {
         let full_count = pruned
             .iter()
             .filter(
-                |m| matches!(m, AgentMessage::Tool { content, .. } if content.contains("aaaaa")),
+                |m| matches!(m, AgentMessage::Tool { content, .. } if content.len() == 5_000),
             )
             .count();
         assert_eq!(full_count, 3);
 
-        let truncated_count = pruned
+        let pruned_count = pruned
             .iter()
-            .filter(|m| matches!(m, AgentMessage::Tool { content, .. } if content.contains("Historical tool output truncated")))
+            .filter(|m| matches!(m, AgentMessage::Tool { content, .. } if content.contains("characters pruned from the middle")))
             .count();
-        assert_eq!(truncated_count, 7);
+        assert_eq!(pruned_count, 7);
+        // Aged outputs keep a bounded head/tail preview instead of a bare stub.
+        for message in &pruned {
+            if let AgentMessage::Tool { content, .. } = message {
+                assert!(content.len() <= 5_000);
+                if content.contains("characters pruned") {
+                    assert!(content.starts_with("aaaaa"));
+                    assert!(content.ends_with("aaaaa"));
+                    assert!(content.len() < 1_600);
+                }
+            }
+        }
 
         let optimal = prepare_token_optimal_context(&msgs, 10_000, &CompactionParams::default());
         assert!(!optimal.is_empty());
         assert_eq!(optimal[0].role_str(), "system");
+    }
+
+    #[test]
+    fn prune_historical_tool_outputs_measures_limits_in_characters() {
+        let mut msgs = vec![AgentMessage::User {
+            content: "prompt".into(),
+        }];
+        for i in 0..6 {
+            msgs.push(AgentMessage::Assistant {
+                content: None,
+                tool_calls: None,
+                stop_reason: None,
+                deferred_handle: None,
+            });
+            msgs.push(AgentMessage::Tool {
+                tool_call_id: format!("call_{i}"),
+                name: "run_command".into(),
+                content: if i == 0 {
+                    // 1_500 chars but >2_000 bytes: under the limit and
+                    // must stay verbatim, never enter the preview path.
+                    "🔥".repeat(1_500)
+                } else {
+                    "🔥".repeat(3_000)
+                },
+                is_error: false,
+                terminate: false,
+                images: Vec::new(),
+            });
+        }
+
+        let pruned = prune_historical_tool_outputs(&msgs, 1);
+        let contents: Vec<&str> = pruned
+            .iter()
+            .filter_map(|message| match message {
+                AgentMessage::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(contents.len(), 6);
+        assert_eq!(contents[0], "🔥".repeat(1_500));
+        for content in &contents[1..4] {
+            assert!(content.contains("characters pruned from the middle"));
+            // Head and tail must not overlap or duplicate content for
+            // multibyte bodies: the preview is strictly smaller than the
+            // input and ends on the body's real tail.
+            assert!(content.chars().count() < 3_000);
+            assert!(content.starts_with('🔥'));
+            assert!(content.ends_with('🔥'));
+        }
+        // The one kept-recent tool turn stays verbatim regardless of size.
+        assert_eq!(contents[5], "🔥".repeat(3_000));
+    }
+
+    #[test]
+    fn prune_historical_tool_outputs_preserving_keeps_referenced_anchors() {
+        let mut msgs = vec![AgentMessage::User {
+            content: "prompt".into(),
+        }];
+        for i in 0..6 {
+            msgs.push(AgentMessage::Assistant {
+                content: None,
+                tool_calls: None,
+                stop_reason: None,
+                deferred_handle: None,
+            });
+            msgs.push(AgentMessage::Tool {
+                tool_call_id: format!("call_{i}"),
+                name: "read_file".into(),
+                content: "a".repeat(5_000),
+                is_error: false,
+                terminate: false,
+                images: Vec::new(),
+            });
+        }
+
+        let mut preserve = HashSet::new();
+        preserve.insert("call_1");
+        let pruned = prune_historical_tool_outputs_preserving(&msgs, 1, &preserve);
+        let contents: Vec<&str> = pruned
+            .iter()
+            .filter_map(|message| match message {
+                AgentMessage::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(contents.len(), 6);
+        assert!(contents[0].contains("characters pruned from the middle"));
+        // The referenced anchor stays full even though it is aged.
+        assert_eq!(contents[1], "a".repeat(5_000));
+        for content in &contents[2..5] {
+            assert!(content.contains("characters pruned from the middle"));
+        }
+        assert_eq!(contents[5], "a".repeat(5_000));
     }
 
     #[test]

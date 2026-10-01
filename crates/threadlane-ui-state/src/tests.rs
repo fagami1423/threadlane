@@ -2088,7 +2088,7 @@ async fn reported_session_shape_keeps_total_processed_separate() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(provider_starts.len(), 102);
+    assert_eq!(provider_starts.len(), 280);
 
     let adaptive_compactions = records
         .iter()
@@ -2196,13 +2196,13 @@ async fn reported_session_shape_keeps_total_processed_separate() {
             _ => {}
         }
     }
-    let expected_loop_ids = (1..=101)
+    let expected_loop_ids = (1..=279)
         .map(|index| format!("loop-{index}"))
         .collect::<Vec<_>>();
     assert_eq!(call_ids, expected_loop_ids);
     assert_eq!(result_ids, expected_loop_ids);
-    assert_eq!(call_positions.len(), 101);
-    assert_eq!(result_positions.len(), 101);
+    assert_eq!(call_positions.len(), 279);
+    assert_eq!(result_positions.len(), 279);
     for call_id in &expected_loop_ids {
         assert!(
             call_positions[call_id] < result_positions[call_id],
@@ -2358,6 +2358,16 @@ async fn newer_provisional_compaction_clears_manifest_estimation() {
 
     let path = generated_reported_session_path().await;
     let mut store = JsonlStore::open(&path).unwrap();
+    let newer_generation = store
+        .records()
+        .iter()
+        .filter_map(|record| match record {
+            Record::ContextCompacted { generation, .. } => Some(*generation),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+        + 1;
     let request_seq = store.next_sequence();
     store
         .append_record(Record::ProviderRequestStarted {
@@ -2379,7 +2389,7 @@ async fn newer_provisional_compaction_clears_manifest_estimation() {
             lane: "main".into(),
             timestamp: 8,
             run_id: "run".into(),
-            generation: 4,
+            generation: newer_generation,
             reason: CompactionReason::AdaptiveBudget,
             effective_model: TraceString::new("newer-model").unwrap(),
             context_limit: 500_000,
@@ -2398,7 +2408,7 @@ async fn newer_provisional_compaction_clears_manifest_estimation() {
         .context_window
         .unwrap();
     assert!(context.provisional);
-    assert_eq!(context.compaction_generation, 4);
+    assert_eq!(context.compaction_generation, newer_generation);
     assert_eq!(context.current_tokens, 111_111);
     assert!(!context.estimating);
     std::fs::remove_file(path).ok();

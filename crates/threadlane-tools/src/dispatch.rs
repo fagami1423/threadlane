@@ -465,10 +465,28 @@ pub fn try_execute_tool_in_workspace_with(
                         output.status, stdout, stderr
                     );
                     if output.status.success() {
-                        if rendered.chars().count() > 12_000 {
+                        const RUN_COMMAND_OUTPUT_MAX_CHARS: usize = 12_000;
+                        const RUN_COMMAND_HEAD_CHARS: usize = 7_000;
+                        const RUN_COMMAND_TAIL_CHARS: usize = 4_000;
+                        let rendered_chars = rendered.chars().count();
+                        if rendered_chars > RUN_COMMAND_OUTPUT_MAX_CHARS {
+                            // Exit status and diagnostics land at the end of
+                            // command output; keep head and tail, prune the
+                            // middle, same shape as truncate_tool_output.
+                            let head: String =
+                                rendered.chars().take(RUN_COMMAND_HEAD_CHARS).collect();
+                            let tail: String = rendered
+                                .chars()
+                                .rev()
+                                .take(RUN_COMMAND_TAIL_CHARS)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect();
+                            let hidden = rendered_chars
+                                .saturating_sub(RUN_COMMAND_HEAD_CHARS + RUN_COMMAND_TAIL_CHARS);
                             Ok(format!(
-                                "{}\n[Output exceeds 12,000 characters; run a narrower command to read the rest.]",
-                                rendered.chars().take(12_000).collect::<String>()
+                                "{head}\n\n[... {hidden} characters pruned; run a narrower command to read the middle ...]\n\n{tail}"
                             ))
                         } else {
                             Ok(rendered)
