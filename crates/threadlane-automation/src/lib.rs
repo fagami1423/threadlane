@@ -243,7 +243,7 @@ impl RunStatus {
         }
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Run {
     pub id: String,
     pub definition: Definition,
@@ -268,7 +268,7 @@ impl Run {
             ))
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub version: u32,
     pub revision: u64,

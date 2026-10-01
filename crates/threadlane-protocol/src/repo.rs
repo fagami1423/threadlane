@@ -189,6 +189,180 @@ pub struct GitStatus {
     pub recent_commits: Vec<GitCommitInfo>,
 }
 
+// ---------------------------------------------------------------------------
+// GitHub (forge) payloads — canonical wire types. `threadlane-git` re-exports
+// them so `threadlane_git::*` paths keep working; they ride
+// `SessionCommand::GitHubRequest`/`CommandResponse::GitHub` on the wire.
+
+/// A forge repository coordinate (`host/owner/repo` parsed from remote URLs).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubRepository {
+    pub host: String,
+    pub owner: String,
+    pub repo: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubLabel {
+    pub name: String,
+    pub color: String,
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubIssueSummary {
+    pub issue: crate::daemon::GitHubIssueRef,
+    pub title: String,
+    pub state: String,
+    pub author: String,
+    pub updated_at: String,
+    pub labels: Vec<GitHubLabel>,
+    pub assignees: Vec<String>,
+    pub comments_count: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubIssueComment {
+    pub remote_id: String,
+    pub author: String,
+    pub body: String,
+    pub created_at: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubIssueDetail {
+    pub summary: GitHubIssueSummary,
+    pub body: String,
+    pub comments: Vec<GitHubIssueComment>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubPullRequestSummary {
+    pub repository: GitHubRepository,
+    pub number: u64,
+    pub title: String,
+    pub state: String,
+    pub url: String,
+    pub is_draft: bool,
+    pub head_ref: String,
+    pub base_ref: String,
+    pub author: String,
+    pub updated_at: String,
+    pub review_decision: Option<String>,
+    pub checks: Vec<PrCheckStatus>,
+}
+
+/// `ListIssues` state filter. The forge API accepts open/closed only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubIssueListState {
+    #[default]
+    Open,
+    Closed,
+}
+
+impl GitHubIssueListState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+/// `ListPullRequests` state filter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubPrListState {
+    #[default]
+    Open,
+    Closed,
+    Merged,
+}
+
+impl GitHubPrListState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+            Self::Merged => "merged",
+        }
+    }
+}
+
+/// One GitHub (forge) operation against the checkout at
+/// `SessionCommand::GitHubRequest::work_dir`. The daemon runs these through
+/// the repository's configured forge integration (`gh`), so they work for
+/// remote clients that have no forge access of their own.
+///
+/// Read-only operations answer with their own [`GitHubResponse`] payload;
+/// mutations answer [`GitHubResponse::Action`] with the command's
+/// user-facing result text, if any.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum GitHubOperation {
+    /// `gh issue list` — summaries for the issue panel.
+    ListIssues {
+        #[serde(default)]
+        state: GitHubIssueListState,
+        #[serde(default)]
+        query: Option<String>,
+        #[serde(default = "default_github_list_limit")]
+        limit: usize,
+    },
+    /// `gh issue view` — one issue with its body and comments.
+    InspectIssue { number: u64 },
+    /// `gh issue create` — answered by [`GitHubResponse::Number`].
+    CreateIssue { title: String, body: String },
+    /// `gh issue comment`.
+    CommentIssue { number: u64, body: String },
+    /// `gh issue close`/`gh issue reopen`.
+    SetIssueState { number: u64, close: bool },
+    /// `gh issue delete` — permanent; callers confirm first.
+    DeleteIssue { number: u64 },
+    /// `gh pr list` — summaries for the pull-request panel.
+    ListPullRequests {
+        #[serde(default)]
+        state: GitHubPrListState,
+        #[serde(default)]
+        query: Option<String>,
+        #[serde(default = "default_github_list_limit")]
+        limit: usize,
+    },
+    /// `gh pr view` — one pull request with checks, reviews, and files.
+    InspectPullRequest { number: u64 },
+    /// `gh pr diff` — the PR's unified diff text.
+    PullRequestDiff { number: u64 },
+    /// `gh pr comment`.
+    CommentPullRequest { number: u64, body: String },
+}
+
+fn default_github_list_limit() -> usize {
+    30
+}
+
+/// Payload of `CommandResponse::GitHub`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GitHubResponse {
+    /// `ListIssues` result.
+    Issues { issues: Vec<GitHubIssueSummary> },
+    /// `InspectIssue` result.
+    Issue { detail: GitHubIssueDetail },
+    /// `ListPullRequests` result.
+    PullRequests { prs: Vec<GitHubPullRequestSummary> },
+    /// `InspectPullRequest` result.
+    PullRequest { pr: GitHubPrInfo },
+    /// `PullRequestDiff` and other textual results.
+    Text { text: String },
+    /// `CreateIssue` result: the new issue's number.
+    Number { number: u64 },
+    /// A mutation settled; `message` is the forge command's user-facing
+    /// result when it produced one.
+    Action { message: Option<String> },
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitFile {
     pub path: String,

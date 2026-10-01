@@ -54,11 +54,20 @@ use crate::repo::{GitOperation, GitResponse, ProjectFileNode};
 /// `ProjectFileExists`/`GitRequest`/`WatchProject`/`UnwatchProject`/
 /// `GetWorktreeBases` commands, their `CommandResponse` payloads, and the
 /// ephemeral [`SessionEvent::WorkspaceChanged`]. Version 4 adds draft creation
-/// and project-scoped composer options.
-pub const WIRE_PROTOCOL_VERSION: u64 = 4;
+/// and project-scoped composer options. Version 5 adds the GitHub (forge)
+/// and automation surfaces — `GitHubRequest`/`AutomationRequest` commands
+/// and the journaled [`SessionEvent::AutomationChanged`].
+pub const WIRE_PROTOCOL_VERSION: u64 = 5;
 
 /// Draft creation and composer catalog requests.
 pub const COMPOSER_PROTOCOL_VERSION: u64 = 4;
+
+/// Wire floor for the GitHub (forge) and automation surfaces:
+/// `GitHubRequest`/`AutomationRequest` commands, their `CommandResponse`
+/// payloads, and [`SessionEvent::AutomationChanged`]. Gate on this constant,
+/// not on [`WIRE_PROTOCOL_VERSION`] itself: when this build's version
+/// advances past it, older-but-still-capable daemons must keep qualifying.
+pub const GITHUB_AUTOMATION_PROTOCOL_VERSION: u64 = 5;
 
 /// The lowest protocol version able to serve project filesystem and Git
 /// requests on the daemon's host. Gate file/git calls on this constant, not
@@ -259,6 +268,20 @@ pub enum SessionCommand {
     /// Answer `SessionEvent::WorktreeBases` with the project's base
     /// branches for a new-task worktree picker; answered by `Ack`.
     GetWorktreeBases { work_dir: PathBuf },
+    /// One GitHub (forge) operation — issue/pull-request reads and
+    /// mutations — against the checkout at `work_dir`; answered by
+    /// `CommandResponse::GitHub`. Wire capability
+    /// [`GITHUB_AUTOMATION_PROTOCOL_VERSION`].
+    GitHubRequest {
+        work_dir: PathBuf,
+        operation: crate::repo::GitHubOperation,
+    },
+    /// One automation-store operation; answered by
+    /// `CommandResponse::Automation` carrying the post-command projection.
+    /// Wire capability [`GITHUB_AUTOMATION_PROTOCOL_VERSION`].
+    AutomationRequest {
+        command: crate::automation::AutomationCommand,
+    },
 }
 
 /// An event the daemon broadcasts to clients.
@@ -391,6 +414,13 @@ pub enum SessionEvent {
         git_dirty: bool,
         files_dirty: bool,
     },
+    /// The automation store's projection changed — published by the
+    /// daemon's automation bridge whenever the service's watch channel
+    /// updates. Journaled, so an attach/reconnect replays the latest known
+    /// state. Wire capability [`GITHUB_AUTOMATION_PROTOCOL_VERSION`].
+    AutomationChanged {
+        projection: crate::automation::AutomationProjection,
+    },
 }
 
 /// A `SessionCommand` that expects a reply, sent as a
@@ -444,6 +474,14 @@ pub enum CommandResponse {
     FileExists { exists: bool },
     /// `GitRequest` result: the operation's payload.
     Git { response: GitResponse },
+    /// `GitHubRequest` result: the operation's payload.
+    GitHub {
+        response: crate::repo::GitHubResponse,
+    },
+    /// `AutomationRequest` result: the post-command projection.
+    Automation {
+        response: crate::automation::AutomationResponse,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

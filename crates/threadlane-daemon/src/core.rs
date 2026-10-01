@@ -128,7 +128,7 @@ impl DaemonCore {
                 }
             });
         }
-        Ok(Arc::new(Self {
+        let core = Arc::new(Self {
             runtimes: Mutex::new(HashMap::new()),
             identities: Mutex::new(HashMap::new()),
             attached_projects: Mutex::new(BTreeSet::new()),
@@ -143,7 +143,95 @@ impl DaemonCore {
             model: RwLock::new(String::new()),
             model_roles: RwLock::new(ModelRoles::default()),
             effort: RwLock::new(ReasoningEffort::default()),
-        }))
+        });
+        core.start_automation_bridge();
+        Ok(core)
+    }
+
+    /// Bridge the process-local automation service into this core: the
+    /// service's agent-event feed joins the shared broadcast (so clients
+    /// attached through the transport see run output), its projection watch
+    /// channel becomes journaled `AutomationChanged` events, and a live
+    /// run's runtime registers here so `Answer*`/`CancelRun` commands
+    /// resolve against it. This is the wiring the desktop host applied
+    /// per-client; doing it once at the core serves local and remote
+    /// clients alike.
+    fn start_automation_bridge(self: &Arc<Self>) {
+        let service = crate::automation::AutomationService::shared();
+        let mut events = service.subscribe();
+        let ingest_tx = self.ingest_tx.clone();
+        if let Ok(executor) = crate::chat::executor() {
+            executor.spawn(async move {
+                loop {
+                    match events.recv().await {
+                        Ok(event) => {
+                            if ingest_tx.send(event).is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+        let mut projections = service.projection.clone();
+        let this = self.clone();
+        if let Ok(executor) = crate::chat::executor() {
+            executor.spawn(async move {
+                loop {
+                    if projections.changed().await.is_err() {
+                        break;
+                    }
+                    let projection = projections.borrow_and_update().clone();
+                    if let Some(runtime) = &projection.active_runtime {
+                        let session_file = runtime.session_file().to_path_buf();
+                        if this.runtime_for_file(&session_file).is_none() {
+                            // Canonical layout nests session files as
+                            // `<project>/.threadlane/sessions/<id>.jsonl`,
+                            // so ancestor(3) is the project root.
+                            let work_dir = session_file
+                                .ancestors()
+                                .nth(3)
+                                .map(Path::to_path_buf)
+                                .unwrap_or_default();
+                            let session_id = Self::session_id_for_file(&session_file)
+                                .unwrap_or_default();
+                            this.register_runtime(
+                                &session_id,
+                                work_dir,
+                                session_file,
+                                runtime.clone(),
+                            );
+                        }
+                    }
+                    let wire = Self::automation_projection_wire(&projection);
+                    if this
+                        .ingest_tx
+                        .send(SessionEvent::AutomationChanged { projection: wire })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+    }
+
+    /// The service's process-local projection as it crosses the wire:
+    /// `active_runtime` (an in-process handle) becomes the run's session id.
+    fn automation_projection_wire(
+        projection: &crate::automation::Projection,
+    ) -> threadlane_protocol::automation::AutomationProjection {
+        threadlane_protocol::automation::AutomationProjection {
+            snapshot: projection.snapshot.clone(),
+            permissions: projection.permissions.clone(),
+            questions: projection.questions.clone(),
+            active_session_id: projection
+                .active_runtime
+                .as_ref()
+                .and_then(|runtime| Self::session_id_for_file(runtime.session_file())),
+        }
     }
 
     /// The host (desktop shell, or the standalone binary's own browser
@@ -481,6 +569,8 @@ impl DaemonCore {
                 | SessionCommand::ReadProjectFile { .. }
                 | SessionCommand::ProjectFileExists { .. }
                 | SessionCommand::GitRequest { .. }
+                | SessionCommand::GitHubRequest { .. }
+                | SessionCommand::AutomationRequest { .. }
         );
         let result = self.dispatch_inner(command, request_id).await;
         if let Err(error) = &result {
@@ -639,6 +729,84 @@ impl DaemonCore {
                 .await??;
                 return Ok(CommandResponse::Git { response });
             }
+            SessionCommand::GitHubRequest { work_dir, operation } => {
+                let work_dir = work_dir.clone();
+                let operation = operation.clone();
+                let response = run_blocking_io(move || {
+                    crate::project_io::run_github_operation(&work_dir, &operation)
+                })
+                .await??;
+                return Ok(CommandResponse::GitHub { response });
+            }
+            SessionCommand::AutomationRequest { command } => {
+                use threadlane_protocol::automation::AutomationCommand as AutomationWire;
+                let service = crate::automation::AutomationService::shared();
+                match command {
+                    AutomationWire::GetSnapshot => {}
+                    AutomationWire::Save { definition } => {
+                        service
+                            .command(crate::automation::Command::Save(definition.clone()))
+                            .await?;
+                    }
+                    AutomationWire::SetEnabled { id, enabled } => {
+                        service
+                            .command(crate::automation::Command::SetEnabled(
+                                id.clone(),
+                                *enabled,
+                            ))
+                            .await?;
+                    }
+                    AutomationWire::Delete { id } => {
+                        service
+                            .command(crate::automation::Command::Delete(id.clone()))
+                            .await?;
+                    }
+                    AutomationWire::DeleteRun { id } => {
+                        service
+                            .command(crate::automation::Command::DeleteRun(id.clone()))
+                            .await?;
+                    }
+                    AutomationWire::RunNow { id } => {
+                        service
+                            .command(crate::automation::Command::RunNow(id.clone()))
+                            .await?;
+                    }
+                    AutomationWire::Cancel { id } => {
+                        service
+                            .command(crate::automation::Command::Cancel(id.clone()))
+                            .await?;
+                    }
+                    AutomationWire::Review { id } => {
+                        service
+                            .command(crate::automation::Command::Review(id.clone()))
+                            .await?;
+                    }
+                }
+                // Mutations answer with the post-command projection — the
+                // actor has applied the command when `command` resolves,
+                // though its watch update can lag a tick, so read fresh
+                // rather than replaying `borrow()`.
+                // `service.command` resolves inside the actor loop just
+                // before its `publish()`, so a bounded wait on `changed()`
+                // lands the post-command revision without a fixed sleep;
+                // a no-op publish (unchanged projection) falls through on
+                // the timeout to the still-current value.
+                let projection = {
+                    let mut receiver = service.projection.clone();
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        receiver.changed(),
+                    )
+                    .await;
+                    let snapshot = receiver.borrow().clone();
+                    snapshot
+                };
+                return Ok(CommandResponse::Automation {
+                    response: threadlane_protocol::automation::AutomationResponse::Projection {
+                        projection: Self::automation_projection_wire(&projection),
+                    },
+                });
+            }
             _ => {}
         }
         self.dispatch_effect(command)
@@ -709,6 +877,8 @@ impl DaemonCore {
                     .runtime_for_session(&session_id)
                     .ok_or_else(|| format!("no live runtime for session {session_id}"))?;
                 if runtime.resolve_permission(&request_id, decision) {
+                    crate::automation::AutomationService::shared()
+                        .resolved(session_id, request_id);
                     Ok(())
                 } else {
                     Err(format!("permission request {request_id} is no longer pending"))
@@ -720,6 +890,8 @@ impl DaemonCore {
                     .ok_or_else(|| format!("no live runtime for session {session_id}"))?;
                 let request_id = answer.request_id.clone();
                 if runtime.resolve_question(&request_id, answer) {
+                    crate::automation::AutomationService::shared()
+                        .resolved(session_id, request_id);
                     Ok(())
                 } else {
                     Err(format!("question request {request_id} is no longer pending"))
@@ -1018,7 +1190,9 @@ impl DaemonCore {
             SessionCommand::ListProjectFiles { .. }
             | SessionCommand::ReadProjectFile { .. }
             | SessionCommand::ProjectFileExists { .. }
-            | SessionCommand::GitRequest { .. } => {
+            | SessionCommand::GitRequest { .. }
+            | SessionCommand::GitHubRequest { .. }
+            | SessionCommand::AutomationRequest { .. } => {
                 Err("payload command bypassed response dispatch".into())
             }
         }

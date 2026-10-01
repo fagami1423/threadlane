@@ -56,6 +56,10 @@ impl DaemonClient for LocalDaemon {
         true
     }
 
+    fn supports_github_automation(&self) -> bool {
+        true
+    }
+
     fn subscribe(&self) -> mpsc::UnboundedReceiver<SessionEvent> {
         // An in-process attach starts an empty cursor — the whole journal
         // tail replays (this client never reconnects, so dedupe by seq

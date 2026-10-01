@@ -33,6 +33,14 @@ pub struct ClientState {
     pub pending_questions: HashMap<String, threadlane_protocol::QuestionRequest>,
     /// Further requests stay queued behind the request currently shown.
     pub queued_questions: HashMap<String, Vec<threadlane_protocol::QuestionRequest>>,
+    /// Latest automation-store projection (`SessionEvent::AutomationChanged`,
+    /// wire ≥5). Default empty on pre-5 daemons, which never emit it.
+    pub automation: threadlane_protocol::automation::AutomationProjection,
+    /// Permission/question entries the automation projection contributed
+    /// to `pending_*` — tracked so the next projection can retract only
+    /// those (a request resolved elsewhere leaves no Agent event).
+    pub automation_permissions: HashMap<String, threadlane_protocol::PermissionRequest>,
+    pub automation_questions: HashMap<String, threadlane_protocol::QuestionRequest>,
 }
 impl ClientState {
     pub fn messages_mut(&mut self) -> &mut Vec<ChatMessageInfo> {
@@ -433,6 +441,38 @@ impl ClientState {
                     self.active_session_id = None;
                     self.messages = Arc::new(Vec::new());
                 }
+            }
+            SessionEvent::AutomationChanged { projection } => {
+                // Retract requests an earlier projection contributed and
+                // this one no longer lists (a resolution came through a
+                // command reply, not an Agent event), then upsert the
+                // store's current request surface.
+                for (session_id, old) in &self.automation_permissions {
+                    if !projection.permissions.contains_key(session_id)
+                        && self
+                            .pending_permissions
+                            .get(session_id)
+                            .is_some_and(|p| p.id == old.id)
+                    {
+                        self.pending_permissions.remove(session_id);
+                    }
+                }
+                for (session_id, old) in &self.automation_questions {
+                    if !projection.questions.contains_key(session_id)
+                        && self
+                            .pending_questions
+                            .get(session_id)
+                            .is_some_and(|q| q.id == old.id)
+                    {
+                        self.pending_questions.remove(session_id);
+                    }
+                }
+                self.pending_permissions
+                    .extend(projection.permissions.clone());
+                self.pending_questions.extend(projection.questions.clone());
+                self.automation_permissions = projection.permissions.clone();
+                self.automation_questions = projection.questions.clone();
+                self.automation = projection;
             }
             SessionEvent::DaemonError {
                 session_id,
