@@ -499,7 +499,12 @@ impl DaemonCore {
                     *self.model.write().expect("model poisoned") = model;
                 }
                 let runtime = self.ensure_runtime(&session_id, &work_dir).await?;
-                *self.effort.write().expect("effort poisoned") = effort;
+                // `None` preserves the daemon's current effort so a client
+                // without an effort control can't clobber another's choice.
+                if let Some(effort) = effort {
+                    *self.effort.write().expect("effort poisoned") = effort;
+                }
+                let effort = *self.effort.read().expect("effort poisoned");
                 if runtime.is_generating() {
                     // Queue a follow-up rather than erroring — a busy turn
                     // picks it up when it settles. Remote clients get the

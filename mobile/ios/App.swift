@@ -3,26 +3,30 @@ import UIKit
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
     func application(_ application: UIApplication,
-                     configurationForConnecting session: UISceneSession,
+                     configurationForConnecting connectingSceneSession: UISceneSession,
                      options: UIScene.ConnectionOptions) -> UISceneConfiguration {
-        let configuration = UISceneConfiguration(name: "Threadlane", sessionRole: session.role)
-        configuration.delegateClass = SceneDelegate.self
-        return configuration
+        let config = UISceneConfiguration(name: "Default Configuration",
+                                          sessionRole: connectingSceneSession.role)
+        config.delegateClass = SceneDelegate.self
+        return config
     }
 }
 
 final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     var window: UIWindow?
 
-    func scene(_ scene: UIScene, willConnectTo session: UISceneSession,
+    func scene(_ scene: UIScene,
+               willConnectTo session: UISceneSession,
                options connectionOptions: UIScene.ConnectionOptions) {
         guard let windowScene = scene as? UIWindowScene else { return }
         let window = UIWindow(windowScene: windowScene)
         window.rootViewController = ThreadlaneContainerController()
-        self.window = window
         window.makeKeyAndVisible()
-        // Creating the root controller registers Rust's deep-link handler first.
-        forwardPairingLinks(connectionOptions.urlContexts)
+        self.window = window
+        // Cold-launch deep link (QR pairing via `threadlane://pair?...`).
+        if let url = connectionOptions.urlContexts.first?.url {
+            Self.handleOpenURL(url)
+        }
     }
 
     func sceneDidBecomeActive(_ scene: UIScene) {
@@ -33,15 +37,15 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         gpui_ios_will_resign_active(nil)
     }
 
-    func scene(_ scene: UIScene, openURLContexts contexts: Set<UIOpenURLContext>) {
-        forwardPairingLinks(contexts)
+    /// QR pairing: the Camera app opens `threadlane://pair?...` here and
+    /// Rust applies it via the deep-link handler.
+    func scene(_ scene: UIScene, openURLContexts urlContexts: Set<UIOpenURLContext>) {
+        guard let url = urlContexts.first?.url else { return }
+        Self.handleOpenURL(url)
     }
 
-    private func forwardPairingLinks(_ contexts: Set<UIOpenURLContext>) {
-        for context in contexts {
-            let url = context.url.absoluteString as NSString
-            gpui_ios_handle_open_url(Unmanaged.passUnretained(url).toOpaque())
-        }
+    private static func handleOpenURL(_ url: URL) {
+        gpui_ios_handle_open_url(Unmanaged.passUnretained(url.absoluteString as NSString).toOpaque())
     }
 }
 

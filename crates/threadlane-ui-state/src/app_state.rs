@@ -2948,7 +2948,7 @@ impl AppState {
                     work_dir: setup.worktree.clone(),
                     text: setup.text.clone(),
                     images: setup.images.clone(),
-                    effort: setup.effort,
+                    effort: Some(setup.effort),
                     acp_config: setup.acp_config.clone(),
                     model: Some(setup.model.clone()),
                 });
@@ -5085,7 +5085,7 @@ impl AppState {
                 work_dir: self.active_work_dir.clone().unwrap_or_default(),
                 text: text.clone(),
                 images,
-                effort: self.reasoning_effort,
+                effort: Some(self.reasoning_effort),
                 acp_config: Vec::new(),
                 model: Some(self.selected_model.clone()),
             });
@@ -5428,7 +5428,7 @@ impl AppState {
                 work_dir: runtime_work_dir.clone(),
                 text: text.clone(),
                 images: images.clone(),
-                effort: self.reasoning_effort,
+                effort: Some(self.reasoning_effort),
                 acp_config: pending_acp,
                 model: Some(self.selected_model.clone()),
             });
