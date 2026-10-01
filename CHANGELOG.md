@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.1.38](https://github.com/wheregmis/threadlane/compare/v0.1.37...v0.1.38) (2026-10-01)
+
+
+### Features
+
+* **sidebar:** snooze settled sessions with a local deadline ([3487af5](https://github.com/wheregmis/threadlane/commit/3487af5ea8330bac856225525df25336993f8323))
+* **sidebar:** snooze settled sessions with a local deadline ([6146434](https://github.com/wheregmis/threadlane/commit/6146434865d001c20cce22c3487adf91d0952cce))
+
+
+### Bug Fixes
+
+* address review findings on daemon project-io ([2fcfe9e](https://github.com/wheregmis/threadlane/commit/2fcfe9efd1c235c26e35b25cef1d7f2aff048385))
+* drain snooze acks on the pump, bound deadlines, retry failed deletions ([83196de](https://github.com/wheregmis/threadlane/commit/83196de7366780bb2a46193685ae65bc80868814))
+
+
+### Code Refactoring
+
+* **ui:** share bubble styling across clients ([8c9c251](https://github.com/wheregmis/threadlane/commit/8c9c251ac0b2b98573560de9effee11a5c470658))
+* **ui:** share bubble styling across clients ([af6bfcb](https://github.com/wheregmis/threadlane/commit/af6bfcbe3655c68b515fd1693eaf5ac1f3139932))
+
 ## [0.1.37](https://github.com/wheregmis/threadlane/compare/v0.1.36...v0.1.37) (2026-10-01)
 
 
