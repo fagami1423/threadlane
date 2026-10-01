@@ -38,6 +38,31 @@ use crate::messages::{ImageAttachment, ReasoningEffort, SessionPlan, TokenUsage}
 use crate::orchestration::{ModelRoles, OrchestratorMode};
 use crate::events::{AgentEvent, SubagentIsolation};
 
+/// Daemon wire protocol version, announced by the server in the
+/// [`PROTOCOL_VERSION_HEADER`] WebSocket handshake response header.
+///
+/// Version 1 is the pre-announcement wire: bare `SessionCommand` frames
+/// inbound, `{"seq", "event"}` frames outbound. A daemon that sends no
+/// header is version 1 — it cannot decode a [`CommandRequest`] envelope
+/// (it rejects the frame as an undecodable command and never dispatches
+/// it), so clients must gate request/reply calls on
+/// [`COMMAND_REQUEST_PROTOCOL_VERSION`]. Version 2 adds the
+/// `CommandRequest`/`CommandReply` pair and the journaled
+/// [`SessionEvent::QueuedEntryCancelled`].
+pub const WIRE_PROTOCOL_VERSION: u64 = 2;
+
+/// The lowest protocol version able to decode a [`CommandRequest`]
+/// envelope. Gate request/reply calls on this constant, not on
+/// [`WIRE_PROTOCOL_VERSION`] itself: when this build's version advances
+/// past 2, older-but-still-capable daemons must keep qualifying.
+pub const COMMAND_REQUEST_PROTOCOL_VERSION: u64 = 2;
+
+/// The handshake response header carrying [`WIRE_PROTOCOL_VERSION`].
+/// Absent on pre-2 daemons, which is exactly how a client learns it is
+/// talking to one — the answer arrives with the socket upgrade, before
+/// any command frame is risked.
+pub const PROTOCOL_VERSION_HEADER: &str = "x-threadlane-protocol";
+
 /// A command a client sends to the daemon.
 ///
 /// Every variant is accepted in any session state; the daemon is the one
@@ -163,8 +188,16 @@ pub enum SessionCommand {
     SteerQueuedMessage { session_id: String, entry_id: String },
     /// Drop a still-pending queued input. Sent inside a [`CommandRequest`]
     /// the reply carries the entry's staged text and images as
-    /// `CommandResponse::CancelledQueuedMessage`.
-    CancelQueuedMessage { session_id: String, entry_id: String },
+    /// `CommandResponse::CancelledQueuedMessage`. `work_dir` pins the
+    /// project the session belongs to: when present the daemon resolves
+    /// the runtime only inside that project, so a same-named session in
+    /// another project cannot be cancelled in its place.
+    CancelQueuedMessage {
+        session_id: String,
+        entry_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        work_dir: Option<PathBuf>,
+    },
     /// Request the full attached-project list; answered by one
     /// `SessionEvent::ProjectChanged` per attached project. A freshly
     /// attached thin client sends this instead of relying on the bounded
@@ -312,7 +345,10 @@ pub struct CommandRequest {
 
 /// Payload a [`CommandRequest`] resolves to. `Ack` is the reply for
 /// commands that carry no return value — the payload-carrying variants
-/// are the point of the request/reply channel.
+/// are the point of the request/reply channel. Only a peer advertising
+/// a protocol version of at least [`COMMAND_REQUEST_PROTOCOL_VERSION`]
+/// can decode the envelope; on a version-1 daemon the frame is rejected
+/// as an undecodable command.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CommandResponse {
@@ -583,6 +619,10 @@ pub struct ToolActivityInfo {
     pub title: String,
     pub display_summary: String,
     pub detail: String,
+    /// Raw tool-call arguments JSON, kept after `detail` is replaced by the
+    /// tool result so the chat surface can render the call itself.
+    #[serde(default)]
+    pub arguments: String,
     pub is_expanded: bool,
 }
 
@@ -855,6 +895,7 @@ mod tests {
             SessionCommand::CancelQueuedMessage {
                 session_id: "sess_1".into(),
                 entry_id: "entry-1".into(),
+                work_dir: Some(PathBuf::from("/repo")),
             },
             SessionCommand::GetProjectState {
                 work_dir: PathBuf::from("/repo"),
@@ -1032,6 +1073,7 @@ mod tests {
             command: SessionCommand::CancelQueuedMessage {
                 session_id: "sess_1".into(),
                 entry_id: "entry-1".into(),
+                work_dir: None,
             },
         };
         let json = serde_json::to_string(&request).expect("request serializes");

@@ -10,6 +10,7 @@ use gpui::*;
 use gpui_component::button::{
     Button, ButtonCustomVariant, ButtonVariants, Toggle, ToggleVariants,
 };
+use gpui_component::combobox::{Combobox, ComboboxEvent, ComboboxState};
 use gpui_component::input::{
     Input, InputEvent, InputState, MoveDown, MoveUp, Textarea, TextareaState,
 };
@@ -22,7 +23,7 @@ use gpui_component::spinner::Spinner;
 use gpui_component::tag::{Tag, TagVariant};
 use gpui_component::text::{TextView, TextViewState};
 use gpui_component::theme::ActiveTheme;
-use gpui_component::{Disableable, Icon, IconName, Selectable, Sizable, WindowExt};
+use gpui_component::{Disableable, Icon, IconName, Selectable, Sizable, WindowExt, v_flex};
 use crate::image_preview::decode_staged_image;
 
 use threadlane_ui_editor::EditorView;
@@ -35,7 +36,9 @@ use threadlane_ui_state::{
 
 use super::composer::*;
 use super::context_meter::*;
+use super::tool_detail;
 use super::markdown::*;
+use super::model_picker::{self, ModelPickerDelegate, ModelPickerValue, PickerOwner};
 use super::trajectory::*;
 use super::transcript::*;
 
@@ -443,6 +446,15 @@ struct PromptRecallState {
 
 pub struct ChatListView {
     model: Entity<AppState>,
+    /// Searchable model picker state + the project/session its snapshot was
+    /// captured for; recreated when that owner changes so navigation can
+    /// never commit a stale row into a different context.
+    pub(crate) model_picker: Option<Entity<ComboboxState<ModelPickerDelegate>>>,
+    model_picker_owner: Option<PickerOwner>,
+    /// Written by the picker's trigger renderer each frame: its snapshot is
+    /// refreshed from live state only while the popup is closed.
+    model_picker_open: std::rc::Rc<std::cell::Cell<bool>>,
+    model_picker_subscription: Option<Subscription>,
     #[cfg(test)]
     reasoning_menu_open: std::rc::Rc<std::cell::Cell<bool>>,
     pub input_state: Entity<TextareaState>,
@@ -591,13 +603,15 @@ impl ChatListView {
             // without disturbing already-typed input or staged attachments.
             // Session-scoped inserts wait for their session to be active.
             let inserts = model.update(cx, |state, _cx| {
-                let active = state.active_session_id.clone();
+                let active_session = state.active_session_id.clone();
+                let active_work_dir = state.active_work_dir.clone();
                 let (ready, waiting): (Vec<_>, Vec<_>) =
                     std::mem::take(&mut state.requested_composer_inserts)
                         .into_iter()
                         .partition(|insert| {
-                            insert.session_id.as_deref().is_none()
-                                || insert.session_id.as_deref() == active.as_deref()
+                            insert.session_id.is_none()
+                                || (insert.session_id == active_session
+                                    && insert.work_dir == active_work_dir)
                         });
                 state.requested_composer_inserts = waiting;
                 ready
@@ -829,6 +843,10 @@ impl ChatListView {
         };
         Self {
             model,
+            model_picker: None,
+            model_picker_owner: None,
+            model_picker_open: Default::default(),
+            model_picker_subscription: None,
             #[cfg(test)]
             reasoning_menu_open: Default::default(),
             input_state,
@@ -1281,6 +1299,72 @@ impl ChatListView {
             input.focus(window, cx);
         });
         cx.notify();
+    }
+
+    /// Applies the row the model picker committed.
+    ///
+    /// The row was captured when the popup opened, so it is revalidated
+    /// against live state first: a project/session change makes the whole
+    /// snapshot invalid (the picker is also recreated on the next render,
+    /// this just guards a commit that already landed), and a choice whose
+    /// exact identity disappeared surfaces an error instead of silently
+    /// retargeting a different model.
+    fn commit_model_picker_choice(
+        &mut self,
+        value: ModelPickerValue,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let ModelPickerValue::OpenAgentSettings = value {
+            self.model.update(cx, |state, cx| {
+                controller::dispatch(state, AppAction::OpenSettings);
+                cx.notify();
+            });
+            return;
+        }
+        let owner_current = self
+            .model_picker_owner
+            .as_ref()
+            .is_some_and(|owner| owner.is_current(self.model.read(cx)));
+        if !owner_current || model_picker::choice_is_stale(&value, self.model.read(cx)) {
+            self.model.update(cx, |state, cx| {
+                state.session_status = Some(model_picker::STALE_CHOICE_MESSAGE.to_string());
+                cx.notify();
+            });
+            return;
+        }
+        self.model.update(cx, |state, cx| {
+            match &value {
+                ModelPickerValue::Model(id) => {
+                    controller::dispatch(state, AppAction::SelectModel(id.clone()));
+                }
+                ModelPickerValue::AgentChoice {
+                    model_id,
+                    config_id,
+                    value: choice,
+                } => {
+                    controller::dispatch(state, AppAction::SelectModel(model_id.clone()));
+                    // `SetAcpConfigOption` targets `selected_model`'s agent,
+                    // so it may only fire when the agent switch actually
+                    // took effect — otherwise the config would land on the
+                    // agent that was selected before the commit.
+                    if state.selected_model == *model_id {
+                        controller::dispatch(
+                            state,
+                            AppAction::SetAcpConfigOption {
+                                config_id: config_id.clone(),
+                                value: choice.clone(),
+                            },
+                        );
+                    }
+                }
+                ModelPickerValue::OpenAgentSettings => {}
+            }
+            cx.notify();
+        });
+        // The kit refocuses the trigger when the popup closes; hand focus to
+        // the composer right after so typing continues where the user left it.
+        cx.defer_in(window, |this, window, cx| this.focus_composer(window, cx));
     }
 
     /// Appends `text` to the draft `destination` names, then reveals Chat
@@ -2239,9 +2323,11 @@ impl ChatListView {
             _ => theme.muted_foreground,
         };
         let model = self.model.clone();
+        let detail_model = self.model.clone();
         let transcript = self.transcript_list_state.clone();
         let tool_call_id = activity.id.clone();
-        let has_detail = !activity.detail.trim().is_empty();
+        let has_detail = !activity.detail.trim().is_empty()
+            || tool_detail::expandable(activity);
         let row_id = SharedString::from(activity.id.clone());
         let display_summary = activity.display_summary.clone();
         let is_error = activity.category == "Error";
@@ -2312,19 +2398,23 @@ impl ChatListView {
                     })),
             )
             .children(activity.is_expanded.then(|| {
-                div()
-                    .ml(rems(1.625))
-                    .mt_1()
-                    .p_2p5()
-                    .max_h(rems(15.0))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme.border.opacity(0.5))
-                    .bg(theme.title_bar)
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .overflow_y_scrollbar()
-                    .child(activity.detail.clone())
+                tool_detail::render_activity_detail_card(activity, &detail_model, cx)
+                    .unwrap_or_else(|| {
+                        div()
+                            .ml(rems(1.625))
+                            .mt_1()
+                            .p_2p5()
+                            .max_h(rems(15.0))
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(theme.border.opacity(0.5))
+                            .bg(theme.title_bar)
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .overflow_y_scrollbar()
+                            .child(activity.detail.clone())
+                            .into_any_element()
+                    })
             }))
     }
 
@@ -4635,7 +4725,6 @@ impl ChatListView {
             }
             sections
         };
-        let model_for_picker = self.model.clone();
         let queue_model = self.model.clone();
         let steer_model = self.model.clone();
         let dismiss_model = self.model.clone();
@@ -5078,6 +5167,25 @@ impl ChatListView {
             .map(|message| (message.id.clone(), message.content.clone()))
             .collect();
         let queued_session_id = active_session_id.clone();
+        // Rows whose removal the daemon has not confirmed yet stay listed
+        // but show "Removing…" instead of their actions — the entry may
+        // still be queued on the peer, so it must not look actionable.
+        let queued_pending_removals: std::collections::HashSet<String> = match queued_session_id
+            .as_deref()
+        {
+            Some(session_id) => {
+                let state = self.model.read(cx);
+                queued_messages
+                    .iter()
+                    .filter_map(|(message_id, _)| {
+                        queued_entry_id(message_id, Some(session_id)).filter(|entry_id| {
+                            state.queued_removal_pending(session_id, entry_id)
+                        })
+                    })
+                    .collect()
+            }
+            None => std::collections::HashSet::new(),
+        };
         let queued_preview = (!queued_messages.is_empty()).then(|| {
             div()
                 .debug_selector(|| "queued-messages-panel".into())
@@ -5138,6 +5246,16 @@ impl ChatListView {
                                         .child(text),
                                 );
                             if let Some(entry_id) = entry_id {
+                                if queued_pending_removals.contains(&entry_id) {
+                                    row = row.child(
+                                        div()
+                                            .flex_none()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child("Removing…"),
+                                    );
+                                    return row;
+                                }
                                 let queued_steer_model = self.model.clone();
                                 let queued_edit_model = self.model.clone();
                                 let queued_remove_model = self.model.clone();
@@ -5344,177 +5462,134 @@ impl ChatListView {
                 )
         });
 
-        let model_picker = Button::new("composer-model-picker")
-            .debug_selector(|| "composer-model-picker".into())
-            .small()
-            .label(model_label.clone())
-            .accessibility_label(format!("Model: {model_label}"))
-            .dropdown_caret(true)
-            .ghost()
-            .rounded_full()
-            .disabled(!has_models)
-            // Long agent model names ("Claude Code · Opus 4.8 with 1M
-            // context") must not squeeze Send off the composer row: cap the
-            // width, the full label stays in the tooltip.
-            .max_w(rems(12.5))
-            .tooltip(if has_models {
-                format!("Model: {model_label}")
-            } else {
-                "No models available — connect a provider in Settings".to_string()
-            });
-
-        let model_picker = if let Some(option) = selected_option.as_ref() {
-            model_picker.icon(Icon::default().path(option.provider.icon_path()))
-        } else {
-            model_picker
+        // The picker owns a per-open snapshot (model_picker.rs): one state
+        // per project/session owner, refreshed only while the popup is
+        // closed, so a catalog update can never reorder rows under the
+        // keyboard cursor mid-open.
+        let picker_owner = PickerOwner::capture(self.model.read(cx));
+        if self.model_picker.is_none() || self.model_picker_owner.as_ref() != Some(&picker_owner) {
+            let delegate = ModelPickerDelegate::new(
+                &model_options,
+                &acp_model_sections,
+                &selected_model,
+            );
+            let picker_state =
+                cx.new(|cx| ComboboxState::new(delegate, Vec::new(), window, cx).searchable(true));
+            self.model_picker_subscription = Some(cx.subscribe_in(
+                &picker_state,
+                window,
+                |this, picker, event, window, cx| match event {
+                    ComboboxEvent::Change(values) => {
+                        if let Some(value) = values.first().cloned() {
+                            this.commit_model_picker_choice(value, window, cx);
+                        }
+                        // The kit detects a selection change by comparing
+                        // IndexPaths, not values: a kept selection at
+                        // {section, row} would suppress the next commit at
+                        // the same filtered index. Rows are actions, so the
+                        // selection resets after every commit.
+                        picker.update(cx, |picker, cx| {
+                            picker.set_selected_indices(Vec::new(), window, cx);
+                        });
+                    }
+                    ComboboxEvent::Confirm(_) => {}
+                },
+            ));
+            self.model_picker = Some(picker_state);
+            self.model_picker_owner = Some(picker_owner);
+        } else if !self.model_picker_open.get() {
+            // Closed: track the live catalog. Swapping the delegate wholesale
+            // keeps the snapshot consistent, and clearing the query makes
+            // the next open land on the full list with the cursor on row one.
+            let delegate = ModelPickerDelegate::new(
+                &model_options,
+                &acp_model_sections,
+                &selected_model,
+            );
+            if let Some(picker_state) = self.model_picker.as_ref() {
+                picker_state.update(cx, |picker, cx| {
+                    picker.set_items(delegate, window, cx);
+                    picker.set_selected_indices(Vec::new(), window, cx);
+                    if !picker.query(cx).is_empty() {
+                        picker.set_query("", window, cx);
+                    }
+                });
+            }
+        }
+        let Some(picker_state) = self.model_picker.clone() else {
+            unreachable!("picker is created or already present above");
         };
-        let selected_model_for_picker = selected_model.clone();
-        let submenu_click_model = self.model.clone();
-        let model_picker = model_picker.dropdown_menu_with_anchor(
-            gpui::Anchor::BottomLeft,
-            move |menu, window, _cx| {
-                let menu = menu.check_side(gpui_component::Side::Right);
-                let mut previous_provider = None;
-                let menu = model_options.iter().cloned().fold(
-                    menu.max_h(window.rem_size() * 20.0).scrollable(true),
-                    |menu, option| {
-                        let menu = if previous_provider == Some(option.provider) {
-                            menu
-                        } else {
-                            previous_provider = Some(option.provider);
-                            menu.item(PopupMenuItem::label(option.provider.label()))
-                        };
-                        if option.provider != threadlane_daemon::catalog::ModelProvider::Acp {
-                            let model = model_for_picker.clone();
-                            let is_current = option.id == selected_model_for_picker;
-                            let label = if is_current {
-                                format!("{} · Current", option.label)
-                            } else {
-                                option.label
-                            };
-                            return menu.item(
-                                PopupMenuItem::new(label)
-                                    .icon(Icon::default().path(option.provider.icon_path()))
-                                    .checked(is_current)
-                                    .on_click(move |_event, _window, cx| {
-                                        model.update(cx, |state, cx| {
-                                            controller::dispatch(
-                                                state,
-                                                AppAction::SelectModel(option.id.to_string()),
-                                            );
-                                            cx.notify();
+        let picker_open_flag = self.model_picker_open.clone();
+        let model_label_for_trigger = model_label.clone();
+        let provider_icon = selected_option
+            .as_ref()
+            .map(|option| option.provider.icon_path());
+        let picker_state_for_empty = picker_state.clone();
+        let model_picker = div().min_w_0().child(
+            Combobox::new(&picker_state)
+                .small()
+                .menu_width(rems(20.))
+                .menu_max_h(rems(20.))
+                .search_placeholder("Search models or agents…")
+                .disabled(!has_models)
+                .empty(move |_window, cx| {
+                    v_flex()
+                        .items_center()
+                        .gap_2()
+                        .py_6()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("No matching models")
+                        .child(
+                            Button::new("model-picker-clear-search")
+                                .small()
+                                .label("Clear search")
+                                .on_click({
+                                    let picker = picker_state_for_empty.clone();
+                                    move |_event, window, cx| {
+                                        picker.update(cx, |picker, cx| {
+                                            picker.set_query("", window, cx);
                                         });
-                                    }),
-                            );
-                        }
-                        // External agents list their own models inline, fed by the
-                        // shared launch-time cache until this session's engine
-                        // connects. Picking one selects the agent and applies the
-                        // model in a single gesture — no hover, no pre-select.
-                        let agent_key = threadlane_acp_engine::acp_agent_id(&option.id)
-                            .unwrap_or_default()
-                            .to_string();
-                        let agent_options = acp_model_sections
-                            .get(&agent_key)
-                            .cloned()
-                            .unwrap_or_default();
-                        let agent_setting = threadlane_acp::config_option_for(
-                            &agent_options,
-                            threadlane_acp::ACP_CONFIG_CATEGORY_MODEL,
-                        )
-                        .cloned();
-                        let is_current = option.id == selected_model_for_picker;
-                        let agent_label = if is_current {
-                            format!("{} · Current", option.label)
-                        } else {
-                            option.label.clone()
-                        };
-                        let select_model = submenu_click_model.clone();
-                        let select_id = option.id.clone();
-                        let menu = menu.item(
-                            PopupMenuItem::new(agent_label)
-                                .icon(Icon::default().path(option.provider.icon_path()))
-                                .checked(is_current)
-                                .on_click(move |_event, _window, cx| {
-                                    select_model.update(cx, |state, cx| {
-                                        controller::dispatch(
-                                            state,
-                                            AppAction::SelectModel(select_id.clone()),
-                                        );
-                                        cx.notify();
-                                    });
+                                    }
                                 }),
-                        );
-                        match agent_setting {
-                            Some(setting) => {
-                                let current = setting.current_value().map(str::to_string);
-                                let config_id = setting.id.clone();
-                                setting.options.into_iter().fold(menu, |menu, choice| {
-                                    let click_model = submenu_click_model.clone();
-                                    let select_id = option.id.clone();
-                                    let config_id = config_id.clone();
-                                    let value = choice.value.clone();
-                                    // Only the selected agent's live state can
-                                    // mark a current model; cached currents may
-                                    // be stale, so other agents show none.
-                                    let checked = is_current
-                                        && current.as_deref() == Some(choice.value.as_str());
-                                    let label = if checked {
-                                        format!("{} · Current", choice.name)
-                                    } else {
-                                        choice.name.clone()
-                                    };
-                                    menu.item(PopupMenuItem::new(label).checked(checked).on_click(
-                                        move |_event, _window, cx| {
-                                            click_model.update(cx, |state, cx| {
-                                                controller::dispatch(
-                                                    state,
-                                                    AppAction::SelectModel(select_id.clone()),
-                                                );
-                                                controller::dispatch(
-                                                    state,
-                                                    AppAction::SetAcpConfigOption {
-                                                        config_id: config_id.clone(),
-                                                        value: value.clone(),
-                                                    },
-                                                );
-                                                cx.notify();
-                                            });
-                                        },
-                                    ))
-                                })
-                            }
-                            None => {
-                                let reason = threadlane_daemon::catalog::cached_acp_error(&agent_key)
-                                    .map(|error| {
-                                        let short: String = error.chars().take(120).collect();
-                                        if error.chars().count() > 120 {
-                                            format!("{short}…")
-                                        } else {
-                                            short
-                                        }
-                                    })
-                                    .unwrap_or_else(|| format!("Connecting to {}…", option.label));
-                                let settings_model = submenu_click_model.clone();
-                                menu.item(PopupMenuItem::new(reason).disabled(true)).item(
-                                    PopupMenuItem::new("Check Settings → ACP Agents").on_click(
-                                        move |_event, _window, cx| {
-                                            settings_model.update(cx, |state, cx| {
-                                                controller::dispatch(
-                                                    state,
-                                                    AppAction::OpenSettings,
-                                                );
-                                                cx.notify();
-                                            });
-                                        },
-                                    ),
-                                )
-                            }
-                        }
-                    },
-                );
-                menu
-            },
+                        )
+                })
+                .render_trigger(move |trigger, _window, _cx| {
+                    picker_open_flag.set(trigger.is_open());
+                    let button = Button::new("composer-model-picker")
+                        .debug_selector(|| "composer-model-picker".into())
+                        // Visual only — the combobox's own trigger owns
+                        // focus and activation.
+                        .tab_stop(false)
+                        .small()
+                        .label(model_label_for_trigger.clone())
+                        .accessibility_label(format!("Model: {model_label_for_trigger}"))
+                        .dropdown_caret(true)
+                        .ghost()
+                        .rounded_full()
+                        // The open popup reads as a held press on its trigger.
+                        .selected(trigger.is_open())
+                        .disabled(trigger.is_disabled())
+                        // Long agent model names ("Claude Code · Opus 4.8 with
+                        // 1M context") must not squeeze Send off the composer
+                        // row: cap the width, the full label stays in the
+                        // tooltip.
+                        .max_w(rems(12.5))
+                        .tooltip(if has_models {
+                            format!("Model: {model_label_for_trigger}")
+                        } else {
+                            "No models available — connect a provider in Settings".to_string()
+                        });
+                    button.when_some(provider_icon, |button, icon| {
+                        button.icon(Icon::default().path(icon))
+                    })
+                })
+                // The inner Button carries the pill look; the frame only
+                // needs the focus ring, so clear its own chrome.
+                .h_7()
+                .border_0()
+                .rounded_full()
+                .bg(cx.theme().transparent)
+                .max_w(rems(12.5)),
         );
 
         let effort_model = self.model.clone();

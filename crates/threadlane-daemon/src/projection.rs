@@ -366,6 +366,7 @@ pub fn project_agent_messages(agent_messages: Vec<AgentMessage>) -> Vec<ChatMess
                         title: act.title,
                         display_summary,
                         detail: act.detail,
+                        arguments: act.arguments,
                         is_expanded: false,
                     }
                 })

@@ -319,6 +319,40 @@ impl DaemonCore {
             .map(|(_, runtime)| runtime.clone())
     }
 
+    /// `runtime_for_session` confined to one project: an identity or
+    /// session file registered under another `work_dir` cannot satisfy
+    /// the lookup, so same-named sessions in two attached projects do
+    /// not cross-resolve. `SessionIdentity.work_dir` is the project root,
+    /// so the caller's effective checkout is normalized the same way
+    /// registration is.
+    pub fn runtime_for_session_in(
+        &self,
+        session_id: &str,
+        work_dir: &Path,
+    ) -> Option<Arc<SessionRuntime>> {
+        let project_dir = Self::project_dir_for(work_dir);
+        let runtimes = self.runtimes.lock().expect("runtimes poisoned");
+        if let Some(identity) = self.identity(session_id) {
+            if identity.work_dir == project_dir {
+                if let Some(runtime) = runtimes.get(&identity.session_file) {
+                    return Some(runtime.clone());
+                }
+            }
+        }
+        // Canonical layout first, then a scan confined to session files
+        // inside the project (worktree transcripts nest under its root).
+        if let Some(runtime) = runtimes.get(&canonical_session_file(work_dir, session_id)) {
+            return Some(runtime.clone());
+        }
+        runtimes
+            .iter()
+            .find(|(file, _)| {
+                Self::session_id_for_file(file).as_deref() == Some(session_id)
+                    && file.starts_with(&project_dir)
+            })
+            .map(|(_, runtime)| runtime.clone())
+    }
+
     /// Kill a hosted terminal whose owning client went away. Shares the
     /// `TerminalClose` path: kill now, entry reaped on reader EOF so the
     /// trailing `Exited` still orders after the last output.
@@ -451,11 +485,14 @@ impl DaemonCore {
         if let SessionCommand::CancelQueuedMessage {
             session_id,
             entry_id,
+            work_dir,
         } = &command
         {
-            let runtime = self
-                .runtime_for_session(session_id)
-                .ok_or_else(|| format!("no live runtime for session {session_id}"))?;
+            let runtime = match work_dir.as_deref() {
+                Some(work_dir) => self.runtime_for_session_in(session_id, work_dir),
+                None => self.runtime_for_session(session_id),
+            }
+            .ok_or_else(|| format!("no live runtime for session {session_id}"))?;
             return runtime
                 .work_handle
                 .cancel_queued_entry(entry_id)
