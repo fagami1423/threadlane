@@ -4475,6 +4475,46 @@ fn prompt_recall_buttons_step_and_report_position(cx: &mut gpui::TestAppContext)
 }
 
 #[gpui::test]
+fn prompt_rail_reveals_unmeasured_active_tick(cx: &mut gpui::TestAppContext) {
+    let (chat, model, cx) = mount_chat_with_work_dir(cx, None);
+    model.update(cx, |state, cx| {
+        state.active_session_id = Some("long-rail-task".into());
+        state.messages = (0..24)
+            .map(|ix| ChatMessageInfo {
+                id: format!("rail-user-{ix}"),
+                role: MessageRole::User,
+                content: format!("Prompt {ix}"),
+                tool_activities: Vec::new(),
+                streaming: false,
+                reasoning_content: None,
+                reasoning_expanded: false,
+            })
+            .collect::<Vec<_>>()
+            .into();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let rail = cx.debug_bounds("prompt-navigation-rail").expect("rail mounted");
+    let newest = cx.debug_bounds("prompt-rail-rail-user-23")
+        .expect("newest prompt must be visible without prior item measurements");
+    assert!(newest.top() >= rail.top() && newest.bottom() <= rail.bottom());
+
+    chat.update(cx, |chat, cx| {
+        chat.initial_scroll_frames = 0;
+        chat.transcript_list_state.pause_following_tail();
+        chat.transcript_list_state.scroll_to(gpui::ListOffset {
+            item_ix: 0,
+            offset_in_item: gpui::px(0.),
+        });
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("prompt-rail-rail-user-0").is_some(),
+        "moving to an earlier prompt also reveals its tick");
+}
+
+#[gpui::test]
 fn conversation_outline_focuses_and_jumps_to_prompts(cx: &mut gpui::TestAppContext) {
     use gpui::AppContext as _;
     cx.update(gpui_component::init);
@@ -4514,9 +4554,29 @@ fn conversation_outline_focuses_and_jumps_to_prompts(cx: &mut gpui::TestAppConte
     cx.update(|window, cx| window.draw(cx).clear(cx));
     chat.update(cx, |chat, _| chat.initial_scroll_frames = 0);
 
+    assert!(cx.debug_bounds("prompt-navigation-rail").is_some());
+    chat.read_with(cx, |chat, _| {
+        assert_eq!(chat.prompt_rail_active_id.as_deref(), Some("u3"));
+    });
+    let tick = cx.debug_bounds("prompt-rail-u1").expect("first prompt tick");
+    cx.simulate_click(tick.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(chat.outline_selected_id.as_deref(), Some("u1"));
+        assert_eq!(chat.prompt_rail_active_id.as_deref(), Some("u1"));
+        assert!(!chat.transcript_list_state.is_following_tail());
+        assert_eq!(chat.transcript_list_state.logical_scroll_top().item_ix, 0);
+        assert_eq!(chat.input_state.read(cx).value().as_ref(), "");
+    });
+    let latest = cx.debug_bounds("jump-to-latest").expect("return to latest");
+    cx.simulate_click(latest.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
     let trigger = cx
         .debug_bounds("conversation-outline-open")
-        .expect("outline command in the header");
+        .expect("outline command in the prompt rail");
     cx.simulate_click(trigger.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
