@@ -154,6 +154,9 @@ pub fn dispatch(state: &mut AppState, action: AppAction) {
             }
         }
         AppAction::OpenFileInEditor(path) => state.request_open_file(path),
+        AppAction::OpenFileInEditorAtLine { path, line } => {
+            state.request_open_file_at_line(path, Some(line));
+        }
         AppAction::RunTerminalCommand(cmd) => state.request_run_terminal_command(cmd),
         AppAction::OpenTerminalAt(work_dir) => state.request_open_terminal(work_dir),
     }

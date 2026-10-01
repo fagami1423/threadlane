@@ -10,3 +10,7 @@ gpui-component = { workspace = true, features = ["tree-sitter-rust", "tree-sitte
 rfd.workspace = true
 threadlane-ui-state.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true

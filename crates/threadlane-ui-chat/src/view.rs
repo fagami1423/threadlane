@@ -642,7 +642,7 @@ impl ChatListView {
                 model.update(cx, |state, _cx| state.requested_editor_target.take())
             {
                 match target {
-                    threadlane_ui_state::RequestedEditorTarget::File { project, path } => {
+                    threadlane_ui_state::RequestedEditorTarget::File { project, path, line } => {
                         let is_active = {
                             let state = model.read(cx);
                             editor_target_matches_active_work_dir(
@@ -653,7 +653,7 @@ impl ChatListView {
                         if is_active {
                             this.set_tab(CentralTab::Editor, cx);
                             this.editor.update(cx, |editor, cx| {
-                                editor.open_file(project, &path, cx);
+                                editor.open_file_at_line(project, &path, line, cx);
                             });
                         }
                     }
@@ -1662,7 +1662,7 @@ impl ChatListView {
 
     /// The workspace owns the available width and hides this summary when a tool panel opens.
     pub fn set_environment_width(&mut self, width: Pixels, rem: Pixels, cx: &mut Context<Self>) {
-        let available = width >= rem * (CHAT_CONTENT_MAX_WIDTH + 20.0);
+        let available = width >= rem * (CHAT_CONTENT_MAX_WIDTH + 24.0);
         if self.environment_available != available {
             self.environment_available = available;
             cx.notify();
@@ -2313,7 +2313,7 @@ impl ChatListView {
         &self,
         activity: &ToolActivityInfo,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         let theme = cx.theme().colors;
         let marker = tool_activity_glyph(activity.category.as_str());
         let marker_color = match activity.category.as_str() {
@@ -2326,8 +2326,7 @@ impl ChatListView {
         let detail_model = self.model.clone();
         let transcript = self.transcript_list_state.clone();
         let tool_call_id = activity.id.clone();
-        let has_detail = !activity.detail.trim().is_empty()
-            || tool_detail::expandable(activity);
+        let has_detail = !activity.detail.trim().is_empty() || tool_detail::expandable(activity);
         let row_id = SharedString::from(activity.id.clone());
         let display_summary = activity.display_summary.clone();
         let is_error = activity.category == "Error";
@@ -2336,6 +2335,24 @@ impl ChatListView {
         } else {
             theme.muted_foreground
         };
+
+        if let Some(preview) = super::tool_preview::render(activity, &self.model, cx) {
+            return div()
+                .w_full()
+                .min_w_0()
+                .py_1()
+                .child(preview)
+                .into_any_element();
+        }
+
+        if tool_detail::is_command_tool(&activity.title) {
+            return div()
+                .w_full()
+                .min_w_0()
+                .py_1()
+                .child(tool_detail::render_command_card(activity, cx))
+                .into_any_element();
+        }
 
         div()
             .w_full()
@@ -2416,6 +2433,7 @@ impl ChatListView {
                             .into_any_element()
                     })
             }))
+            .into_any_element()
     }
 
     fn render_activity_group(
@@ -7022,7 +7040,11 @@ impl Render for ChatListView {
                             .flex()
                             .flex_col()
                             .w_full()
-                            .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
+                            // Scrollable gutters keep cards clear of the rail and Environment.
+                            .max_w(rems(
+                                CHAT_CONTENT_MAX_WIDTH
+                                    + if show_environment { 4.0 } else { 0.0 },
+                            ))
                             .min_h_0()
                             .min_w_0()
                             .children(
@@ -7089,7 +7111,7 @@ impl Render for ChatListView {
                                                             cx.processor(Self::render_transcript_row),
                                                         )
                                                         .w_full()
-                                                        .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
+                                                        .when(show_environment, |el| el.px_8())
                                                         .h_full()
                                                         .mx_auto()
                                                         .pt_3()

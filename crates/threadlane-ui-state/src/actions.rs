@@ -84,6 +84,10 @@ pub enum AppAction {
     RemoveCodexAccount(String),
     ToggleReasoningExpanded(String),
     OpenFileInEditor(String),
+    OpenFileInEditorAtLine {
+        path: String,
+        line: usize,
+    },
     RunTerminalCommand(String),
     OpenTerminalAt(PathBuf),
 }

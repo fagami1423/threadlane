@@ -1,11 +1,9 @@
-//! Purpose-built detail cards for expanded tool activities: a terminal-style
-//! card for command tools and a diff-styled code card for edit/write tools.
+//! Compact command cards and diff-styled detail cards for edit/write tools.
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::scroll::{Scrollable, ScrollableElement};
-use gpui_component::tag::{Tag, TagVariant};
 use gpui_component::theme::ActiveTheme;
 use gpui_component::{Icon, IconName, Sizable};
 
@@ -81,7 +79,7 @@ fn normalized_tool_name(title: &str) -> String {
     title.trim().to_lowercase().replace(' ', "_")
 }
 
-fn is_command_tool(title: &str) -> bool {
+pub(crate) fn is_command_tool(title: &str) -> bool {
     let name = normalized_tool_name(title);
     if matches!(
         name.as_str(),
@@ -123,7 +121,7 @@ fn is_edit_tool(title: &str) -> bool {
     )
 }
 
-fn args_json(arguments: &str) -> Option<serde_json::Value> {
+pub(crate) fn args_json(arguments: &str) -> Option<serde_json::Value> {
     let trimmed = arguments.trim();
     if trimmed.is_empty() {
         return None;
@@ -147,7 +145,7 @@ fn args_payload<'a>(args: &'a serde_json::Value, keys: &[&str]) -> Option<&'a st
         .find_map(|key| args.get(*key).and_then(|value| value.as_str()))
 }
 
-fn args_path(args: &serde_json::Value) -> Option<String> {
+pub(crate) fn args_path(args: &serde_json::Value) -> Option<String> {
     args_str(
         args,
         &[
@@ -489,7 +487,7 @@ fn exit_status_label(status: &str) -> Option<(String, bool)> {
     Some((format!("exit {code}"), code == 0))
 }
 
-fn card_container(theme: &gpui_component::theme::ThemeColor) -> Div {
+pub(crate) fn card_container(theme: &gpui_component::theme::ThemeColor) -> Div {
     div()
         .w_full()
         .min_w_0()
@@ -500,7 +498,7 @@ fn card_container(theme: &gpui_component::theme::ThemeColor) -> Div {
         .overflow_hidden()
 }
 
-fn card_header(theme: &gpui_component::theme::ThemeColor) -> Div {
+pub(crate) fn card_header(theme: &gpui_component::theme::ThemeColor) -> Div {
     div()
         .flex()
         .items_center()
@@ -525,17 +523,64 @@ fn card_body(theme: &gpui_component::theme::ThemeColor, id: &str) -> Scrollable<
         .text_color(theme.foreground)
 }
 
-/// Renders a command activity as a small terminal: a `$` prompt line carrying
-/// the command (and `cwd` when reported) plus its stdout/stderr, with an exit
-/// status badge once the result lands.
-fn render_command_card(
-    activity: &ToolActivityInfo,
-    cx: &mut App,
-) -> AnyElement {
+/// Shared compact viewport; consume wheel events after the inner scrollbar handles them.
+pub(crate) fn preview_viewport(id: String) -> Stateful<Div> {
+    div()
+        .id(SharedString::from(id))
+        .h(rems(6.0))
+        .flex_none()
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+}
+
+fn highlighted_command(text: String, cx: &App) -> StyledText {
+    highlighted_code(text, "bash", cx)
+}
+
+pub(crate) fn highlighted_code(text: String, language: &str, cx: &App) -> StyledText {
+    let mut highlighter = gpui_component::highlighter::SyntaxHighlighter::new(language);
+    highlighter.update(None, &gpui_component::Rope::from_str(&text), None);
+    let highlights = highlighter.styles(&(0..text.len()), cx.theme().highlight_theme.as_ref());
+    StyledText::new(text).with_highlights(highlights)
+}
+
+fn highlighted_output(text: String, cx: &App) -> StyledText {
+    let mut offset = 0;
+    let highlights = text
+        .split_inclusive('\n')
+        .filter_map(|line| {
+            let start = offset;
+            offset += line.len();
+            let line_start = line.trim_start();
+            let color = if line_start.starts_with("error") || line_start.starts_with("Error") {
+                cx.theme().danger
+            } else if line_start.starts_with("warning") || line_start.starts_with("Warning") {
+                cx.theme().warning
+            } else {
+                return None;
+            };
+            Some((
+                start..offset,
+                HighlightStyle {
+                    color: Some(color),
+                    ..Default::default()
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    StyledText::new(text).with_highlights(highlights)
+}
+
+/// Command and output remain visible; the output owns a compact scroll viewport.
+pub(crate) fn render_command_card(activity: &ToolActivityInfo, cx: &mut App) -> AnyElement {
     let theme = cx.theme().colors;
     let detail = command_detail(activity);
-    let is_error = activity.category == "Error";
-
+    let is_error = activity.category == "Error"
+        || detail
+            .output
+            .status
+            .as_deref()
+            .and_then(exit_status_label)
+            .is_some_and(|(_, ok)| !ok);
     let command_text = detail
         .command
         .clone()
@@ -544,116 +589,130 @@ fn render_command_card(
             args_str(&args, &["command", "CommandLine", "cmd"]).map(str::to_owned)
         })
         .unwrap_or_else(|| activity.display_summary.clone());
-
-    let mut header = card_header(&theme)
-        .child(
-            div()
-                .flex_none()
-                .font_family("monospace")
-                .text_sm()
-                .font_weight(FontWeight::BOLD)
-                .text_color(theme.primary)
-                .child("$"),
-        )
-        .child(
-            div()
-                .min_w_0()
-                .flex_1()
-                .truncate()
-                .font_family("monospace")
-                .text_xs()
-                .text_color(theme.foreground)
-                .child(command_text),
-        );
-    if let Some(cwd) = detail.cwd.clone() {
-        header = header.child(
-            div()
-                .id(SharedString::from(format!("tool-cwd-{}", activity.id)))
-                .flex_none()
-                .truncate()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .tooltip({
-                    let cwd = cwd.clone();
-                    move |window, cx| {
-                        gpui_component::tooltip::Tooltip::new(cwd.clone()).build(window, cx)
-                    }
-                })
-                .child(format!("in {cwd}")),
-        );
-    }
-    if detail.pending {
-        header = header.child(
-            div()
-                .flex_none()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child("Running…"),
-        );
-    } else if let Some((label, ok)) = detail
-        .output
-        .status
-        .as_deref()
-        .and_then(exit_status_label)
-    {
-        header = header.child(
-            Tag::new()
-                .child(label)
-                .with_variant(TagVariant::Secondary)
-                .small()
-                .text_color(if is_error || !ok {
-                    theme.danger
-                } else {
-                    theme.success
-                }),
-        );
-    }
-
-    let mut body = card_body(&theme, &activity.id).flex().flex_col();
-    if detail.pending {
-        body = body.child(
-            div()
-                .text_color(theme.muted_foreground)
-                .child("Waiting for output…"),
-        );
+    let running = activity.category == "Working";
+    let status = if running {
+        "Running".to_string()
+    } else if let Some((label, _)) = detail.output.status.as_deref().and_then(exit_status_label) {
+        label
     } else {
-        let stdout = detail.output.stdout.trim_end_matches('\n');
-        let stderr = detail.output.stderr.trim_end_matches('\n');
-        if stdout.is_empty() && stderr.is_empty() {
-            body = body.child(
-                div()
-                    .text_color(theme.muted_foreground)
-                    .child("(no output)"),
-            );
-        } else {
-            if !stdout.is_empty() {
-                body = body.child(
+        activity.category.clone()
+    };
+    let has_output =
+        !detail.pending && (!detail.output.stdout.is_empty() || !detail.output.stderr.is_empty());
+
+    card_container(&theme)
+        .debug_selector(|| "command-card".into())
+        .p_3()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(Icon::new(IconName::SquareTerminal).small())
+                .child(
                     div()
-                        .w_full()
-                        .whitespace_nowrap()
-                        .text_color(theme.foreground)
-                        .child(stdout.to_string()),
-                );
-            }
-            if !stderr.is_empty() {
-                body = body.child(
+                        .id(SharedString::from(format!("tool-cwd-{}", activity.id)))
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .tooltip({
+                            let cwd = detail.cwd.clone().unwrap_or_else(|| "Command".into());
+                            move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(cwd.clone()).build(window, cx)
+                            }
+                        })
+                        .child(
+                            detail
+                                .cwd
+                                .map(|cwd| format!("Command in {cwd}"))
+                                .unwrap_or_else(|| "Command".into()),
+                        ),
+                )
+                .child(
                     div()
-                        .w_full()
-                        .whitespace_nowrap()
+                        .flex_none()
+                        .text_xs()
                         .text_color(if is_error {
                             theme.danger
                         } else {
-                            theme.warning
+                            theme.muted_foreground
                         })
-                        .child(stderr.to_string()),
-                );
-            }
-        }
-    }
-
-    card_container(&theme)
-        .child(header)
-        .child(body)
+                        .child(status),
+                ),
+        )
+        .child(
+            div()
+                .debug_selector(|| "command-text".into())
+                .flex()
+                .items_start()
+                .gap_2()
+                .mt_3()
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(if is_error {
+                            theme.danger
+                        } else {
+                            theme.muted_foreground
+                        })
+                        .child(if running {
+                            "◌"
+                        } else if is_error {
+                            "!"
+                        } else {
+                            "$"
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .font_family("monospace")
+                        .text_sm()
+                        .text_color(theme.foreground)
+                        .child(highlighted_command(command_text, cx)),
+                ),
+        )
+        .when(has_output, |card| {
+            card.child(
+                preview_viewport(format!("command-output-{}", activity.id))
+                    .debug_selector(|| "command-output".into())
+                    .mt_2()
+                    .border_t_1()
+                    .border_color(theme.border.opacity(0.3))
+                    .child(
+                        div()
+                            .debug_selector(|| "command-output-content".into())
+                            .h_full()
+                            .min_h_0()
+                            .pt_2()
+                            .font_family("monospace")
+                            .text_xs()
+                            .text_color(theme.foreground)
+                            .overflow_y_scrollbar()
+                            .id(SharedString::from(format!(
+                                "command-output-scroll-{}",
+                                activity.id
+                            )))
+                            .children(
+                                (!detail.output.stdout.is_empty()).then(|| {
+                                    div().child(highlighted_output(detail.output.stdout, cx))
+                                }),
+                            )
+                            .children((!detail.output.stderr.is_empty()).then(|| {
+                                div()
+                                    .text_color(if is_error {
+                                        theme.danger
+                                    } else {
+                                        theme.foreground
+                                    })
+                                    .child(highlighted_output(detail.output.stderr, cx))
+                            })),
+                    ),
+            )
+        })
         .into_any_element()
 }
 
@@ -854,9 +913,6 @@ pub(crate) fn render_activity_detail_card(
     model: &Entity<AppState>,
     cx: &mut App,
 ) -> Option<AnyElement> {
-    if is_command_tool(&activity.title) {
-        return Some(render_command_card(activity, cx));
-    }
     if is_edit_tool(&activity.title) {
         return render_diff_card(activity, model, cx);
     }

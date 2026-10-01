@@ -23,6 +23,7 @@ threadlane-skills = { version = "0.1.0", path = "../threadlane-skills" }
 threadlane-daemon.workspace = true
 threadlane-ui-editor.workspace = true
 threadlane-ui-mirror.workspace = true
+threadlane-tools.workspace = true
 threadlane-ui-state.workspace = true
 threadlane-ui-theme.workspace = true
 tokio = { workspace = true, features = ["full"] }

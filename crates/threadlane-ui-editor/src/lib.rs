@@ -5,4 +5,4 @@
 
 mod view;
 
-pub use view::{EditorView, SaveFile};
+pub use view::{detect_language, EditorView, SaveFile};
