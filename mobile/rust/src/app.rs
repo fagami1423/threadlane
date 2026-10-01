@@ -28,8 +28,6 @@ use threadlane_protocol::events::AgentEvent;
 use threadlane_protocol::interaction::{
     PermissionRequest, PermissionScope, QuestionAnswer, QuestionItemAnswer, QuestionRequest,
 };
-use threadlane_protocol::messages::ReasoningEffort;
-
 use crate::client::{MobileDaemon, MobileEvent};
 use crate::preferences;
 
@@ -84,6 +82,11 @@ fn clear_pairing() {
 /// `embedded` constants instead.
 fn icon(bytes: &'static [u8]) -> Icon {
     Icon::default().data(bytes)
+}
+
+/// Selection/custom-answer map key: one entry per request + question item.
+fn question_key(request_id: &str, item_id: &str) -> String {
+    format!("{request_id}\0{item_id}")
 }
 
 /// Whether the transcript is scrolled to (within a few px of) the bottom —
@@ -158,9 +161,9 @@ pub struct MobileApp {
     port: Entity<InputState>,
     token: Entity<InputState>,
     composer: Entity<InputState>,
-    /// Shared input for a question's custom answer — requests with several
-    /// `allow_custom` items are rare, so one input under the first such item.
-    question_custom: Entity<InputState>,
+    /// One custom-answer input per `allow_custom` question item, keyed by
+    /// `question_key(request.id, item.id)` and created lazily on render.
+    question_inputs: HashMap<String, Entity<InputState>>,
     connect_error: Option<String>,
     /// Whether a persisted pairing exists — drives the Forget button.
     saved_pairing: bool,
@@ -189,8 +192,7 @@ impl MobileApp {
         let port = cx.new(|cx| InputState::new(window, cx).placeholder("port"));
         let token = cx.new(|cx| InputState::new(window, cx).placeholder("pairing token"));
         let composer = cx.new(|cx| InputState::new(window, cx).placeholder("Message"));
-        let question_custom = cx.new(|cx| InputState::new(window, cx).placeholder("Custom answer"));
-        let mut subscriptions = [&host, &port, &token, &question_custom]
+        let mut subscriptions = [&host, &port, &token]
             .iter()
             .map(|input| {
                 cx.subscribe_in(input, window, |_, _, event, _, _| match event {
@@ -260,7 +262,7 @@ impl MobileApp {
             port,
             token,
             composer,
-            question_custom,
+            question_inputs: HashMap::new(),
             connect_error: None,
             saved_pairing,
             daemon: None,
@@ -307,6 +309,18 @@ impl MobileApp {
                 .find(|(name, _)| name == key)
                 .map(|(_, value)| value.to_string())
         };
+        // A link that redirects to a different endpoint but carries no token
+        // must not inherit the credential saved for another host — the Bearer
+        // token is only valid for the endpoint it was paired with.
+        let endpoint_changed = query("host").is_some_and(|host| {
+            host != self.host.read(cx).value().trim().to_owned()
+        }) || query("port").is_some_and(|port| {
+            port != self.port.read(cx).value().trim().to_owned()
+        });
+        if endpoint_changed && query("token").is_none() {
+            self.token
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
         if let Some(host) = query("host") {
             self.host
                 .update(cx, |input, cx| input.set_value(host, window, cx));
@@ -573,7 +587,9 @@ impl MobileApp {
                 work_dir: active.work_dir.clone(),
                 text: text.clone(),
                 images: Vec::new(),
-                effort: ReasoningEffort::default(),
+                // Keep the effort the daemon already holds — mobile has no
+                // effort picker, so it must not re-seed a default.
+                effort: None,
                 acp_config: Vec::new(),
                 model: None,
             }
@@ -628,11 +644,11 @@ impl MobileApp {
         cx.notify();
     }
 
-    fn toggle_question_option(&mut self, item_id: &str, option: &str, cx: &mut Context<Self>) {
+    fn toggle_question_option(&mut self, key: &str, option: &str, cx: &mut Context<Self>) {
         let Some(active) = &mut self.active else {
             return;
         };
-        let selected = active.answers.entry(item_id.to_string()).or_default();
+        let selected = active.answers.entry(key.to_string()).or_default();
         if let Some(position) = selected.iter().position(|picked| picked == option) {
             selected.remove(position);
         } else {
@@ -641,7 +657,7 @@ impl MobileApp {
         cx.notify();
     }
 
-    fn answer_question(&mut self, dismiss: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn answer_question(&mut self, dismiss: bool, cx: &mut Context<Self>) {
         let Some(active) = &mut self.active else {
             return;
         };
@@ -657,8 +673,6 @@ impl MobileApp {
             cx.notify();
             return;
         }
-        let custom = self.question_custom.read(cx).value().trim().to_owned();
-        let mut custom_used = false;
         let answer = if dismiss {
             QuestionAnswer::dismissed(&request.id)
         } else {
@@ -669,25 +683,40 @@ impl MobileApp {
                     .questions
                     .iter()
                     .map(|item| {
-                        let custom_text = if item.allow_custom && !custom.is_empty() && !custom_used
-                        {
-                            custom_used = true;
-                            Some(custom.clone())
-                        } else {
-                            None
-                        };
+                        let key = question_key(&request.id, &item.id);
                         QuestionItemAnswer {
                             question_id: item.id.clone(),
-                            selected: active.answers.get(&item.id).cloned().unwrap_or_default(),
-                            custom_text,
+                            selected: active.answers.get(&key).cloned().unwrap_or_default(),
+                            custom_text: self
+                                .question_inputs
+                                .get(&key)
+                                .map(|input| input.read(cx).value().trim().to_string())
+                                .filter(|text| !text.is_empty()),
                         }
                     })
                     .collect(),
             }
         };
+        // Submit stays disabled until something is answered, but never resolve
+        // a totally unanswered card through any path — an empty answer is
+        // indistinguishable from a real one downstream.
+        if !dismiss
+            && answer.answers.iter().all(|item| {
+                item.selected.is_empty()
+                    && item
+                        .custom_text
+                        .as_deref()
+                        .is_none_or(|text| text.is_empty())
+            })
+        {
+            return;
+        }
         active.pop_question();
-        self.question_custom
-            .update(cx, |input, cx| input.set_value("", window, cx));
+        // Drop selections and inputs for the answered request.
+        let prefix = format!("{}\0", request.id);
+        active.answers.retain(|key, _| !key.starts_with(&prefix));
+        self.question_inputs
+            .retain(|key, _| !key.starts_with(&prefix));
         if let Some(daemon) = &self.daemon {
             daemon.send(SessionCommand::AnswerQuestion {
                 session_id: active.id.clone(),
@@ -890,7 +919,7 @@ impl MobileApp {
                                     .text_color(cx.theme().muted_foreground)
                                     .child("Host"),
                             )
-                            .child(Input::new(&self.host)),
+                            .child(Input::new(&self.host).aria_label("Daemon host")),
                     )
                     .child(
                         div()
@@ -903,7 +932,7 @@ impl MobileApp {
                                     .text_color(cx.theme().muted_foreground)
                                     .child("Port"),
                             )
-                            .child(Input::new(&self.port)),
+                            .child(Input::new(&self.port).aria_label("Daemon port")),
                     )
                     .child(
                         div()
@@ -916,7 +945,7 @@ impl MobileApp {
                                     .text_color(cx.theme().muted_foreground)
                                     .child("Token"),
                             )
-                            .child(Input::new(&self.token)),
+                            .child(Input::new(&self.token).aria_label("Pairing token")),
                     ),
             )
             .when_some(self.connect_error.clone(), |this, error| {
@@ -1117,7 +1146,7 @@ impl MobileApp {
             )
     }
 
-    fn render_session(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_session(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(active) = &self.active else {
             return div().size_full().bg(cx.theme().background);
         };
@@ -1154,7 +1183,19 @@ impl MobileApp {
                             .icon(icon(kit_icons::ArrowLeft.1))
                             .label("Back")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.active = None;
+                                // Snapshots don't carry pending requests, so
+                                // stash them back — the card and its row badge
+                                // must survive a Back-and-return round trip.
+                                if let Some(active) = this.active.take() {
+                                    if let Some(permission) = active.permission {
+                                        this.pending_permissions
+                                            .insert(active.id.clone(), permission);
+                                    }
+                                    if !active.questions.is_empty() {
+                                        this.pending_questions
+                                            .insert(active.id.clone(), active.questions);
+                                    }
+                                }
                                 this.screen = Screen::Sessions;
                                 cx.notify();
                             })),
@@ -1275,7 +1316,7 @@ impl MobileApp {
                 this.child(self.render_permission(&permission, cx))
             })
             .when_some(question, |this, question| {
-                this.child(self.render_question(&question, cx))
+                this.child(self.render_question(&question, window, cx))
             })
             .child(
                 div()
@@ -1287,7 +1328,12 @@ impl MobileApp {
                     .py_2()
                     .border_t_1()
                     .border_color(cx.theme().border)
-                    .child(div().flex_1().min_w_0().child(Input::new(&self.composer)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&self.composer).aria_label("Message")),
+                    )
                     .child(
                         Button::new("send")
                             .primary()
@@ -1445,21 +1491,45 @@ impl MobileApp {
             )
     }
 
-    /// The front question request: option toggles per item, one shared
-    /// custom-answer input under the first `allow_custom` item, then
-    /// Submit/Dismiss.
+    /// The front question request: option toggles per item, one custom-answer
+    /// input per `allow_custom` item, then Submit/Dismiss.
     fn render_question(
-        &self,
+        &mut self,
         request: &QuestionRequest,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let Some(active) = &self.active else {
             return div().into_any_element();
         };
         let answers = active.answers.clone();
-        let mut custom_rendered = false;
+        // Lazily create one custom-text input per allow_custom question so the
+        // entity (and focus) survives re-renders.
+        for item in request.questions.iter().filter(|item| item.allow_custom) {
+            let key = question_key(&request.id, &item.id);
+            if !self.question_inputs.contains_key(&key) {
+                let input =
+                    cx.new(|cx| InputState::new(window, cx).placeholder("Custom answer (optional)…"));
+                let subscription = cx.subscribe_in(
+                    &input,
+                    window,
+                    |_, _, event, _, _| match event {
+                        InputEvent::Focus => gpui_mobile::show_keyboard(),
+                        InputEvent::Blur => gpui_mobile::hide_keyboard(),
+                        _ => {}
+                    },
+                );
+                self._subscriptions.push(subscription);
+                self.question_inputs.insert(key, input);
+            }
+        }
+        // Drop state for superseded requests so a new question starts clean.
+        let prefix = format!("{}\0", request.id);
+        self.question_inputs
+            .retain(|key, _| key.starts_with(&prefix));
         let mut items = Vec::new();
         for item in &request.questions {
+            let key = question_key(&request.id, &item.id);
             let mut card = div()
                 .flex()
                 .flex_col()
@@ -1477,9 +1547,9 @@ impl MobileApp {
                 .child(div().flex().flex_wrap().gap_2().children(
                     item.options.iter().enumerate().map(|(index, option)| {
                         let selected = answers
-                            .get(&item.id)
+                            .get(&key)
                             .is_some_and(|picked| picked.iter().any(|o| o == option));
-                        let item_id = item.id.clone();
+                        let key = key.clone();
                         let option = option.clone();
                         let mut button = Button::new(format!("qopt-{}-{index}", item.id))
                             .small()
@@ -1490,30 +1560,41 @@ impl MobileApp {
                             button.outline()
                         };
                         button.on_click(cx.listener(move |this, _, _, cx| {
-                            this.toggle_question_option(&item_id, &option, cx)
+                            this.toggle_question_option(&key, &option, cx)
                         }))
                     }),
                 ));
-            // The shared custom-answer input renders under the first item
-            // that accepts one; `answer_question` attaches its text there.
-            if item.allow_custom && !custom_rendered {
-                custom_rendered = true;
-                card = card.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("Or write your own"),
-                        )
-                        .child(Input::new(&self.question_custom)),
-                );
+            if item.allow_custom {
+                if let Some(input) = self.question_inputs.get(&key) {
+                    card = card.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Or write your own"),
+                            )
+                            .child(Input::new(input).aria_label("Custom answer")),
+                    );
+                }
             }
             items.push(card);
         }
+        // Sending with zero selections and zero custom text resolves an empty
+        // answer (indistinguishable from a real one downstream), so Submit
+        // stays disabled until something is answered.
+        let has_answer = request.questions.iter().any(|item| {
+            let key = question_key(&request.id, &item.id);
+            let selected = answers.get(&key).is_some_and(|picked| !picked.is_empty());
+            let custom = self
+                .question_inputs
+                .get(&key)
+                .is_some_and(|input| !input.read(cx).value().trim().is_empty());
+            selected || custom
+        });
         let remaining = active.questions.len() - 1;
         div()
             .flex_none()
@@ -1563,8 +1644,9 @@ impl MobileApp {
                             .primary()
                             .small()
                             .label("Submit")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.answer_question(false, window, cx)
+                            .disabled(!has_answer)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.answer_question(false, cx)
                             })),
                     )
                     .child(
@@ -1572,8 +1654,8 @@ impl MobileApp {
                             .ghost()
                             .small()
                             .label("Dismiss")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.answer_question(true, window, cx)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.answer_question(true, cx)
                             })),
                     ),
             )
@@ -1582,11 +1664,11 @@ impl MobileApp {
 }
 
 impl Render for MobileApp {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         match self.screen {
             Screen::Connect => self.render_connect(cx).into_any_element(),
             Screen::Sessions => self.render_sessions(cx).into_any_element(),
-            Screen::Session => self.render_session(cx).into_any_element(),
+            Screen::Session => self.render_session(window, cx).into_any_element(),
         }
     }
 }

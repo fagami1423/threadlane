@@ -52,13 +52,16 @@ pub enum SessionCommand {
     /// agent settings to apply before the first turn. `model` re-seeds the
     /// daemon's current selection before the runtime is built — required on
     /// the first prompt of a daemon that has not seen a `SetModel` yet.
+    /// `effort` likewise re-seeds the daemon's current effort; `None` keeps
+    /// the selection already held (e.g. from a `SetReasoningEffort`).
     SubmitPrompt {
         session_id: String,
         work_dir: PathBuf,
         text: String,
         #[serde(default)]
         images: Vec<ImageAttachment>,
-        effort: ReasoningEffort,
+        #[serde(default)]
+        effort: Option<ReasoningEffort>,
         #[serde(default)]
         acp_config: Vec<(String, String)>,
         #[serde(default)]
@@ -761,7 +764,7 @@ mod tests {
                     display_name: "shot.png".into(),
                     data_url: "data:image/png;base64,AAAA".into(),
                 }],
-                effort: ReasoningEffort::High,
+                effort: Some(ReasoningEffort::High),
                 acp_config: vec![("model".into(), "auto".into())],
                 model: Some("gpt-5".into()),
             },
