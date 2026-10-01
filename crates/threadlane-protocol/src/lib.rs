@@ -8,6 +8,7 @@ pub mod interaction;
 pub mod live;
 pub mod messages;
 pub mod orchestration;
+pub mod repo;
 pub mod tool;
 
 pub use acp::{

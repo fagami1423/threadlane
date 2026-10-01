@@ -166,10 +166,6 @@ pub struct AppState {
     /// pins, pending prompts) runs only on the ack — a rejected delete
     /// must leave that data intact when the session row returns.
     pending_remote_deletes: HashMap<String, PathBuf>,
-    /// Correlates the `CommandRequest`s this client issues: replies
-    /// re-enter the stream as `SessionEvent::CommandResult` keyed by this
-    /// caller-chosen id.
-    next_command_request_id: u64,
     /// Queued-message cancels awaiting the daemon's confirmation:
     /// request_id → intent. `drain_chat_stream` resolves them when the
     /// `CommandResult` reply (or the journaled `QueuedEntryCancelled`)
@@ -769,7 +765,6 @@ impl AppState {
             terminal_command_tx,
             terminal_event_tx,
             pending_remote_deletes: HashMap::new(),
-            next_command_request_id: 1,
             pending_queued_cancels: HashMap::new(),
             scheduler_handles: HashMap::new(),
             scheduler_results: HashMap::new(),
@@ -1559,6 +1554,26 @@ impl AppState {
             let Some(project) = self.active_work_dir.clone() else {
                 return;
             };
+            if self.daemon_remote {
+                if self.daemon_client.supports_project_io() {
+                    // The daemon enumerates bases on its own filesystem
+                    // and answers through the journaled `WorktreeBases`
+                    // event — the only correct answer for a remote host.
+                    self.dispatch_command(SessionCommand::GetWorktreeBases {
+                        work_dir: project,
+                    });
+                } else {
+                    // A pre-3 remote daemon cannot answer; reporting the
+                    // limitation beats listing the client's own checkout.
+                    let _ = self.stream_tx.send(SessionEvent::WorktreeBases {
+                        project,
+                        result: Err(
+                            crate::project_io::UNSUPPORTED_PROJECT_IO.to_string(),
+                        ),
+                    });
+                }
+                return;
+            }
             match crate::chat::executor() {
                 Ok(runtime) => {
                     let tx = self.stream_tx.clone();
@@ -3164,10 +3179,19 @@ impl AppState {
     where
         F: FnOnce(&mut Self, String) -> Result<(), String>,
     {
-        let work_dir = std::fs::canonicalize(work_dir).map_err(|error| error.to_string())?;
         if model.trim().is_empty() {
             return Err("Choose a model before starting the task.".into());
         }
+        if self.daemon_remote {
+            // Issue work creates the worktree and `.threadlane/` session
+            // files inline below — that lifecycle is not daemon-side yet,
+            // so a remote attachment cannot run it. Fail clearly rather
+            // than touching the client's own filesystem.
+            return Err(
+                "GitHub issue work is not yet supported on remote daemons".into(),
+            );
+        }
+        let work_dir = std::fs::canonicalize(work_dir).map_err(|error| error.to_string())?;
         let effort =
             threadlane_provider::model_registry::effective_effort(&model, effort, Some(&work_dir));
         if !threadlane_git::is_git_repo(&work_dir) {
@@ -5069,6 +5093,11 @@ impl AppState {
                     }
                 }
                 SessionEvent::ProjectChanged { .. } => {}
+                SessionEvent::WorkspaceChanged { .. } => {
+                    // Files/git surfaces hold their own daemon
+                    // subscription and refresh off this event; AppState
+                    // itself keeps no filesystem mirror to update.
+                }
                 SessionEvent::SessionSnapshot {
                     session_id,
                     snapshot,
@@ -5307,8 +5336,9 @@ impl AppState {
                 .map(|message| message.content.clone())
                 .unwrap_or_default();
             if self.daemon_client.supports_command_requests() {
-                let request_id = self.next_command_request_id;
-                self.next_command_request_id += 1;
+                // Shared allocator: panel project-io requests mint ids
+                // against the same `RemoteDaemon` waiter map.
+                let request_id = threadlane_client::next_request_id();
                 self.pending_queued_cancels.insert(
                     request_id,
                     PendingQueuedCancel {

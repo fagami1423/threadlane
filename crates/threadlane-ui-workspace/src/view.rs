@@ -1344,7 +1344,7 @@ impl WorkspaceView {
         self.last_git_work_dir = active_git_work_dir.clone();
 
         if let Some(work_dir) = active_git_work_dir {
-            self.spawn_git_status_refresh(work_dir);
+            self.spawn_git_status_refresh(work_dir, cx);
         }
     }
 
@@ -1369,21 +1369,28 @@ impl WorkspaceView {
             .collect::<Vec<_>>();
         self.last_git_pr_targets = targets;
         for (work_dir, branch) in new_targets {
-            self.spawn_session_pr_refresh(work_dir, branch);
+            self.spawn_session_pr_refresh(work_dir, branch, cx);
         }
     }
 
-    fn spawn_session_pr_refresh(&self, work_dir: PathBuf, branch: String) {
+    fn spawn_session_pr_refresh(&self, work_dir: PathBuf, branch: String, cx: &App) {
         let tx = self.git_event_tx.clone();
-        std::thread::spawn(move || {
-            let result = threadlane_git::inspect_pr_for_branch(&work_dir, &branch)
-                .map_err(|error| error.to_string());
-            let _ = tx.send(GitEvent::PrLoaded {
-                work_dir,
-                branch,
-                result,
-            });
-        });
+        let client = self.model.read(cx).daemon_client.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let result = threadlane_ui_state::project_io::inspect_pr_for_branch(
+                    &client,
+                    &work_dir,
+                    branch.clone(),
+                )
+                .await;
+                let _ = tx.send(GitEvent::PrLoaded {
+                    work_dir,
+                    branch,
+                    result,
+                });
+            })
+            .detach();
     }
 
     fn schedule_session_pr_refresh(
@@ -1395,7 +1402,7 @@ impl WorkspaceView {
             cx.background_executor().timer(delay).await;
             let _ = this.update(cx, |this, _cx| {
                 if session_pr_target_is_active(&this.last_git_pr_targets, &target) {
-                    this.spawn_session_pr_refresh(target.0, target.1);
+                    this.spawn_session_pr_refresh(target.0, target.1, _cx);
                 }
             });
         })
@@ -1409,18 +1416,22 @@ impl WorkspaceView {
         };
 
         self.last_git_work_dir = Some(work_dir.clone());
-        self.spawn_git_status_refresh(work_dir);
+        self.spawn_git_status_refresh(work_dir, cx);
     }
 
-    fn spawn_git_status_refresh(&self, work_dir: PathBuf) {
+    fn spawn_git_status_refresh(&self, work_dir: PathBuf, cx: &App) {
         let tx = self.git_event_tx.clone();
-        std::thread::spawn(move || {
-            // Refresh remote-tracking refs before calculating ahead/behind and PR state.
-            // A failed fetch should not hide the local Git status (offline use is valid).
-            let _ = threadlane_git::sync_remote(&work_dir);
-            let result = threadlane_git::inspect(&work_dir).map_err(|error| error.to_string());
-            let _ = tx.send(GitEvent::Loaded { work_dir, result });
-        });
+        let client = self.model.read(cx).daemon_client.clone();
+        cx.background_executor()
+            .spawn(async move {
+                // `sync_remote` refreshes remote-tracking refs first; a
+                // failed fetch must not hide the local Git status
+                // (offline use is valid).
+                let result = threadlane_ui_state::project_io::inspect(&client, &work_dir, true)
+                    .await;
+                let _ = tx.send(GitEvent::Loaded { work_dir, result });
+            })
+            .detach();
     }
 
     fn apply_git_event(&mut self, event: GitEvent, cx: &mut Context<Self>) {

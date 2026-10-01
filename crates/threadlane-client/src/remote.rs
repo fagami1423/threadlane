@@ -25,7 +25,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use threadlane_protocol::daemon::{
     CommandReply, CommandRequest, CommandResponse, SessionCommand, SessionEvent,
-    COMMAND_REQUEST_PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
+    COMMAND_REQUEST_PROTOCOL_VERSION, PROJECT_IO_PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
 };
 
 use crate::DaemonClient;
@@ -38,8 +38,9 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// Longest a `command_request` waits for its reply before the caller is
 /// failed — the reply and the journaled recovery both land far inside
 /// it, so expiry means the answer was never coming (a peer that does
-/// not speak the request envelope, a dropped frame).
-const COMMAND_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// not speak the request envelope, a dropped frame). Sized for project-io
+/// Git mutations (`fetch`/`pull` over a WAN), not just control traffic.
+const COMMAND_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// One outbound frame: a bare fire-and-forget command, or a request
 /// envelope the server answers with a `{"response": ...}` reply.
@@ -515,6 +516,10 @@ impl DaemonClient for RemoteDaemon {
 
     fn supports_command_requests(&self) -> bool {
         self.protocol_version.load(Ordering::SeqCst) >= COMMAND_REQUEST_PROTOCOL_VERSION
+    }
+
+    fn supports_project_io(&self) -> bool {
+        self.protocol_version.load(Ordering::SeqCst) >= PROJECT_IO_PROTOCOL_VERSION
     }
 
     fn subscribe(&self) -> mpsc::UnboundedReceiver<SessionEvent> {

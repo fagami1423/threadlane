@@ -15,8 +15,12 @@ pub(super) fn generation_prompt(field: PrField, diff: &str) -> String {
     format!("{request}\n\nPR base-to-HEAD diff:\n{diff}")
 }
 
-pub(super) fn current_diff(work_dir: &Path, base: &str) -> Result<String, String> {
-    threadlane_git::draft_pr_diff(work_dir, base)
-        .map_err(|error| error.to_string())
+pub(super) async fn current_diff(
+    client: &std::sync::Arc<dyn threadlane_client::DaemonClient>,
+    work_dir: &Path,
+    base: &str,
+) -> Result<String, String> {
+    threadlane_ui_state::project_io::draft_pr_diff(client, work_dir, base.to_string())
+        .await
         .map(|diff| diff.chars().take(24_000).collect())
 }

@@ -256,8 +256,12 @@ impl Editor {
     fn refresh_project(&mut self, cx: &mut Context<Self>) {
         let project = self.definition.project.clone();
         let task_project = project.clone();
-        let task = threadlane_provider::exec::get_runtime()
-            .spawn_blocking(move || threadlane_git::is_git_repo(&task_project));
+        let client = self.model.read(cx).daemon_client.clone();
+        let task = threadlane_provider::exec::get_runtime().spawn(async move {
+            threadlane_ui_state::project_io::is_repo(&client, &task_project)
+                .await
+                .unwrap_or(false)
+        });
         cx.spawn(async move |owner, cx| {
             if let Ok(is_git) = task.await {
                 let _ = owner.update(cx, |this, cx| {

@@ -265,13 +265,9 @@ pub fn selection_bar_discard_options(
     options
 }
 
-#[derive(Clone, Debug)]
-pub struct FileNode {
-    pub relative_path: String,
-    pub name: String,
-    pub is_dir: bool,
-    pub children: Vec<FileNode>,
-}
+/// Files-surface tree node, delivered daemon-side by
+/// `SessionCommand::ListProjectFiles` (protocol v3).
+pub type FileNode = threadlane_protocol::repo::ProjectFileNode;
 
 pub enum PanelEvent {
     FilesLoaded {

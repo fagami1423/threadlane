@@ -9,6 +9,40 @@ use threadlane_ui_state::{
 };
 use threadlane_ui_state::{actions::AppAction, controller};
 
+/// Run a mutating wire-level `GitOperation` on the attached daemon and
+/// surface the action's own error (transport failures included).
+async fn run_git_op(
+    client: &std::sync::Arc<dyn threadlane_client::DaemonClient>,
+    work_dir: &std::path::Path,
+    operation: threadlane_protocol::repo::GitOperation,
+) -> Result<(), String> {
+    let outcome = threadlane_ui_state::project_io::run_action(client, work_dir, operation).await?;
+    match outcome.action_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Whether the subagent worktree still exists on the daemon host. When the
+/// worktree sits outside the project root the confinement check cannot
+/// answer, so we assume present and let `git worktree` report honestly.
+async fn worktree_present(
+    client: &std::sync::Arc<dyn threadlane_client::DaemonClient>,
+    root: &std::path::Path,
+    worktree: &std::path::Path,
+) -> bool {
+    let Ok(relative) = worktree.strip_prefix(root) else {
+        return true;
+    };
+    threadlane_ui_state::project_io::file_exists(
+        client,
+        root,
+        relative.to_string_lossy().into_owned(),
+    )
+    .await
+    .unwrap_or(true)
+}
+
 pub struct AgentsPanel {
     model: Entity<AppState>,
     selected_run_id: Option<String>,
@@ -519,11 +553,15 @@ impl AgentsPanel {
         cx: &mut Context<Self>,
     ) -> Option<Div> {
         let isolation = item.isolation.as_ref()?;
-        let root = self.model.read(cx).active_git_work_dir()?;
-        let theme = cx.theme().colors;
+        let state = self.model.read(cx);
+        let root = state.active_git_work_dir()?;
         let branch = isolation.branch.clone();
         let worktree = isolation.workspace.clone();
-        let worktree_available = worktree.is_dir();
+        // The worktree lives on the daemon host; remote callers verify
+        // presence through project-io inside the action instead of
+        // touching the client's disk.
+        let worktree_available = state.daemon_remote || worktree.is_dir();
+        let theme = cx.theme().colors;
 
         let inspect_model = self.model.clone();
         let inspect_root = root.clone();
@@ -575,19 +613,24 @@ impl AgentsPanel {
                                 .on_click(move |_, _, cx| {
                                     let root = inspect_root.clone();
                                     let branch = inspect_branch.clone();
+                                    let label = branch.clone();
+                                    let client =
+                                        inspect_model.read(cx).daemon_client.clone();
                                     let task = cx.background_executor().spawn(async move {
-                                        threadlane_git::diff_branch(&root, &branch)
-                                            .map(|diff| (root, branch, diff))
-                                            .map_err(|error| error.to_string())
+                                        threadlane_ui_state::project_io::diff_branch(
+                                            &client, &root, branch,
+                                        )
+                                        .await
+                                        .map(|diff| (root, diff))
                                     });
                                     let model = inspect_model.clone();
                                     cx.spawn(async move |cx| {
                                         let result = task.await;
                                         let _ = model.update(cx, |state, cx| {
                                             match result {
-                                                Ok((root, branch, diff)) => state.request_open_diff(
+                                                Ok((root, diff)) => state.request_open_diff(
                                                     root,
-                                                    format!("{branch}.diff"),
+                                                    format!("{label}.diff"),
                                                     if diff.is_empty() {
                                                         "No committed changes on this branch."
                                                             .into()
@@ -634,28 +677,56 @@ impl AgentsPanel {
                                     let root = apply_root.clone();
                                     let branch = apply_branch.clone();
                                     let worktree = apply_worktree.clone();
+                                    let client = apply_model.read(cx).daemon_client.clone();
                                     let task = cx.background_executor().spawn(async move {
-                                        let parent = threadlane_git::inspect(&root)
-                                            .map_err(|error| error.to_string())?;
+                                        let parent = threadlane_ui_state::project_io::inspect(
+                                            &client, &root, false,
+                                        )
+                                        .await?;
                                         if parent.has_changes {
                                             return Err("Commit or stash parent changes before applying a subagent branch.".into());
                                         }
-                                        if worktree.is_dir()
-                                            && threadlane_git::inspect(&worktree)
-                                                .map_err(|error| error.to_string())?
-                                                .has_changes
+                                        let worktree_present =
+                                            worktree_present(&client, &root, &worktree).await;
+                                        if worktree_present
+                                            && threadlane_ui_state::project_io::inspect(
+                                                &client, &worktree, false,
+                                            )
+                                            .await?
+                                            .has_changes
                                         {
                                             return Err("The subagent worktree has uncommitted changes; commit them before applying.".into());
                                         }
-                                        threadlane_git::merge(&root, &branch)
-                                            .map_err(|error| error.to_string())?;
-                                        if worktree.is_dir() {
-                                            threadlane_git::remove_worktree(&root, &worktree, false)
-                                                .map_err(|error| error.to_string())?;
-                                            threadlane_tools::remove_worktree_cargo_target_dir(&worktree);
+                                        run_git_op(
+                                            &client,
+                                            &root,
+                                            threadlane_protocol::repo::GitOperation::Merge {
+                                                branch: branch.clone(),
+                                            },
+                                        )
+                                        .await?;
+                                        if worktree_present {
+                                            // The daemon also clears the
+                                            // worktree's cargo-target lane.
+                                            run_git_op(
+                                                &client,
+                                                &root,
+                                                threadlane_protocol::repo::GitOperation::RemoveWorktree {
+                                                    worktree: worktree.clone(),
+                                                    force: false,
+                                                },
+                                            )
+                                            .await?;
                                         }
-                                        threadlane_git::delete_branch(&root, &branch, false)
-                                            .map_err(|error| error.to_string())?;
+                                        run_git_op(
+                                            &client,
+                                            &root,
+                                            threadlane_protocol::repo::GitOperation::DeleteBranch {
+                                                branch: branch.clone(),
+                                                force: false,
+                                            },
+                                        )
+                                        .await?;
                                         Ok(format!("Applied {branch}"))
                                     });
                                     let model = apply_model.clone();
@@ -696,15 +767,37 @@ impl AgentsPanel {
                                         if !matches!(confirmed, rfd::MessageDialogResult::Yes) {
                                             return;
                                         }
+                                        let client = model.update(cx, |state, _| {
+                                            state.daemon_client.clone()
+                                        });
                                         let task = cx.background_executor().spawn(async move {
-                                            if worktree.is_dir() {
-                                                threadlane_git::remove_worktree(&root, &worktree, true)
-                                                    .map_err(|error| error.to_string())?;
-                                                threadlane_tools::remove_worktree_cargo_target_dir(&worktree);
+                                            if worktree_present(&client, &root, &worktree).await
+                                            {
+                                                run_git_op(
+                                                    &client,
+                                                    &root,
+                                                    threadlane_protocol::repo::GitOperation::RemoveWorktree {
+                                                        worktree: worktree.clone(),
+                                                        force: true,
+                                                    },
+                                                )
+                                                .await?;
                                             }
-                                            threadlane_git::delete_branch(&root, &branch, true)
-                                                .map_err(|error| error.to_string())?;
-                                            let _ = threadlane_git::prune_worktrees(&root);
+                                            run_git_op(
+                                                &client,
+                                                &root,
+                                                threadlane_protocol::repo::GitOperation::DeleteBranch {
+                                                    branch: branch.clone(),
+                                                    force: true,
+                                                },
+                                            )
+                                            .await?;
+                                            let _ = run_git_op(
+                                                &client,
+                                                &root,
+                                                threadlane_protocol::repo::GitOperation::PruneWorktrees,
+                                            )
+                                            .await;
                                             Ok::<_, String>(format!("Discarded {branch}"))
                                         });
                                         let result = task.await;

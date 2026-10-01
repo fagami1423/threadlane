@@ -67,6 +67,9 @@ pub struct DaemonCore {
     worktree_setups: Mutex<HashMap<String, WorktreeSetup>>,
     /// Daemon-hosted PTYs, addressed by client-chosen terminal ids.
     terminals: crate::terminal::TerminalManager,
+    /// Refcounted filesystem watchers for `WatchProject`/`UnwatchProject`,
+    /// feeding the ephemeral `WorkspaceChanged` stream.
+    project_watchers: crate::project_io::ProjectWatchers,
     /// Events producers write into; pumped onto the journal + broadcast.
     ingest_tx: mpsc::UnboundedSender<SessionEvent>,
     /// `(seq, event)` pairs: the pump assigns a monotonic journal sequence
@@ -109,7 +112,7 @@ impl DaemonCore {
                         &event,
                         SessionEvent::TerminalEvent {
                             event: TerminalEvent::Output { .. }
-                        }
+                        } | SessionEvent::WorkspaceChanged { .. }
                     );
                     let mut journal = journal.lock().expect("daemon journal poisoned");
                     if journalable {
@@ -131,6 +134,7 @@ impl DaemonCore {
             attached_projects: Mutex::new(BTreeSet::new()),
             worktree_setups: Mutex::new(HashMap::new()),
             terminals: crate::terminal::TerminalManager::default(),
+            project_watchers: crate::project_io::ProjectWatchers::default(),
             ingest_tx,
             broadcast_tx,
             journal,
@@ -465,12 +469,25 @@ impl DaemonCore {
         command: SessionCommand,
         request_id: Option<u64>,
     ) -> Result<CommandResponse, String> {
+        // Payload commands return their error to the requester in the
+        // `CommandResponse`; echoing it again as a broadcast `DaemonError`
+        // would surface an expected request-scoped failure (e.g. a
+        // `FileInventory` "not a repository") as a global daemon fault.
+        let reports_via_response = matches!(
+            command,
+            SessionCommand::ListProjectFiles { .. }
+                | SessionCommand::ReadProjectFile { .. }
+                | SessionCommand::ProjectFileExists { .. }
+                | SessionCommand::GitRequest { .. }
+        );
         let result = self.dispatch_inner(command, request_id).await;
         if let Err(error) = &result {
-            let _ = self.ingest_tx.send(SessionEvent::DaemonError {
-                session_id: None,
-                message: error.clone(),
-            });
+            if !reports_via_response {
+                let _ = self.ingest_tx.send(SessionEvent::DaemonError {
+                    session_id: None,
+                    message: error.clone(),
+                });
+            }
         }
         result
     }
@@ -515,6 +532,47 @@ impl DaemonCore {
                         images,
                     }
                 });
+        }
+        // Project-io commands with a return payload resolve here; all are
+        // blocking filesystem/Git work.
+        match &command {
+            SessionCommand::ListProjectFiles { work_dir, limit } => {
+                let work_dir = work_dir.clone();
+                let limit = *limit;
+                let nodes = run_blocking_io(move || {
+                    threadlane_project::files::scan_project_tree(&work_dir, limit)
+                })
+                .await?;
+                return Ok(CommandResponse::ProjectFiles { nodes });
+            }
+            SessionCommand::ReadProjectFile { work_dir, path } => {
+                let work_dir = work_dir.clone();
+                let path = path.clone();
+                let content = run_blocking_io(move || {
+                    threadlane_project::files::read_project_file(&work_dir, &path)
+                })
+                .await??;
+                return Ok(CommandResponse::FileContent { content });
+            }
+            SessionCommand::ProjectFileExists { work_dir, path } => {
+                let work_dir = work_dir.clone();
+                let path = path.clone();
+                let exists = run_blocking_io(move || {
+                    threadlane_project::files::project_file_exists(&work_dir, &path)
+                })
+                .await??;
+                return Ok(CommandResponse::FileExists { exists });
+            }
+            SessionCommand::GitRequest { work_dir, operation } => {
+                let work_dir = work_dir.clone();
+                let operation = operation.clone();
+                let response = run_blocking_io(move || {
+                    crate::project_io::run_git_operation(&work_dir, &operation)
+                })
+                .await??;
+                return Ok(CommandResponse::Git { response });
+            }
+            _ => {}
         }
         self.dispatch_effect(command)
             .await
@@ -848,6 +906,49 @@ impl DaemonCore {
             SessionCommand::GetSessionSnapshot { session_id } => {
                 self.emit_session_snapshot(&session_id)
             }
+            SessionCommand::WriteProjectFile {
+                work_dir,
+                path,
+                content,
+            } => {
+                run_blocking_io(move || {
+                    threadlane_project::files::write_project_file(&work_dir, &path, &content)
+                })
+                .await?
+            }
+            SessionCommand::WatchProject { work_dir } => self
+                .project_watchers
+                .watch(work_dir, self.ingest_tx.clone()),
+            SessionCommand::UnwatchProject { work_dir } => {
+                self.project_watchers.unwatch(&work_dir)
+            }
+            SessionCommand::GetWorktreeBases { work_dir } => {
+                // Answered through the journaled `WorktreeBases` event —
+                // same path the embedded host's direct call used to take.
+                let ingest_tx = self.ingest_tx.clone();
+                let emit = move || {
+                    let result = threadlane_git::worktree_bases(&work_dir)
+                        .map_err(|error| error.to_string());
+                    let _ = ingest_tx.send(SessionEvent::WorktreeBases {
+                        project: work_dir,
+                        result,
+                    });
+                };
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    crate::chat::executor()?.spawn_blocking(emit);
+                } else {
+                    emit();
+                }
+                Ok(())
+            }
+            // Payload commands are answered inside `dispatch_inner` and
+            // never reach the effect path.
+            SessionCommand::ListProjectFiles { .. }
+            | SessionCommand::ReadProjectFile { .. }
+            | SessionCommand::ProjectFileExists { .. }
+            | SessionCommand::GitRequest { .. } => {
+                Err("payload command bypassed response dispatch".into())
+            }
         }
     }
 
@@ -1160,5 +1261,23 @@ impl std::fmt::Debug for DaemonCore {
             .debug_struct("DaemonCore")
             .field("runtimes", &self.runtimes.lock().map(|map| map.len()))
             .finish_non_exhaustive()
+    }
+}
+
+/// Run blocking filesystem/Git work on the shared reactor's blocking
+/// pool when a Tokio runtime is driving the dispatch (the WebSocket
+/// server path), or inline when it is not: an in-process `LocalDaemon`
+/// polled from a non-Tokio executor has no runtime to hop onto, and its
+/// caller's thread is already a blocking-safe place.
+async fn run_blocking_io<R: Send + 'static>(
+    work: impl FnOnce() -> R + Send + 'static,
+) -> Result<R, String> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        crate::chat::executor()?
+            .spawn_blocking(work)
+            .await
+            .map_err(|error| error.to_string())
+    } else {
+        Ok(work())
     }
 }

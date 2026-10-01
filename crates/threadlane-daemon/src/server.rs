@@ -111,10 +111,10 @@ fn note_terminal(command: &SessionCommand, owned: &mut std::collections::HashSet
 /// [`WIRE_PROTOCOL_VERSION`] as a header value — `from_static` needs a
 /// literal, so keep this in step with the constant. The const assert
 /// below fails the build when one moves without the other.
-const WIRE_PROTOCOL_VERSION_STR: &str = "2";
+const WIRE_PROTOCOL_VERSION_STR: &str = "3";
 
 const _: () = assert!(
-    WIRE_PROTOCOL_VERSION == 2,
+    WIRE_PROTOCOL_VERSION == 3,
     "WIRE_PROTOCOL_VERSION_STR must match WIRE_PROTOCOL_VERSION"
 );
 

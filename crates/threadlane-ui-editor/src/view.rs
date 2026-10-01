@@ -346,11 +346,12 @@ impl EditorView {
         let load_project = project_dir.to_path_buf();
         let load_path = relative_path.to_string();
         let load_editor = editor;
+        let read_client = self.model.read(cx).daemon_client.clone();
         let read_project = load_project.clone();
         let read_path = load_path.clone();
         let read = cx.background_executor().spawn(async move {
-            std::fs::read_to_string(read_project.join(&read_path))
-                .map_err(|error| error.to_string())
+            threadlane_ui_state::project_io::read_file(&read_client, &read_project, read_path)
+                .await
         });
         cx.spawn(async move |this, cx| {
             let result = read.await;
@@ -671,23 +672,59 @@ impl EditorView {
             return;
         };
 
-        let file_path = tab.project_dir.join(&tab.relative_path);
+        let project_dir = tab.project_dir.clone();
+        let relative_path = tab.relative_path.clone();
+        let file_path = project_dir.join(&relative_path);
         let content = editor.read(cx).value().to_string();
         let file_name = tab.file_name.clone();
+        let editor = editor.clone();
+        let client = self.model.read(cx).daemon_client.clone();
 
-        match std::fs::write(&file_path, &content) {
-            Ok(_) => {
-                tab.saved_content = content;
-                tab.is_dirty = false;
-                self.set_status(format!("Saved {file_name}"), false);
+        // The file lives on the daemon host; save through project-io and
+        // only settle the tab once the daemon confirms the write.
+        cx.spawn(async move |this, cx| {
+            let write_dir = project_dir.clone();
+            let write_path = relative_path.clone();
+            let write_content = content.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    threadlane_ui_state::project_io::write_file(
+                        &client,
+                        &write_dir,
+                        write_path,
+                        write_content,
+                    )
+                    .await
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        if let Some(tab) = this.tabs.iter_mut().find(|t| {
+                            t.project_dir == project_dir
+                                && t.relative_path == relative_path
+                                && !t.is_diff
+                        }) {
+                            let current = editor.read(cx).value();
+                            tab.is_dirty = current.as_str() != content.as_str();
+                            tab.saved_content = content;
+                        }
+                        this.set_status(format!("Saved {file_name}"), false);
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            "Failed to save file {}: {}",
+                            file_path.display(),
+                            err
+                        );
+                        this.set_status(format!("Error saving {file_name}: {err}"), true);
+                    }
+                }
                 cx.notify();
-            }
-            Err(err) => {
-                tracing::error!("Failed to save file {}: {}", file_path.display(), err);
-                self.set_status(format!("Error saving {file_name}: {err}"), true);
-                cx.notify();
-            }
-        }
+            });
+        })
+        .detach();
     }
 
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {

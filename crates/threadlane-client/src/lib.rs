@@ -25,10 +25,22 @@ pub use local::LocalDaemon;
 pub use remote::RemoteDaemon;
 
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use threadlane_protocol::daemon::{
     CommandRequest, CommandResponse, SessionCommand, SessionEvent,
 };
+
+/// Caller-chosen `request_id` source shared by every `CommandRequest`
+/// issued through this crate — `AppState` control requests and per-view
+/// project-io calls alike — so two issuers on one `RemoteDaemon`
+/// connection can never collide and strand each other's waiters.
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate a connection-unique `request_id` for a `CommandRequest`.
+pub fn next_request_id() -> u64 {
+    NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// The session contract a daemon serves and clients consume.
 #[async_trait]
@@ -53,6 +65,18 @@ pub trait DaemonClient: Send + Sync {
         request: CommandRequest,
     ) -> Result<CommandResponse, String>;
 
+    /// `command_request` with a freshly allocated id from
+    /// [`crate::next_request_id`] — the common case for callers that do
+    /// not need to know the id up front (e.g. to correlate a journaled
+    /// recovery event).
+    async fn request(&self, command: SessionCommand) -> Result<CommandResponse, String> {
+        self.command_request(CommandRequest {
+            request_id: crate::next_request_id(),
+            command,
+        })
+        .await
+    }
+
     /// Whether the attached daemon speaks the `CommandRequest` envelope
     /// (wire protocol version ≥ 2). Always true in-process; a remote
     /// client learns it from the handshake's `x-threadlane-protocol`
@@ -60,6 +84,15 @@ pub trait DaemonClient: Send + Sync {
     /// to a pre-2 daemon. Callers use it to pick a degraded path (e.g. a
     /// fire-and-forget bare command) rather than lose the command.
     fn supports_command_requests(&self) -> bool;
+
+    /// Whether the attached daemon serves the project-io surface: file
+    /// tree/read/write commands, `GitRequest` operations, and
+    /// `WatchProject`/`UnwatchProject`/`GetWorktreeBases` (wire protocol
+    /// version ≥ [`PROJECT_IO_PROTOCOL_VERSION`]). Always true in-process;
+    /// a remote client reports false while unconnected or attached to a
+    /// pre-3 daemon — callers must fail the operation rather than touch
+    /// their own filesystem, which is not the host's.
+    fn supports_project_io(&self) -> bool;
 
     /// Attach to the daemon's event stream. Each call returns an
     /// independent receiver; journal replay (for late attach/reconnect)

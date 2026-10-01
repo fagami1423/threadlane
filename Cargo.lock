@@ -8745,6 +8745,7 @@ dependencies = [
  "rfd",
  "serde_json",
  "threadlane-acp-engine",
+ "threadlane-client",
  "threadlane-coding-agent",
  "threadlane-git",
  "threadlane-project",
