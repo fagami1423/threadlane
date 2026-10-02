@@ -88,6 +88,10 @@ impl MobileDaemon {
         runtime().spawn(async move {
             let result = if matches!(command, SessionCommand::BeginSession { .. } | SessionCommand::GetComposerOptions { .. }) && !client.supports_composer_options() {
                 Err("Update desktop to use new chats and composer options".into())
+            } else if matches!(command, SessionCommand::GitRequest { .. }) && !client.supports_project_io() {
+                Err("Update desktop to use the Git panel".into())
+            } else if matches!(command, SessionCommand::GitHubRequest { .. } | SessionCommand::AutomationRequest { .. }) && !client.supports_github_automation() {
+                Err("Update desktop to use issues, pull requests, and automations".into())
             } else if client.supports_command_requests() { client.request(command.clone()).await }
                 else { Err("This desktop version cannot acknowledge commands. Update desktop before sending.".into()) };
             let _ = tx.send(MobileEvent::CommandResult { command, result });

@@ -29,7 +29,7 @@ use threadlane_protocol::repo::{
     CheckoutMode, DiffOptions, GitBranchInfo, GitCommitInfo, GitFile,
     GitHubIssueDetail, GitHubIssueListState, GitHubIssueSummary, GitHubOperation,
     GitHubPrInfo, GitHubPrListState, GitHubPullRequestSummary, GitHubResponse,
-    GitOperation, GitResponse, GitStashInfo, GitStatus,
+    GitOperation, GitResponse, GitStashInfo, GitStatus, PrCheckStatus,
 };
 use threadlane_protocol::{OrchestratorMode, ReasoningEffort};
 
@@ -108,6 +108,35 @@ fn icon(bytes: &'static [u8]) -> Icon {
 /// Selection/custom-answer map key: one entry per request + question item.
 fn question_key(request_id: &str, item_id: &str) -> String {
     format!("{request_id}\0{item_id}")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckState {
+    Passing,
+    Pending,
+    Failing,
+}
+
+/// `gh` reports check statuses and conclusions in uppercase; this mirrors
+/// the classification in `crates/threadlane-git/src/github.rs`.
+fn check_state(check: &PrCheckStatus) -> CheckState {
+    let conclusion = check.conclusion.as_deref().unwrap_or("").to_uppercase();
+    if matches!(
+        conclusion.as_str(),
+        "FAILURE" | "TIMED_OUT" | "ACTION_REQUIRED" | "CANCELLED" | "ERROR"
+    ) {
+        CheckState::Failing
+    } else if matches!(
+        check.status.to_uppercase().as_str(),
+        "IN_PROGRESS" | "QUEUED" | "PENDING" | "EXPECTED"
+    ) || check.conclusion.is_none()
+    {
+        CheckState::Pending
+    } else if matches!(conclusion.as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED") {
+        CheckState::Passing
+    } else {
+        CheckState::Pending
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -236,6 +265,10 @@ pub struct MobileApp {
     pr_detail: Option<GitHubPrInfo>,
     pr_detail_pending: Option<u64>,
     pr_comment: Entity<gpui_kit::component::input::TextareaState>,
+    /// Comment text per detail target, keyed
+    /// `<work_dir>|issue-<number>` / `<work_dir>|pr-<number>` — stashed
+    /// on close so switching details can't misdirect a draft.
+    comment_drafts: HashMap<String, String>,
     models: Vec<ComposerModel>,
     session_drafts: Vec<SessionInfo>,
     selected_model: Option<String>,
@@ -426,6 +459,7 @@ impl MobileApp {
             pr_detail: None,
             pr_detail_pending: None,
             pr_comment,
+            comment_drafts: HashMap::new(),
             models: Vec::new(),
             session_drafts: Vec::new(),
             selected_model: None,
@@ -533,6 +567,7 @@ impl MobileApp {
         self.prs = None;
         self.pr_detail = None;
         self.pr_detail_pending = None;
+        self.comment_drafts.clear();
         self.daemon = Some(daemon);
         self.screen = Screen::Main;
         self.tab = Tab::Chats;
@@ -713,23 +748,42 @@ impl MobileApp {
                 self.mode = mode;
             }
             CommandResponse::GitHub { response } => {
-                let SessionCommand::GitHubRequest { operation, .. } = command else {
+                let SessionCommand::GitHubRequest { work_dir, operation } = command else {
                     return;
                 };
+                // Replies are scoped to the project filter they were
+                // issued under; a reply from a previous pick must not
+                // land on the current panel.
+                if self.client.sidebar_project_filter.as_ref() != Some(work_dir) {
+                    return;
+                }
                 match response {
                     GitHubResponse::Issues { issues } => {
-                        self.issues = Some(issues);
+                        if matches!(operation, GitHubOperation::ListIssues { .. }) {
+                            self.issues = Some(issues);
+                        }
                     }
                     GitHubResponse::Issue { detail } => {
-                        self.issue_detail_pending = None;
-                        self.issue_detail = Some(detail);
+                        let number = detail.summary.issue.number;
+                        if self.issue_detail_pending == Some(number) {
+                            self.issue_detail_pending = None;
+                            self.stash_comment_drafts(cx);
+                            self.restore_comment_draft("issue", number, window, cx);
+                            self.issue_detail = Some(detail);
+                        }
                     }
                     GitHubResponse::PullRequests { prs } => {
-                        self.prs = Some(prs);
+                        if matches!(operation, GitHubOperation::ListPullRequests { .. }) {
+                            self.prs = Some(prs);
+                        }
                     }
                     GitHubResponse::PullRequest { pr } => {
-                        self.pr_detail_pending = None;
-                        self.pr_detail = Some(pr);
+                        if self.pr_detail_pending == Some(pr.number) {
+                            self.pr_detail_pending = None;
+                            self.stash_comment_drafts(cx);
+                            self.restore_comment_draft("pr", pr.number, window, cx);
+                            self.pr_detail = Some(pr);
+                        }
                     }
                     GitHubResponse::Text { text } => {
                         if let Some(title) = self.git_diff_pending.take() {
@@ -750,8 +804,12 @@ impl MobileApp {
                         // Refresh whatever a mutation may have touched: the
                         // list, and the open detail's comment/state.
                         match operation {
-                            GitHubOperation::CommentIssue { .. }
-                            | GitHubOperation::SetIssueState { .. } => {
+                            GitHubOperation::CommentIssue { number, .. }
+                            | GitHubOperation::SetIssueState { number, .. } => {
+                                if matches!(operation, GitHubOperation::CommentIssue { .. }) {
+                                    self.comment_drafts
+                                        .remove(&format!("{}|issue-{number}", work_dir.display()));
+                                }
                                 if let Some(detail) = &self.issue_detail {
                                     let number = detail.summary.issue.number;
                                     self.issue_detail_pending = Some(number);
@@ -759,11 +817,15 @@ impl MobileApp {
                                 }
                                 self.refresh_issues();
                             }
-                            GitHubOperation::DeleteIssue { .. } => {
+                            GitHubOperation::DeleteIssue { number, .. } => {
                                 self.issue_detail = None;
+                                self.comment_drafts
+                                    .remove(&format!("{}|issue-{number}", work_dir.display()));
                                 self.refresh_issues();
                             }
-                            GitHubOperation::CommentPullRequest { .. } => {
+                            GitHubOperation::CommentPullRequest { number, .. } => {
+                                self.comment_drafts
+                                    .remove(&format!("{}|pr-{number}", work_dir.display()));
                                 if let Some(pr) = &self.pr_detail {
                                     let number = pr.number;
                                     self.pr_detail_pending = Some(number);
@@ -2440,6 +2502,57 @@ impl MobileApp {
         });
     }
 
+    /// Stash both detail comment inputs under their target keys so a
+    /// draft typed on one issue/PR cannot leak onto the next one opened.
+    fn stash_comment_drafts(&mut self, cx: &mut Context<Self>) {
+        let Some(work_dir) = self.client.sidebar_project_filter.clone() else {
+            return;
+        };
+        if let Some(detail) = &self.issue_detail {
+            let key = format!("{}|issue-{}", work_dir.display(), detail.summary.issue.number);
+            let text = self.issue_comment.read(cx).value().to_string();
+            if text.trim().is_empty() {
+                self.comment_drafts.remove(&key);
+            } else {
+                self.comment_drafts.insert(key, text);
+            }
+        }
+        if let Some(pr) = &self.pr_detail {
+            let key = format!("{}|pr-{}", work_dir.display(), pr.number);
+            let text = self.pr_comment.read(cx).value().to_string();
+            if text.trim().is_empty() {
+                self.comment_drafts.remove(&key);
+            } else {
+                self.comment_drafts.insert(key, text);
+            }
+        }
+    }
+
+    /// Load the stashed draft (or blank) for a target about to open.
+    fn restore_comment_draft(
+        &mut self,
+        scope: &str,
+        number: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = self
+            .client
+            .sidebar_project_filter
+            .as_ref()
+            .and_then(|work_dir| {
+                self.comment_drafts
+                    .remove(&format!("{}|{scope}-{number}", work_dir.display()))
+            })
+            .unwrap_or_default();
+        let input = if scope == "issue" {
+            &self.issue_comment
+        } else {
+            &self.pr_comment
+        };
+        input.update(cx, |input, cx| input.set_value(text, window, cx));
+    }
+
     /// The sidebar's project pick is the scope for every panel — chats and
     /// Git both read `sidebar_project_filter`, so switching re-scopes the
     /// whole surface at once.
@@ -2447,10 +2560,13 @@ impl MobileApp {
         self.client.sidebar_project_filter = Some(work_dir.clone());
         self.sidebar_open = false;
         self.git_diff = None;
+        self.stash_comment_drafts(cx);
         self.issues = None;
         self.issue_detail = None;
+        self.issue_detail_pending = None;
         self.prs = None;
         self.pr_detail = None;
+        self.pr_detail_pending = None;
         self.send_git(GitOperation::Inspect { sync_remote: false });
         if matches!(self.tab, Tab::Issues) {
             self.refresh_issues();
@@ -4158,7 +4274,7 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let number = issue.issue.number;
-        let open = issue.state == "open";
+        let open = issue.state.eq_ignore_ascii_case("open");
         let dot = if open {
             cx.theme().success
         } else {
@@ -4245,7 +4361,7 @@ impl MobileApp {
     ) -> impl IntoElement {
         let issue = &detail.summary;
         let number = issue.issue.number;
-        let open = issue.state == "open";
+        let open = issue.state.eq_ignore_ascii_case("open");
         let pending = self.issue_detail_pending == Some(number);
         let confirming = self.issue_confirm_delete;
         let comment_ready = !self.issue_comment.read(cx).value().trim().is_empty();
@@ -4274,7 +4390,9 @@ impl MobileApp {
                             .icon(icon(kit_icons::X.1))
                             .accessibility_label("Close issue")
                             .on_click(cx.listener(|this, _, _, cx| {
+                                this.stash_comment_drafts(cx);
                                 this.issue_detail = None;
+                                this.issue_detail_pending = None;
                                 cx.notify();
                             })),
                     )
@@ -4696,9 +4814,9 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let number = pr.number;
-        let glyph = if pr.state == "merged" {
+        let glyph = if pr.state.eq_ignore_ascii_case("merged") {
             cx.theme().info
-        } else if pr.state == "open" {
+        } else if pr.state.eq_ignore_ascii_case("open") {
             cx.theme().success
         } else {
             cx.theme().muted_foreground
@@ -4707,7 +4825,10 @@ impl MobileApp {
             .checks
             .iter()
             .fold((0usize, 0usize), |(ok, all), check| {
-                (ok + usize::from(check.conclusion.as_deref() == Some("success")), all + 1)
+                (
+                    ok + usize::from(check_state(check) == CheckState::Passing),
+                    all + 1,
+                )
             });
         div().px_2().py_1().child(
             Button::new(format!("pr-row-{number}"))
@@ -4820,7 +4941,9 @@ impl MobileApp {
                             .icon(icon(kit_icons::X.1))
                             .accessibility_label("Close pull request")
                             .on_click(cx.listener(|this, _, _, cx| {
+                                this.stash_comment_drafts(cx);
                                 this.pr_detail = None;
+                                this.pr_detail_pending = None;
                                 cx.notify();
                             })),
                     )
@@ -4915,12 +5038,16 @@ impl MobileApp {
                                 )
                             })
                             .children(pr.checks.iter().map(|check| {
-                                let (glyph, color) = match check.conclusion.as_deref() {
-                                    Some("success") => {
+                                let (glyph, color) = match check_state(check) {
+                                    CheckState::Passing => {
                                         (kit_icons::CircleCheck.1, cx.theme().success)
                                     }
-                                    Some(_) => (kit_icons::CircleX.1, cx.theme().danger),
-                                    None => (kit_icons::Loader.1, cx.theme().muted_foreground),
+                                    CheckState::Failing => {
+                                        (kit_icons::CircleX.1, cx.theme().danger)
+                                    }
+                                    CheckState::Pending => {
+                                        (kit_icons::Loader.1, cx.theme().muted_foreground)
+                                    }
                                 };
                                 div()
                                     .flex()
