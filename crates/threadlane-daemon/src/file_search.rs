@@ -1,6 +1,6 @@
 //! Bounded saved-file search; queries and snippets never enter the journal.
 use std::{
-    fs::File,
+    fs::{File, Metadata},
     io::Read,
     path::{Component, Path},
     time::{Duration, Instant},
@@ -10,7 +10,18 @@ const FILE_BYTES: u64 = 2 * 1024 * 1024;
 const TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const RESPONSE_BYTES: usize = 1024 * 1024;
 
+#[cfg(all(test, unix))]
+thread_local! {
+    static FILE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub fn validate_target(root: &Path, relative: &str) -> Result<(), String> {
+    open_validated(root, relative).map(|_| ())
+}
+
+/// Share the validated descriptor and its metadata with the scan, avoiding a
+/// second traversal/open and a repeated descriptor metadata lookup.
+fn open_validated(root: &Path, relative: &str) -> Result<(File, Metadata), String> {
     let path = threadlane_project::files::resolve_project_path(root, relative)?;
     let mut current = root.to_path_buf();
     for part in Path::new(relative).components() {
@@ -30,13 +41,15 @@ pub fn validate_target(root: &Path, relative: &str) -> Result<(), String> {
     if !path.is_file() {
         return Err("Not a regular file; refresh the search".into());
     }
-    open_regular(root, relative).map(|_| ())
+    open_regular(root, relative)
 }
 
 /// Walk directory descriptors instead of reopening a checked string path: a
 /// rename or symlink swap cannot redirect a scan outside the captured root.
 #[cfg(unix)]
-fn open_regular(root: &Path, relative: &str) -> Result<File, String> {
+fn open_regular(root: &Path, relative: &str) -> Result<(File, Metadata), String> {
+    #[cfg(test)]
+    FILE_OPENS.set(FILE_OPENS.get() + 1);
     use rustix::fs::{open, openat, Mode, OFlags};
     let mut fd = open(
         root,
@@ -56,16 +69,22 @@ fn open_regular(root: &Path, relative: &str) -> Result<File, String> {
         fd = openat(&fd, *part, flags, Mode::empty()).map_err(|e| e.to_string())?;
     }
     let file = File::from(fd);
-    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() {
         return Err("Not a regular file".into());
     }
-    Ok(file)
+    Ok((file, metadata))
 }
 
 #[cfg(not(unix))]
-fn open_regular(root: &Path, relative: &str) -> Result<File, String> {
+fn open_regular(root: &Path, relative: &str) -> Result<(File, Metadata), String> {
     let path = threadlane_project::files::resolve_project_path(root, relative)?;
-    File::open(path).map_err(|e| e.to_string())
+    let file = File::open(path).map_err(|e| e.to_string())?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() {
+        return Err("Not a regular file".into());
+    }
+    Ok((file, metadata))
 }
 
 pub fn search(root: &Path, query: &str) -> Result<FileSearchResult, String> {
@@ -97,22 +116,10 @@ pub fn search(root: &Path, query: &str) -> Result<FileSearchResult, String> {
                 .push("64 MiB total-read budget reached".into());
             break;
         }
-        if validate_target(root, &path).is_err() {
-            skipped += 1;
-            continue;
-        }
-        let Ok(file) = open_regular(root, &path) else {
+        let Ok((file, meta)) = open_validated(root, &path) else {
             skipped += 1;
             continue;
         };
-        let Ok(meta) = file.metadata() else {
-            skipped += 1;
-            continue;
-        };
-        if !meta.is_file() {
-            skipped += 1;
-            continue;
-        }
         if meta.len() > FILE_BYTES {
             oversized += 1;
             continue;
@@ -455,5 +462,21 @@ mod root_replacement_tests {
         std::os::unix::fs::symlink(&outside, &root).unwrap();
         assert!(super::open_regular(&root, "same.txt").is_err());
         assert!(super::validate_target(&root, "same.txt").is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod descriptor_reuse_tests {
+    #[test]
+    fn file_search_opens_each_inventory_entry_once() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"]).arg(dir.path()).status().unwrap().success());
+        std::fs::write(dir.path().join("sample.txt"), "needle").unwrap();
+        super::FILE_OPENS.set(0);
+        let result = super::search(dir.path(), "needle").unwrap();
+        assert_eq!(result.matches.len(), 1);
+        assert!(result.partial.is_empty());
+        assert_eq!(super::FILE_OPENS.get(), 1);
     }
 }
