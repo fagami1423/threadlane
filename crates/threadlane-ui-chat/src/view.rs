@@ -619,6 +619,21 @@ impl ChatListView {
                 model.update(cx, |state, _cx| state.requested_editor_target.take())
             {
                 match target {
+                    threadlane_ui_state::RequestedEditorTarget::SearchFile {
+                        project, path, line, owner_project, owner_session, daemon_identity, connection_epoch,
+                    } => {
+                        let state = model.read(cx);
+                        let active = state.daemon_client.supports_file_search()
+                            && state.daemon_client.file_search_connection_epoch() == connection_epoch
+                            && state.client.active_work_dir == owner_project
+                            && state.client.active_session_id == owner_session
+                            && std::sync::Arc::as_ptr(&state.daemon_client) as *const () as usize == daemon_identity
+                            && state.active_git_work_dir().as_ref() == Some(&project);
+                        if active {
+                            this.set_tab(CentralTab::Editor, cx);
+                            this.editor.update(cx, |editor, cx| editor.open_file_at_line(project, &path, Some(line), cx));
+                        }
+                    }
                     threadlane_ui_state::RequestedEditorTarget::File { project, path, line } => {
                         let is_active = {
                             let state = model.read(cx);

@@ -1227,6 +1227,7 @@ impl WorkspaceView {
                 })
                 .detach();
             }
+            "find_files" => threadlane_ui_right_panel::file_search::open(self.model.clone(), window, cx),
             "git" => self.open_git_review(cx),
             "automations" => {
                 self.model.update(cx, |state, cx| { controller::dispatch(state, AppAction::OpenAutomations); cx.notify(); });
@@ -1556,7 +1557,7 @@ impl WorkspaceView {
         let model = self.model.clone();
         let state = model.read(cx);
 
-        let commands: [(&str, &str, &str, Icon, &[&str], &str); 24] = [
+        let commands: [(&str, &str, &str, Icon, &[&str], &str); 25] = [
             (
                 "New Task",
                 "Start a fresh session",
@@ -1603,6 +1604,14 @@ impl WorkspaceView {
                 "add_terminal_selection",
                 Icon::default().path("icons/square-pen.svg"),
                 &["terminal", "selection", "chat", "draft", "add", "output"],
+                "",
+            ),
+            (
+                "Find in files…",
+                "Search saved files in the active checkout",
+                "find_files",
+                Icon::from(IconName::Search),
+                &["find", "files", "search", "text", "contents"],
                 "",
             ),
             (

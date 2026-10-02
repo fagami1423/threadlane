@@ -6,6 +6,7 @@
 mod browser;
 mod agents;
 mod draft_pr;
+pub mod file_search;
 mod pr_generation;
 #[cfg(test)]
 mod tests;

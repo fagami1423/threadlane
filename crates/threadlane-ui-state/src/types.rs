@@ -8,6 +8,16 @@ pub use threadlane_daemon::types::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RequestedEditorTarget {
+    /// Host-validated saved-file navigation, rechecked again at consumption.
+    SearchFile {
+        project: PathBuf,
+        path: String,
+        line: usize,
+        owner_project: Option<PathBuf>,
+        owner_session: Option<String>,
+        daemon_identity: usize,
+        connection_epoch: u64,
+    },
     File {
         project: PathBuf,
         path: String,

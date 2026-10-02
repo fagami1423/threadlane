@@ -426,3 +426,48 @@ fn remote_client_fails_command_requests_fast_on_a_v1_peer() {
         );
     });
 }
+
+#[test]
+fn file_search_remote_root_never_needs_to_exist_on_client() {
+    use futures::{SinkExt, StreamExt};
+    use threadlane_protocol::{daemon::{CommandReply, PROTOCOL_VERSION_HEADER}, repo::{FileSearchMatch, FileSearchResult}};
+    use tokio_tungstenite::tungstenite::{Message, handshake::server::{Request, Response}};
+    threadlane_daemon::chat::executor().unwrap().block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_hdr_async(socket, |_: &Request, mut response: Response| {
+                response.headers_mut().insert(PROTOCOL_VERSION_HEADER, "6".parse().unwrap());
+                Ok(response)
+            }).await.unwrap();
+            let message = socket.next().await.unwrap().unwrap();
+            let request: CommandRequest = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            let SessionCommand::SearchProjectFiles { work_dir, query } = request.command else { panic!("wrong request") };
+            assert_eq!(work_dir, std::path::PathBuf::from("/daemon-only/nonexistent-on-client"));
+            assert_eq!(query, "λ : needle");
+            let reply = CommandReply { request_id: request.request_id, result: Ok(CommandResponse::FileSearch {
+                result: FileSearchResult { matches: vec![FileSearchMatch { path: "colon:name".into(), line: 7, snippet: query, match_start: 0, match_end: 11 }], partial: vec![] }
+            }) };
+            socket.send(Message::Text(serde_json::json!({"response": reply}).to_string().into())).await.unwrap();
+            let message = socket.next().await.unwrap().unwrap();
+            let request: CommandRequest = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            assert!(matches!(request.command, SessionCommand::ValidateSearchTarget { .. }));
+            socket.send(Message::Text(serde_json::json!({"response": CommandReply { request_id: request.request_id, result: Ok(CommandResponse::Ack) }}).to_string().into())).await.unwrap();
+        });
+        let client = RemoteDaemon::connect(format!("ws://{addr}"), None);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !client.supports_file_search() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let root = std::path::PathBuf::from("/daemon-only/nonexistent-on-client");
+        assert!(!root.exists());
+        let reply = client.request(SessionCommand::SearchProjectFiles { work_dir: root.clone(), query: "λ : needle".into() }).await.unwrap();
+        let CommandResponse::FileSearch { result } = reply else { panic!("wrong response") };
+        assert_eq!(result.matches[0].line, 7);
+        assert_eq!(result.matches[0].path, "colon:name");
+        assert!(matches!(client.request(SessionCommand::ValidateSearchTarget { work_dir: root, path: "colon:name".into() }).await.unwrap(), CommandResponse::Ack));
+        server.await.unwrap();
+    });
+}

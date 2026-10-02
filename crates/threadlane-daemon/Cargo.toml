@@ -40,3 +40,6 @@ threadlane-coding-agent = { workspace = true, features = ["test-support"] }
 
 [features]
 test-support = []
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }

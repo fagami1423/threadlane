@@ -556,3 +556,21 @@ pub enum GitResponse {
     /// A mutation settled; see [`GitActionOutcome`].
     Action { outcome: GitActionOutcome },
 }
+
+/// One saved-file matching line. Snippets are plain text, not Markdown.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSearchMatch {
+    pub path: String,
+    pub line: usize,
+    pub snippet: String,
+    /// UTF-8 byte range of the first match within the bounded snippet.
+    pub match_start: usize,
+    pub match_end: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSearchResult {
+    pub matches: Vec<FileSearchMatch>,
+    /// Exact coverage limits and skip counts; empty only for a complete scan.
+    pub partial: Vec<String>,
+}

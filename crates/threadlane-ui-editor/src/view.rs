@@ -180,6 +180,9 @@ impl EditorView {
                     .find(|tab| tab.project_dir == project && tab.relative_path == path)
                 {
                     tab.pending_line = line;
+                    if let Some(editor) = &tab.editor_state {
+                        editor.update(cx, |editor, cx| editor.focus(window, cx));
+                    }
                 }
             }
             PendingOpen::Diff { path, content } => {
@@ -281,6 +284,9 @@ impl EditorView {
             .position(|t| t.project_dir == project_dir && t.relative_path == relative_path)
         {
             self.active_tab_index = Some(existing_idx);
+            if self.tabs[existing_idx].is_dirty {
+                self.set_status("Unsaved buffer preserved; saved-file line numbers may differ.".into(), false);
+            }
             cx.notify();
             return;
         }
@@ -1068,6 +1074,11 @@ mod navigation_tests {
                 "requested line must be visibly revealed: {caret:?} in {viewport:?}"
             );
         });
+        cx.simulate_input("unsaved");
+        let unsaved = editor.read_with(cx, |editor, cx| {
+            assert!(editor.tabs[0].is_dirty);
+            editor.tabs[0].editor_state.as_ref().unwrap().read(cx).value().to_string()
+        });
         editor.update(cx, |editor, cx| {
             editor.open_file_at_line(project, "sample.rs", Some(3), cx)
         });
@@ -1089,6 +1100,9 @@ mod navigation_tests {
                     .line,
                 2
             );
+            assert!(editor.tabs[0].is_dirty);
+            assert_eq!(editor.tabs[0].editor_state.as_ref().unwrap().read(cx).value().as_str(), unsaved);
+            assert!(editor.visible_status().unwrap().0.contains("Unsaved buffer preserved"));
         });
     }
 }

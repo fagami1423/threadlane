@@ -8405,6 +8405,7 @@ dependencies = [
  "getrandom 0.4.3",
  "portable-pty",
  "robius-open",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

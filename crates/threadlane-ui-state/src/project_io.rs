@@ -341,3 +341,21 @@ pub async fn get_worktree_bases(
         })
         .await
 }
+
+/// Search only the owning daemon's saved files. Never fall back to client disk.
+pub async fn search_files(client: &Arc<dyn DaemonClient>, root: &Path, query: String) -> Result<threadlane_protocol::repo::FileSearchResult, String> {
+    if !client.is_connected() { return Err("Daemon disconnected. Reconnect and retry.".into()); }
+    if !client.supports_file_search() { return Err("Unsupported daemon version. Update to protocol v6 or newer.".into()); }
+    match client.request(SessionCommand::SearchProjectFiles { work_dir: root.into(), query }).await? {
+        CommandResponse::FileSearch { result } => Ok(result),
+        _ => Err("Unexpected search response".into()),
+    }
+}
+
+pub async fn validate_search_target(client: &Arc<dyn DaemonClient>, root: &Path, path: String) -> Result<(), String> {
+    if !client.supports_file_search() { return Err("Find in files requires a connected protocol v6 daemon".into()); }
+    match client.request(SessionCommand::ValidateSearchTarget { work_dir: root.into(), path }).await? {
+        CommandResponse::Ack => Ok(()),
+        _ => Err("Unexpected file validation response".into()),
+    }
+}

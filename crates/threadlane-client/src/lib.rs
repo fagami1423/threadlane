@@ -98,6 +98,13 @@ pub trait DaemonClient: Send + Sync {
     /// their own filesystem, which is not the host's.
     fn supports_project_io(&self) -> bool;
 
+    /// Distinct capability floor: project I/O alone does not imply search.
+    fn supports_file_search(&self) -> bool { false }
+    /// Current transport availability (in-process clients are always connected).
+    fn is_connected(&self) -> bool { true }
+    /// Changes on reconnect, invalidating ephemeral results from an old host.
+    fn file_search_connection_epoch(&self) -> u64 { 0 }
+
     /// Whether the attached daemon serves the GitHub (forge) and
     /// automation surfaces: `GitHubRequest`/`AutomationRequest` commands
     /// and `SessionEvent::AutomationChanged` (wire protocol version ≥

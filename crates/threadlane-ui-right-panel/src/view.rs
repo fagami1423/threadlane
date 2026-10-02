@@ -2064,6 +2064,10 @@ impl RightPanelView {
             .flex_1()
             .min_h_0()
             .py_2()
+            .child(Button::new("find-in-files").label("Find in files…").ghost().small()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    super::file_search::open(this.model.clone(), window, cx);
+                })))
             .child(
                 Tree::new(
                     &self.tree_state,
