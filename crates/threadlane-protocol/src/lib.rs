@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod acp;
+pub mod automation;
 pub mod browser;
 pub mod daemon;
 pub mod events;

@@ -98,6 +98,15 @@ pub trait DaemonClient: Send + Sync {
     /// their own filesystem, which is not the host's.
     fn supports_project_io(&self) -> bool;
 
+    /// Whether the attached daemon serves the GitHub (forge) and
+    /// automation surfaces: `GitHubRequest`/`AutomationRequest` commands
+    /// and `SessionEvent::AutomationChanged` (wire protocol version ≥
+    /// [`GITHUB_AUTOMATION_PROTOCOL_VERSION`]). Always true in-process;
+    /// a remote client reports false while unconnected or attached to a
+    /// pre-5 daemon — callers hide the panels rather than issue commands
+    /// an older daemon cannot decode.
+    fn supports_github_automation(&self) -> bool;
+
     /// Attach to the daemon's event stream. Each call returns an
     /// independent receiver; journal replay (for late attach/reconnect)
     /// is decided by the transport, not the caller.

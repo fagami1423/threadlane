@@ -16,7 +16,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use threadlane_protocol::daemon::SessionEvent;
-use threadlane_protocol::repo::{CheckoutMode, GitActionOutcome, GitOperation, GitResponse};
+use threadlane_protocol::repo::{
+    CheckoutMode, GitActionOutcome, GitHubOperation, GitHubResponse, GitOperation, GitResponse,
+};
 use threadlane_project::watcher::{WorkspaceChangeEvent, WorkspaceWatcher};
 use tokio::sync::mpsc;
 
@@ -343,6 +345,91 @@ pub fn run_git_operation(work_dir: &Path, operation: &GitOperation) -> Result<Gi
                 .map(|_| None)
                 .map_err(git_error)
         }),
+    };
+    Ok(response)
+}
+
+/// Execute one [`GitHubOperation`] against `work_dir`. Issue/PR reads answer
+/// their own payload variant; mutations answer [`GitHubResponse::Action`]
+/// with the forge command's user-facing output when it produced any.
+/// Everything runs through `gh`, so callers honor the host's configured
+/// forge credentials — not the client's.
+pub fn run_github_operation(
+    work_dir: &Path,
+    operation: &GitHubOperation,
+) -> Result<GitHubResponse, String> {
+    let git_error = |error: threadlane_git::GitError| error.to_string();
+    let response = match operation {
+        GitHubOperation::ListIssues {
+            state,
+            query,
+            limit,
+        } => GitHubResponse::Issues {
+            issues: threadlane_git::list_github_issues(
+                work_dir,
+                state.as_str(),
+                query.as_deref(),
+                *limit,
+            )
+            .map_err(git_error)?,
+        },
+        GitHubOperation::InspectIssue { number } => GitHubResponse::Issue {
+            detail: threadlane_git::inspect_github_issue(work_dir, *number).map_err(git_error)?,
+        },
+        GitHubOperation::CreateIssue { title, body } => GitHubResponse::Number {
+            number: threadlane_git::create_github_issue(work_dir, title, body)
+                .map_err(git_error)?,
+        },
+        GitHubOperation::CommentIssue { number, body } => GitHubResponse::Action {
+            message: Some(
+                threadlane_git::comment_on_github_issue(work_dir, *number, body)
+                    .map_err(git_error)?,
+            )
+            .filter(|text| !text.is_empty()),
+        },
+        GitHubOperation::SetIssueState { number, close } => {
+            threadlane_git::set_github_issue_state(work_dir, *number, *close)
+                .map_err(git_error)?;
+            GitHubResponse::Action {
+                message: Some(if *close {
+                    format!("Closed issue #{number}")
+                } else {
+                    format!("Reopened issue #{number}")
+                }),
+            }
+        }
+        GitHubOperation::DeleteIssue { number } => {
+            threadlane_git::delete_github_issue(work_dir, *number).map_err(git_error)?;
+            GitHubResponse::Action {
+                message: Some(format!("Deleted issue #{number}")),
+            }
+        }
+        GitHubOperation::ListPullRequests {
+            state,
+            query,
+            limit,
+        } => GitHubResponse::PullRequests {
+            prs: threadlane_git::list_github_pull_requests(
+                work_dir,
+                state.as_str(),
+                query.as_deref(),
+                *limit,
+            )
+            .map_err(git_error)?,
+        },
+        GitHubOperation::InspectPullRequest { number } => GitHubResponse::PullRequest {
+            pr: threadlane_git::inspect_pr_number(work_dir, *number).map_err(git_error)?,
+        },
+        GitHubOperation::PullRequestDiff { number } => GitHubResponse::Text {
+            text: threadlane_git::pull_request_diff(work_dir, *number).map_err(git_error)?,
+        },
+        GitHubOperation::CommentPullRequest { number, body } => GitHubResponse::Action {
+            message: Some(
+                threadlane_git::comment_on_pull_request(work_dir, *number, body)
+                    .map_err(git_error)?,
+            )
+            .filter(|text| !text.is_empty()),
+        },
     };
     Ok(response)
 }

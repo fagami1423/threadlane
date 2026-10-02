@@ -1258,17 +1258,9 @@ impl AppState {
 
     pub fn start_automations(&mut self) -> tokio::sync::watch::Receiver<crate::automation::Projection> {
         let service = crate::automation::AutomationService::shared();
-        let mut events = service.subscribe();
-        let tx = self.stream_tx.clone();
-        threadlane_provider::exec::get_runtime().spawn(async move {
-            loop {
-                match events.recv().await {
-                    Ok(event) => if tx.send(event).is_err() { break; },
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(_) => break,
-                }
-            }
-        });
+        // The daemon core's automation bridge forwards the service's agent
+        // events into the same broadcast `daemon_client.subscribe()` feeds
+        // `stream_tx` — subscribing here too would apply each twice.
         let updates = service.projection.clone();
         self.automation_service = Some(service);
         self.apply_automation_projection(updates.borrow().clone());
@@ -5187,6 +5179,11 @@ impl AppState {
                     }
                 }
                 SessionEvent::ProjectChanged { .. } => {}
+                SessionEvent::AutomationChanged { .. } => {
+                    // `apply_automation_projection` already applies the
+                    // service's watch channel directly — the journaled copy
+                    // exists for transport clients.
+                }
                 SessionEvent::WorkspaceChanged { .. } => {
                     // Files/git surfaces hold their own daemon
                     // subscription and refresh off this event; AppState

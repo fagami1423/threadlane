@@ -8545,6 +8545,7 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+ "threadlane-automation",
  "tokio",
 ]
 

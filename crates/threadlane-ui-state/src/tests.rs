@@ -5373,6 +5373,10 @@ impl threadlane_client::DaemonClient for RecordingDaemonClient {
         false
     }
 
+    fn supports_github_automation(&self) -> bool {
+        false
+    }
+
     fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<SessionEvent> {
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
         rx
