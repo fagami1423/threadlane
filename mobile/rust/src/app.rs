@@ -1036,7 +1036,13 @@ impl MobileApp {
             } => {
                 let echo_id = format!("queued-user-{session_id}-{entry_id}");
                 self.client.messages_mut().retain(|m| m.id != echo_id);
-                self.pending_queued_cancel = None;
+                if self
+                    .pending_queued_cancel
+                    .as_ref()
+                    .is_some_and(|(sid, eid)| sid == &session_id && eid == &entry_id)
+                {
+                    self.pending_queued_cancel = None;
+                }
                 self.client.session_status = Some("Queued message removed".to_string());
             }
             CommandResponse::Ack => {
@@ -1373,9 +1379,20 @@ impl MobileApp {
                         self.client.session_status = Some(error.clone());
                         return;
                     }
-                    if let SessionCommand::CancelQueuedMessage { .. } = &command {
+                    if let SessionCommand::CancelQueuedMessage {
+                        session_id,
+                        entry_id,
+                        ..
+                    } = &command
+                    {
                         // The echo stays: the entry never left the queue.
-                        self.pending_queued_cancel = None;
+                        if self
+                            .pending_queued_cancel
+                            .as_ref()
+                            .is_some_and(|(sid, eid)| sid == session_id && eid == entry_id)
+                        {
+                            self.pending_queued_cancel = None;
+                        }
                         self.client.session_status =
                             Some(format!("Could not remove queued message: {error}"));
                         return;
@@ -1653,6 +1670,15 @@ impl MobileApp {
                 "This agent does not support live steering. Use Queue for the next turn."
                     .to_string(),
             );
+            cx.notify();
+            return;
+        }
+        let connected = self
+            .daemon
+            .as_ref()
+            .is_some_and(|daemon| daemon.is_connected());
+        if !connected {
+            self.client.session_status = Some("Not connected — message was not sent".to_string());
             cx.notify();
             return;
         }
