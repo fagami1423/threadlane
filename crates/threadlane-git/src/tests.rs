@@ -1697,6 +1697,106 @@ fn worktree_bases_refreshes_refs_and_selects_only_existing_defaults() {
     assert_eq!(worktree_bases(local.path()).unwrap(), (default, branches));
 }
 
+fn init_fetch_repo_pair() -> (tempfile::TempDir, tempfile::TempDir) {
+    let remote = tempdir().unwrap();
+    let local = tempdir().unwrap();
+    for dir in [remote.path(), local.path()] {
+        run_git(dir, &["init", "-q", "-b", "main"]);
+        run_git(dir, &["config", "user.email", "test@example.com"]);
+        run_git(dir, &["config", "user.name", "Test"]);
+    }
+    run_git(
+        remote.path(),
+        &["commit", "--allow-empty", "-qm", "initial"],
+    );
+    run_git(
+        local.path(),
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
+    (remote, local)
+}
+
+#[test]
+fn sync_remote_coalesces_fetches_within_a_window() {
+    let (_remote, local) = init_fetch_repo_pair();
+    REMOTE_FETCH_RUNS.set(0);
+    sync_remote(local.path()).unwrap();
+    assert_eq!(REMOTE_FETCH_RUNS.get(), 1);
+    // Within the window the remote state is shared, not refetched.
+    sync_remote(local.path()).unwrap();
+    assert_eq!(REMOTE_FETCH_RUNS.get(), 1);
+    // An explicit Fetch always runs and re-arms the window.
+    fetch(local.path()).unwrap();
+    assert_eq!(REMOTE_FETCH_RUNS.get(), 2);
+    sync_remote(local.path()).unwrap();
+    assert_eq!(REMOTE_FETCH_RUNS.get(), 2);
+}
+
+#[test]
+fn sync_remote_shares_one_fetch_across_linked_worktrees() {
+    let (_remote, local) = init_fetch_repo_pair();
+    run_git(local.path(), &["commit", "--allow-empty", "-qm", "local"]);
+    let sibling = local.path().join("sibling");
+    run_git(
+        local.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            sibling.to_str().unwrap(),
+            "-b",
+            "sibling",
+        ],
+    );
+    REMOTE_FETCH_RUNS.set(0);
+    sync_remote(local.path()).unwrap();
+    assert_eq!(REMOTE_FETCH_RUNS.get(), 1);
+    // A linked worktree shares refs/remotes with the root, so its sync
+    // is already fresh — no second remote call.
+    sync_remote(&sibling).unwrap();
+    assert_eq!(REMOTE_FETCH_RUNS.get(), 1);
+}
+
+#[test]
+fn sync_remote_retries_after_a_failed_fetch() {
+    let (_remote, local) = init_fetch_repo_pair();
+    run_git(
+        local.path(),
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "/nonexistent/threadlane-test-remote",
+        ],
+    );
+    REMOTE_FETCH_RUNS.set(0);
+    assert!(sync_remote(local.path()).is_err());
+    // A failure is not freshness-stamped: the next sync retries.
+    assert!(sync_remote(local.path()).is_err());
+    assert_eq!(REMOTE_FETCH_RUNS.get(), 2);
+}
+
+#[test]
+fn pull_marks_remote_refs_fresh_for_background_syncs() {
+    let (remote, _keep) = init_fetch_repo_pair();
+    let parent = tempdir().unwrap();
+    run_git(
+        parent.path(),
+        &[
+            "clone",
+            "-q",
+            remote.path().to_str().unwrap(),
+            "local",
+        ],
+    );
+    let local = parent.path().join("local");
+    pull(&local).unwrap();
+    REMOTE_FETCH_RUNS.set(0);
+    // The pull already refreshed remote-tracking refs.
+    sync_remote(&local).unwrap();
+    assert_eq!(REMOTE_FETCH_RUNS.get(), 0);
+}
+
 #[test]
 fn list_project_files_reports_tracked_and_nonignored_untracked() {
     let dir = tempdir().unwrap();
