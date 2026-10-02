@@ -52,6 +52,8 @@ impl DaemonClient for LocalDaemon {
         true
     }
 
+    fn supports_file_search(&self) -> bool { true }
+
     fn supports_project_io(&self) -> bool {
         true
     }

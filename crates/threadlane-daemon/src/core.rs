@@ -568,6 +568,8 @@ impl DaemonCore {
             command,
             SessionCommand::BeginSession { .. }
                 | SessionCommand::GetComposerOptions { .. }
+                | SessionCommand::SearchProjectFiles { .. }
+                | SessionCommand::ValidateSearchTarget { .. }
                 | SessionCommand::ListProjectFiles { .. }
                 | SessionCommand::ReadProjectFile { .. }
                 | SessionCommand::ProjectFileExists { .. }
@@ -695,6 +697,24 @@ impl DaemonCore {
                         .unwrap_or_else(|| *self.effort.read().expect("effort poisoned")),
                     mode: threadlane_project::subagent_settings::load(work_dir).orchestrator_mode,
                 });
+            }
+            SessionCommand::SearchProjectFiles { work_dir, query } => {
+                // Bound simultaneous blocking scans even across connected clients.
+                static SEARCH_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+                let permit = SEARCH_SLOTS.try_acquire().map_err(|_| "Search busy; retry shortly")?;
+                let work_dir = work_dir.clone();
+                let query = query.clone();
+                let result = run_blocking_io(move || {
+                    let _permit = permit;
+                    crate::file_search::search(&work_dir, &query)
+                }).await??;
+                return Ok(CommandResponse::FileSearch { result });
+            }
+            SessionCommand::ValidateSearchTarget { work_dir, path } => {
+                let work_dir = work_dir.clone();
+                let path = path.clone();
+                run_blocking_io(move || crate::file_search::validate_target(&work_dir, &path)).await??;
+                return Ok(CommandResponse::Ack);
             }
             SessionCommand::ListProjectFiles { work_dir, limit } => {
                 let work_dir = work_dir.clone();
@@ -1190,7 +1210,9 @@ impl DaemonCore {
             }
             // Payload commands are answered inside `dispatch_inner` and
             // never reach the effect path.
-            SessionCommand::ListProjectFiles { .. }
+            SessionCommand::SearchProjectFiles { .. }
+            | SessionCommand::ValidateSearchTarget { .. }
+            | SessionCommand::ListProjectFiles { .. }
             | SessionCommand::ReadProjectFile { .. }
             | SessionCommand::ProjectFileExists { .. }
             | SessionCommand::GitRequest { .. }

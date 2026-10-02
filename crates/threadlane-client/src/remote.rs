@@ -114,6 +114,7 @@ pub struct RemoteDaemon {
     /// on every connect, so a rollback to an older daemon re-gates the
     /// `CommandRequest` envelope.
     protocol_version: Arc<AtomicU64>,
+    connection_epoch: Arc<AtomicU64>,
 }
 
 impl RemoteDaemon {
@@ -214,6 +215,7 @@ impl RemoteDaemon {
             connected: Arc::new(AtomicBool::new(false)),
             last_seq: Arc::new(AtomicU64::new(0)),
             protocol_version: Arc::new(AtomicU64::new(0)),
+            connection_epoch: Arc::new(AtomicU64::new(0)),
         });
         if let Some(error) = (!pairing)
             .then(|| Self::transport_policy_error(&url, &token))
@@ -240,6 +242,7 @@ impl RemoteDaemon {
         let connected = client.connected.clone();
         let last_seq = client.last_seq.clone();
         let protocol_version = client.protocol_version.clone();
+        let connection_epoch = client.connection_epoch.clone();
         let driver = executor.spawn(Self::drive(
             url,
             token,
@@ -249,6 +252,7 @@ impl RemoteDaemon {
             connected,
             last_seq,
             protocol_version,
+            connection_epoch,
             client.connection.clone(),
         ));
         *client.driver.lock().expect("connection driver poisoned") = Some(driver.abort_handle());
@@ -349,6 +353,7 @@ impl RemoteDaemon {
         connected: Arc<AtomicBool>,
         last_seq: Arc<AtomicU64>,
         protocol_version: Arc<AtomicU64>,
+        connection_epoch: Arc<AtomicU64>,
         connection: tokio::sync::watch::Sender<ConnectionState>,
     ) {
         let mut was_connected = false;
@@ -460,6 +465,7 @@ impl RemoteDaemon {
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(1);
             protocol_version.store(peer_version, Ordering::SeqCst);
+            connection_epoch.fetch_add(1, Ordering::SeqCst);
             was_connected = true;
             backoff = RECONNECT_BACKOFF_INITIAL;
             connected.store(true, Ordering::SeqCst);
@@ -611,6 +617,10 @@ impl RemoteDaemon {
                 "daemon does not support command requests (protocol version {peer_version})"
             ));
         }
+        if matches!(request.command, SessionCommand::SearchProjectFiles { .. } | SessionCommand::ValidateSearchTarget { .. })
+            && peer_version < threadlane_protocol::daemon::FILE_SEARCH_PROTOCOL_VERSION {
+            return Err(format!("Find in files requires protocol v6; attached daemon uses v{peer_version}"));
+        }
         let request_id = request.request_id;
         let replayable = matches!(request.command, SessionCommand::CancelQueuedMessage { .. });
         let (tx, rx) = oneshot::channel();
@@ -709,6 +719,12 @@ impl DaemonClient for RemoteDaemon {
         self.protocol_version.load(Ordering::SeqCst) >= COMMAND_REQUEST_PROTOCOL_VERSION
     }
 
+    fn is_connected(&self) -> bool { self.connected.load(Ordering::SeqCst) }
+
+    fn file_search_connection_epoch(&self) -> u64 { self.connection_epoch.load(Ordering::SeqCst) }
+
+    fn supports_file_search(&self) -> bool { self.connected.load(Ordering::SeqCst) && self.protocol_version.load(Ordering::SeqCst) >= threadlane_protocol::daemon::FILE_SEARCH_PROTOCOL_VERSION }
+
     fn supports_project_io(&self) -> bool {
         self.protocol_version.load(Ordering::SeqCst) >= PROJECT_IO_PROTOCOL_VERSION
     }
@@ -753,6 +769,21 @@ impl Drop for RemoteDaemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn file_search_old_daemon_fails_before_enqueue() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let connected = Arc::new(AtomicBool::new(true));
+        let version = Arc::new(AtomicU64::new(5));
+        let result = RemoteDaemon::answer_request(&tx, &pending, &connected, &version, CommandRequest {
+            request_id: 99,
+            command: SessionCommand::SearchProjectFiles { work_dir: "/remote-only".into(), query: "private query".into() },
+        }).await;
+        assert!(result.unwrap_err().contains("requires protocol v6"));
+        assert!(rx.try_recv().is_err());
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn pairing_is_explicit_and_confined_to_token_protected_local_addresses() {
         for address in [

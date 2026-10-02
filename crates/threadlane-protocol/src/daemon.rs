@@ -56,8 +56,11 @@ use crate::repo::{GitOperation, GitResponse, ProjectFileNode};
 /// ephemeral [`SessionEvent::WorkspaceChanged`]. Version 4 adds draft creation
 /// and project-scoped composer options. Version 5 adds the GitHub (forge)
 /// and automation surfaces — `GitHubRequest`/`AutomationRequest` commands
-/// and the journaled [`SessionEvent::AutomationChanged`].
-pub const WIRE_PROTOCOL_VERSION: u64 = 5;
+/// and the journaled [`SessionEvent::AutomationChanged`]. Version 6 adds
+/// ephemeral saved-file search and daemon-host target validation.
+pub const WIRE_PROTOCOL_VERSION: u64 = 6;
+/// Saved-file content search and host-validated navigation.
+pub const FILE_SEARCH_PROTOCOL_VERSION: u64 = 6;
 
 /// Draft creation and composer catalog requests.
 pub const COMPOSER_PROTOCOL_VERSION: u64 = 4;
@@ -241,6 +244,9 @@ pub enum SessionCommand {
     /// List the project's file tree on the daemon's filesystem; answered by
     /// `CommandResponse::ProjectFiles`.
     ListProjectFiles { work_dir: PathBuf, limit: usize },
+    /// Ephemeral read-only search; never journal the query or results.
+    SearchProjectFiles { work_dir: PathBuf, query: String },
+    ValidateSearchTarget { work_dir: PathBuf, path: String },
     /// Read one project file as UTF-8 text; answered by
     /// `CommandResponse::FileContent`.
     ReadProjectFile { work_dir: PathBuf, path: String },
@@ -468,6 +474,7 @@ pub enum CommandResponse {
     },
     /// `ListProjectFiles` result: the project tree up to `limit` entries.
     ProjectFiles { nodes: Vec<ProjectFileNode> },
+    FileSearch { result: crate::repo::FileSearchResult },
     /// `ReadProjectFile` result: the file's UTF-8 content.
     FileContent { content: String },
     /// `ProjectFileExists` result.

@@ -96,6 +96,7 @@ pub struct EditorTab {
     /// requires). Applied once by `sync_pending_content`, then cleared.
     pending_content: Option<String>,
     pending_line: Option<usize>,
+    loading: bool,
     editor_state: Option<Entity<EditorState>>,
     text_view_state: Option<Entity<TextViewState>>,
     _subscription: Option<Subscription>,
@@ -180,6 +181,9 @@ impl EditorView {
                     .find(|tab| tab.project_dir == project && tab.relative_path == path)
                 {
                     tab.pending_line = line;
+                    if let Some(editor) = &tab.editor_state {
+                        editor.update(cx, |editor, cx| editor.focus(window, cx));
+                    }
                 }
             }
             PendingOpen::Diff { path, content } => {
@@ -257,6 +261,7 @@ impl EditorView {
             is_diff: true,
             pending_content: None,
             pending_line: None,
+            loading: false,
             editor_state: None,
             text_view_state: Some(markdown_state),
             _subscription: None,
@@ -274,13 +279,20 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // If already open, just select the tab
+        // Reuse the tab, but refresh saved content before navigating a clean buffer.
         if let Some(existing_idx) = self
             .tabs
             .iter()
             .position(|t| t.project_dir == project_dir && t.relative_path == relative_path)
         {
             self.active_tab_index = Some(existing_idx);
+            if self.tabs[existing_idx].is_dirty {
+                self.set_status("Unsaved buffer preserved; saved-file line numbers may differ.".into(), false);
+            } else if !self.tabs[existing_idx].loading
+                && self.tabs[existing_idx].pending_content.is_none()
+            {
+                self.start_file_read(existing_idx, cx);
+            }
             cx.notify();
             return;
         }
@@ -313,6 +325,8 @@ impl EditorView {
                     .iter_mut()
                     .find(|t| t.project_dir == target_project && t.relative_path == target_path)
                 {
+                    // An edit after a read completed must also cancel its queued replacement.
+                    tab.pending_content = None;
                     let dirty = current.as_str() != tab.saved_content.as_str();
                     if tab.is_dirty != dirty {
                         tab.is_dirty = dirty;
@@ -334,6 +348,7 @@ impl EditorView {
             is_diff: false,
             pending_content: None,
             pending_line: None,
+            loading: false,
             editor_state: Some(editor.clone()),
             text_view_state: None,
             _subscription: Some(subscription),
@@ -343,9 +358,16 @@ impl EditorView {
         self.status_msg = None;
         cx.notify();
 
-        let load_project = project_dir.to_path_buf();
-        let load_path = relative_path.to_string();
-        let load_editor = editor;
+        self.start_file_read(self.tabs.len() - 1, cx);
+    }
+
+    fn start_file_read(&mut self, index: usize, cx: &mut Context<Self>) {
+        let tab = &mut self.tabs[index];
+        let Some(load_editor) = tab.editor_state.clone() else { return; };
+        tab.loading = true;
+        tab.pending_content = None;
+        let load_project = tab.project_dir.clone();
+        let load_path = tab.relative_path.clone();
         let read_client = self.model.read(cx).daemon_client.clone();
         let read_project = load_project.clone();
         let read_path = load_path.clone();
@@ -384,13 +406,15 @@ impl EditorView {
             t.project_dir == project_dir
                 && t.relative_path == relative_path
                 && !t.is_diff
+                && t.editor_state.as_ref() == Some(editor)
         }) else {
             return;
         };
+        tab.loading = false;
         match result {
             Ok(content) => {
                 let current = editor.read(cx).value();
-                if current.as_str() == "Loading…" || current.as_str().is_empty() {
+                if !tab.is_dirty && (current.as_str() == tab.saved_content || current.as_str() == "Loading…") {
                     tab.pending_content = Some(content.clone());
                     // Matches once `sync_pending_content` applies it.
                     tab.is_dirty = false;
@@ -400,6 +424,7 @@ impl EditorView {
                 tab.saved_content = content;
             }
             Err(error) => {
+                tab.pending_line = None;
                 tracing::error!(
                     "Failed to open file {}: {}",
                     project_dir.join(relative_path).display(),
@@ -431,6 +456,7 @@ impl EditorView {
                 if Some(ix) == self.active_tab_index
                     && editor.read(cx).value().as_str() != "Loading…"
                     && tab.pending_line.is_some()
+                    && !tab.loading
                 {
                     // Cursor scrolling needs the loaded document's completed layout.
                     // Keep the request pending if the user switches tabs before then.
@@ -441,6 +467,7 @@ impl EditorView {
                         };
                         if tab.editor_state.as_ref() != Some(&editor)
                             || tab.pending_content.is_some()
+                            || tab.loading
                         {
                             return;
                         }
@@ -1068,8 +1095,39 @@ mod navigation_tests {
                 "requested line must be visibly revealed: {caret:?} in {viewport:?}"
             );
         });
+        let updated = "// saved externally\n".repeat(500);
+        std::fs::write(project.join("sample.rs"), &updated).unwrap();
         editor.update(cx, |editor, cx| {
-            editor.open_file_at_line(project, "sample.rs", Some(3), cx)
+            editor.open_file_at_line(project.clone(), "sample.rs", Some(450), cx);
+        });
+        cx.run_until_parked();
+        for _ in 0..4 {
+            cx.update(|window, cx| window.simulate_next_frame(cx));
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.run_until_parked();
+        }
+        editor.read_with(cx, |editor, cx| {
+            assert_eq!(editor.tabs.len(), 1);
+            let tab = &editor.tabs[0];
+            assert!(!tab.is_dirty);
+            let state = tab.editor_state.as_ref().unwrap().read(cx);
+            assert_eq!(state.value().as_str(), updated);
+            assert_eq!(state.cursor_position().line, 449);
+        });
+        cx.simulate_input("unsaved");
+        let unsaved = editor.read_with(cx, |editor, cx| {
+            assert!(editor.tabs[0].is_dirty);
+            editor.tabs[0].editor_state.as_ref().unwrap().read(cx).value().to_string()
+        });
+        // A daemon read finishing after typing must retain those edits, too.
+        editor.update(cx, |editor, cx| {
+            let input = editor.tabs[0].editor_state.clone().unwrap();
+            editor.tabs[0].loading = true;
+            editor.finish_file_open(&project, "sample.rs", &input, Ok("new saved text\n".into()), cx);
+            assert!(!editor.tabs[0].loading);
+            assert!(editor.tabs[0].pending_content.is_none());
+            assert_eq!(input.read(cx).value().as_str(), unsaved);
+            editor.open_file_at_line(project.clone(), "sample.rs", Some(3), cx)
         });
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -1089,6 +1147,19 @@ mod navigation_tests {
                     .line,
                 2
             );
+            assert!(editor.tabs[0].is_dirty);
+            assert_eq!(editor.tabs[0].editor_state.as_ref().unwrap().read(cx).value().as_str(), unsaved);
+            assert!(editor.visible_status().unwrap().0.contains("Unsaved buffer preserved"));
+        });
+        // Failure must not jump into stale text or strand the tab as loading.
+        editor.update(cx, |editor, cx| {
+            let input = editor.tabs[0].editor_state.clone().unwrap();
+            editor.tabs[0].loading = true;
+            editor.tabs[0].pending_line = Some(99);
+            editor.finish_file_open(&project, "sample.rs", &input, Err("disconnected".into()), cx);
+            assert!(!editor.tabs[0].loading);
+            assert!(editor.tabs[0].pending_line.is_none());
+            assert_eq!(input.read(cx).value().as_str(), unsaved);
         });
     }
 }

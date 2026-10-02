@@ -171,6 +171,9 @@ A normal `cargo run` may be unsuitable for testing installation: update installa
 
 ## Background Tasks and Capabilities
 
+- Saved-file search uses its own protocol-v6 capability, not the project-I/O floor. Keep query/snippet payloads point-to-point and ephemeral. Search editor targets carry project/session/daemon identity and connection epoch through consumption; never canonicalize a remote search root on the UI host. On Unix, content reads use descriptor-relative no-follow opens so concurrent symlink swaps cannot redirect a scan.
+
+
 - Explicit background tasks were removed with the supervisor crate: every session runs on `SessionController` through the existing `SessionRuntime` path. Do not mirror chat sessions into a second task registry; no adapter owns a second operation log or lane-recovery authority.
 - Interactive turns are driven by `SessionController::spawn_interactive_turn` (generation guard, task registration, ACP pre-selection, git-branch fact, event pump, cleanup). GPUI maps its four sinks onto chat stream events and owns no turn-driving policy of its own; do not re-implement the pump in UI code.
 - `CodingSessionHarness` (`coding_agent/harness.rs`) is the canonical session adapter. Production code must route foreground and model subagent durable operations through it. No production caller may directly append session or operation-log records outside this harness path.

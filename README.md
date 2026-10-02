@@ -30,6 +30,29 @@ Threadlane brings project workspaces, persistent conversation sessions, coding-a
 - **Extensibility** — Sandboxed WebAssembly System Interface (WASI) extensions and discovered skills.
 - **Automations** — Recurring prompts with durable run history, fresh chats, optional isolated worktrees, and explicit permission handling.
 
+## Find in files
+
+Choose **Find in files…** in Files or the workspace command palette. Type literal,
+case-sensitive, single-line text; spaces are significant. Use Up/Down and Enter,
+or click a matching line, to open it in the existing editor. Escape closes the
+dialog and restores focus. This does not run an agent or change the chat draft.
+
+Search reads saved UTF-8 regular files in the active Git checkout, including the
+session worktree rather than the primary checkout. Tracked files remain eligible
+even when ignored; nonignored untracked files are included. Git ignore rules are
+not a secret detector. `.git`, `.threadlane`, symlinks, binary/non-UTF-8 content,
+and files larger than 2 MiB are excluded. Unsaved tabs retain their buffers;
+saved-file line numbers may differ from unsaved content. Snippet match markers
+`【…】` distinguish matches without relying on color.
+
+Scans stop at 500 matching lines, 1 MiB of response data, 4 MiB of inventory,
+64 MiB of file reads, or three seconds of work. Partial results show the exact
+limit or skipped-file counts; they are not exhaustive “no matches.” Queries are
+limited to 4096 UTF-8 bytes and are not saved or sent to a model. Remote search
+requires a connected protocol-v6 daemon and never falls back to client disk.
+Changing project, session, checkout, or daemon invalidates the dialog; reopen it
+for the new scope. Refresh / Retry reruns a failed or outdated search.
+
 ## Quick Start
 
 ### Prerequisites

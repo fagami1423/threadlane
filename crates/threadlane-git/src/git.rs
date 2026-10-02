@@ -2012,3 +2012,54 @@ fn validate_branch_name(work_dir: &Path, name: &str) -> Result<String, GitError>
     command(work_dir, &["check-ref-format", "--branch", name])?;
     Ok(name.to_owned())
 }
+
+/// Bounded variant of the Git inventory for interactive content search.
+/// Uses the same tracked/nonignored-untracked policy, excluding deleted entries.
+/// The reader stops at the byte ceiling; the parent kills/reaps Git on timeout.
+pub fn list_search_files(work_dir: &Path, deadline: Instant) -> Result<(GitFileInventory, Option<&'static str>), String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    const LIMIT: u64 = 4 * 1024 * 1024;
+    let mut child = Command::new("git")
+        .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+        .current_dir(work_dir).env("GIT_TERMINAL_PROMPT", "0")
+        .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|e| e.to_string())?;
+    let stdout = child.stdout.take().ok_or("Git stdout unavailable")?;
+    let full = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_full = full.clone();
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.take(LIMIT + 1).read_to_end(&mut bytes)?;
+        reader_full.store(bytes.len() > LIMIT as usize, std::sync::atomic::Ordering::Release);
+        Ok::<_, std::io::Error>(bytes)
+    });
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? { break status; }
+        if Instant::now() >= deadline || full.load(std::sync::atomic::Ordering::Acquire) {
+            timed_out = Instant::now() >= deadline;
+            let _ = child.kill();
+            break child.wait().map_err(|e| e.to_string())?;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let mut bytes = reader.join().map_err(|_| "Git inventory reader failed")?.map_err(|e| e.to_string())?;
+    let partial = timed_out || bytes.len() > LIMIT as usize;
+    if !status.success() && !partial { return Err("Find in files requires an available Git checkout".into()); }
+    if partial {
+        bytes.truncate(LIMIT as usize);
+        if let Some(end) = bytes.iter().rposition(|b| *b == 0) { bytes.truncate(end + 1); } else { bytes.clear(); }
+    }
+    let mut inventory = GitFileInventory::default();
+    let mut seen = HashSet::new();
+    for raw in bytes.split(|b| *b == 0).filter(|raw| !raw.is_empty()) {
+        if Instant::now() >= deadline { timed_out = true; break; }
+        let Ok(path) = std::str::from_utf8(raw) else { inventory.non_utf8_skipped += 1; continue; };
+        if path.split('/').any(|part| matches!(part, ".git" | ".threadlane" | "..")) { continue; }
+        if std::fs::symlink_metadata(work_dir.join(path)).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) { continue; }
+        if seen.insert(path) { inventory.paths.push(path.to_owned()); }
+    }
+    inventory.paths.sort();
+    Ok((inventory, if timed_out { Some("3-second inventory budget reached") }
+        else if partial { Some("4 MiB inventory limit reached") } else { None }))
+}
