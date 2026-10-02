@@ -189,11 +189,13 @@ impl DaemonCore {
                         if this.runtime_for_file(&session_file).is_none() {
                             // Canonical layout nests session files as
                             // `<project>/.threadlane/sessions/<id>.jsonl`,
-                            // so ancestor(3) is the project root.
+                            // so ancestor(3) is the project root — or the
+                            // linked worktree for worktree runs, which
+                            // `project_dir_for` maps back to its project.
                             let work_dir = session_file
                                 .ancestors()
                                 .nth(3)
-                                .map(Path::to_path_buf)
+                                .map(|dir| Self::project_dir_for(dir))
                                 .unwrap_or_default();
                             let session_id = Self::session_id_for_file(&session_file)
                                 .unwrap_or_default();
@@ -231,6 +233,7 @@ impl DaemonCore {
                 .active_runtime
                 .as_ref()
                 .and_then(|runtime| Self::session_id_for_file(runtime.session_file())),
+            error: projection.error.clone(),
         }
     }
 

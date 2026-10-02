@@ -55,6 +55,11 @@ pub struct AutomationProjection {
     pub questions: HashMap<String, QuestionRequest>,
     /// Session id of the run currently executing, when one is.
     pub active_session_id: Option<String>,
+    /// Store-level failure (e.g. the service could not open its state). The
+    /// snapshot may still carry last-known definitions; mutations fail
+    /// while this is set.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// Payload of `CommandResponse::Automation`.
