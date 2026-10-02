@@ -40,8 +40,8 @@ use crate::client::{MobileDaemon, MobileEvent};
 use crate::preferences;
 use threadlane_client::ClientState;
 use threadlane_protocol::daemon::{
-    ChatMessageInfo, MessageRole, PermissionDecision, SessionCommand, SessionEvent, SessionHealth,
-    SessionInfo,
+    ChatMessageInfo, GitHubIssueRef, MessageRole, PermissionDecision, SessionCommand, SessionEvent,
+    SessionHealth, SessionInfo,
 };
 use threadlane_protocol::interaction::{
     PermissionRequest, QuestionAnswer, QuestionItemAnswer, QuestionRequest,
@@ -162,6 +162,11 @@ struct ActiveSession {
     answers: HashMap<String, Vec<String>>,
     transcript: threadlane_ui_session::transcript::TranscriptState,
     confirm_delete: bool,
+    /// Repo context mirrored from `SessionInfo` for the header meta row.
+    git_branch: Option<String>,
+    is_worktree: bool,
+    /// Linked issue rendered as a chip that opens the Issues panel.
+    github_issue: Option<GitHubIssueRef>,
 }
 
 impl ActiveSession {
@@ -178,6 +183,9 @@ impl ActiveSession {
             answers: HashMap::new(),
             transcript: threadlane_ui_session::transcript::TranscriptState::new(window),
             confirm_delete: false,
+            git_branch: info.git_branch.clone(),
+            is_worktree: info.is_worktree,
+            github_issue: info.github_issue.clone(),
         }
     }
 }
@@ -273,6 +281,10 @@ pub struct MobileApp {
     auto_enabled: bool,
     /// Definition id awaiting its delete-confirm strip.
     auto_delete_confirm: Option<String>,
+    /// A queued-message cancel awaiting its reply or the journaled
+    /// `QueuedEntryCancelled`: the echo row stays until the daemon
+    /// confirms the entry left the queue. `(session_id, entry_id)`.
+    pending_queued_cancel: Option<(String, String)>,
     /// Run id awaiting its delete-confirm strip.
     auto_run_delete_confirm: Option<String>,
     models: Vec<ComposerModel>,
@@ -502,6 +514,7 @@ impl MobileApp {
             auto_worktree: true,
             auto_enabled: true,
             auto_delete_confirm: None,
+            pending_queued_cancel: None,
             auto_run_delete_confirm: None,
             models: Vec::new(),
             session_drafts: Vec::new(),
@@ -911,6 +924,16 @@ impl MobileApp {
                     _ => {}
                 }
             }
+            CommandResponse::CancelledQueuedMessage {
+                session_id,
+                entry_id,
+                ..
+            } => {
+                let echo_id = format!("queued-user-{session_id}-{entry_id}");
+                self.client.messages_mut().retain(|m| m.id != echo_id);
+                self.pending_queued_cancel = None;
+                self.client.session_status = Some("Queued message removed".to_string());
+            }
             CommandResponse::Ack => {
                 let session_id = match command {
                     SessionCommand::SetModel { session_id, .. }
@@ -1236,6 +1259,13 @@ impl MobileApp {
                         self.client.session_status = Some(error.clone());
                         return;
                     }
+                    if let SessionCommand::CancelQueuedMessage { .. } = &command {
+                        // The echo stays: the entry never left the queue.
+                        self.pending_queued_cancel = None;
+                        self.client.session_status =
+                            Some(format!("Could not remove queued message: {error}"));
+                        return;
+                    }
                     self.connect_error = Some(error.clone());
                     self.client.session_status = Some(error);
                 }
@@ -1253,6 +1283,43 @@ impl MobileApp {
         let mut event = event;
         if let SessionEvent::SessionRemoved { session_id, .. } = &event {
             self.session_drafts.retain(|draft| draft.id != *session_id);
+        }
+        match &event {
+            // Bind the optimistic `queued-user-{session}` echo to its durable
+            // queue entry so the row's steer/edit/remove controls appear.
+            SessionEvent::FollowUpQueued {
+                session_id,
+                entry_id,
+            } => {
+                let pending_id = format!("queued-user-{session_id}");
+                if let Some(message) = self
+                    .client
+                    .messages_mut()
+                    .iter_mut()
+                    .find(|m| m.id == pending_id)
+                {
+                    message.id = format!("queued-user-{session_id}-{entry_id}");
+                }
+            }
+            // The entry left the daemon's queue — ours or another client's
+            // cancel: drop the retained echo and settle the parked intent.
+            SessionEvent::QueuedEntryCancelled {
+                session_id,
+                entry_id,
+                ..
+            } => {
+                let echo_id = format!("queued-user-{session_id}-{entry_id}");
+                self.client.messages_mut().retain(|m| m.id != echo_id);
+                if self
+                    .pending_queued_cancel
+                    .as_ref()
+                    .is_some_and(|(sid, eid)| sid == session_id && eid == entry_id)
+                {
+                    self.pending_queued_cancel = None;
+                    self.client.session_status = Some("Queued message removed".to_string());
+                }
+            }
+            _ => {}
         }
         if let SessionEvent::ProjectChanged { project } = &mut event {
             self.session_drafts.retain(|draft| {
@@ -1299,6 +1366,9 @@ impl MobileApp {
                 if !info.title.trim().is_empty() {
                     active.title = info.title.clone();
                 }
+                active.git_branch = info.git_branch.clone();
+                active.is_worktree = info.is_worktree;
+                active.github_issue = info.github_issue.clone();
             }
             active.transcript.sync(
                 self.client.messages.clone(),
@@ -1354,7 +1424,15 @@ impl MobileApp {
             model: self.selected_model.clone(),
         };
         if let Some(daemon) = &self.daemon {
-            let echo_id = format!("pending-user-{}", active.id);
+            // Mid-turn submissions queue as follow-ups; the unbound
+            // `queued-user-{session}` echo is bound to its entry id by
+            // `SessionEvent::FollowUpQueued`, which turns on the row's
+            // steer/edit/remove controls.
+            let echo_id = if self.client.is_generating {
+                format!("queued-user-{}", active.id)
+            } else {
+                format!("pending-user-{}", active.id)
+            };
             let draft = match &command {
                 SessionCommand::SubmitPrompt { text, .. } => text.clone(),
                 _ => unreachable!(),
@@ -1377,7 +1455,149 @@ impl MobileApp {
             active.transcript.list.scroll_to_end();
             daemon.request(command);
             self.sending = true;
+            if self.client.is_generating {
+                self.client.session_status = Some("Message queued…".to_string());
+            }
         }
+        cx.notify();
+    }
+
+    /// Interrupt the live turn with the composer text instead of queueing
+    /// behind it.
+    fn steer_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.composer.read(cx).value().trim().to_owned();
+        if text.is_empty() || !self.client.is_generating {
+            return;
+        }
+        let Some(active) = &mut self.active else {
+            return;
+        };
+        let connected = self
+            .daemon
+            .as_ref()
+            .is_some_and(|daemon| daemon.is_connected());
+        if !connected {
+            self.client.session_status = Some("Not connected — message was not sent".to_string());
+            cx.notify();
+            return;
+        }
+        let session_id = active.id.clone();
+        if let Some(daemon) = &self.daemon {
+            daemon.send(SessionCommand::SteerMessage {
+                session_id: session_id.clone(),
+                text: text.clone(),
+                images: Vec::new(),
+            });
+            let echo_id = format!(
+                "steered-user-{session_id}-{}",
+                self.client.messages.len()
+            );
+            self.client.messages_mut().push(ChatMessageInfo {
+                id: echo_id,
+                role: MessageRole::User,
+                content: text,
+                tool_activities: Vec::new(),
+                streaming: false,
+                reasoning_content: None,
+                reasoning_expanded: false,
+            });
+            active.transcript.sync(
+                self.client.messages.clone(),
+                self.client.is_generating,
+                false,
+                false,
+            );
+            active.transcript.list.scroll_to_end();
+            self.client.session_status = Some("Steering current turn…".to_string());
+            self.composer
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Re-route a still-pending queued follow-up into the live turn.
+    fn steer_queued(&mut self, entry_id: &str, cx: &mut Context<Self>) {
+        let Some(session_id) = self.client.active_session_id.clone() else {
+            return;
+        };
+        if let Some(daemon) = &self.daemon {
+            daemon.send(SessionCommand::SteerQueuedMessage {
+                session_id: session_id.clone(),
+                entry_id: entry_id.to_string(),
+            });
+        }
+        let queued_id = format!("queued-user-{session_id}-{entry_id}");
+        if let Some(message) = self
+            .client
+            .messages_mut()
+            .iter_mut()
+            .find(|m| m.id == queued_id)
+        {
+            message.id = format!("steered-user-{session_id}-{entry_id}");
+        }
+        self.client.session_status = Some("Steering current turn…".to_string());
+        cx.notify();
+    }
+
+    /// Drop a still-pending queued follow-up. `restore` puts the echo's
+    /// staged text back into the composer immediately — the entry leaves
+    /// the queue once the reply or the journaled
+    /// `QueuedEntryCancelled` confirms it, so the row stays until then.
+    fn cancel_queued_message(
+        &mut self,
+        entry_id: &str,
+        restore: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_id) = self.client.active_session_id.clone() else {
+            return;
+        };
+        let echo_id = format!("queued-user-{session_id}-{entry_id}");
+        if restore {
+            let staged = self
+                .client
+                .messages
+                .iter()
+                .find(|m| m.id == echo_id)
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+            if !staged.is_empty() {
+                self.composer
+                    .update(cx, |input, cx| input.set_value(staged, window, cx));
+            }
+        }
+        self.pending_queued_cancel = Some((session_id.clone(), entry_id.to_string()));
+        if let Some(daemon) = &self.daemon {
+            daemon.request(SessionCommand::CancelQueuedMessage {
+                session_id,
+                entry_id: entry_id.to_string(),
+                work_dir: self.client.active_work_dir.clone(),
+            });
+        }
+        self.client.session_status = Some("Removing queued message…".to_string());
+        cx.notify();
+    }
+
+    /// Open the session's linked GitHub issue: jump to the Issues tab in
+    /// the session's project scope and load the detail overlay.
+    fn open_linked_issue(&mut self, number: u64, cx: &mut Context<Self>) {
+        let Some(active) = &self.active else {
+            return;
+        };
+        let Some(work_dir) = self
+            .client
+            .projects
+            .iter()
+            .find(|project| project.sessions.iter().any(|s| s.id == active.id))
+            .map(|project| project.work_dir.clone())
+        else {
+            return;
+        };
+        self.select_project(work_dir, cx);
+        self.select_tab(Tab::Issues, cx);
+        self.issue_detail_pending = Some(number);
+        self.send_github(GitHubOperation::InspectIssue { number });
         cx.notify();
     }
 
@@ -1963,6 +2183,26 @@ impl MobileApp {
         let question = self.client.pending_questions.get(&active.id).cloned();
         let confirm_delete = active.confirm_delete;
         let composer_empty = self.composer.read(cx).value().trim().is_empty();
+        let session_meta = {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(branch) = &active.git_branch {
+                if !branch.is_empty() {
+                    parts.push(branch.clone());
+                }
+            }
+            if active.is_worktree {
+                parts.push("worktree".to_string());
+            }
+            parts.join(" · ")
+        };
+        let linked_issue = active.github_issue.clone();
+        let connected = self.daemon.as_ref().is_some_and(|d| d.is_connected());
+        let send_disabled = composer_empty
+            || self.sending
+            || self.composer_pending()
+            || self.selected_model.is_none()
+            || uncertain_prompt
+            || !connected;
 
         div()
             .size_full()
@@ -2007,6 +2247,15 @@ impl MobileApp {
                             .flex_1()
                             .min_w_0()
                             .child(div().font_bold().truncate().child(title))
+                            .when(!session_meta.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .truncate()
+                                        .child(session_meta),
+                                )
+                            })
                             .when_some(status, |this, status| {
                                 this.child(
                                     div()
@@ -2016,6 +2265,24 @@ impl MobileApp {
                                 )
                             }),
                     )
+                    .when_some(linked_issue, |this, issue| {
+                        let number = issue.number;
+                        this.child(
+                            Button::new(format!("linked-issue-{number}"))
+                                .ghost()
+                                .small()
+                                .h_10()
+                                .icon(icon(kit_icons::CircleDot.1))
+                                .label(format!("#{number}"))
+                                .tooltip("Open linked issue")
+                                .accessibility_label(format!(
+                                    "Open linked issue number {number}"
+                                ))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_linked_issue(number, cx)
+                                })),
+                        )
+                    })
                     .when(working, |this| {
                         this.child(
                             Button::new("cancel-run")
@@ -2142,31 +2409,39 @@ impl MobileApp {
                         ))
                         .child(self.composer_options(cx))
                         .child(
-                            div().flex().justify_end().child(
-                                Button::new("send")
-                                    .primary()
-                                    .size_11()
-                                    .icon(icon(kit_icons::SendHorizontal.1))
-                                    .accessibility_label(if working {
-                                        "Queue for next turn"
-                                    } else {
-                                        "Send message"
-                                    })
-                                    .disabled(
-                                        composer_empty
-                                            || self.sending
-                                            || self.composer_pending()
-                                            || self.selected_model.is_none()
-                                            || uncertain_prompt
-                                            || !self
-                                                .daemon
-                                                .as_ref()
-                                                .is_some_and(|d| d.is_connected()),
+                            div().flex().justify_end().gap_2()
+                                .when(working, |this| {
+                                    this.child(
+                                        Button::new("steer")
+                                            .ghost()
+                                            .h_11()
+                                            .icon(icon(kit_icons::Zap.1))
+                                            .label("Steer")
+                                            .tooltip("Interrupt the current turn")
+                                            .accessibility_label(
+                                                "Steer the current turn with this message",
+                                            )
+                                            .disabled(send_disabled)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.steer_composer(window, cx)
+                                            })),
                                     )
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.submit_composer(window, cx)
-                                    })),
-                            ),
+                                })
+                                .child(
+                                    Button::new("send")
+                                        .primary()
+                                        .size_11()
+                                        .icon(icon(kit_icons::SendHorizontal.1))
+                                        .accessibility_label(if working {
+                                            "Queue for next turn"
+                                        } else {
+                                            "Send message"
+                                        })
+                                        .disabled(send_disabled)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.submit_composer(window, cx)
+                                        })),
+                                ),
                         ),
                 ),
             )
@@ -2334,9 +2609,90 @@ impl MobileApp {
             })
             .children(tools);
         if is_user {
-            threadlane_ui_session::message_row(MessageRole::User)
-                .child(threadlane_ui_session::user_message_bubble(cx).child(body))
-                .into_any_element()
+            let session_id = self
+                .client
+                .active_session_id
+                .clone()
+                .unwrap_or_default();
+            let queued_entry = message
+                .id
+                .strip_prefix(&format!("queued-user-{session_id}-"))
+                .map(|entry| entry.to_string());
+            let is_queued = queued_entry.is_some()
+                || message.id == format!("queued-user-{session_id}");
+            let is_steered = message
+                .id
+                .starts_with(&format!("steered-user-{session_id}-"));
+            let cancel_pending = queued_entry.as_ref().is_some_and(|entry| {
+                self.pending_queued_cancel
+                    .as_ref()
+                    .is_some_and(|(sid, eid)| sid == &session_id && eid == entry)
+            });
+            let mut row = threadlane_ui_session::message_row(MessageRole::User)
+                .child(threadlane_ui_session::user_message_bubble(cx).child(body));
+            if is_queued || is_steered {
+                let mut controls = div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .px_3()
+                    .pb_1()
+                    .child(Tag::new().small().child(if is_steered {
+                        "Steered"
+                    } else {
+                        "Queued"
+                    }));
+                if let Some(entry_id) = queued_entry {
+                    let steer_id = entry_id.clone();
+                    let edit_id = entry_id.clone();
+                    let remove_id = entry_id.clone();
+                    controls = controls
+                        .child(
+                            Button::new(format!("queued-steer-{entry_id}"))
+                                .ghost()
+                                .small()
+                                .h_9()
+                                .icon(icon(kit_icons::Zap.1))
+                                .label("Steer")
+                                .tooltip("Send into the current turn")
+                                .accessibility_label("Steer queued message into the current turn")
+                                .disabled(cancel_pending)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.steer_queued(&steer_id, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new(format!("queued-edit-{entry_id}"))
+                                .ghost()
+                                .small()
+                                .h_9()
+                                .label("Edit")
+                                .tooltip("Restore to composer")
+                                .accessibility_label("Restore queued message to composer")
+                                .disabled(cancel_pending)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.cancel_queued_message(&edit_id, true, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new(format!("queued-remove-{entry_id}"))
+                                .ghost()
+                                .small()
+                                .h_9()
+                                .icon(icon(kit_icons::X.1))
+                                .label("Remove")
+                                .tooltip("Discard queued message")
+                                .accessibility_label("Discard queued message")
+                                .disabled(cancel_pending)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.cancel_queued_message(&remove_id, false, window, cx)
+                                })),
+                        );
+                }
+                row = row.child(controls);
+            }
+            row.into_any_element()
         } else {
             threadlane_ui_session::message_row(message.role.clone())
                 .child(body)
