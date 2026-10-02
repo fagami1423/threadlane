@@ -791,6 +791,14 @@ impl MobileApp {
                         }
                     }
                     GitHubResponse::Number { number } => {
+                        // Only now is the issue durable — the form's text
+                        // survived any transport/auth failure until here.
+                        self.issue_title.update(cx, |input, cx| {
+                            input.set_value("", window, cx)
+                        });
+                        self.issue_body.update(cx, |input, cx| {
+                            input.set_value("", window, cx)
+                        });
                         self.new_issue_open = false;
                         self.client.session_status = Some(format!("Created issue #{number}"));
                         self.refresh_issues();
@@ -4659,19 +4667,16 @@ impl MobileApp {
                             .flex_1()
                             .label("Create issue")
                             .disabled(!title_ready)
-                            .on_click(cx.listener(|this, _, window, cx| {
+                            .on_click(cx.listener(|this, _, _window, cx| {
                                 let title = this.issue_title.read(cx).value().trim().to_owned();
                                 if title.is_empty() {
                                     return;
                                 }
                                 let body = this.issue_body.read(cx).value().trim().to_owned();
                                 this.send_github(GitHubOperation::CreateIssue { title, body });
-                                this.issue_title.update(cx, |input, cx| {
-                                    input.set_value("", window, cx)
-                                });
-                                this.issue_body.update(cx, |input, cx| {
-                                    input.set_value("", window, cx)
-                                });
+                                // Fields keep their text until the `Number`
+                                // reply confirms creation — a failed send
+                                // must not wipe the user's draft.
                                 cx.notify();
                             })),
                     ),
