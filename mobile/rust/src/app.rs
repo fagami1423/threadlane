@@ -1208,9 +1208,13 @@ impl MobileApp {
                             cx.notify();
                             return;
                         }
-                        self.client
-                            .messages_mut()
-                            .retain(|m| m.id != format!("pending-user-{session_id}"));
+                        // Drop whichever optimistic echo the failed submit
+                        // left — `pending-user-*` or the unbound
+                        // `queued-user-*` one a mid-turn send pushes.
+                        self.client.messages_mut().retain(|m| {
+                            m.id != format!("pending-user-{session_id}")
+                                && m.id != format!("queued-user-{session_id}")
+                        });
                         if let Some(active) = &mut self.active {
                             active.transcript.sync(
                                 self.client.messages.clone(),
@@ -1462,11 +1466,28 @@ impl MobileApp {
         cx.notify();
     }
 
+    /// Mirrors `threadlane_acp_engine`'s `acp/` model-id prefix — ACP
+    /// agents run external processes that cannot take a mid-turn steer,
+    /// only queued follow-ups for the next turn.
+    fn acp_selected(&self) -> bool {
+        self.selected_model
+            .as_deref()
+            .is_some_and(|model| model.starts_with("acp/"))
+    }
+
     /// Interrupt the live turn with the composer text instead of queueing
     /// behind it.
     fn steer_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().trim().to_owned();
         if text.is_empty() || !self.client.is_generating {
+            return;
+        }
+        if self.acp_selected() {
+            self.client.session_status = Some(
+                "This agent does not support live steering. Use Queue for the next turn."
+                    .to_string(),
+            );
+            cx.notify();
             return;
         }
         let Some(active) = &mut self.active else {
@@ -1517,6 +1538,14 @@ impl MobileApp {
 
     /// Re-route a still-pending queued follow-up into the live turn.
     fn steer_queued(&mut self, entry_id: &str, cx: &mut Context<Self>) {
+        if self.acp_selected() {
+            self.client.session_status = Some(
+                "This agent does not support live steering. Use Queue for the next turn."
+                    .to_string(),
+            );
+            cx.notify();
+            return;
+        }
         let Some(session_id) = self.client.active_session_id.clone() else {
             return;
         };
@@ -2203,6 +2232,13 @@ impl MobileApp {
             || self.selected_model.is_none()
             || uncertain_prompt
             || !connected;
+        // ACP agents can queue follow-ups but cannot take a mid-turn steer.
+        let acp = self.acp_selected();
+        let steer_tip = if acp {
+            "This agent does not support live steering. Use Queue for the next turn."
+        } else {
+            "Interrupt the current turn"
+        };
 
         div()
             .size_full()
@@ -2389,6 +2425,9 @@ impl MobileApp {
             .when_some(question, |this, question| {
                 this.child(self.render_question(&question, window, cx))
             })
+            .when_some(self.render_queued_strip(cx), |this, strip| {
+                this.child(strip)
+            })
             .child(
                 div().flex_none().w_full().px_3().mb_3().child(
                     threadlane_ui_session::composer_surface(cx)
@@ -2417,11 +2456,9 @@ impl MobileApp {
                                             .h_11()
                                             .icon(icon(kit_icons::Zap.1))
                                             .label("Steer")
-                                            .tooltip("Interrupt the current turn")
-                                            .accessibility_label(
-                                                "Steer the current turn with this message",
-                                            )
-                                            .disabled(send_disabled)
+                                            .tooltip(steer_tip)
+                                            .accessibility_label(steer_tip)
+                                            .disabled(send_disabled || acp)
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.steer_composer(window, cx)
                                             })),
@@ -2614,83 +2651,21 @@ impl MobileApp {
                 .active_session_id
                 .clone()
                 .unwrap_or_default();
-            let queued_entry = message
-                .id
-                .strip_prefix(&format!("queued-user-{session_id}-"))
-                .map(|entry| entry.to_string());
-            let is_queued = queued_entry.is_some()
-                || message.id == format!("queued-user-{session_id}");
             let is_steered = message
                 .id
                 .starts_with(&format!("steered-user-{session_id}-"));
-            let cancel_pending = queued_entry.as_ref().is_some_and(|entry| {
-                self.pending_queued_cancel
-                    .as_ref()
-                    .is_some_and(|(sid, eid)| sid == &session_id && eid == entry)
-            });
             let mut row = threadlane_ui_session::message_row(MessageRole::User)
                 .child(threadlane_ui_session::user_message_bubble(cx).child(body));
-            if is_queued || is_steered {
-                let mut controls = div()
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap_2()
-                    .px_3()
-                    .pb_1()
-                    .child(Tag::new().small().child(if is_steered {
-                        "Steered"
-                    } else {
-                        "Queued"
-                    }));
-                if let Some(entry_id) = queued_entry {
-                    let steer_id = entry_id.clone();
-                    let edit_id = entry_id.clone();
-                    let remove_id = entry_id.clone();
-                    controls = controls
-                        .child(
-                            Button::new(format!("queued-steer-{entry_id}"))
-                                .ghost()
-                                .small()
-                                .h_9()
-                                .icon(icon(kit_icons::Zap.1))
-                                .label("Steer")
-                                .tooltip("Send into the current turn")
-                                .accessibility_label("Steer queued message into the current turn")
-                                .disabled(cancel_pending)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.steer_queued(&steer_id, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new(format!("queued-edit-{entry_id}"))
-                                .ghost()
-                                .small()
-                                .h_9()
-                                .label("Edit")
-                                .tooltip("Restore to composer")
-                                .accessibility_label("Restore queued message to composer")
-                                .disabled(cancel_pending)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.cancel_queued_message(&edit_id, true, window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new(format!("queued-remove-{entry_id}"))
-                                .ghost()
-                                .small()
-                                .h_9()
-                                .icon(icon(kit_icons::X.1))
-                                .label("Remove")
-                                .tooltip("Discard queued message")
-                                .accessibility_label("Discard queued message")
-                                .disabled(cancel_pending)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.cancel_queued_message(&remove_id, false, window, cx)
-                                })),
-                        );
-                }
-                row = row.child(controls);
+            if is_steered {
+                row = row.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .px_3()
+                        .pb_1()
+                        .child(Tag::new().small().child("Steered")),
+                );
             }
             row.into_any_element()
         } else {
@@ -2698,6 +2673,153 @@ impl MobileApp {
                 .child(body)
                 .into_any_element()
         }
+    }
+
+    /// Pending follow-ups are filtered out of the transcript rows by the
+    /// shared builder (`is_queued_message`), so they get the desktop's
+    /// own strip above the composer — echo rows without an entry id show
+    /// no controls until `FollowUpQueued` binds them.
+    fn render_queued_strip(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let session_id = self.client.active_session_id.clone()?;
+        let generating = self.client.is_generating;
+        let queued: Vec<(String, String)> = self
+            .client
+            .messages
+            .iter()
+            .filter(|m| threadlane_ui_session::transcript::is_queued_message(m, generating))
+            .map(|m| (m.id.clone(), m.content.clone()))
+            .collect();
+        if queued.is_empty() {
+            return None;
+        }
+        let acp = self.acp_selected();
+        let steer_tip = if acp {
+            "This agent does not support live steering. Use Queue for the next turn."
+        } else {
+            "Steer the current turn with this message"
+        };
+        let prefix = format!("queued-user-{session_id}-");
+        Some(
+            div()
+                .flex_none()
+                .w_full()
+                .px_3()
+                .mb_2()
+                .child(
+                    div()
+                        .w_full()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(cx.theme().sidebar_border)
+                        .bg(cx.theme().sidebar)
+                        .child(
+                            div()
+                                .w_full()
+                                .px_3()
+                                .py_2()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!(
+                                    "Queued messages ({})",
+                                    queued.len()
+                                )),
+                        )
+                        .children(queued.into_iter().map(|(message_id, text)| {
+                            let entry_id = message_id
+                                .strip_prefix(&prefix)
+                                .map(|entry| entry.to_string());
+                            let cancel_pending = entry_id.as_ref().is_some_and(|entry| {
+                                self.pending_queued_cancel.as_ref().is_some_and(|(sid, eid)| {
+                                    sid == &session_id && eid == entry
+                                })
+                            });
+                            let mut row = div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .py_2()
+                                .border_t_1()
+                                .border_color(cx.theme().sidebar_border)
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_sm()
+                                        .line_clamp(2)
+                                        .child(text),
+                                );
+                            if let Some(entry_id) = entry_id {
+                                if cancel_pending {
+                                    row = row.child(
+                                        div()
+                                            .flex_none()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("Removing…"),
+                                    );
+                                } else {
+                                    let steer_id = entry_id.clone();
+                                    let edit_id = entry_id.clone();
+                                    let remove_id = entry_id.clone();
+                                    row = row
+                                        .child(
+                                            Button::new(format!("queued-steer-{entry_id}"))
+                                                .ghost()
+                                                .small()
+                                                .h_9()
+                                                .icon(icon(kit_icons::Zap.1))
+                                                .label("Steer")
+                                                .tooltip(steer_tip)
+                                                .accessibility_label(steer_tip)
+                                                .disabled(acp)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.steer_queued(&steer_id, cx)
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new(format!("queued-edit-{entry_id}"))
+                                                .ghost()
+                                                .small()
+                                                .h_9()
+                                                .label("Edit")
+                                                .tooltip("Restore to composer")
+                                                .accessibility_label(
+                                                    "Restore queued message to composer",
+                                                )
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.cancel_queued_message(
+                                                            &edit_id, true, window, cx,
+                                                        )
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            Button::new(format!("queued-remove-{entry_id}"))
+                                                .ghost()
+                                                .small()
+                                                .h_9()
+                                                .icon(icon(kit_icons::X.1))
+                                                .label("Remove")
+                                                .tooltip("Discard queued message")
+                                                .accessibility_label("Discard queued message")
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.cancel_queued_message(
+                                                            &remove_id, false, window, cx,
+                                                        )
+                                                    },
+                                                )),
+                                        );
+                                }
+                            }
+                            row
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_permission(
