@@ -222,18 +222,36 @@ struct RemoteFetchSlot {
 #[derive(Default)]
 struct RemoteFetchState {
     in_flight: bool,
+    /// Callers blocked on `changed`, observable to tests.
+    waiters: usize,
     /// The completed run's outcome; errors reach queued callers but are
     /// never freshness-stamped, so a failed fetch does not suppress retries.
     last_completed: Option<(Instant, Result<(), String>)>,
 }
 
-static REMOTE_FETCH_SLOTS: OnceLock<Mutex<HashMap<PathBuf, Arc<RemoteFetchSlot>>>> =
+static REMOTE_FETCH_SLOTS: OnceLock<Mutex<HashMap<(PathBuf, String), Arc<RemoteFetchSlot>>>> =
     OnceLock::new();
+
+/// A bare `git fetch` reads `branch.<name>.remote`, falling back to
+/// `origin`. Sibling worktrees on branches tracking different remotes must
+/// not share a slot, or one fetch satisfies callers expecting the other.
+fn fetch_remote_name(work_dir: &Path) -> String {
+    if let Ok(branch) = command(work_dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+        let key = format!("branch.{}.remote", branch.trim());
+        if let Ok(remote) = command(work_dir, &["config", "--get", &key]) {
+            let remote = remote.trim();
+            if !remote.is_empty() {
+                return remote.to_owned();
+            }
+        }
+    }
+    "origin".to_owned()
+}
 
 fn remote_fetch_slot(work_dir: &Path) -> Arc<RemoteFetchSlot> {
     // `--git-common-dir` resolves to the shared refs dir for linked
     // worktrees, so callers in sibling worktrees land on one slot.
-    let key = command(work_dir, &["rev-parse", "--git-common-dir"])
+    let dir = command(work_dir, &["rev-parse", "--git-common-dir"])
         .ok()
         .map(|output| {
             let dir = output.trim();
@@ -246,6 +264,7 @@ fn remote_fetch_slot(work_dir: &Path) -> Arc<RemoteFetchSlot> {
         })
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| repository_key(work_dir));
+    let key = (dir, fetch_remote_name(work_dir));
     REMOTE_FETCH_SLOTS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -265,7 +284,9 @@ fn run_remote_fetch(
         let mut state = slot.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if state.in_flight {
+                state.waiters += 1;
                 state = slot.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+                state.waiters -= 1;
                 if !state.in_flight {
                     // The run just completed is fresh by definition: its
                     // result satisfies a queued caller on any window.
@@ -344,7 +365,6 @@ mod fetch_tests {
     fn queued_callers_share_the_in_flight_run() {
         let slot = RemoteFetchSlot::default();
         let runs = Arc::new(AtomicUsize::new(0));
-        let arrived = Arc::new(AtomicUsize::new(0));
         let entered = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
         std::thread::scope(|scope| {
@@ -365,21 +385,19 @@ mod fetch_tests {
             entered.wait();
             let waiters: Vec<_> = (0..4)
                 .map(|_| {
-                    let arrived = arrived.clone();
                     let slot = &slot;
                     scope.spawn(move || {
-                        arrived.fetch_add(1, Ordering::SeqCst);
                         run_remote_fetch(Path::new("/repo"), slot, Duration::ZERO, |_| {
                             Err(GitError::new("/repo", "must not run"))
                         })
                     })
                 })
                 .collect();
-            while arrived.load(Ordering::SeqCst) < waiters.len() {
+            // Release the leader only once every waiter is blocked on the
+            // condvar, so a descheduled waiter can't restart a fresh run.
+            while slot.state.lock().unwrap().waiters < waiters.len() {
                 std::thread::yield_now();
             }
-            // Each waiter still needs a few instructions to reach the wait.
-            std::thread::sleep(Duration::from_millis(100));
             release.wait();
             for waiter in waiters {
                 waiter.join().unwrap().unwrap();
