@@ -131,9 +131,12 @@ enum Tab {
 }
 
 /// Schedule presets the automation form offers — the full calendar
-/// editor is desktop-only for now.
+/// editor is desktop-only for now. `Existing` preserves the loaded
+/// definition's own schedule so editing an automation made on desktop
+/// can't collapse its calendar to a preset.
 #[derive(Clone, Copy, PartialEq)]
 enum AutoSchedule {
+    Existing,
     Manual,
     Interval,
     DailyUtc,
@@ -142,6 +145,7 @@ enum AutoSchedule {
 impl AutoSchedule {
     fn label(self) -> &'static str {
         match self {
+            Self::Existing => "Keep existing schedule",
             Self::Manual => "Manual",
             Self::Interval => "Every N minutes",
             Self::DailyUtc => "Daily 09:00 UTC",
@@ -791,7 +795,17 @@ impl MobileApp {
             }
             CommandResponse::Automation { response } => {
                 let AutomationResponse::Projection { projection } = response;
-                self.client.automation = projection;
+                // GetSnapshot doubles as the (re)connect baseline — reconcile
+                // it exactly like an AutomationChanged event so the pending
+                // permission/question surfaces stay attached to the run.
+                let commands = self
+                    .client
+                    .apply_event(SessionEvent::AutomationChanged { projection });
+                if let Some(daemon) = &self.daemon {
+                    for command in commands {
+                        daemon.send(command);
+                    }
+                }
                 if matches!(
                     command,
                     SessionCommand::AutomationRequest {
@@ -2576,7 +2590,9 @@ impl MobileApp {
         self.auto_schedule = match &draft.schedule {
             Schedule::Manual => AutoSchedule::Manual,
             Schedule::Interval { .. } => AutoSchedule::Interval,
-            Schedule::Calendar { .. } => AutoSchedule::DailyUtc,
+            // A calendar the form can't express stays selected via
+            // `Existing`; picking a preset is the only way it changes.
+            Schedule::Calendar { .. } => AutoSchedule::Existing,
         };
         self.auto_worktree = draft.worktree;
         self.auto_enabled = draft.enabled;
@@ -2615,6 +2631,8 @@ impl MobileApp {
         draft.worktree = self.auto_worktree;
         draft.enabled = self.auto_enabled;
         draft.schedule = match self.auto_schedule {
+            // `auto_editing` still carries the loaded calendar — keep it.
+            AutoSchedule::Existing => draft.schedule.clone(),
             AutoSchedule::Manual => Schedule::Manual,
             AutoSchedule::Interval => Schedule::Interval {
                 minutes: self
@@ -5824,7 +5842,30 @@ impl MobileApp {
         let is_new = editing.as_ref().is_some_and(|def| def.revision == 0);
         let schedule = self.auto_schedule;
         let entity = cx.entity();
-        let kinds = [AutoSchedule::Manual, AutoSchedule::Interval, AutoSchedule::DailyUtc];
+        // `Existing` only appears while it is the active pick — selecting
+        // a preset is a one-way door to a schedule the form can express.
+        let kinds: Vec<AutoSchedule> = if schedule == AutoSchedule::Existing {
+            vec![
+                AutoSchedule::Existing,
+                AutoSchedule::Manual,
+                AutoSchedule::Interval,
+                AutoSchedule::DailyUtc,
+            ]
+        } else {
+            vec![
+                AutoSchedule::Manual,
+                AutoSchedule::Interval,
+                AutoSchedule::DailyUtc,
+            ]
+        };
+        let schedule_label = if schedule == AutoSchedule::Existing {
+            editing
+                .as_ref()
+                .map(|def| def.schedule.label())
+                .unwrap_or_else(|| schedule.label().to_string())
+        } else {
+            schedule.label().to_string()
+        };
         let project_label = editing
             .as_ref()
             .and_then(|def| def.project.file_name())
@@ -5907,7 +5948,7 @@ impl MobileApp {
                                         Button::new("auto-schedule-menu")
                                             .outline()
                                             .h_11()
-                                            .label(format!("Schedule: {} ▾", schedule.label()))
+                                            .label(format!("Schedule: {schedule_label} ▾"))
                                             .accessibility_label("Schedule")
                                             .dropdown_caret(true)
                                             .dropdown_menu_with_anchor(
@@ -5918,7 +5959,11 @@ impl MobileApp {
                                                         let kind = *kind;
                                                         menu.item(
                                                             PopupMenuItem::new(
-                                                                kind.label().to_string(),
+                                                                if kind == AutoSchedule::Existing {
+                                                                    schedule_label.clone()
+                                                                } else {
+                                                                    kind.label().to_string()
+                                                                },
                                                             )
                                                             .checked(kind == schedule)
                                                             .on_click(move |_, _, cx| {
