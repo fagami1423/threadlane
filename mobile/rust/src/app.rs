@@ -1,9 +1,12 @@
 //! GPUI views for the Threadlane mobile client.
 //!
-//! Three screens in one view — connect (pairing entry), session list,
-//! and the live transcript with a composer. All daemon traffic flows through
-//! [`crate::client::MobileDaemon`]; the view pumps its event stream on
-//! the GPUI executor and keeps a flat projection of the wire types.
+//! A connect (pairing entry) screen in front of a tabbed shell: a chats
+//! tab holding the session list and the live transcript with composer, a
+//! Git tab for the selected project's repository, and a slide-over
+//! sidebar for project picking and connection controls. All daemon
+//! traffic flows through [`crate::client::MobileDaemon`]; the view pumps
+//! its event stream on the GPUI executor and keeps a flat projection of
+//! the wire types.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -11,16 +14,20 @@ use std::time::Duration;
 
 use gpui::{prelude::*, *};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_component::scroll::ScrollableElement;
 use gpui_kit::component::StyledExt;
 use gpui_kit::component::{
     button::{Button, ButtonVariants},
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState, Textarea},
     marker::{Marker, MarkerContent, MarkerLoadingStyle},
     ActiveTheme, Disableable, Icon, Sizable,
 };
 use gpui_kit_assets::__private as kit_icons;
 use threadlane_protocol::daemon::{CommandResponse, ComposerModel};
-use threadlane_protocol::repo::{GitOperation, GitResponse, GitStatus};
+use threadlane_protocol::repo::{
+    CheckoutMode, DiffOptions, GitBranchInfo, GitCommitInfo, GitFile, GitHubPrInfo,
+    GitOperation, GitResponse, GitStashInfo, GitStatus,
+};
 use threadlane_protocol::{OrchestratorMode, ReasoningEffort};
 
 use crate::client::{MobileDaemon, MobileEvent};
@@ -103,8 +110,15 @@ fn question_key(request_id: &str, item_id: &str) -> String {
 #[derive(Clone, Copy, PartialEq)]
 enum Screen {
     Connect,
-    Sessions,
-    Session,
+    Main,
+}
+
+/// A destination in the main screen's bottom tab bar. Tabs only appear
+/// once their surface works — the bar grows as panels land.
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Chats,
+    Git,
 }
 
 /// The session whose transcript the view is watching.
@@ -176,6 +190,24 @@ pub struct MobileApp {
     sessions_list: ListState,
     session_rows: Vec<MobileSessionRow>,
     project_git: HashMap<std::path::PathBuf, GitStatus>,
+    /// Which tab the main screen shows.
+    tab: Tab,
+    /// Slide-over drawer with the project list and connection controls.
+    sidebar_open: bool,
+    /// Commit-message composer on the Git tab.
+    git_message: Entity<gpui_kit::component::input::TextareaState>,
+    /// New-branch name input on the Git tab.
+    git_branch: Entity<InputState>,
+    /// Open diff overlay: `(title, unified diff text)`.
+    git_diff: Option<(String, String)>,
+    /// Diff request in flight — the next `GitResponse::Text` fills `git_diff`.
+    git_diff_pending: Option<String>,
+    /// Expanded commit/stash objects on the Git tab, keyed `commit-<sha>`
+    /// or `stash-<index>`.
+    git_expanded: HashSet<String>,
+    /// Files loaded for an expanded object, same key space; presence of
+    /// the key distinguishes loaded-empty from still-loading.
+    git_object_files: HashMap<String, Vec<GitFile>>,
     models: Vec<ComposerModel>,
     session_drafts: Vec<SessionInfo>,
     selected_model: Option<String>,
@@ -192,6 +224,14 @@ impl MobileApp {
         let port = cx.new(|cx| InputState::new(window, cx).placeholder("port"));
         let token = cx.new(|cx| InputState::new(window, cx).placeholder("pairing token"));
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search chats"));
+        let git_message = cx.new(|cx| {
+            gpui_kit::component::input::TextareaState::new(window, cx)
+                .placeholder("Commit message")
+                .auto_grow(1, 4)
+                .soft_wrap(true)
+        });
+        let git_branch =
+            cx.new(|cx| InputState::new(window, cx).placeholder("New branch name"));
         let composer = cx.new(|cx| {
             gpui_kit::component::input::TextareaState::new(window, cx)
                 .placeholder("Message")
@@ -199,7 +239,7 @@ impl MobileApp {
                 .submit_on_enter(true)
                 .soft_wrap(true)
         });
-        let mut subscriptions = [&host, &port, &token, &search]
+        let mut subscriptions = [&host, &port, &token, &search, &git_branch]
             .iter()
             .map(|input| {
                 cx.subscribe_in(input, window, |_, _, event, _, _| match event {
@@ -220,6 +260,15 @@ impl MobileApp {
                     _ => {}
                 },
             ),
+        );
+        subscriptions.push(
+            cx.subscribe_in(&git_message, window, |_, _, event, _, _| {
+                match event {
+                    InputEvent::Focus => gpui_mobile::show_keyboard(),
+                    InputEvent::Blur => gpui_mobile::hide_keyboard(),
+                    _ => {}
+                }
+            }),
         );
 
         subscriptions.push(
@@ -301,6 +350,14 @@ impl MobileApp {
             sessions_list: ListState::new(0, ListAlignment::Top, window.rem_size() * 4.5),
             session_rows: Vec::new(),
             project_git: HashMap::new(),
+            tab: Tab::Chats,
+            sidebar_open: false,
+            git_message,
+            git_branch,
+            git_diff: None,
+            git_diff_pending: None,
+            git_expanded: HashSet::new(),
+            git_object_files: HashMap::new(),
             models: Vec::new(),
             session_drafts: Vec::new(),
             selected_model: None,
@@ -397,8 +454,14 @@ impl MobileApp {
         self.selected_model = None;
         self.effort = None;
         self.active = None;
+        self.git_diff = None;
+        self.git_diff_pending = None;
+        self.git_expanded.clear();
+        self.git_object_files.clear();
         self.daemon = Some(daemon);
-        self.screen = Screen::Sessions;
+        self.screen = Screen::Main;
+        self.tab = Tab::Chats;
+        self.sidebar_open = false;
 
         // Pump the wire onto the view until the daemon is dropped.
         let mut events = self.daemon.as_mut().and_then(|daemon| daemon.take_events());
@@ -431,6 +494,12 @@ impl MobileApp {
         self.client.pending_questions.clear();
         self.client.queued_questions.clear();
         self.link_state = "Disconnected".to_string();
+        self.tab = Tab::Chats;
+        self.sidebar_open = false;
+        self.git_diff = None;
+        self.git_diff_pending = None;
+        self.git_expanded.clear();
+        self.git_object_files.clear();
         self.screen = Screen::Connect;
         cx.notify();
     }
@@ -471,7 +540,7 @@ impl MobileApp {
         self.composer
             .update(cx, |input, cx| input.set_value(draft.text, window, cx));
         self.active = Some(ActiveSession::new(info, window));
-        self.screen = Screen::Session;
+        self.tab = Tab::Chats;
         cx.notify();
     }
 
@@ -533,7 +602,7 @@ impl MobileApp {
                 self.composer
                     .update(cx, |input, cx| input.set_value("", window, cx));
                 self.active = Some(ActiveSession::new(&session, window));
-                self.screen = Screen::Session;
+                self.tab = Tab::Chats;
                 self.request_composer(SessionCommand::GetComposerOptions {
                     work_dir: session.work_dir,
                     session_id: Some(session.id),
@@ -561,12 +630,49 @@ impl MobileApp {
                 self.effort = Some(effort);
                 self.mode = mode;
             }
-            CommandResponse::Git {
-                response: GitResponse::Status { status },
-            } => {
-                if let SessionCommand::GitRequest { work_dir, .. } = command {
-                    self.project_git.insert(work_dir.clone(), *status);
-                    self.refresh_session_rows();
+            CommandResponse::Git { response } => {
+                let SessionCommand::GitRequest { work_dir, operation } = command else {
+                    return;
+                };
+                match response {
+                    GitResponse::Status { status } => {
+                        self.project_git.insert(work_dir.clone(), *status);
+                        self.refresh_session_rows();
+                    }
+                    GitResponse::Action { outcome } => {
+                        if let Some(error) = &outcome.action_error {
+                            self.client.session_status = Some(error.clone());
+                        } else if let Some(message) = &outcome.message {
+                            self.client.session_status = Some(message.clone());
+                        }
+                        if let Ok(status) = outcome.status {
+                            self.project_git.insert(work_dir.clone(), status);
+                            self.refresh_session_rows();
+                        }
+                        if outcome.action_error.is_none()
+                            && matches!(operation, GitOperation::Commit { .. })
+                        {
+                            self.git_message.update(cx, |input, cx| {
+                                input.set_value("", window, cx)
+                            });
+                        }
+                    }
+                    GitResponse::Files { files } => {
+                        let key = match operation {
+                            GitOperation::CommitFiles { sha } => Some(format!("commit-{sha}")),
+                            GitOperation::StashFiles { index } => Some(format!("stash-{index}")),
+                            _ => None,
+                        };
+                        if let Some(key) = key {
+                            self.git_object_files.insert(key, files);
+                        }
+                    }
+                    GitResponse::Text { text } => {
+                        if let Some(title) = self.git_diff_pending.take() {
+                            self.git_diff = Some((title, text));
+                        }
+                    }
+                    _ => {}
                 }
             }
             CommandResponse::Ack => {
@@ -872,7 +978,15 @@ impl MobileApp {
                             });
                         }
                     }
-                    if matches!(command, SessionCommand::GitRequest { .. }) {
+                    if let SessionCommand::GitRequest { operation, .. } = &command {
+                        self.git_diff_pending = None;
+                        // A background Inspect failing is not worth surfacing —
+                        // the panel keeps showing its last status. Everything
+                        // else the user asked for, so the error belongs near
+                        // the surface they acted on.
+                        if !matches!(operation, GitOperation::Inspect { .. }) {
+                            self.client.session_status = Some(error.clone());
+                        }
                         return;
                     }
                     self.connect_error = Some(error.clone());
@@ -926,7 +1040,6 @@ impl MobileApp {
         }
         if self.client.active_session_id.is_none() && self.active.is_some() {
             self.active = None;
-            self.screen = Screen::Sessions;
         }
         if let Some(active) = &mut self.active {
             if let Some(info) = self
@@ -1300,11 +1413,22 @@ impl MobileApp {
                     .flex_none()
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .px_4()
+                    .gap_2()
+                    .px_3()
                     .py_3()
                     .border_b_1()
                     .border_color(cx.theme().border)
+                    .child(
+                        Button::new("open-sidebar")
+                            .ghost()
+                            .h_11()
+                            .icon(icon(kit_icons::Menu.1))
+                            .accessibility_label("Menu")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sidebar_open = true;
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         div()
                             .flex()
@@ -1323,13 +1447,6 @@ impl MobileApp {
                                     .text_color(cx.theme().muted_foreground)
                                     .child(self.link_state.clone()),
                             ),
-                    )
-                    .child(
-                        Button::new("disconnect")
-                            .ghost()
-                            .label("Disconnect")
-                            .h_11()
-                            .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx))),
                     ),
             )
             .child(
@@ -1635,7 +1752,6 @@ impl MobileApp {
                                     },
                                 );
                                 this.active = None;
-                                this.screen = Screen::Sessions;
                                 cx.notify();
                             })),
                     )
@@ -2134,14 +2250,1458 @@ impl MobileApp {
             )
             .into_any_element()
     }
+
+    /// Route a `GitRequest` at the sidebar-selected project, if one is set.
+    fn send_git(&self, operation: GitOperation) {
+        if let (Some(work_dir), Some(daemon)) =
+            (self.client.sidebar_project_filter.clone(), &self.daemon)
+        {
+            daemon.request(SessionCommand::GitRequest { work_dir, operation });
+        }
+    }
+
+    /// The sidebar's project pick is the scope for every panel — chats and
+    /// Git both read `sidebar_project_filter`, so switching re-scopes the
+    /// whole surface at once.
+    fn select_project(&mut self, work_dir: std::path::PathBuf, cx: &mut Context<Self>) {
+        self.client.sidebar_project_filter = Some(work_dir.clone());
+        self.sidebar_open = false;
+        self.git_diff = None;
+        self.send_git(GitOperation::Inspect { sync_remote: false });
+        self.refresh_session_rows();
+        cx.notify();
+    }
+
+    fn select_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        if self.tab == tab {
+            return;
+        }
+        self.tab = tab;
+        self.sidebar_open = false;
+        if matches!(tab, Tab::Git) {
+            self.git_diff = None;
+            self.send_git(GitOperation::Inspect { sync_remote: false });
+        }
+        cx.notify();
+    }
+
+    /// File rows open a full-screen diff rather than a popover — a phone
+    /// has no hover, and a code view wants the whole viewport.
+    fn open_file_diff(
+        &mut self,
+        title: String,
+        operation: GitOperation,
+        cx: &mut Context<Self>,
+    ) {
+        self.git_diff_pending = Some(title);
+        self.send_git(operation);
+        cx.notify();
+    }
+
+    /// Expand or collapse a commit/stash object on the Git tab, fetching
+    /// its file list the first time it opens.
+    fn toggle_git_object(
+        &mut self,
+        key: String,
+        operation: GitOperation,
+        cx: &mut Context<Self>,
+    ) {
+        if self.git_expanded.contains(&key) {
+            self.git_expanded.remove(&key);
+        } else {
+            self.git_expanded.insert(key.clone());
+            if !self.git_object_files.contains_key(&key) {
+                self.send_git(operation);
+            }
+        }
+        cx.notify();
+    }
+}
+
+impl MobileApp {
+    /// The shell: tabbed content over a bottom tab bar, with the sidebar
+    /// and the diff overlay stacked above both.
+    fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let content = match self.tab {
+            Tab::Chats => {
+                if self.active.is_some() {
+                    self.render_session(window, cx).into_any_element()
+                } else {
+                    self.render_sessions(cx).into_any_element()
+                }
+            }
+            Tab::Git => self.render_git_panel(cx).into_any_element(),
+        };
+        div()
+            .id("mobile-main")
+            .size_full()
+            .relative()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(div().flex_1().min_h_0().w_full().child(content))
+                    .child(self.render_tab_bar(cx)),
+            )
+            .when(self.sidebar_open, |this| {
+                this.child(self.render_sidebar(window, cx))
+            })
+            .when_some(self.git_diff.clone(), |this, (title, text)| {
+                this.child(self.render_git_diff(&title, &text, cx))
+            })
+    }
+
+    fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tabs = [
+            (Tab::Chats, "Chats", kit_icons::MessagesSquare.1),
+            (Tab::Git, "Git", kit_icons::GitBranch.1),
+        ];
+        div()
+            .flex_none()
+            .w_full()
+            .flex()
+            .items_stretch()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .children(tabs.into_iter().map(|(tab, label, bytes)| {
+                let color = if self.tab == tab {
+                    cx.theme().primary
+                } else {
+                    cx.theme().muted_foreground
+                };
+                Button::new(format!("tab-{label}"))
+                    .ghost()
+                    .flex_1()
+                    .h_12()
+                    .accessibility_label(format!("{label} tab"))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .gap_1()
+                            .child(icon(bytes).small().text_color(color))
+                            .child(div().text_xs().text_color(color).child(label)),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_tab(tab, cx)))
+            }))
+    }
+
+    /// Slide-over drawer: the phone has no room for a persistent sidebar,
+    /// so project picking and connection controls live behind the scrim.
+    fn render_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let width = window.viewport_size().width * 0.82;
+        let saved_pairing = self.saved_pairing;
+        let connected = self.daemon.as_ref().is_some_and(|d| d.is_connected());
+        div()
+            .id("mobile-sidebar")
+            .absolute()
+            .inset_0()
+            .child(
+                div()
+                    .id("sidebar-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(threadlane_ui_theme::overlay_scrim())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_open = false;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id("sidebar-panel")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .bottom_0()
+                    .w(width)
+                    .flex()
+                    .flex_col()
+                    .bg(cx.theme().sidebar)
+                    .border_r_1()
+                    .border_color(cx.theme().sidebar_border)
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_4()
+                            .py_3()
+                            .border_b_1()
+                            .border_color(cx.theme().sidebar_border)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(div().font_bold().child("Threadlane"))
+                                            .child(self.link_dot(cx)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(self.link_state.clone()),
+                                    ),
+                            )
+                            .child(
+                                Button::new("close-sidebar")
+                                    .ghost()
+                                    .icon(icon(kit_icons::X.1))
+                                    .accessibility_label("Close menu")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.sidebar_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div().flex_none().px_4().pt_3().pb_1().child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Projects"),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id("sidebar-projects")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .children(self.client.projects.iter().map(|project| {
+                                self.render_sidebar_project(project, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .border_t_1()
+                            .border_color(cx.theme().sidebar_border)
+                            .p_3()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                Button::new("sidebar-disconnect")
+                                    .ghost()
+                                    .w_full()
+                                    .h_11()
+                                    .icon(icon(kit_icons::Unplug.1))
+                                    .label("Disconnect")
+                                    .disabled(!connected)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.sidebar_open = false;
+                                        this.disconnect(cx);
+                                    })),
+                            )
+                            .when(saved_pairing, |this| {
+                                this.child(
+                                    Button::new("sidebar-forget")
+                                        .ghost()
+                                        .w_full()
+                                        .h_11()
+                                        .icon(icon(kit_icons::Trash.1))
+                                        .label("Forget saved pairing")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.sidebar_open = false;
+                                            this.forget_pairing(window, cx);
+                                        })),
+                                )
+                            }),
+                    ),
+            )
+    }
+
+    fn render_sidebar_project(
+        &self,
+        project: &threadlane_protocol::daemon::ProjectInfo,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let work_dir = project.work_dir.clone();
+        let selected = self.client.sidebar_project_filter.as_ref() == Some(&work_dir);
+        let accent = if selected {
+            cx.theme().sidebar_accent
+        } else {
+            cx.theme().muted_foreground
+        };
+        let status = self
+            .project_git
+            .get(&work_dir)
+            .map(|git| {
+                format!(
+                    "{} · {}{}",
+                    git.branch.as_deref().unwrap_or("Detached"),
+                    if git.has_changes { "Modified" } else { "Clean" },
+                    if git.ahead > 0 || git.behind > 0 {
+                        format!(" · ↑{} ↓{}", git.ahead, git.behind)
+                    } else {
+                        String::new()
+                    }
+                )
+            })
+            .unwrap_or_else(|| "Git status unavailable".into());
+        div()
+            .px_2()
+            .child(
+                Button::new(format!("sidebar-project-{}", work_dir.display()))
+                    .ghost()
+                    .w_full()
+                    .h_auto()
+                    .min_h_12()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .w_full()
+                            .min_w_0()
+                            .child(icon(kit_icons::Folder.1).xsmall().text_color(accent))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .items_start()
+                                    .gap_1()
+                                    .child(
+                                        div().font_bold().truncate().child(project.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .truncate()
+                                            .child(format!(
+                                                "{} {} · {}",
+                                                project.sessions.len(),
+                                                if project.sessions.len() == 1 {
+                                                    "chat"
+                                                } else {
+                                                    "chats"
+                                                },
+                                                status
+                                            )),
+                                    ),
+                            )
+                            .when(selected, |this| {
+                                this.child(icon(kit_icons::Check.1).xsmall().text_color(accent))
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_project(work_dir.clone(), cx)
+                    })),
+            )
+            .into_any_element()
+    }
+}
+
+impl MobileApp {
+    /// The Git tab: the desktop's right-panel git surface stacked into one
+    /// scrolling column — sync, changes, commit, branches, stashes,
+    /// commits — scoped to the sidebar-selected project.
+    fn render_git_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let work_dir = self.client.sidebar_project_filter.clone();
+        let project_name = work_dir
+            .as_ref()
+            .and_then(|dir| self.client.projects.iter().find(|p| &p.work_dir == dir))
+            .map(|project| project.name.clone());
+        let status = work_dir
+            .as_ref()
+            .and_then(|dir| self.project_git.get(dir).cloned());
+        let status_line = self.client.session_status.clone();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        Button::new("git-open-sidebar")
+                            .ghost()
+                            .h_11()
+                            .icon(icon(kit_icons::Menu.1))
+                            .accessibility_label("Menu")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sidebar_open = true;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div().font_bold().truncate().child(
+                                            project_name
+                                                .map(|name| format!("Git — {name}"))
+                                                .unwrap_or_else(|| "Git".into()),
+                                        ),
+                                    )
+                                    .child(self.link_dot(cx)),
+                            )
+                            .when_some(status_line, |this, line| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(line),
+                                )
+                            }),
+                    )
+                    .child(
+                        Button::new("git-refresh")
+                            .ghost()
+                            .h_11()
+                            .icon(icon(kit_icons::RefreshCw.1))
+                            .accessibility_label("Fetch and refresh")
+                            .disabled(work_dir.is_none())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.send_git(GitOperation::Inspect { sync_remote: true });
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .when(work_dir.is_none(), |this| {
+                this.child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_3()
+                        .px_6()
+                        .child(
+                            icon(kit_icons::GitBranch.1)
+                                .large()
+                                .text_color(cx.theme().muted_foreground),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Choose a project to see its repository"),
+                        )
+                        .child(
+                            Button::new("git-choose-project")
+                                .primary()
+                                .h_11()
+                                .label("Choose project")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.sidebar_open = true;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .when_some(work_dir, |this, _work_dir| match status {
+                Some(status) => this.child(self.render_git_status(&status, cx)),
+                None => this.child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Loading Git status…"),
+                        ),
+                ),
+            })
+    }
+
+    fn render_git_status(&mut self, status: &GitStatus, cx: &mut Context<Self>) -> impl IntoElement {
+        let staged: Vec<&GitFile> = status.files.iter().filter(|file| file.staged).collect();
+        let unstaged: Vec<&GitFile> = status
+            .files
+            .iter()
+            .filter(|file| file.unstaged)
+            .collect();
+        let staged_paths: Vec<String> = staged.iter().map(|file| file.path.clone()).collect();
+        let push_paths = staged_paths.clone();
+        let message = self.git_message.read(cx).value().trim().to_owned();
+        let commit_ready = !message.is_empty() && !staged_paths.is_empty();
+        let new_branch = self.git_branch.read(cx).value().trim().to_owned();
+        // Checkout targets: local branches only, current first then the
+        // default branch, name-ordered after that so the menu is stable.
+        // Owned because the dropdown builder closure must be 'static.
+        let mut branches: Vec<GitBranchInfo> = status
+            .branch_details
+            .iter()
+            .filter(|branch| !branch.is_remote)
+            .cloned()
+            .collect();
+        branches.sort_by(|a, b| {
+            b.is_current
+                .cmp(&a.is_current)
+                .then(b.is_default.cmp(&a.is_default))
+                .then(a.name.cmp(&b.name))
+        });
+        let entity = cx.entity();
+        div()
+            .id("git-panel")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        icon(kit_icons::GitBranch.1)
+                                            .xsmall()
+                                            .text_color(cx.theme().muted_foreground),
+                                    )
+                                    .child(
+                                        div().flex_1().min_w_0().truncate().font_bold().child(
+                                            status
+                                                .branch
+                                                .clone()
+                                                .unwrap_or_else(|| "Detached HEAD".into()),
+                                        ),
+                                    )
+                                    .when(status.ahead > 0 || status.behind > 0, |this| {
+                                        this.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(format!(
+                                                    "↑{} ↓{}",
+                                                    status.ahead, status.behind
+                                                )),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("git-fetch")
+                                            .ghost()
+                                            .h_11()
+                                            .flex_1()
+                                            .icon(icon(kit_icons::RefreshCw.1))
+                                            .label("Fetch")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.send_git(GitOperation::Fetch);
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("git-pull")
+                                            .ghost()
+                                            .h_11()
+                                            .flex_1()
+                                            .icon(icon(kit_icons::Download.1))
+                                            .label(if status.behind > 0 {
+                                                format!("Pull ({})", status.behind)
+                                            } else {
+                                                "Pull".into()
+                                            })
+                                            .disabled(!status.has_upstream)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.send_git(GitOperation::Pull);
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("git-push")
+                                            .ghost()
+                                            .h_11()
+                                            .flex_1()
+                                            .icon(icon(kit_icons::Upload.1))
+                                            .label(if status.ahead > 0 {
+                                                format!("Push ({})", status.ahead)
+                                            } else {
+                                                "Push".into()
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.send_git(GitOperation::Push);
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .when_some(status.pr.clone(), |this, pr| {
+                        this.child(self.render_git_pr(&pr, cx))
+                    })
+                    .when(
+                        status.pr.is_none() && status.pr_ready && status.has_upstream,
+                        |this| {
+                            this.child(
+                                Button::new("git-create-pr")
+                                    .outline()
+                                    .h_11()
+                                    .icon(icon(kit_icons::GitPullRequest.1))
+                                    .label("Create pull request")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.send_git(GitOperation::CreatePullRequest);
+                                        cx.notify();
+                                    })),
+                            )
+                        },
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(if staged.is_empty() && unstaged.is_empty() {
+                                                "Working tree clean".to_string()
+                                            } else {
+                                                format!("Changes ({})", staged.len() + unstaged.len())
+                                            }),
+                                    )
+                                    .when(!unstaged.is_empty(), |this| {
+                                        this.child(
+                                            Button::new("git-stage-all")
+                                                .ghost()
+                                                .small()
+                                                .label("Stage all")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.send_git(GitOperation::StageAll);
+                                                    cx.notify();
+                                                })),
+                                        )
+                                    })
+                                    .when(!staged.is_empty(), |this| {
+                                        this.child(
+                                            Button::new("git-unstage-all")
+                                                .ghost()
+                                                .small()
+                                                .label("Unstage all")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.send_git(GitOperation::UnstageAll);
+                                                    cx.notify();
+                                                })),
+                                        )
+                                    }),
+                            )
+                            .when(!staged.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .pt_1()
+                                        .child("Staged"),
+                                )
+                            })
+                            .children(staged.iter().map(|file| {
+                                self.render_git_file(
+                                    format!("git-file-staged-{}", file.path),
+                                    file,
+                                    GitOperation::DiffFile {
+                                        path: file.path.clone(),
+                                        options: DiffOptions::default(),
+                                    },
+                                    Some(GitOperation::Unstage {
+                                        paths: vec![file.path.clone()],
+                                    }),
+                                    cx,
+                                )
+                            }))
+                            .when(!unstaged.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .pt_1()
+                                        .child("Unstaged"),
+                                )
+                            })
+                            .children(unstaged.iter().map(|file| {
+                                self.render_git_file(
+                                    format!("git-file-unstaged-{}", file.path),
+                                    file,
+                                    GitOperation::DiffFile {
+                                        path: file.path.clone(),
+                                        options: DiffOptions::default(),
+                                    },
+                                    Some(GitOperation::Stage {
+                                        paths: vec![file.path.clone()],
+                                    }),
+                                    cx,
+                                )
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Commit"),
+                            )
+                            .child(
+                                Textarea::new(&self.git_message)
+                                    .aria_label("Commit message")
+                                    .h_11(),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("git-commit")
+                                            .primary()
+                                            .h_11()
+                                            .flex_1()
+                                            .label("Commit")
+                                            .disabled(!commit_ready)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                let message = this
+                                                    .git_message
+                                                    .read(cx)
+                                                    .value()
+                                                    .trim()
+                                                    .to_owned();
+                                                if message.is_empty() {
+                                                    return;
+                                                }
+                                                this.send_git(GitOperation::Commit {
+                                                    message,
+                                                    selected_paths: staged_paths.clone(),
+                                                    push: false,
+                                                });
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("git-commit-push")
+                                            .ghost()
+                                            .h_11()
+                                            .flex_1()
+                                            .label("Commit & push")
+                                            .disabled(!commit_ready)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                let message = this
+                                                    .git_message
+                                                    .read(cx)
+                                                    .value()
+                                                    .trim()
+                                                    .to_owned();
+                                                if message.is_empty() {
+                                                    return;
+                                                }
+                                                this.send_git(GitOperation::Commit {
+                                                    message,
+                                                    selected_paths: push_paths.clone(),
+                                                    push: true,
+                                                });
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Branches"),
+                            )
+                            .child(
+                                Button::new("git-branch-menu")
+                                    .outline()
+                                    .h_11()
+                                    .w_full()
+                                    .label(format!(
+                                        "{} ▾",
+                                        status.branch.as_deref().unwrap_or("Detached")
+                                    ))
+                                    .accessibility_label("Switch branch")
+                                    .dropdown_caret(true)
+                                    .dropdown_menu_with_anchor(Anchor::BottomLeft, {
+                                        move |menu, _, _| {
+                                            branches.iter().fold(menu.scrollable(true), |menu, branch| {
+                                                let entity = entity.clone();
+                                                let name = branch.name.clone();
+                                                menu.item(
+                                                    PopupMenuItem::new(branch.name.clone())
+                                                        .checked(branch.is_current)
+                                                        .on_click(move |_, _, cx| {
+                                                            let _ = entity.update(cx, |this, cx| {
+                                                                this.send_git(GitOperation::Checkout {
+                                                                    branch: name.clone(),
+                                                                    mode: CheckoutMode::Clean,
+                                                                });
+                                                                cx.notify();
+                                                            });
+                                                        }),
+                                                )
+                                            })
+                                        }
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        div().flex_1().min_w_0().child(
+                                            Input::new(&self.git_branch)
+                                                .aria_label("New branch name")
+                                                .h_11(),
+                                        ),
+                                    )
+                                    .child(
+                                        Button::new("git-create-branch")
+                                            .outline()
+                                            .h_11()
+                                            .icon(icon(kit_icons::Plus.1))
+                                            .label("Create")
+                                            .disabled(new_branch.is_empty())
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                let name = this
+                                                    .git_branch
+                                                    .read(cx)
+                                                    .value()
+                                                    .trim()
+                                                    .to_owned();
+                                                if name.is_empty() {
+                                                    return;
+                                                }
+                                                this.send_git(GitOperation::CreateBranch { name });
+                                                this.git_branch.update(cx, |input, cx| {
+                                                    input.set_value("", window, cx)
+                                                });
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(if status.stashes.is_empty() {
+                                                "Stash".to_string()
+                                            } else {
+                                                format!("Stashes ({})", status.stashes.len())
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("git-stash-push")
+                                            .ghost()
+                                            .small()
+                                            .icon(icon(kit_icons::Inbox.1))
+                                            .label("Stash changes")
+                                            .disabled(!status.has_changes)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.send_git(GitOperation::StashPush {
+                                                    message: None,
+                                                    include_untracked: true,
+                                                });
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .children(
+                                status
+                                    .stashes
+                                    .iter()
+                                    .map(|stash| self.render_stash_row(stash, cx)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Recent commits"),
+                            )
+                            .when(status.recent_commits.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("No commits yet"),
+                                )
+                            })
+                            .children(
+                                status
+                                    .recent_commits
+                                    .iter()
+                                    .map(|commit| self.render_commit_row(commit, cx)),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_git_pr(&self, pr: &GitHubPrInfo, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                icon(kit_icons::GitPullRequest.1)
+                    .xsmall()
+                    .text_color(cx.theme().accent),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_bold()
+                            .truncate()
+                            .child(format!("#{} — {}", pr.number, pr.title)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "{}{} · {} checks{}",
+                                if pr.is_draft { "Draft " } else { "" },
+                                pr.state,
+                                pr.passing_checks,
+                                if pr.total_checks > 0 {
+                                    format!("/{} passing", pr.total_checks)
+                                } else {
+                                    String::new()
+                                }
+                            )),
+                    ),
+            )
+    }
+
+    /// One file row: tap opens the full-screen diff; the trailing button
+    /// carries the stage/unstage action when the row is a working-tree
+    /// file (commit and stash rows pass `None`).
+    fn render_git_file(
+        &self,
+        id: String,
+        file: &GitFile,
+        diff: GitOperation,
+        action: Option<GitOperation>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let title = file.path.clone();
+        let action_key = file.path.clone();
+        let (action_label, action_verb) = match &action {
+            Some(GitOperation::Stage { .. }) => (Some("stage"), Some("Stage")),
+            Some(GitOperation::Unstage { .. }) => (Some("unstage"), Some("Unstage")),
+            _ => (None, None),
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                Button::new(id)
+                    .ghost()
+                    .flex_1()
+                    .h_auto()
+                    .min_h_10()
+                    .child(self.render_git_file_label(file, cx))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_file_diff(title.clone(), diff.clone(), cx);
+                    })),
+            )
+            .when_some(action, |this, action| {
+                this.child(
+                    Button::new(format!("git-action-{}-{action_key}", action_label.unwrap_or("noop")))
+                        .ghost()
+                        .small()
+                        .h_9()
+                        .label(action_verb.unwrap_or_default())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.send_git(action.clone());
+                            cx.notify();
+                        })),
+                )
+            })
+    }
+
+    fn render_git_file_label(&self, file: &GitFile, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .min_w_0()
+            .child(
+                div()
+                    .w_4()
+                    .flex_none()
+                    .text_xs()
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_color(git_status_color(file.status_char(), cx))
+                    .child(file.status_char().to_string()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .child(div().text_sm().truncate().child(file.path.clone()))
+                    .when(file.additions + file.deletions > 0, |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .gap_1()
+                                .text_xs()
+                                .child(
+                                    div()
+                                        .text_color(cx.theme().success)
+                                        .child(format!("+{}", file.additions)),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(cx.theme().danger)
+                                        .child(format!("-{}", file.deletions)),
+                                ),
+                        )
+                    }),
+            )
+    }
+
+    fn render_stash_row(&self, stash: &GitStashInfo, cx: &mut Context<Self>) -> impl IntoElement {
+        let key = format!("stash-{}", stash.index);
+        let index = stash.index;
+        let expanded = self.git_expanded.contains(&key);
+        let files = self.git_object_files.get(&key).cloned();
+        let title = if stash.message.is_empty() {
+            stash.name.clone()
+        } else {
+            stash.message.clone()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Button::new(format!("git-{key}"))
+                            .ghost()
+                            .flex_1()
+                            .h_auto()
+                            .min_h_10()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .w_full()
+                                    .min_w_0()
+                                    .child(
+                                        icon(kit_icons::Inbox.1)
+                                            .xsmall()
+                                            .text_color(cx.theme().muted_foreground),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .items_start()
+                                            .child(div().text_sm().truncate().child(title))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(stash.relative_time.clone()),
+                                            ),
+                                    )
+                                    .child(
+                                        icon(if expanded {
+                                            kit_icons::ChevronDown.1
+                                        } else {
+                                            kit_icons::ChevronRight.1
+                                        })
+                                        .xsmall()
+                                        .text_color(cx.theme().muted_foreground),
+                                    ),
+                            )
+                            .accessibility_label(format!(
+                                "{} files in {}",
+                                if expanded { "Hide" } else { "Show" },
+                                stash.name
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_git_object(
+                                    key.clone(),
+                                    GitOperation::StashFiles { index },
+                                    cx,
+                                );
+                            })),
+                    )
+                    .child(
+                        Button::new(format!("git-stash-pop-{index}"))
+                            .ghost()
+                            .small()
+                            .h_9()
+                            .label("Pop")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.send_git(GitOperation::PopStash {
+                                    index: Some(index),
+                                });
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new(format!("git-stash-drop-{index}"))
+                            .ghost()
+                            .small()
+                            .h_9()
+                            .label("Drop")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.send_git(GitOperation::DropStash {
+                                    index: Some(index),
+                                });
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .when(expanded, |this| {
+                this.child(
+                    div().pl_6().flex().flex_col().children(match files {
+                        Some(files) if files.is_empty() => vec![div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("No files")
+                            .into_any_element()],
+                        Some(files) => files
+                            .iter()
+                            .enumerate()
+                            .map(|(ix, file)| {
+                                self.render_git_file(
+                                    format!("git-stash-file-{index}-{ix}"),
+                                    file,
+                                    GitOperation::DiffStashFile {
+                                        index,
+                                        path: file.path.clone(),
+                                    },
+                                    None,
+                                    cx,
+                                )
+                                .into_any_element()
+                            })
+                            .collect(),
+                        None => vec![div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Loading…")
+                            .into_any_element()],
+                    }),
+                )
+            })
+    }
+
+    fn render_commit_row(&self, commit: &GitCommitInfo, cx: &mut Context<Self>) -> impl IntoElement {
+        let key = format!("commit-{}", commit.sha);
+        let expanded = self.git_expanded.contains(&key);
+        let files = self.git_object_files.get(&key).cloned();
+        let sha = commit.sha.clone();
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                Button::new(format!("git-{key}"))
+                    .ghost()
+                    .w_full()
+                    .h_auto()
+                    .min_h_12()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .w_full()
+                            .min_w_0()
+                            .child(
+                                icon(kit_icons::GitCommitHorizontal.1)
+                                    .xsmall()
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .items_start()
+                                    .child(
+                                        div().text_sm().truncate().child(commit.summary.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .truncate()
+                                            .child(format!(
+                                                "{} · {} · {}",
+                                                commit.short_sha,
+                                                commit.author_name,
+                                                commit.relative_time
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                icon(if expanded {
+                                    kit_icons::ChevronDown.1
+                                } else {
+                                    kit_icons::ChevronRight.1
+                                })
+                                .xsmall()
+                                .text_color(cx.theme().muted_foreground),
+                            ),
+                    )
+                    .accessibility_label(format!(
+                        "{} files in commit {}",
+                        if expanded { "Hide" } else { "Show" },
+                        commit.short_sha
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_git_object(
+                            key.clone(),
+                            GitOperation::CommitFiles { sha: sha.clone() },
+                            cx,
+                        );
+                    })),
+            )
+            .when(expanded, |this| {
+                this.child(
+                    div().pl_6().flex().flex_col().children(match files {
+                        Some(files) if files.is_empty() => vec![div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("No files")
+                            .into_any_element()],
+                        Some(files) => files
+                            .iter()
+                            .enumerate()
+                            .map(|(ix, file)| {
+                                self.render_git_file(
+                                    format!("git-commit-file-{}-{ix}", commit.sha),
+                                    file,
+                                    GitOperation::DiffCommitFile {
+                                        sha: commit.sha.clone(),
+                                        path: file.path.clone(),
+                                    },
+                                    None,
+                                    cx,
+                                )
+                                .into_any_element()
+                            })
+                            .collect(),
+                        None => vec![div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Loading…")
+                            .into_any_element()],
+                    }),
+                )
+            })
+    }
+
+    /// Full-screen unified diff — per-line tinting mirrors the desktop's
+    /// diff rows without dragging its tool-detail machinery into mobile.
+    fn render_git_diff(&self, title: &str, text: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let rows = if text.is_empty() {
+            vec![div()
+                .w_full()
+                .px_3()
+                .py_1()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("No changes".to_string())
+                .into_any_element()]
+        } else {
+            text.lines()
+                .enumerate()
+                .map(|(ix, line)| {
+                    let (tint, color) = if line.starts_with("+++") || line.starts_with("---") {
+                        (theme.muted_foreground.opacity(0.0), theme.muted_foreground)
+                    } else if line.starts_with('+') {
+                        (theme.success.opacity(0.10), theme.success)
+                    } else if line.starts_with('-') {
+                        (theme.danger.opacity(0.10), theme.danger)
+                    } else if line.starts_with("@@") {
+                        (theme.info.opacity(0.10), theme.info)
+                    } else if line.starts_with("diff --git") || line.starts_with("index ") {
+                        (theme.muted.opacity(0.25), theme.muted_foreground)
+                    } else {
+                        (theme.muted_foreground.opacity(0.0), theme.foreground)
+                    };
+                    div()
+                        .id(("git-diff-row", ix))
+                        .w_full()
+                        .px_3()
+                        .py_0p5()
+                        .bg(tint)
+                        .text_xs()
+                        .font_family(theme.mono_font_family.clone())
+                        .text_color(color)
+                        .whitespace_nowrap()
+                        .child(line.to_string())
+                        .into_any_element()
+                })
+                .collect()
+        };
+        div()
+            .id("git-diff")
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_col()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        Button::new("close-diff")
+                            .ghost()
+                            .h_11()
+                            .icon(icon(kit_icons::X.1))
+                            .accessibility_label("Close diff")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.git_diff = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_bold()
+                            .child(title.to_string()),
+                    ),
+            )
+            .child(
+                div()
+                    .id("git-diff-body")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scroll()
+                    .overflow_x_scrollbar()
+                    .child(div().flex().flex_col().py_1().children(rows)),
+            )
+    }
+}
+
+fn git_status_color(status: char, cx: &App) -> Hsla {
+    match status {
+        'A' | '?' => cx.theme().success,
+        'M' => cx.theme().warning,
+        'D' => cx.theme().danger,
+        'R' | 'C' => cx.theme().info,
+        _ => cx.theme().muted_foreground,
+    }
 }
 
 impl Render for MobileApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         match self.screen {
             Screen::Connect => self.render_connect(cx).into_any_element(),
-            Screen::Sessions => self.render_sessions(cx).into_any_element(),
-            Screen::Session => self.render_session(window, cx).into_any_element(),
+            Screen::Main => self.render_main(window, cx).into_any_element(),
         }
     }
 }
