@@ -32,7 +32,7 @@ use threadlane_protocol::repo::{
     CheckoutMode, DiffOptions, GitBranchInfo, GitCommitInfo, GitFile,
     GitHubIssueDetail, GitHubIssueListState, GitHubIssueSummary, GitHubOperation,
     GitHubPrInfo, GitHubPrListState, GitHubPullRequestSummary, GitHubResponse,
-    GitOperation, GitResponse, GitStashInfo, GitStatus,
+    GitOperation, GitResponse, GitStashInfo, GitStatus, PrCheckStatus,
 };
 use threadlane_protocol::{OrchestratorMode, ReasoningEffort};
 
@@ -113,6 +113,35 @@ fn question_key(request_id: &str, item_id: &str) -> String {
     format!("{request_id}\0{item_id}")
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckState {
+    Passing,
+    Pending,
+    Failing,
+}
+
+/// `gh` reports check statuses and conclusions in uppercase; this mirrors
+/// the classification in `crates/threadlane-git/src/github.rs`.
+fn check_state(check: &PrCheckStatus) -> CheckState {
+    let conclusion = check.conclusion.as_deref().unwrap_or("").to_uppercase();
+    if matches!(
+        conclusion.as_str(),
+        "FAILURE" | "TIMED_OUT" | "ACTION_REQUIRED" | "CANCELLED" | "ERROR"
+    ) {
+        CheckState::Failing
+    } else if matches!(
+        check.status.to_uppercase().as_str(),
+        "IN_PROGRESS" | "QUEUED" | "PENDING" | "EXPECTED"
+    ) || check.conclusion.is_none()
+    {
+        CheckState::Pending
+    } else if matches!(conclusion.as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED") {
+        CheckState::Passing
+    } else {
+        CheckState::Pending
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Screen {
     Connect,
@@ -131,9 +160,12 @@ enum Tab {
 }
 
 /// Schedule presets the automation form offers — the full calendar
-/// editor is desktop-only for now.
+/// editor is desktop-only for now. `Existing` preserves the loaded
+/// definition's own schedule so editing an automation made on desktop
+/// can't collapse its calendar to a preset.
 #[derive(Clone, Copy, PartialEq)]
 enum AutoSchedule {
+    Existing,
     Manual,
     Interval,
     DailyUtc,
@@ -142,6 +174,7 @@ enum AutoSchedule {
 impl AutoSchedule {
     fn label(self) -> &'static str {
         match self {
+            Self::Existing => "Keep existing schedule",
             Self::Manual => "Manual",
             Self::Interval => "Every N minutes",
             Self::DailyUtc => "Daily 09:00 UTC",
@@ -238,8 +271,9 @@ pub struct MobileApp {
     git_diff: Option<(String, String)>,
     /// Diff request in flight — the next `GitResponse::Text` fills `git_diff`.
     git_diff_pending: Option<String>,
-    /// Expanded commit/stash objects on the Git tab, keyed `commit-<sha>`
-    /// or `stash-<index>`.
+    /// Expanded commit/stash objects on the Git tab, keyed
+    /// `<work_dir>|commit-<sha>` or `<work_dir>|stash-<index>` — index
+    /// keys repeat across projects.
     git_expanded: HashSet<String>,
     /// Files loaded for an expanded object, same key space; presence of
     /// the key distinguishes loaded-empty from still-loading.
@@ -287,6 +321,15 @@ pub struct MobileApp {
     pending_queued_cancel: Option<(String, String)>,
     /// Run id awaiting its delete-confirm strip.
     auto_run_delete_confirm: Option<String>,
+    /// Comment text per detail target, keyed
+    /// `<work_dir>|issue-<number>` / `<work_dir>|pr-<number>` — stashed
+    /// on close so switching details can't misdirect a draft.
+    comment_drafts: HashMap<String, String>,
+    /// `DropStash` index armed by a first tap; a second tap sends it.
+    stash_drop_confirm: Option<usize>,
+    /// `DropStash` request in flight — drop buttons serialize on it so a
+    /// double tap cannot delete the stash that slides into the index.
+    stash_drop_inflight: Option<usize>,
     models: Vec<ComposerModel>,
     session_drafts: Vec<SessionInfo>,
     selected_model: Option<String>,
@@ -516,6 +559,9 @@ impl MobileApp {
             auto_delete_confirm: None,
             pending_queued_cancel: None,
             auto_run_delete_confirm: None,
+            comment_drafts: HashMap::new(),
+            stash_drop_confirm: None,
+            stash_drop_inflight: None,
             models: Vec::new(),
             session_drafts: Vec::new(),
             selected_model: None,
@@ -623,6 +669,9 @@ impl MobileApp {
         self.prs = None;
         self.pr_detail = None;
         self.pr_detail_pending = None;
+        self.comment_drafts.clear();
+        self.stash_drop_confirm = None;
+        self.stash_drop_inflight = None;
         self.daemon = Some(daemon);
         self.screen = Screen::Main;
         self.tab = Tab::Chats;
@@ -672,6 +721,9 @@ impl MobileApp {
         self.prs = None;
         self.pr_detail = None;
         self.pr_detail_pending = None;
+        self.comment_drafts.clear();
+        self.stash_drop_confirm = None;
+        self.stash_drop_inflight = None;
         self.screen = Screen::Connect;
         cx.notify();
     }
@@ -804,7 +856,17 @@ impl MobileApp {
             }
             CommandResponse::Automation { response } => {
                 let AutomationResponse::Projection { projection } = response;
-                self.client.automation = projection;
+                // GetSnapshot doubles as the (re)connect baseline — reconcile
+                // it exactly like an AutomationChanged event so the pending
+                // permission/question surfaces stay attached to the run.
+                let commands = self
+                    .client
+                    .apply_event(SessionEvent::AutomationChanged { projection });
+                if let Some(daemon) = &self.daemon {
+                    for command in commands {
+                        daemon.send(command);
+                    }
+                }
                 if matches!(
                     command,
                     SessionCommand::AutomationRequest {
@@ -815,23 +877,42 @@ impl MobileApp {
                 }
             }
             CommandResponse::GitHub { response } => {
-                let SessionCommand::GitHubRequest { operation, .. } = command else {
+                let SessionCommand::GitHubRequest { work_dir, operation } = command else {
                     return;
                 };
+                // Replies are scoped to the project filter they were
+                // issued under; a reply from a previous pick must not
+                // land on the current panel.
+                if self.client.sidebar_project_filter.as_ref() != Some(work_dir) {
+                    return;
+                }
                 match response {
                     GitHubResponse::Issues { issues } => {
-                        self.issues = Some(issues);
+                        if matches!(operation, GitHubOperation::ListIssues { .. }) {
+                            self.issues = Some(issues);
+                        }
                     }
                     GitHubResponse::Issue { detail } => {
-                        self.issue_detail_pending = None;
-                        self.issue_detail = Some(detail);
+                        let number = detail.summary.issue.number;
+                        if self.issue_detail_pending == Some(number) {
+                            self.issue_detail_pending = None;
+                            self.stash_comment_drafts(cx);
+                            self.restore_comment_draft("issue", number, window, cx);
+                            self.issue_detail = Some(detail);
+                        }
                     }
                     GitHubResponse::PullRequests { prs } => {
-                        self.prs = Some(prs);
+                        if matches!(operation, GitHubOperation::ListPullRequests { .. }) {
+                            self.prs = Some(prs);
+                        }
                     }
                     GitHubResponse::PullRequest { pr } => {
-                        self.pr_detail_pending = None;
-                        self.pr_detail = Some(pr);
+                        if self.pr_detail_pending == Some(pr.number) {
+                            self.pr_detail_pending = None;
+                            self.stash_comment_drafts(cx);
+                            self.restore_comment_draft("pr", pr.number, window, cx);
+                            self.pr_detail = Some(pr);
+                        }
                     }
                     GitHubResponse::Text { text } => {
                         if let Some(title) = self.git_diff_pending.take() {
@@ -839,6 +920,14 @@ impl MobileApp {
                         }
                     }
                     GitHubResponse::Number { number } => {
+                        // Only now is the issue durable — the form's text
+                        // survived any transport/auth failure until here.
+                        self.issue_title.update(cx, |input, cx| {
+                            input.set_value("", window, cx)
+                        });
+                        self.issue_body.update(cx, |input, cx| {
+                            input.set_value("", window, cx)
+                        });
                         self.new_issue_open = false;
                         self.client.session_status = Some(format!("Created issue #{number}"));
                         self.refresh_issues();
@@ -852,8 +941,12 @@ impl MobileApp {
                         // Refresh whatever a mutation may have touched: the
                         // list, and the open detail's comment/state.
                         match operation {
-                            GitHubOperation::CommentIssue { .. }
-                            | GitHubOperation::SetIssueState { .. } => {
+                            GitHubOperation::CommentIssue { number, .. }
+                            | GitHubOperation::SetIssueState { number, .. } => {
+                                if matches!(operation, GitHubOperation::CommentIssue { .. }) {
+                                    self.comment_drafts
+                                        .remove(&format!("{}|issue-{number}", work_dir.display()));
+                                }
                                 if let Some(detail) = &self.issue_detail {
                                     let number = detail.summary.issue.number;
                                     self.issue_detail_pending = Some(number);
@@ -861,11 +954,15 @@ impl MobileApp {
                                 }
                                 self.refresh_issues();
                             }
-                            GitHubOperation::DeleteIssue { .. } => {
+                            GitHubOperation::DeleteIssue { number, .. } => {
                                 self.issue_detail = None;
+                                self.comment_drafts
+                                    .remove(&format!("{}|issue-{number}", work_dir.display()));
                                 self.refresh_issues();
                             }
-                            GitHubOperation::CommentPullRequest { .. } => {
+                            GitHubOperation::CommentPullRequest { number, .. } => {
+                                self.comment_drafts
+                                    .remove(&format!("{}|pr-{number}", work_dir.display()));
                                 if let Some(pr) = &self.pr_detail {
                                     let number = pr.number;
                                     self.pr_detail_pending = Some(number);
@@ -889,6 +986,10 @@ impl MobileApp {
                         self.refresh_session_rows();
                     }
                     GitResponse::Action { outcome } => {
+                        if matches!(operation, GitOperation::DropStash { .. }) {
+                            self.stash_drop_inflight = None;
+                            self.stash_drop_confirm = None;
+                        }
                         if let Some(error) = &outcome.action_error {
                             self.client.session_status = Some(error.clone());
                         } else if let Some(message) = &outcome.message {
@@ -913,7 +1014,11 @@ impl MobileApp {
                             _ => None,
                         };
                         if let Some(key) = key {
-                            self.git_object_files.insert(key, files);
+                            // Scope by the request's own project: index
+                            // keys repeat across projects and a late reply
+                            // must not land under another project's list.
+                            self.git_object_files
+                                .insert(format!("{}|{key}", work_dir.display()), files);
                         }
                     }
                     GitResponse::Text { text } => {
@@ -1241,13 +1346,18 @@ impl MobileApp {
                             });
                         }
                     }
-                    if let SessionCommand::GitRequest { operation, .. } = &command {
+                    if let SessionCommand::GitRequest { work_dir, operation } = &command {
                         self.git_diff_pending = None;
-                        // A background Inspect failing is not worth surfacing —
-                        // the panel keeps showing its last status. Everything
-                        // else the user asked for, so the error belongs near
-                        // the surface they acted on.
-                        if !matches!(operation, GitOperation::Inspect { .. }) {
+                        self.stash_drop_inflight = None;
+                        // An Inspect failing after a status was cached is not
+                        // worth surfacing — the panel keeps showing its last
+                        // status. With nothing cached (a non-git or
+                        // unreachable repo) the tab would stall on "Loading…"
+                        // with no explanation, so surface it like every
+                        // other op the user asked for.
+                        if !matches!(operation, GitOperation::Inspect { .. })
+                            || !self.project_git.contains_key(work_dir)
+                        {
                             self.client.session_status = Some(error.clone());
                         }
                         return;
@@ -3054,7 +3164,9 @@ impl MobileApp {
         self.auto_schedule = match &draft.schedule {
             Schedule::Manual => AutoSchedule::Manual,
             Schedule::Interval { .. } => AutoSchedule::Interval,
-            Schedule::Calendar { .. } => AutoSchedule::DailyUtc,
+            // A calendar the form can't express stays selected via
+            // `Existing`; picking a preset is the only way it changes.
+            Schedule::Calendar { .. } => AutoSchedule::Existing,
         };
         self.auto_worktree = draft.worktree;
         self.auto_enabled = draft.enabled;
@@ -3093,6 +3205,8 @@ impl MobileApp {
         draft.worktree = self.auto_worktree;
         draft.enabled = self.auto_enabled;
         draft.schedule = match self.auto_schedule {
+            // `auto_editing` still carries the loaded calendar — keep it.
+            AutoSchedule::Existing => draft.schedule.clone(),
             AutoSchedule::Manual => Schedule::Manual,
             AutoSchedule::Interval => Schedule::Interval {
                 minutes: self
@@ -3126,6 +3240,57 @@ impl MobileApp {
         cx.notify();
     }
 
+    /// Stash both detail comment inputs under their target keys so a
+    /// draft typed on one issue/PR cannot leak onto the next one opened.
+    fn stash_comment_drafts(&mut self, cx: &mut Context<Self>) {
+        let Some(work_dir) = self.client.sidebar_project_filter.clone() else {
+            return;
+        };
+        if let Some(detail) = &self.issue_detail {
+            let key = format!("{}|issue-{}", work_dir.display(), detail.summary.issue.number);
+            let text = self.issue_comment.read(cx).value().to_string();
+            if text.trim().is_empty() {
+                self.comment_drafts.remove(&key);
+            } else {
+                self.comment_drafts.insert(key, text);
+            }
+        }
+        if let Some(pr) = &self.pr_detail {
+            let key = format!("{}|pr-{}", work_dir.display(), pr.number);
+            let text = self.pr_comment.read(cx).value().to_string();
+            if text.trim().is_empty() {
+                self.comment_drafts.remove(&key);
+            } else {
+                self.comment_drafts.insert(key, text);
+            }
+        }
+    }
+
+    /// Load the stashed draft (or blank) for a target about to open.
+    fn restore_comment_draft(
+        &mut self,
+        scope: &str,
+        number: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = self
+            .client
+            .sidebar_project_filter
+            .as_ref()
+            .and_then(|work_dir| {
+                self.comment_drafts
+                    .remove(&format!("{}|{scope}-{number}", work_dir.display()))
+            })
+            .unwrap_or_default();
+        let input = if scope == "issue" {
+            &self.issue_comment
+        } else {
+            &self.pr_comment
+        };
+        input.update(cx, |input, cx| input.set_value(text, window, cx));
+    }
+
     /// The sidebar's project pick is the scope for every panel — chats and
     /// Git both read `sidebar_project_filter`, so switching re-scopes the
     /// whole surface at once.
@@ -3133,10 +3298,41 @@ impl MobileApp {
         self.client.sidebar_project_filter = Some(work_dir.clone());
         self.sidebar_open = false;
         self.git_diff = None;
+        self.stash_drop_confirm = None;
+        // An open chat belongs to its project: keep the composer draft
+        // under its key, then detach it so Chats lands on the newly
+        // scoped session list instead of still driving the old project.
+        if self
+            .client
+            .active_work_dir
+            .as_ref()
+            .is_some_and(|dir| dir != &work_dir)
+        {
+            if self.active.is_some() {
+                self.client.composer_drafts.insert(
+                    (
+                        self.client.active_work_dir.clone(),
+                        self.client.active_session_id.clone(),
+                    ),
+                    threadlane_client::ComposerDraft {
+                        text: self.composer.read(cx).value().to_string(),
+                        images: Vec::new(),
+                    },
+                );
+                self.active = None;
+            }
+            self.client.active_work_dir = None;
+            self.client.active_session_id = None;
+            self.client.messages = Default::default();
+            self.client.is_generating = false;
+        }
+        self.stash_comment_drafts(cx);
         self.issues = None;
         self.issue_detail = None;
+        self.issue_detail_pending = None;
         self.prs = None;
         self.pr_detail = None;
+        self.pr_detail_pending = None;
         self.send_git(GitOperation::Inspect { sync_remote: false });
         if matches!(self.tab, Tab::Issues) {
             self.refresh_issues();
@@ -3187,6 +3383,15 @@ impl MobileApp {
         self.git_diff_pending = Some(title);
         self.send_git(operation);
         cx.notify();
+    }
+
+    /// `stash-<i>`/`commit-<sha>` keys repeat across projects, so the
+    /// expansion caches are namespaced by the sidebar pick.
+    fn git_object_key(&self, key: &str) -> String {
+        match &self.client.sidebar_project_filter {
+            Some(dir) => format!("{}|{key}", dir.display()),
+            None => key.to_string(),
+        }
     }
 
     /// Expand or collapse a commit/stash object on the Git tab, fetching
@@ -4258,8 +4463,9 @@ impl MobileApp {
     fn render_stash_row(&self, stash: &GitStashInfo, cx: &mut Context<Self>) -> impl IntoElement {
         let key = format!("stash-{}", stash.index);
         let index = stash.index;
-        let expanded = self.git_expanded.contains(&key);
-        let files = self.git_object_files.get(&key).cloned();
+        let scoped = self.git_object_key(&key);
+        let expanded = self.git_expanded.contains(&scoped);
+        let files = self.git_object_files.get(&scoped).cloned();
         let title = if stash.message.is_empty() {
             stash.name.clone()
         } else {
@@ -4323,8 +4529,9 @@ impl MobileApp {
                                 stash.name
                             ))
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                let key = this.git_object_key(&key);
                                 this.toggle_git_object(
-                                    key.clone(),
+                                    key,
                                     GitOperation::StashFiles { index },
                                     cx,
                                 );
@@ -4343,19 +4550,46 @@ impl MobileApp {
                                 cx.notify();
                             })),
                     )
-                    .child(
+                    .child({
+                        let armed = self.stash_drop_confirm == Some(index);
+                        let in_flight = self.stash_drop_inflight.is_some();
+                        // Dropping a stash destroys unmerged work: arm it
+                        // with a first tap, and serialize sends so a fast
+                        // second tap cannot delete the stash that shifts
+                        // into this index after the first drop lands.
                         Button::new(format!("git-stash-drop-{index}"))
                             .ghost()
                             .small()
                             .h_9()
-                            .label("Drop")
+                            .label(if in_flight {
+                                "Dropping…"
+                            } else if armed {
+                                "Drop?"
+                            } else {
+                                "Drop"
+                            })
+                            .disabled(in_flight)
+                            .accessibility_label(if armed {
+                                format!("Confirm drop of {}", stash.name)
+                            } else {
+                                format!("Drop {}", stash.name)
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.send_git(GitOperation::DropStash {
-                                    index: Some(index),
-                                });
+                                if this.stash_drop_inflight.is_some() {
+                                    return;
+                                }
+                                if this.stash_drop_confirm == Some(index) {
+                                    this.stash_drop_confirm = None;
+                                    this.stash_drop_inflight = Some(index);
+                                    this.send_git(GitOperation::DropStash {
+                                        index: Some(index),
+                                    });
+                                } else {
+                                    this.stash_drop_confirm = Some(index);
+                                }
                                 cx.notify();
-                            })),
-                    ),
+                            }))
+                    }),
             )
             .when(expanded, |this| {
                 this.child(
@@ -4394,8 +4628,9 @@ impl MobileApp {
 
     fn render_commit_row(&self, commit: &GitCommitInfo, cx: &mut Context<Self>) -> impl IntoElement {
         let key = format!("commit-{}", commit.sha);
-        let expanded = self.git_expanded.contains(&key);
-        let files = self.git_object_files.get(&key).cloned();
+        let scoped = self.git_object_key(&key);
+        let expanded = self.git_expanded.contains(&scoped);
+        let files = self.git_object_files.get(&scoped).cloned();
         let sha = commit.sha.clone();
         div()
             .flex()
@@ -4458,8 +4693,9 @@ impl MobileApp {
                         commit.short_sha
                     ))
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        let key = this.git_object_key(&key);
                         this.toggle_git_object(
-                            key.clone(),
+                            key,
                             GitOperation::CommitFiles { sha: sha.clone() },
                             cx,
                         );
@@ -4852,7 +5088,7 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let number = issue.issue.number;
-        let open = issue.state == "open";
+        let open = issue.state.eq_ignore_ascii_case("open");
         let dot = if open {
             cx.theme().success
         } else {
@@ -4939,7 +5175,7 @@ impl MobileApp {
     ) -> impl IntoElement {
         let issue = &detail.summary;
         let number = issue.issue.number;
-        let open = issue.state == "open";
+        let open = issue.state.eq_ignore_ascii_case("open");
         let pending = self.issue_detail_pending == Some(number);
         let confirming = self.issue_confirm_delete;
         let comment_ready = !self.issue_comment.read(cx).value().trim().is_empty();
@@ -4968,7 +5204,9 @@ impl MobileApp {
                             .icon(icon(kit_icons::X.1))
                             .accessibility_label("Close issue")
                             .on_click(cx.listener(|this, _, _, cx| {
+                                this.stash_comment_drafts(cx);
                                 this.issue_detail = None;
+                                this.issue_detail_pending = None;
                                 cx.notify();
                             })),
                     )
@@ -5235,19 +5473,16 @@ impl MobileApp {
                             .flex_1()
                             .label("Create issue")
                             .disabled(!title_ready)
-                            .on_click(cx.listener(|this, _, window, cx| {
+                            .on_click(cx.listener(|this, _, _window, cx| {
                                 let title = this.issue_title.read(cx).value().trim().to_owned();
                                 if title.is_empty() {
                                     return;
                                 }
                                 let body = this.issue_body.read(cx).value().trim().to_owned();
                                 this.send_github(GitHubOperation::CreateIssue { title, body });
-                                this.issue_title.update(cx, |input, cx| {
-                                    input.set_value("", window, cx)
-                                });
-                                this.issue_body.update(cx, |input, cx| {
-                                    input.set_value("", window, cx)
-                                });
+                                // Fields keep their text until the `Number`
+                                // reply confirms creation — a failed send
+                                // must not wipe the user's draft.
                                 cx.notify();
                             })),
                     ),
@@ -5390,9 +5625,9 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let number = pr.number;
-        let glyph = if pr.state == "merged" {
+        let glyph = if pr.state.eq_ignore_ascii_case("merged") {
             cx.theme().info
-        } else if pr.state == "open" {
+        } else if pr.state.eq_ignore_ascii_case("open") {
             cx.theme().success
         } else {
             cx.theme().muted_foreground
@@ -5401,7 +5636,10 @@ impl MobileApp {
             .checks
             .iter()
             .fold((0usize, 0usize), |(ok, all), check| {
-                (ok + usize::from(check.conclusion.as_deref() == Some("success")), all + 1)
+                (
+                    ok + usize::from(check_state(check) == CheckState::Passing),
+                    all + 1,
+                )
             });
         div().px_2().py_1().child(
             Button::new(format!("pr-row-{number}"))
@@ -5514,7 +5752,9 @@ impl MobileApp {
                             .icon(icon(kit_icons::X.1))
                             .accessibility_label("Close pull request")
                             .on_click(cx.listener(|this, _, _, cx| {
+                                this.stash_comment_drafts(cx);
                                 this.pr_detail = None;
+                                this.pr_detail_pending = None;
                                 cx.notify();
                             })),
                     )
@@ -5609,12 +5849,16 @@ impl MobileApp {
                                 )
                             })
                             .children(pr.checks.iter().map(|check| {
-                                let (glyph, color) = match check.conclusion.as_deref() {
-                                    Some("success") => {
+                                let (glyph, color) = match check_state(check) {
+                                    CheckState::Passing => {
                                         (kit_icons::CircleCheck.1, cx.theme().success)
                                     }
-                                    Some(_) => (kit_icons::CircleX.1, cx.theme().danger),
-                                    None => (kit_icons::Loader.1, cx.theme().muted_foreground),
+                                    CheckState::Failing => {
+                                        (kit_icons::CircleX.1, cx.theme().danger)
+                                    }
+                                    CheckState::Pending => {
+                                        (kit_icons::Loader.1, cx.theme().muted_foreground)
+                                    }
                                 };
                                 div()
                                     .flex()
@@ -6302,7 +6546,30 @@ impl MobileApp {
         let is_new = editing.as_ref().is_some_and(|def| def.revision == 0);
         let schedule = self.auto_schedule;
         let entity = cx.entity();
-        let kinds = [AutoSchedule::Manual, AutoSchedule::Interval, AutoSchedule::DailyUtc];
+        // `Existing` only appears while it is the active pick — selecting
+        // a preset is a one-way door to a schedule the form can express.
+        let kinds: Vec<AutoSchedule> = if schedule == AutoSchedule::Existing {
+            vec![
+                AutoSchedule::Existing,
+                AutoSchedule::Manual,
+                AutoSchedule::Interval,
+                AutoSchedule::DailyUtc,
+            ]
+        } else {
+            vec![
+                AutoSchedule::Manual,
+                AutoSchedule::Interval,
+                AutoSchedule::DailyUtc,
+            ]
+        };
+        let schedule_label = if schedule == AutoSchedule::Existing {
+            editing
+                .as_ref()
+                .map(|def| def.schedule.label())
+                .unwrap_or_else(|| schedule.label().to_string())
+        } else {
+            schedule.label().to_string()
+        };
         let project_label = editing
             .as_ref()
             .and_then(|def| def.project.file_name())
@@ -6385,7 +6652,7 @@ impl MobileApp {
                                         Button::new("auto-schedule-menu")
                                             .outline()
                                             .h_11()
-                                            .label(format!("Schedule: {} ▾", schedule.label()))
+                                            .label(format!("Schedule: {schedule_label} ▾"))
                                             .accessibility_label("Schedule")
                                             .dropdown_caret(true)
                                             .dropdown_menu_with_anchor(
@@ -6396,7 +6663,11 @@ impl MobileApp {
                                                         let kind = *kind;
                                                         menu.item(
                                                             PopupMenuItem::new(
-                                                                kind.label().to_string(),
+                                                                if kind == AutoSchedule::Existing {
+                                                                    schedule_label.clone()
+                                                                } else {
+                                                                    kind.label().to_string()
+                                                                },
                                                             )
                                                             .checked(kind == schedule)
                                                             .on_click(move |_, _, cx| {
