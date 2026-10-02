@@ -15,6 +15,7 @@ use std::time::Duration;
 use gpui::{prelude::*, *};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
+use gpui_component::tag::Tag;
 use gpui_kit::component::StyledExt;
 use gpui_kit::component::{
     button::{Button, ButtonVariants},
@@ -25,7 +26,9 @@ use gpui_kit::component::{
 use gpui_kit_assets::__private as kit_icons;
 use threadlane_protocol::daemon::{CommandResponse, ComposerModel};
 use threadlane_protocol::repo::{
-    CheckoutMode, DiffOptions, GitBranchInfo, GitCommitInfo, GitFile, GitHubPrInfo,
+    CheckoutMode, DiffOptions, GitBranchInfo, GitCommitInfo, GitFile,
+    GitHubIssueDetail, GitHubIssueListState, GitHubIssueSummary, GitHubOperation,
+    GitHubPrInfo, GitHubPrListState, GitHubPullRequestSummary, GitHubResponse,
     GitOperation, GitResponse, GitStashInfo, GitStatus,
 };
 use threadlane_protocol::{OrchestratorMode, ReasoningEffort};
@@ -119,6 +122,8 @@ enum Screen {
 enum Tab {
     Chats,
     Git,
+    Issues,
+    Pulls,
 }
 
 /// The session whose transcript the view is watching.
@@ -208,6 +213,29 @@ pub struct MobileApp {
     /// Files loaded for an expanded object, same key space; presence of
     /// the key distinguishes loaded-empty from still-loading.
     git_object_files: HashMap<String, Vec<GitFile>>,
+    /// Issue list for the selected project; `None` until the first
+    /// `ListIssues` reply lands.
+    issues: Option<Vec<GitHubIssueSummary>>,
+    issue_filter: GitHubIssueListState,
+    issue_search: Entity<InputState>,
+    /// Open issue detail overlay (body + comments).
+    issue_detail: Option<GitHubIssueDetail>,
+    /// `InspectIssue` request in flight.
+    issue_detail_pending: Option<u64>,
+    /// Confirm strip inside the detail overlay before `DeleteIssue`.
+    issue_confirm_delete: bool,
+    issue_comment: Entity<gpui_kit::component::input::TextareaState>,
+    /// New-issue form state.
+    new_issue_open: bool,
+    issue_title: Entity<InputState>,
+    issue_body: Entity<gpui_kit::component::input::TextareaState>,
+    /// Pull-request list + detail for the selected project.
+    prs: Option<Vec<GitHubPullRequestSummary>>,
+    pr_filter: GitHubPrListState,
+    pr_search: Entity<InputState>,
+    pr_detail: Option<GitHubPrInfo>,
+    pr_detail_pending: Option<u64>,
+    pr_comment: Entity<gpui_kit::component::input::TextareaState>,
     models: Vec<ComposerModel>,
     session_drafts: Vec<SessionInfo>,
     selected_model: Option<String>,
@@ -232,6 +260,27 @@ impl MobileApp {
         });
         let git_branch =
             cx.new(|cx| InputState::new(window, cx).placeholder("New branch name"));
+        let issue_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search issues"));
+        let issue_title = cx.new(|cx| InputState::new(window, cx).placeholder("Issue title"));
+        let issue_body = cx.new(|cx| {
+            gpui_kit::component::input::TextareaState::new(window, cx)
+                .placeholder("Describe the issue")
+                .auto_grow(2, 8)
+                .soft_wrap(true)
+        });
+        let issue_comment = cx.new(|cx| {
+            gpui_kit::component::input::TextareaState::new(window, cx)
+                .placeholder("Add a comment")
+                .auto_grow(1, 4)
+                .soft_wrap(true)
+        });
+        let pr_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search pull requests"));
+        let pr_comment = cx.new(|cx| {
+            gpui_kit::component::input::TextareaState::new(window, cx)
+                .placeholder("Add a comment")
+                .auto_grow(1, 4)
+                .soft_wrap(true)
+        });
         let composer = cx.new(|cx| {
             gpui_kit::component::input::TextareaState::new(window, cx)
                 .placeholder("Message")
@@ -239,8 +288,9 @@ impl MobileApp {
                 .submit_on_enter(true)
                 .soft_wrap(true)
         });
-        let mut subscriptions = [&host, &port, &token, &search, &git_branch]
-            .iter()
+        let mut subscriptions =
+            [&host, &port, &token, &search, &git_branch, &issue_search, &issue_title, &pr_search]
+                .iter()
             .map(|input| {
                 cx.subscribe_in(input, window, |_, _, event, _, _| match event {
                     InputEvent::Focus => gpui_mobile::show_keyboard(),
@@ -261,15 +311,17 @@ impl MobileApp {
                 },
             ),
         );
-        subscriptions.push(
-            cx.subscribe_in(&git_message, window, |_, _, event, _, _| {
-                match event {
-                    InputEvent::Focus => gpui_mobile::show_keyboard(),
-                    InputEvent::Blur => gpui_mobile::hide_keyboard(),
-                    _ => {}
-                }
-            }),
-        );
+        for entity in [&git_message, &issue_body, &issue_comment, &pr_comment] {
+            subscriptions.push(
+                cx.subscribe_in(entity, window, |_, _, event, _, _| {
+                    match event {
+                        InputEvent::Focus => gpui_mobile::show_keyboard(),
+                        InputEvent::Blur => gpui_mobile::hide_keyboard(),
+                        _ => {}
+                    }
+                }),
+            );
+        }
 
         subscriptions.push(
             cx.subscribe_in(&search, window, |this, input, event, _, cx| {
@@ -358,6 +410,22 @@ impl MobileApp {
             git_diff_pending: None,
             git_expanded: HashSet::new(),
             git_object_files: HashMap::new(),
+            issues: None,
+            issue_filter: GitHubIssueListState::Open,
+            issue_search,
+            issue_detail: None,
+            issue_detail_pending: None,
+            issue_confirm_delete: false,
+            issue_comment,
+            new_issue_open: false,
+            issue_title,
+            issue_body,
+            prs: None,
+            pr_filter: GitHubPrListState::Open,
+            pr_search,
+            pr_detail: None,
+            pr_detail_pending: None,
+            pr_comment,
             models: Vec::new(),
             session_drafts: Vec::new(),
             selected_model: None,
@@ -458,6 +526,13 @@ impl MobileApp {
         self.git_diff_pending = None;
         self.git_expanded.clear();
         self.git_object_files.clear();
+        self.issues = None;
+        self.issue_detail = None;
+        self.issue_detail_pending = None;
+        self.new_issue_open = false;
+        self.prs = None;
+        self.pr_detail = None;
+        self.pr_detail_pending = None;
         self.daemon = Some(daemon);
         self.screen = Screen::Main;
         self.tab = Tab::Chats;
@@ -500,6 +575,13 @@ impl MobileApp {
         self.git_diff_pending = None;
         self.git_expanded.clear();
         self.git_object_files.clear();
+        self.issues = None;
+        self.issue_detail = None;
+        self.issue_detail_pending = None;
+        self.new_issue_open = false;
+        self.prs = None;
+        self.pr_detail = None;
+        self.pr_detail_pending = None;
         self.screen = Screen::Connect;
         cx.notify();
     }
@@ -629,6 +711,71 @@ impl MobileApp {
                 self.selected_model = Some(model);
                 self.effort = Some(effort);
                 self.mode = mode;
+            }
+            CommandResponse::GitHub { response } => {
+                let SessionCommand::GitHubRequest { operation, .. } = command else {
+                    return;
+                };
+                match response {
+                    GitHubResponse::Issues { issues } => {
+                        self.issues = Some(issues);
+                    }
+                    GitHubResponse::Issue { detail } => {
+                        self.issue_detail_pending = None;
+                        self.issue_detail = Some(detail);
+                    }
+                    GitHubResponse::PullRequests { prs } => {
+                        self.prs = Some(prs);
+                    }
+                    GitHubResponse::PullRequest { pr } => {
+                        self.pr_detail_pending = None;
+                        self.pr_detail = Some(pr);
+                    }
+                    GitHubResponse::Text { text } => {
+                        if let Some(title) = self.git_diff_pending.take() {
+                            self.git_diff = Some((title, text));
+                        }
+                    }
+                    GitHubResponse::Number { number } => {
+                        self.new_issue_open = false;
+                        self.client.session_status = Some(format!("Created issue #{number}"));
+                        self.refresh_issues();
+                        self.send_github(GitHubOperation::InspectIssue { number });
+                        self.issue_detail_pending = Some(number);
+                    }
+                    GitHubResponse::Action { message } => {
+                        if let Some(message) = message {
+                            self.client.session_status = Some(message);
+                        }
+                        // Refresh whatever a mutation may have touched: the
+                        // list, and the open detail's comment/state.
+                        match operation {
+                            GitHubOperation::CommentIssue { .. }
+                            | GitHubOperation::SetIssueState { .. } => {
+                                if let Some(detail) = &self.issue_detail {
+                                    let number = detail.summary.issue.number;
+                                    self.issue_detail_pending = Some(number);
+                                    self.send_github(GitHubOperation::InspectIssue { number });
+                                }
+                                self.refresh_issues();
+                            }
+                            GitHubOperation::DeleteIssue { .. } => {
+                                self.issue_detail = None;
+                                self.refresh_issues();
+                            }
+                            GitHubOperation::CommentPullRequest { .. } => {
+                                if let Some(pr) = &self.pr_detail {
+                                    let number = pr.number;
+                                    self.pr_detail_pending = Some(number);
+                                    self.send_github(GitHubOperation::InspectPullRequest {
+                                        number,
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
             CommandResponse::Git { response } => {
                 let SessionCommand::GitRequest { work_dir, operation } = command else {
@@ -987,6 +1134,13 @@ impl MobileApp {
                         if !matches!(operation, GitOperation::Inspect { .. }) {
                             self.client.session_status = Some(error.clone());
                         }
+                        return;
+                    }
+                    if let SessionCommand::GitHubRequest { .. } = &command {
+                        self.git_diff_pending = None;
+                        self.issue_detail_pending = None;
+                        self.pr_detail_pending = None;
+                        self.client.session_status = Some(error.clone());
                         return;
                     }
                     self.connect_error = Some(error.clone());
@@ -2260,6 +2414,32 @@ impl MobileApp {
         }
     }
 
+    /// Route a `GitHubRequest` at the sidebar-selected project — the
+    /// daemon shells out to `gh` against that checkout's forge remote.
+    fn send_github(&self, operation: GitHubOperation) {
+        if let (Some(work_dir), Some(daemon)) =
+            (self.client.sidebar_project_filter.clone(), &self.daemon)
+        {
+            daemon.request(SessionCommand::GitHubRequest { work_dir, operation });
+        }
+    }
+
+    fn refresh_issues(&self) {
+        self.send_github(GitHubOperation::ListIssues {
+            state: self.issue_filter,
+            query: None,
+            limit: 30,
+        });
+    }
+
+    fn refresh_prs(&self) {
+        self.send_github(GitHubOperation::ListPullRequests {
+            state: self.pr_filter,
+            query: None,
+            limit: 30,
+        });
+    }
+
     /// The sidebar's project pick is the scope for every panel — chats and
     /// Git both read `sidebar_project_filter`, so switching re-scopes the
     /// whole surface at once.
@@ -2267,7 +2447,16 @@ impl MobileApp {
         self.client.sidebar_project_filter = Some(work_dir.clone());
         self.sidebar_open = false;
         self.git_diff = None;
+        self.issues = None;
+        self.issue_detail = None;
+        self.prs = None;
+        self.pr_detail = None;
         self.send_git(GitOperation::Inspect { sync_remote: false });
+        if matches!(self.tab, Tab::Issues) {
+            self.refresh_issues();
+        } else if matches!(self.tab, Tab::Pulls) {
+            self.refresh_prs();
+        }
         self.refresh_session_rows();
         cx.notify();
     }
@@ -2278,9 +2467,22 @@ impl MobileApp {
         }
         self.tab = tab;
         self.sidebar_open = false;
-        if matches!(tab, Tab::Git) {
-            self.git_diff = None;
-            self.send_git(GitOperation::Inspect { sync_remote: false });
+        match tab {
+            Tab::Git => {
+                self.git_diff = None;
+                self.send_git(GitOperation::Inspect { sync_remote: false });
+            }
+            Tab::Issues => {
+                if self.issues.is_none() {
+                    self.refresh_issues();
+                }
+            }
+            Tab::Pulls => {
+                if self.prs.is_none() {
+                    self.refresh_prs();
+                }
+            }
+            Tab::Chats => {}
         }
         cx.notify();
     }
@@ -2331,6 +2533,8 @@ impl MobileApp {
                 }
             }
             Tab::Git => self.render_git_panel(cx).into_any_element(),
+            Tab::Issues => self.render_issues_panel(cx).into_any_element(),
+            Tab::Pulls => self.render_pulls_panel(cx).into_any_element(),
         };
         div()
             .id("mobile-main")
@@ -2349,6 +2553,15 @@ impl MobileApp {
             .when(self.sidebar_open, |this| {
                 this.child(self.render_sidebar(window, cx))
             })
+            .when_some(self.issue_detail.clone(), |this, detail| {
+                this.child(self.render_issue_detail(&detail, cx))
+            })
+            .when_some(self.pr_detail.clone(), |this, pr| {
+                this.child(self.render_pr_detail(&pr, cx))
+            })
+            .when(self.new_issue_open, |this| {
+                this.child(self.render_new_issue(cx))
+            })
             .when_some(self.git_diff.clone(), |this, (title, text)| {
                 this.child(self.render_git_diff(&title, &text, cx))
             })
@@ -2358,6 +2571,8 @@ impl MobileApp {
         let tabs = [
             (Tab::Chats, "Chats", kit_icons::MessagesSquare.1),
             (Tab::Git, "Git", kit_icons::GitBranch.1),
+            (Tab::Issues, "Issues", kit_icons::CircleDot.1),
+            (Tab::Pulls, "PRs", kit_icons::GitPullRequest.1),
         ];
         div()
             .flex_none()
@@ -3683,6 +3898,1192 @@ impl MobileApp {
                     .overflow_y_scroll()
                     .overflow_x_scrollbar()
                     .child(div().flex().flex_col().py_1().children(rows)),
+            )
+    }
+}
+
+impl MobileApp {
+    /// Shared panel header: drawer button, title + link state, a refresh
+    /// affordance. `refresh` is the panel's own list reload so the header
+    /// stays one shape.
+    fn github_panel_header(
+        &self,
+        title: String,
+        refresh: fn(&Self),
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let status_line = self.client.session_status.clone();
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_3()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                Button::new(format!("panel-menu-{title}"))
+                    .ghost()
+                    .h_11()
+                    .icon(icon(kit_icons::Menu.1))
+                    .accessibility_label("Menu")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_open = true;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().font_bold().truncate().child(title.clone()))
+                            .child(self.link_dot(cx)),
+                    )
+                    .when_some(status_line, |this, line| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(line),
+                        )
+                    }),
+            )
+            .child(
+                Button::new(format!("panel-refresh-{title}"))
+                    .ghost()
+                    .h_11()
+                    .icon(icon(kit_icons::RefreshCw.1))
+                    .accessibility_label("Refresh")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        refresh(this);
+                        cx.notify();
+                    })),
+            )
+    }
+
+    /// Empty state when no project is selected — every project-scoped
+    /// panel lands here until the sidebar pick resolves.
+    fn render_choose_project(
+        &self,
+        id: &'static str,
+        glyph: &'static [u8],
+        hint: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .px_6()
+            .child(
+                icon(glyph)
+                    .large()
+                    .text_color(cx.theme().muted_foreground),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(hint),
+            )
+            .child(
+                Button::new(id)
+                    .primary()
+                    .h_11()
+                    .label("Choose project")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_open = true;
+                        cx.notify();
+                    })),
+            )
+    }
+
+    fn render_issues_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let work_dir = self.client.sidebar_project_filter.clone();
+        let filter = self.issue_filter;
+        let entity = cx.entity();
+        let states = [GitHubIssueListState::Open, GitHubIssueListState::Closed];
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(self.github_panel_header("Issues".into(), Self::refresh_issues, cx))
+            .when(work_dir.is_some(), |this| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .child(
+                            Button::new("issue-state-filter")
+                                .outline()
+                                .h_10()
+                                .label(format!("{} ▾", filter.as_str()))
+                                .accessibility_label(format!("Issue filter: {}", filter.as_str()))
+                                .dropdown_caret(true)
+                                .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                                    states.iter().fold(menu, |menu, state| {
+                                        let entity = entity.clone();
+                                        let state = *state;
+                                        menu.item(
+                                            PopupMenuItem::new(state.as_str().to_string())
+                                                .checked(state == filter)
+                                                .on_click(move |_, _, cx| {
+                                                    let _ = entity.update(cx, |this, cx| {
+                                                        this.issue_filter = state;
+                                                        this.issues = None;
+                                                        this.refresh_issues();
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        )
+                                    })
+                                }),
+                        )
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                Input::new(&self.issue_search)
+                                    .aria_label("Search issues")
+                                    .h_10(),
+                            ),
+                        )
+                        .child(
+                            Button::new("issue-search-go")
+                                .ghost()
+                                .h_10()
+                                .icon(icon(kit_icons::Search.1))
+                                .accessibility_label("Search")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let query = this.issue_search.read(cx).value().trim().to_owned();
+                                    this.send_github(GitHubOperation::ListIssues {
+                                        state: this.issue_filter,
+                                        query: (!query.is_empty()).then_some(query),
+                                        limit: 30,
+                                    });
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("issue-new")
+                                .primary()
+                                .h_10()
+                                .icon(icon(kit_icons::Plus.1))
+                                .accessibility_label("New issue")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.new_issue_open = true;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .id("issue-list")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .when(work_dir.is_none(), |this| {
+                        this.child(self.render_choose_project(
+                            "issues-choose",
+                            kit_icons::CircleDot.1,
+                            "Choose a project to see its issues",
+                            cx,
+                        ))
+                    })
+                    .when(work_dir.is_some() && self.issues.is_none(), |this| {
+                        this.child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("Loading issues…"),
+                                ),
+                        )
+                    })
+                    .when_some(self.issues.clone(), |this, issues| {
+                        if issues.is_empty() {
+                            this.child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!("No {} issues", filter.as_str())),
+                                    ),
+                            )
+                        } else {
+                            this.children(
+                                issues
+                                    .iter()
+                                    .map(|issue| self.render_issue_row(issue, cx)),
+                            )
+                        }
+                    }),
+            )
+    }
+
+    fn render_issue_row(
+        &self,
+        issue: &GitHubIssueSummary,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let number = issue.issue.number;
+        let open = issue.state == "open";
+        let dot = if open {
+            cx.theme().success
+        } else {
+            cx.theme().muted_foreground
+        };
+        div().px_2().py_1().child(
+            Button::new(format!("issue-row-{number}"))
+                .ghost()
+                .w_full()
+                .h_auto()
+                .min_h_12()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .w_full()
+                        .min_w_0()
+                        .child(
+                            icon(kit_icons::CircleDot.1)
+                                .xsmall()
+                                .text_color(dot),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .items_start()
+                                .gap_1()
+                                .child(
+                                    div().text_sm().font_bold().truncate().child(issue.title.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .truncate()
+                                        .child(format!(
+                                            "#{number} · {} · {}",
+                                            issue.author, issue.updated_at
+                                        )),
+                                ),
+                        )
+                        .children(issue.labels.iter().take(2).map(|label| {
+                            Tag::new().small().child(label.name.clone()).into_any_element()
+                        }))
+                        .when(issue.comments_count > 0, |this| {
+                            this.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        icon(kit_icons::MessageSquare.1)
+                                            .xsmall()
+                                            .text_color(cx.theme().muted_foreground),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(issue.comments_count.to_string()),
+                                    ),
+                            )
+                        }),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.issue_detail_pending = Some(number);
+                    this.issue_confirm_delete = false;
+                    this.send_github(GitHubOperation::InspectIssue { number });
+                    cx.notify();
+                })),
+        )
+    }
+
+    /// Issue detail as a full-screen overlay: body, labels, the comment
+    /// thread, and a footer with the comment composer and state actions.
+    fn render_issue_detail(
+        &mut self,
+        detail: &GitHubIssueDetail,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let issue = &detail.summary;
+        let number = issue.issue.number;
+        let open = issue.state == "open";
+        let pending = self.issue_detail_pending == Some(number);
+        let confirming = self.issue_confirm_delete;
+        let comment_ready = !self.issue_comment.read(cx).value().trim().is_empty();
+        div()
+            .id("issue-detail")
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_col()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        Button::new("issue-detail-close")
+                            .ghost()
+                            .h_11()
+                            .icon(icon(kit_icons::X.1))
+                            .accessibility_label("Close issue")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.issue_detail = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_bold()
+                            .child(format!("#{number} — {}", issue.title)),
+                    )
+                    .child(Tag::new().small().child(issue.state.clone()))
+                    .when(pending, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("…"),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .id("issue-detail-body")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .px_4()
+                            .py_3()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!(
+                                        "Opened by {} · updated {}",
+                                        issue.author, issue.updated_at
+                                    )),
+                            )
+                            .when(!issue.labels.is_empty(), |this| {
+                                this.child(
+                                    div().flex().gap_1().flex_wrap().children(
+                                        issue.labels.iter().map(|label| {
+                                            Tag::new().small().child(label.name.clone())
+                                        }),
+                                    ),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .child(if detail.body.trim().is_empty() {
+                                        "No description.".to_string()
+                                    } else {
+                                        detail.body.clone()
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .pt_2()
+                                    .child(format!("Comments ({})", detail.comments.len())),
+                            )
+                            .children(detail.comments.iter().map(|comment| {
+                                div()
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .rounded_md()
+                                    .p_3()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!(
+                                                "{} · {}",
+                                                comment.author, comment.created_at
+                                            )),
+                                    )
+                                    .child(div().text_sm().child(comment.body.clone()))
+                            })),
+                    ),
+            )
+            .when(confirming, |this| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_4()
+                        .py_2()
+                        .bg(cx.theme().danger.opacity(0.08))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_sm()
+                                .text_color(cx.theme().danger)
+                                .child(format!("Delete issue #{number}? This cannot be undone.")),
+                        )
+                        .child(
+                            Button::new("issue-delete-confirm")
+                                .danger()
+                                .small()
+                                .label("Delete")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.issue_confirm_delete = false;
+                                    this.send_github(GitHubOperation::DeleteIssue { number });
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("issue-delete-cancel")
+                                .ghost()
+                                .small()
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.issue_confirm_delete = false;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(Textarea::new(&self.issue_comment).aria_label("Add a comment"))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                Button::new("issue-comment-send")
+                                    .primary()
+                                    .h_11()
+                                    .flex_1()
+                                    .label("Comment")
+                                    .disabled(!comment_ready)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        let body = this
+                                            .issue_comment
+                                            .read(cx)
+                                            .value()
+                                            .trim()
+                                            .to_owned();
+                                        if body.is_empty() {
+                                            return;
+                                        }
+                                        this.send_github(GitHubOperation::CommentIssue {
+                                            number,
+                                            body,
+                                        });
+                                        this.issue_comment.update(cx, |input, cx| {
+                                            input.set_value("", window, cx)
+                                        });
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("issue-toggle-state")
+                                    .outline()
+                                    .h_11()
+                                    .label(if open { "Close" } else { "Reopen" })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.send_github(GitHubOperation::SetIssueState {
+                                            number,
+                                            close: open,
+                                        });
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("issue-delete")
+                                    .danger()
+                                    .h_11()
+                                    .icon(icon(kit_icons::Trash.1))
+                                    .accessibility_label("Delete issue")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.issue_confirm_delete = true;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
+    /// The new-issue form — another overlay, since the composer belongs
+    /// over the list it will update.
+    fn render_new_issue(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let title_ready = !self.issue_title.read(cx).value().trim().is_empty();
+        div()
+            .id("new-issue")
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_col()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        Button::new("new-issue-close")
+                            .ghost()
+                            .h_11()
+                            .icon(icon(kit_icons::X.1))
+                            .accessibility_label("Cancel new issue")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.new_issue_open = false;
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().flex_1().font_bold().child("New issue")),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        Input::new(&self.issue_title)
+                            .aria_label("Issue title")
+                            .h_11(),
+                    )
+                    .child(Textarea::new(&self.issue_body).aria_label("Issue body")),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .p_3()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("new-issue-create")
+                            .primary()
+                            .h_11()
+                            .flex_1()
+                            .label("Create issue")
+                            .disabled(!title_ready)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let title = this.issue_title.read(cx).value().trim().to_owned();
+                                if title.is_empty() {
+                                    return;
+                                }
+                                let body = this.issue_body.read(cx).value().trim().to_owned();
+                                this.send_github(GitHubOperation::CreateIssue { title, body });
+                                this.issue_title.update(cx, |input, cx| {
+                                    input.set_value("", window, cx)
+                                });
+                                this.issue_body.update(cx, |input, cx| {
+                                    input.set_value("", window, cx)
+                                });
+                                cx.notify();
+                            })),
+                    ),
+            )
+    }
+
+    fn render_pulls_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let work_dir = self.client.sidebar_project_filter.clone();
+        let filter = self.pr_filter;
+        let entity = cx.entity();
+        let states = [
+            GitHubPrListState::Open,
+            GitHubPrListState::Closed,
+            GitHubPrListState::Merged,
+        ];
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(self.github_panel_header("Pull requests".into(), Self::refresh_prs, cx))
+            .when(work_dir.is_some(), |this| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .child(
+                            Button::new("pr-state-filter")
+                                .outline()
+                                .h_10()
+                                .label(format!("{} ▾", filter.as_str()))
+                                .accessibility_label(format!("Pull request filter: {}", filter.as_str()))
+                                .dropdown_caret(true)
+                                .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                                    states.iter().fold(menu, |menu, state| {
+                                        let entity = entity.clone();
+                                        let state = *state;
+                                        menu.item(
+                                            PopupMenuItem::new(state.as_str().to_string())
+                                                .checked(state == filter)
+                                                .on_click(move |_, _, cx| {
+                                                    let _ = entity.update(cx, |this, cx| {
+                                                        this.pr_filter = state;
+                                                        this.prs = None;
+                                                        this.refresh_prs();
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        )
+                                    })
+                                }),
+                        )
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                Input::new(&self.pr_search)
+                                    .aria_label("Search pull requests")
+                                    .h_10(),
+                            ),
+                        )
+                        .child(
+                            Button::new("pr-search-go")
+                                .ghost()
+                                .h_10()
+                                .icon(icon(kit_icons::Search.1))
+                                .accessibility_label("Search")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let query = this.pr_search.read(cx).value().trim().to_owned();
+                                    this.send_github(GitHubOperation::ListPullRequests {
+                                        state: this.pr_filter,
+                                        query: (!query.is_empty()).then_some(query),
+                                        limit: 30,
+                                    });
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .id("pr-list")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .when(work_dir.is_none(), |this| {
+                        this.child(self.render_choose_project(
+                            "prs-choose",
+                            kit_icons::GitPullRequest.1,
+                            "Choose a project to see its pull requests",
+                            cx,
+                        ))
+                    })
+                    .when(work_dir.is_some() && self.prs.is_none(), |this| {
+                        this.child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("Loading pull requests…"),
+                                ),
+                        )
+                    })
+                    .when_some(self.prs.clone(), |this, prs| {
+                        if prs.is_empty() {
+                            this.child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!("No {} pull requests", filter.as_str())),
+                                    ),
+                            )
+                        } else {
+                            this.children(prs.iter().map(|pr| self.render_pr_row(pr, cx)))
+                        }
+                    }),
+            )
+    }
+
+    fn render_pr_row(
+        &self,
+        pr: &GitHubPullRequestSummary,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let number = pr.number;
+        let glyph = if pr.state == "merged" {
+            cx.theme().info
+        } else if pr.state == "open" {
+            cx.theme().success
+        } else {
+            cx.theme().muted_foreground
+        };
+        let (passing, total) = pr
+            .checks
+            .iter()
+            .fold((0usize, 0usize), |(ok, all), check| {
+                (ok + usize::from(check.conclusion.as_deref() == Some("success")), all + 1)
+            });
+        div().px_2().py_1().child(
+            Button::new(format!("pr-row-{number}"))
+                .ghost()
+                .w_full()
+                .h_auto()
+                .min_h_12()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .w_full()
+                        .min_w_0()
+                        .child(icon(kit_icons::GitPullRequest.1).xsmall().text_color(glyph))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .items_start()
+                                .gap_1()
+                                .child(
+                                    div().text_sm().font_bold().truncate().child(pr.title.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .truncate()
+                                        .child(format!(
+                                            "#{number} · {} → {} · {} · {}",
+                                            pr.head_ref, pr.base_ref, pr.author, pr.updated_at
+                                        )),
+                                ),
+                        )
+                        .when(pr.is_draft, |this| {
+                            this.child(Tag::new().small().child("Draft"))
+                        })
+                        .when(total > 0, |this| {
+                            let ok = passing == total;
+                            this.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        icon(if ok {
+                                            kit_icons::CircleCheck.1
+                                        } else {
+                                            kit_icons::CircleX.1
+                                        })
+                                        .xsmall()
+                                        .text_color(if ok {
+                                            cx.theme().success
+                                        } else {
+                                            cx.theme().danger
+                                        }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(if ok {
+                                                cx.theme().success
+                                            } else {
+                                                cx.theme().danger
+                                            })
+                                            .child(format!("{passing}/{total}")),
+                                    ),
+                            )
+                        }),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.pr_detail_pending = Some(number);
+                    this.send_github(GitHubOperation::InspectPullRequest { number });
+                    cx.notify();
+                })),
+        )
+    }
+
+    /// Pull-request detail overlay: state tags, refs, checks, files, the
+    /// conversation, a View-diff button, and a comment composer.
+    fn render_pr_detail(&mut self, pr: &GitHubPrInfo, cx: &mut Context<Self>) -> impl IntoElement {
+        let number = pr.number;
+        let pending = self.pr_detail_pending == Some(number);
+        let comment_ready = !self.pr_comment.read(cx).value().trim().is_empty();
+        div()
+            .id("pr-detail")
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_col()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        Button::new("pr-detail-close")
+                            .ghost()
+                            .h_11()
+                            .icon(icon(kit_icons::X.1))
+                            .accessibility_label("Close pull request")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.pr_detail = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_bold()
+                            .child(format!("#{number} — {}", pr.title)),
+                    )
+                    .when(pending, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("…"),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .id("pr-detail-body")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .px_4()
+                            .py_3()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_1()
+                                    .flex_wrap()
+                                    .child(Tag::new().small().child(pr.state.clone()))
+                                    .when(pr.is_draft, |this| {
+                                        this.child(Tag::new().small().child("Draft"))
+                                    })
+                                    .when_some(pr.review_decision.clone(), |this, decision| {
+                                        this.child(Tag::new().small().child(decision))
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!(
+                                        "{} → {} · {} · updated {} · {} comments",
+                                        pr.head_ref,
+                                        pr.base_ref,
+                                        pr.author,
+                                        pr.updated_at,
+                                        pr.comments_count
+                                    )),
+                            )
+                            .child(
+                                Button::new("pr-view-diff")
+                                    .outline()
+                                    .h_11()
+                                    .icon(icon(kit_icons::FileDiff.1))
+                                    .label("View diff")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.git_diff_pending =
+                                            Some(format!("PR #{number} diff"));
+                                        this.send_github(GitHubOperation::PullRequestDiff {
+                                            number,
+                                        });
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(!pr.body.trim().is_empty(), |this| {
+                                this.child(div().text_sm().child(pr.body.clone()))
+                            })
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .pt_2()
+                                    .child(format!("Checks ({})", pr.checks.len())),
+                            )
+                            .when(pr.checks.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("No checks reported"),
+                                )
+                            })
+                            .children(pr.checks.iter().map(|check| {
+                                let (glyph, color) = match check.conclusion.as_deref() {
+                                    Some("success") => {
+                                        (kit_icons::CircleCheck.1, cx.theme().success)
+                                    }
+                                    Some(_) => (kit_icons::CircleX.1, cx.theme().danger),
+                                    None => (kit_icons::Loader.1, cx.theme().muted_foreground),
+                                };
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(icon(glyph).xsmall().text_color(color))
+                                    .child(div().flex_1().min_w_0().text_sm().truncate().child(
+                                        check.name.clone(),
+                                    ))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(
+                                                check
+                                                    .conclusion
+                                                    .clone()
+                                                    .unwrap_or_else(|| check.status.clone()),
+                                            ),
+                                    )
+                            }))
+                            .when(!pr.files.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .pt_2()
+                                        .child(format!("Files ({})", pr.files.len())),
+                                )
+                            })
+                            .children(pr.files.iter().map(|file| {
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_sm()
+                                            .truncate()
+                                            .child(file.path.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().success)
+                                            .child(format!("+{}", file.additions)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().danger)
+                                            .child(format!("-{}", file.deletions)),
+                                    )
+                            }))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .pt_2()
+                                    .child(format!("Conversation ({})", pr.issue_comments.len())),
+                            )
+                            .when(pr.issue_comments.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("No comments yet"),
+                                )
+                            })
+                            .children(pr.issue_comments.iter().map(|comment| {
+                                div()
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .rounded_md()
+                                    .p_3()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!(
+                                                "{} · {}",
+                                                comment.author, comment.created_at
+                                            )),
+                                    )
+                                    .child(div().text_sm().child(comment.body.clone()))
+                            }))
+                            .when(!pr.reviews.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .pt_2()
+                                        .child(format!("Reviews ({})", pr.reviews.len())),
+                                )
+                            })
+                            .children(pr.reviews.iter().map(|review| {
+                                div()
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .rounded_md()
+                                    .p_3()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(Tag::new().small().child(review.state.clone()))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(format!(
+                                                        "{} · {}",
+                                                        review.author, review.submitted_at
+                                                    )),
+                                            ),
+                                    )
+                                    .when(!review.body.trim().is_empty(), |this| {
+                                        this.child(div().text_sm().child(review.body.clone()))
+                                    })
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(Textarea::new(&self.pr_comment).aria_label("Add a comment"))
+                    .child(
+                        Button::new("pr-comment-send")
+                            .primary()
+                            .h_11()
+                            .w_full()
+                            .label("Comment")
+                            .disabled(!comment_ready)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let body = this.pr_comment.read(cx).value().trim().to_owned();
+                                if body.is_empty() {
+                                    return;
+                                }
+                                this.send_github(GitHubOperation::CommentPullRequest {
+                                    number,
+                                    body,
+                                });
+                                this.pr_comment.update(cx, |input, cx| {
+                                    input.set_value("", window, cx)
+                                });
+                                cx.notify();
+                            })),
+                    ),
             )
     }
 }
