@@ -40,7 +40,7 @@ fn open_regular(root: &Path, relative: &str) -> Result<File, String> {
     use rustix::fs::{open, openat, Mode, OFlags};
     let mut fd = open(
         root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )
     .map_err(|e| e.to_string())?;
@@ -436,5 +436,24 @@ mod budget_and_worktree_tests {
         }
         let result = search(root, "needle").unwrap();
         assert!(result.partial.iter().any(|p| p.contains("64 MiB") || p.contains("3-second")));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod root_replacement_tests {
+    #[test]
+    fn file_search_rejects_checkout_root_replaced_by_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("checkout");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(root.join("same.txt"), "checkout text").unwrap();
+        std::fs::write(outside.join("same.txt"), "host secret").unwrap();
+        assert!(super::open_regular(&root, "same.txt").is_ok());
+        std::fs::rename(&root, dir.path().join("original")).unwrap();
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+        assert!(super::open_regular(&root, "same.txt").is_err());
+        assert!(super::validate_target(&root, "same.txt").is_err());
     }
 }
