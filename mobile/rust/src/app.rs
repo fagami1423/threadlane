@@ -202,12 +202,18 @@ pub struct MobileApp {
     git_diff: Option<(String, String)>,
     /// Diff request in flight — the next `GitResponse::Text` fills `git_diff`.
     git_diff_pending: Option<String>,
-    /// Expanded commit/stash objects on the Git tab, keyed `commit-<sha>`
-    /// or `stash-<index>`.
+    /// Expanded commit/stash objects on the Git tab, keyed
+    /// `<work_dir>|commit-<sha>` or `<work_dir>|stash-<index>` — index
+    /// keys repeat across projects.
     git_expanded: HashSet<String>,
     /// Files loaded for an expanded object, same key space; presence of
     /// the key distinguishes loaded-empty from still-loading.
     git_object_files: HashMap<String, Vec<GitFile>>,
+    /// `DropStash` index armed by a first tap; a second tap sends it.
+    stash_drop_confirm: Option<usize>,
+    /// `DropStash` request in flight — drop buttons serialize on it so a
+    /// double tap cannot delete the stash that slides into the index.
+    stash_drop_inflight: Option<usize>,
     models: Vec<ComposerModel>,
     session_drafts: Vec<SessionInfo>,
     selected_model: Option<String>,
@@ -358,6 +364,8 @@ impl MobileApp {
             git_diff_pending: None,
             git_expanded: HashSet::new(),
             git_object_files: HashMap::new(),
+            stash_drop_confirm: None,
+            stash_drop_inflight: None,
             models: Vec::new(),
             session_drafts: Vec::new(),
             selected_model: None,
@@ -458,6 +466,8 @@ impl MobileApp {
         self.git_diff_pending = None;
         self.git_expanded.clear();
         self.git_object_files.clear();
+        self.stash_drop_confirm = None;
+        self.stash_drop_inflight = None;
         self.daemon = Some(daemon);
         self.screen = Screen::Main;
         self.tab = Tab::Chats;
@@ -500,6 +510,8 @@ impl MobileApp {
         self.git_diff_pending = None;
         self.git_expanded.clear();
         self.git_object_files.clear();
+        self.stash_drop_confirm = None;
+        self.stash_drop_inflight = None;
         self.screen = Screen::Connect;
         cx.notify();
     }
@@ -640,6 +652,10 @@ impl MobileApp {
                         self.refresh_session_rows();
                     }
                     GitResponse::Action { outcome } => {
+                        if matches!(operation, GitOperation::DropStash { .. }) {
+                            self.stash_drop_inflight = None;
+                            self.stash_drop_confirm = None;
+                        }
                         if let Some(error) = &outcome.action_error {
                             self.client.session_status = Some(error.clone());
                         } else if let Some(message) = &outcome.message {
@@ -664,7 +680,11 @@ impl MobileApp {
                             _ => None,
                         };
                         if let Some(key) = key {
-                            self.git_object_files.insert(key, files);
+                            // Scope by the request's own project: index
+                            // keys repeat across projects and a late reply
+                            // must not land under another project's list.
+                            self.git_object_files
+                                .insert(format!("{}|{key}", work_dir.display()), files);
                         }
                     }
                     GitResponse::Text { text } => {
@@ -978,13 +998,18 @@ impl MobileApp {
                             });
                         }
                     }
-                    if let SessionCommand::GitRequest { operation, .. } = &command {
+                    if let SessionCommand::GitRequest { work_dir, operation } = &command {
                         self.git_diff_pending = None;
-                        // A background Inspect failing is not worth surfacing —
-                        // the panel keeps showing its last status. Everything
-                        // else the user asked for, so the error belongs near
-                        // the surface they acted on.
-                        if !matches!(operation, GitOperation::Inspect { .. }) {
+                        self.stash_drop_inflight = None;
+                        // An Inspect failing after a status was cached is not
+                        // worth surfacing — the panel keeps showing its last
+                        // status. With nothing cached (a non-git or
+                        // unreachable repo) the tab would stall on "Loading…"
+                        // with no explanation, so surface it like every
+                        // other op the user asked for.
+                        if !matches!(operation, GitOperation::Inspect { .. })
+                            || !self.project_git.contains_key(work_dir)
+                        {
                             self.client.session_status = Some(error.clone());
                         }
                         return;
@@ -2267,6 +2292,34 @@ impl MobileApp {
         self.client.sidebar_project_filter = Some(work_dir.clone());
         self.sidebar_open = false;
         self.git_diff = None;
+        self.stash_drop_confirm = None;
+        // An open chat belongs to its project: keep the composer draft
+        // under its key, then detach it so Chats lands on the newly
+        // scoped session list instead of still driving the old project.
+        if self
+            .client
+            .active_work_dir
+            .as_ref()
+            .is_some_and(|dir| dir != &work_dir)
+        {
+            if self.active.is_some() {
+                self.client.composer_drafts.insert(
+                    (
+                        self.client.active_work_dir.clone(),
+                        self.client.active_session_id.clone(),
+                    ),
+                    threadlane_client::ComposerDraft {
+                        text: self.composer.read(cx).value().to_string(),
+                        images: Vec::new(),
+                    },
+                );
+                self.active = None;
+            }
+            self.client.active_work_dir = None;
+            self.client.active_session_id = None;
+            self.client.messages = Default::default();
+            self.client.is_generating = false;
+        }
         self.send_git(GitOperation::Inspect { sync_remote: false });
         self.refresh_session_rows();
         cx.notify();
@@ -2296,6 +2349,15 @@ impl MobileApp {
         self.git_diff_pending = Some(title);
         self.send_git(operation);
         cx.notify();
+    }
+
+    /// `stash-<i>`/`commit-<sha>` keys repeat across projects, so the
+    /// expansion caches are namespaced by the sidebar pick.
+    fn git_object_key(&self, key: &str) -> String {
+        match &self.client.sidebar_project_filter {
+            Some(dir) => format!("{}|{key}", dir.display()),
+            None => key.to_string(),
+        }
     }
 
     /// Expand or collapse a commit/stash object on the Git tab, fetching
@@ -3349,8 +3411,9 @@ impl MobileApp {
     fn render_stash_row(&self, stash: &GitStashInfo, cx: &mut Context<Self>) -> impl IntoElement {
         let key = format!("stash-{}", stash.index);
         let index = stash.index;
-        let expanded = self.git_expanded.contains(&key);
-        let files = self.git_object_files.get(&key).cloned();
+        let scoped = self.git_object_key(&key);
+        let expanded = self.git_expanded.contains(&scoped);
+        let files = self.git_object_files.get(&scoped).cloned();
         let title = if stash.message.is_empty() {
             stash.name.clone()
         } else {
@@ -3414,8 +3477,9 @@ impl MobileApp {
                                 stash.name
                             ))
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                let key = this.git_object_key(&key);
                                 this.toggle_git_object(
-                                    key.clone(),
+                                    key,
                                     GitOperation::StashFiles { index },
                                     cx,
                                 );
@@ -3434,19 +3498,46 @@ impl MobileApp {
                                 cx.notify();
                             })),
                     )
-                    .child(
+                    .child({
+                        let armed = self.stash_drop_confirm == Some(index);
+                        let in_flight = self.stash_drop_inflight.is_some();
+                        // Dropping a stash destroys unmerged work: arm it
+                        // with a first tap, and serialize sends so a fast
+                        // second tap cannot delete the stash that shifts
+                        // into this index after the first drop lands.
                         Button::new(format!("git-stash-drop-{index}"))
                             .ghost()
                             .small()
                             .h_9()
-                            .label("Drop")
+                            .label(if in_flight {
+                                "Dropping…"
+                            } else if armed {
+                                "Drop?"
+                            } else {
+                                "Drop"
+                            })
+                            .disabled(in_flight)
+                            .accessibility_label(if armed {
+                                format!("Confirm drop of {}", stash.name)
+                            } else {
+                                format!("Drop {}", stash.name)
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.send_git(GitOperation::DropStash {
-                                    index: Some(index),
-                                });
+                                if this.stash_drop_inflight.is_some() {
+                                    return;
+                                }
+                                if this.stash_drop_confirm == Some(index) {
+                                    this.stash_drop_confirm = None;
+                                    this.stash_drop_inflight = Some(index);
+                                    this.send_git(GitOperation::DropStash {
+                                        index: Some(index),
+                                    });
+                                } else {
+                                    this.stash_drop_confirm = Some(index);
+                                }
                                 cx.notify();
-                            })),
-                    ),
+                            }))
+                    }),
             )
             .when(expanded, |this| {
                 this.child(
@@ -3485,8 +3576,9 @@ impl MobileApp {
 
     fn render_commit_row(&self, commit: &GitCommitInfo, cx: &mut Context<Self>) -> impl IntoElement {
         let key = format!("commit-{}", commit.sha);
-        let expanded = self.git_expanded.contains(&key);
-        let files = self.git_object_files.get(&key).cloned();
+        let scoped = self.git_object_key(&key);
+        let expanded = self.git_expanded.contains(&scoped);
+        let files = self.git_object_files.get(&scoped).cloned();
         let sha = commit.sha.clone();
         div()
             .flex()
@@ -3549,8 +3641,9 @@ impl MobileApp {
                         commit.short_sha
                     ))
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        let key = this.git_object_key(&key);
                         this.toggle_git_object(
-                            key.clone(),
+                            key,
                             GitOperation::CommitFiles { sha: sha.clone() },
                             cx,
                         );
