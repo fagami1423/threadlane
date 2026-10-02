@@ -24,6 +24,9 @@ use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, Sizable,
 };
 use gpui_kit_assets::__private as kit_icons;
+use threadlane_protocol::automation::{
+    AutomationCommand, AutomationResponse, Definition, Run, RunStatus, Schedule,
+};
 use threadlane_protocol::daemon::{CommandResponse, ComposerModel};
 use threadlane_protocol::repo::{
     CheckoutMode, DiffOptions, GitBranchInfo, GitCommitInfo, GitFile,
@@ -124,6 +127,26 @@ enum Tab {
     Git,
     Issues,
     Pulls,
+    Automations,
+}
+
+/// Schedule presets the automation form offers — the full calendar
+/// editor is desktop-only for now.
+#[derive(Clone, Copy, PartialEq)]
+enum AutoSchedule {
+    Manual,
+    Interval,
+    DailyUtc,
+}
+
+impl AutoSchedule {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "Manual",
+            Self::Interval => "Every N minutes",
+            Self::DailyUtc => "Daily 09:00 UTC",
+        }
+    }
 }
 
 /// The session whose transcript the view is watching.
@@ -236,6 +259,22 @@ pub struct MobileApp {
     pr_detail: Option<GitHubPrInfo>,
     pr_detail_pending: Option<u64>,
     pr_comment: Entity<gpui_kit::component::input::TextareaState>,
+    /// Automation editor overlay: `None` when closed, `Some(definition)`
+    /// carries the definition being edited (or the draft skeleton for a
+    /// new one — `revision == 0` marks it new).
+    auto_editing: Option<Definition>,
+    auto_name: Entity<InputState>,
+    auto_model: Entity<InputState>,
+    auto_effort: Entity<InputState>,
+    auto_minutes: Entity<InputState>,
+    auto_prompt: Entity<gpui_kit::component::input::TextareaState>,
+    auto_schedule: AutoSchedule,
+    auto_worktree: bool,
+    auto_enabled: bool,
+    /// Definition id awaiting its delete-confirm strip.
+    auto_delete_confirm: Option<String>,
+    /// Run id awaiting its delete-confirm strip.
+    auto_run_delete_confirm: Option<String>,
     models: Vec<ComposerModel>,
     session_drafts: Vec<SessionInfo>,
     selected_model: Option<String>,
@@ -281,6 +320,21 @@ impl MobileApp {
                 .auto_grow(1, 4)
                 .soft_wrap(true)
         });
+        let auto_name =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Automation name"));
+        let auto_model = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Model, e.g. claude-sonnet-4-5")
+        });
+        let auto_effort =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Effort, e.g. medium"));
+        let auto_minutes =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Minutes between runs"));
+        let auto_prompt = cx.new(|cx| {
+            gpui_kit::component::input::TextareaState::new(window, cx)
+                .placeholder("Prompt the run executes")
+                .auto_grow(3, 10)
+                .soft_wrap(true)
+        });
         let composer = cx.new(|cx| {
             gpui_kit::component::input::TextareaState::new(window, cx)
                 .placeholder("Message")
@@ -288,9 +342,21 @@ impl MobileApp {
                 .submit_on_enter(true)
                 .soft_wrap(true)
         });
-        let mut subscriptions =
-            [&host, &port, &token, &search, &git_branch, &issue_search, &issue_title, &pr_search]
-                .iter()
+        let mut subscriptions = [
+            &host,
+            &port,
+            &token,
+            &search,
+            &git_branch,
+            &issue_search,
+            &issue_title,
+            &pr_search,
+            &auto_name,
+            &auto_model,
+            &auto_effort,
+            &auto_minutes,
+        ]
+        .iter()
             .map(|input| {
                 cx.subscribe_in(input, window, |_, _, event, _, _| match event {
                     InputEvent::Focus => gpui_mobile::show_keyboard(),
@@ -311,7 +377,7 @@ impl MobileApp {
                 },
             ),
         );
-        for entity in [&git_message, &issue_body, &issue_comment, &pr_comment] {
+        for entity in [&git_message, &issue_body, &issue_comment, &pr_comment, &auto_prompt] {
             subscriptions.push(
                 cx.subscribe_in(entity, window, |_, _, event, _, _| {
                     match event {
@@ -426,6 +492,17 @@ impl MobileApp {
             pr_detail: None,
             pr_detail_pending: None,
             pr_comment,
+            auto_editing: None,
+            auto_name,
+            auto_model,
+            auto_effort,
+            auto_minutes,
+            auto_prompt,
+            auto_schedule: AutoSchedule::Interval,
+            auto_worktree: true,
+            auto_enabled: true,
+            auto_delete_confirm: None,
+            auto_run_delete_confirm: None,
             models: Vec::new(),
             session_drafts: Vec::new(),
             selected_model: None,
@@ -711,6 +788,18 @@ impl MobileApp {
                 self.selected_model = Some(model);
                 self.effort = Some(effort);
                 self.mode = mode;
+            }
+            CommandResponse::Automation { response } => {
+                let AutomationResponse::Projection { projection } = response;
+                self.client.automation = projection;
+                if matches!(
+                    command,
+                    SessionCommand::AutomationRequest {
+                        command: AutomationCommand::Save { .. }
+                    }
+                ) {
+                    self.auto_editing = None;
+                }
             }
             CommandResponse::GitHub { response } => {
                 let SessionCommand::GitHubRequest { operation, .. } = command else {
@@ -1140,6 +1229,10 @@ impl MobileApp {
                         self.git_diff_pending = None;
                         self.issue_detail_pending = None;
                         self.pr_detail_pending = None;
+                        self.client.session_status = Some(error.clone());
+                        return;
+                    }
+                    if let SessionCommand::AutomationRequest { .. } = &command {
                         self.client.session_status = Some(error.clone());
                         return;
                     }
@@ -2440,6 +2533,121 @@ impl MobileApp {
         });
     }
 
+    /// The automation store is daemon-global (not per project), so this
+    /// needs no work_dir.
+    fn send_automation(&self, command: AutomationCommand) {
+        if let Some(daemon) = &self.daemon {
+            daemon.request(SessionCommand::AutomationRequest { command });
+        }
+    }
+
+    fn refresh_automations(&self) {
+        self.send_automation(AutomationCommand::GetSnapshot);
+    }
+
+    /// Open the editor: `Some(definition)` pre-fills for editing, `None`
+    /// starts a fresh draft scoped to the selected project.
+    fn open_auto_form(&mut self, definition: Option<Definition>, window: &mut Window, cx: &mut Context<Self>) {
+        let draft = definition.unwrap_or_else(|| Definition {
+            id: threadlane_protocol::automation::new_id(),
+            revision: 0,
+            name: String::new(),
+            prompt: String::new(),
+            project: self
+                .client
+                .sidebar_project_filter
+                .clone()
+                .or_else(|| self.client.projects.first().map(|p| p.work_dir.clone()))
+                .unwrap_or_default(),
+            model: self.selected_model.clone().unwrap_or_default(),
+            effort: self
+                .effort
+                .map(|effort| effort.label().to_string())
+                .unwrap_or_else(|| "medium".into()),
+            worktree: true,
+            schedule: Schedule::Interval { minutes: 60 },
+            enabled: true,
+            notify_all: false,
+            anchor: threadlane_protocol::automation::now(),
+            next_at: None,
+            failures: 0,
+            paused_reason: None,
+        });
+        self.auto_schedule = match &draft.schedule {
+            Schedule::Manual => AutoSchedule::Manual,
+            Schedule::Interval { .. } => AutoSchedule::Interval,
+            Schedule::Calendar { .. } => AutoSchedule::DailyUtc,
+        };
+        self.auto_worktree = draft.worktree;
+        self.auto_enabled = draft.enabled;
+        for (entity, value) in [
+            (&self.auto_name, draft.name.clone()),
+            (&self.auto_model, draft.model.clone()),
+            (&self.auto_effort, draft.effort.clone()),
+            (
+                &self.auto_minutes,
+                match &draft.schedule {
+                    Schedule::Interval { minutes } => minutes.to_string(),
+                    _ => "60".into(),
+                },
+            ),
+        ] {
+            entity.update(cx, |input, cx| input.set_value(value, window, cx));
+        }
+        self.auto_prompt.update(cx, |input, cx| {
+            input.set_value(draft.prompt.clone(), window, cx)
+        });
+        self.auto_editing = Some(draft);
+        cx.notify();
+    }
+
+    /// Save the editor's draft: read inputs, rebuild the Definition,
+    /// validate locally, and send `Save`. The panel closes when the
+    /// projection reply confirms it landed.
+    fn save_auto_form(&mut self, cx: &mut Context<Self>) {
+        let Some(mut draft) = self.auto_editing.clone() else {
+            return;
+        };
+        draft.name = self.auto_name.read(cx).value().trim().to_owned();
+        draft.model = self.auto_model.read(cx).value().trim().to_owned();
+        draft.effort = self.auto_effort.read(cx).value().trim().to_owned();
+        draft.prompt = self.auto_prompt.read(cx).value().trim().to_owned();
+        draft.worktree = self.auto_worktree;
+        draft.enabled = self.auto_enabled;
+        draft.schedule = match self.auto_schedule {
+            AutoSchedule::Manual => Schedule::Manual,
+            AutoSchedule::Interval => Schedule::Interval {
+                minutes: self
+                    .auto_minutes
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .parse()
+                    .unwrap_or(0),
+            },
+            AutoSchedule::DailyUtc => Schedule::Calendar {
+                hour: 9,
+                minute: 0,
+                days: (0..7).collect(),
+                timezone: "UTC".into(),
+            },
+        };
+        if draft.project.as_os_str().is_empty() {
+            self.client.session_status = Some("Choose a project first".into());
+            cx.notify();
+            return;
+        }
+        if let Err(error) = draft.validate() {
+            self.client.session_status = Some(error);
+            cx.notify();
+            return;
+        }
+        self.send_automation(AutomationCommand::Save {
+            definition: draft,
+        });
+        cx.notify();
+    }
+
     /// The sidebar's project pick is the scope for every panel — chats and
     /// Git both read `sidebar_project_filter`, so switching re-scopes the
     /// whole surface at once.
@@ -2481,6 +2689,9 @@ impl MobileApp {
                 if self.prs.is_none() {
                     self.refresh_prs();
                 }
+            }
+            Tab::Automations => {
+                self.refresh_automations();
             }
             Tab::Chats => {}
         }
@@ -2535,6 +2746,7 @@ impl MobileApp {
             Tab::Git => self.render_git_panel(cx).into_any_element(),
             Tab::Issues => self.render_issues_panel(cx).into_any_element(),
             Tab::Pulls => self.render_pulls_panel(cx).into_any_element(),
+            Tab::Automations => self.render_automations_panel(cx).into_any_element(),
         };
         div()
             .id("mobile-main")
@@ -2562,6 +2774,9 @@ impl MobileApp {
             .when(self.new_issue_open, |this| {
                 this.child(self.render_new_issue(cx))
             })
+            .when(self.auto_editing.is_some(), |this| {
+                this.child(self.render_auto_form(cx))
+            })
             .when_some(self.git_diff.clone(), |this, (title, text)| {
                 this.child(self.render_git_diff(&title, &text, cx))
             })
@@ -2573,6 +2788,7 @@ impl MobileApp {
             (Tab::Git, "Git", kit_icons::GitBranch.1),
             (Tab::Issues, "Issues", kit_icons::CircleDot.1),
             (Tab::Pulls, "PRs", kit_icons::GitPullRequest.1),
+            (Tab::Automations, "Automations", kit_icons::Zap.1),
         ];
         div()
             .flex_none()
@@ -5083,6 +5299,706 @@ impl MobileApp {
                                 });
                                 cx.notify();
                             })),
+                    ),
+            )
+    }
+}
+
+impl MobileApp {
+    /// The automations tab mirrors the daemon-global store: definitions
+    /// with enable/run/edit/delete controls, then the run history with
+    /// cancel/review/open-chat affordances.
+    fn render_automations_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let snapshot = self.client.automation.snapshot.clone();
+        let attention: HashSet<String> = self
+            .client
+            .automation_permissions
+            .keys()
+            .chain(self.client.automation_questions.keys())
+            .cloned()
+            .collect();
+        let delete_def = self.auto_delete_confirm.clone();
+        let delete_run = self.auto_run_delete_confirm.clone();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(
+                self.github_panel_header(
+                    "Automations".into(),
+                    Self::refresh_automations,
+                    cx,
+                ),
+            )
+            .child(
+                div().flex_none().px_3().py_2().child(
+                    Button::new("auto-new")
+                        .primary()
+                        .h_10()
+                        .w_full()
+                        .icon(icon(kit_icons::Plus.1))
+                        .label("New automation")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_auto_form(None, window, cx)
+                        })),
+                ),
+            )
+            .when_some(delete_def, |this, id| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_4()
+                        .py_2()
+                        .bg(cx.theme().danger.opacity(0.08))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_sm()
+                                .text_color(cx.theme().danger)
+                                .child("Delete this automation and its runs?"),
+                        )
+                        .child(
+                            Button::new("auto-delete-confirm")
+                                .danger()
+                                .small()
+                                .label("Delete")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.auto_delete_confirm = None;
+                                    this.send_automation(AutomationCommand::Delete {
+                                        id: id.clone(),
+                                    });
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("auto-delete-cancel")
+                                .ghost()
+                                .small()
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.auto_delete_confirm = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .when_some(delete_run, |this, id| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_4()
+                        .py_2()
+                        .bg(cx.theme().danger.opacity(0.08))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_sm()
+                                .text_color(cx.theme().danger)
+                                .child("Delete this run? An active run is cancelled."),
+                        )
+                        .child(
+                            Button::new("auto-run-delete-confirm")
+                                .danger()
+                                .small()
+                                .label("Delete")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.auto_run_delete_confirm = None;
+                                    this.send_automation(AutomationCommand::DeleteRun {
+                                        id: id.clone(),
+                                    });
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("auto-run-delete-cancel")
+                                .ghost()
+                                .small()
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.auto_run_delete_confirm = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .id("auto-list")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .px_3()
+                            .pb_4()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .pt_1()
+                                    .child(format!("Definitions ({})", snapshot.definitions.len())),
+                            )
+                            .when(snapshot.definitions.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .py_6()
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            icon(kit_icons::Zap.1)
+                                                .large()
+                                                .text_color(cx.theme().muted_foreground),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child("No automations yet — create one above"),
+                                        ),
+                                )
+                            })
+                            .children(
+                                snapshot
+                                    .definitions
+                                    .iter()
+                                    .map(|def| self.render_auto_definition(def, cx)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .pt_2()
+                                    .child(format!("Runs ({})", snapshot.runs.len())),
+                            )
+                            .when(snapshot.runs.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("No runs recorded"),
+                                )
+                            })
+                            .children(
+                                snapshot
+                                    .runs
+                                    .iter()
+                                    .map(|run| self.render_auto_run(run, cx, &attention)),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_auto_definition(
+        &self,
+        def: &Definition,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let toggle_id = def.id.clone();
+        let run_id = def.id.clone();
+        let delete_id = def.id.clone();
+        let enabled = def.enabled;
+        let definition = def.clone();
+        let project_name = def
+            .project
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let meta = format!(
+            "{} · {}{}{}",
+            def.schedule.label(),
+            project_name,
+            if def.failures > 0 {
+                format!(" · {} failures", def.failures)
+            } else {
+                String::new()
+            },
+            def.next_at
+                .map(|at| format!(
+                    " · next {}",
+                    threadlane_protocol::automation::display_time(at, "UTC")
+                ))
+                .unwrap_or_default()
+        );
+        div()
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded_md()
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        icon(if def.enabled {
+                            kit_icons::Zap.1
+                        } else {
+                            kit_icons::ZapOff.1
+                        })
+                        .xsmall()
+                        .text_color(if def.enabled {
+                            cx.theme().success
+                        } else {
+                            cx.theme().muted_foreground
+                        }),
+                    )
+                    .child(div().flex_1().min_w_0().font_bold().truncate().child(
+                        if def.name.trim().is_empty() {
+                            "Untitled automation".to_string()
+                        } else {
+                            def.name.clone()
+                        },
+                    ))
+                    .when_some(def.paused_reason.clone(), |this, reason| {
+                        this.child(Tag::new().small().child(reason))
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(meta),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new(format!("auto-toggle-{}", def.id))
+                            .ghost()
+                            .small()
+                            .h_10()
+                            .icon(icon(if enabled {
+                                kit_icons::ZapOff.1
+                            } else {
+                                kit_icons::Zap.1
+                            }))
+                            .label(if enabled { "Disable" } else { "Enable" })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.send_automation(AutomationCommand::SetEnabled {
+                                    id: toggle_id.clone(),
+                                    enabled: !enabled,
+                                });
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new(format!("auto-run-{}", def.id))
+                            .outline()
+                            .small()
+                            .h_10()
+                            .icon(icon(kit_icons::Play.1))
+                            .label("Run now")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.send_automation(AutomationCommand::RunNow {
+                                    id: run_id.clone(),
+                                });
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new(format!("auto-edit-{}", def.id))
+                            .ghost()
+                            .small()
+                            .h_10()
+                            .label("Edit")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_auto_form(Some(definition.clone()), window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new(format!("auto-delete-{}", def.id))
+                            .ghost()
+                            .small()
+                            .h_10()
+                            .icon(icon(kit_icons::Trash.1))
+                            .accessibility_label("Delete automation")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.auto_delete_confirm = Some(delete_id.clone());
+                                cx.notify();
+                            })),
+                    ),
+            )
+    }
+
+    fn render_auto_run(
+        &self,
+        run: &Run,
+        cx: &mut Context<Self>,
+        attention: &HashSet<String>,
+    ) -> impl IntoElement {
+        let cancel_id = run.id.clone();
+        let review_id = run.id.clone();
+        let delete_id = run.id.clone();
+        let active = run.status.active();
+        let needs_you = attention.contains(&run.session_id)
+            || matches!(
+                run.status,
+                RunStatus::WaitingPermission | RunStatus::WaitingAnswer
+            );
+        let (glyph, color) = match run.status {
+            RunStatus::Succeeded => (kit_icons::CircleCheck.1, cx.theme().success),
+            RunStatus::Failed => (kit_icons::CircleX.1, cx.theme().danger),
+            RunStatus::Cancelled | RunStatus::Interrupted => {
+                (kit_icons::Ban.1, cx.theme().muted_foreground)
+            }
+            RunStatus::WaitingPermission | RunStatus::WaitingAnswer => {
+                (kit_icons::TriangleAlert.1, cx.theme().warning)
+            }
+            _ => (kit_icons::Loader.1, cx.theme().info),
+        };
+        let times = format!(
+            "started {}{}",
+            threadlane_protocol::automation::display_time(run.created_at, "UTC"),
+            run.finished_at
+                .map(|at| format!(
+                    " · finished {}",
+                    threadlane_protocol::automation::display_time(at, "UTC")
+                ))
+                .unwrap_or_default()
+        );
+        let session = self
+            .client
+            .projects
+            .iter()
+            .flat_map(|project| &project.sessions)
+            .find(|session| session.id == run.session_id)
+            .cloned();
+        div()
+            .border_1()
+            .border_color(if needs_you {
+                cx.theme().warning
+            } else {
+                cx.theme().border
+            })
+            .rounded_md()
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(icon(glyph).xsmall().text_color(color))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div().text_sm().font_bold().truncate().child(
+                                    if run.definition.name.trim().is_empty() {
+                                        run.definition.id.clone()
+                                    } else {
+                                        run.definition.name.clone()
+                                    },
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("{} · {}", run.status.label(), times)),
+                            ),
+                    )
+                    .when(needs_you, |this| {
+                        this.child(Tag::new().small().child("Needs you"))
+                    })
+                    .when(
+                        !run.reviewed
+                            && matches!(
+                                run.status,
+                                RunStatus::Succeeded
+                                    | RunStatus::Failed
+                                    | RunStatus::Interrupted
+                            ),
+                        |this| this.child(Tag::new().small().child("Unreviewed")),
+                    ),
+            )
+            .when_some(run.error.clone(), |this, error| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().danger)
+                        .child(error),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .when(active, |this| {
+                        this.child(
+                            Button::new(format!("auto-run-cancel-{}", run.id))
+                                .ghost()
+                                .small()
+                                .h_10()
+                                .icon(icon(kit_icons::Ban.1))
+                                .label("Cancel")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.send_automation(AutomationCommand::Cancel {
+                                        id: cancel_id.clone(),
+                                    });
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .when_some(session, |this, session| {
+                        this.child(
+                            Button::new(format!("auto-run-chat-{}", run.id))
+                                .outline()
+                                .small()
+                                .h_10()
+                                .icon(icon(kit_icons::MessagesSquare.1))
+                                .label("Open chat")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_session(&session, window, cx)
+                                })),
+                        )
+                    })
+                    .when(
+                        !run.reviewed
+                            && matches!(
+                                run.status,
+                                RunStatus::Succeeded
+                                    | RunStatus::Failed
+                                    | RunStatus::Interrupted
+                            ),
+                        |this| {
+                            this.child(
+                                Button::new(format!("auto-run-review-{}", run.id))
+                                    .ghost()
+                                    .small()
+                                    .h_10()
+                                    .icon(icon(kit_icons::Eye.1))
+                                    .label("Mark reviewed")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.send_automation(AutomationCommand::Review {
+                                            id: review_id.clone(),
+                                        });
+                                        cx.notify();
+                                    })),
+                            )
+                        },
+                    )
+                    .child(
+                        Button::new(format!("auto-run-delete-{}", run.id))
+                            .ghost()
+                            .small()
+                            .h_10()
+                            .icon(icon(kit_icons::Trash.1))
+                            .accessibility_label("Delete run")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.auto_run_delete_confirm = Some(delete_id.clone());
+                                cx.notify();
+                            })),
+                    ),
+            )
+    }
+
+    /// Automation editor overlay — name, prompt, model/effort, a small
+    /// schedule preset set, and the worktree/enabled toggles.
+    fn render_auto_form(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let editing = self.auto_editing.clone();
+        let is_new = editing.as_ref().is_some_and(|def| def.revision == 0);
+        let schedule = self.auto_schedule;
+        let entity = cx.entity();
+        let kinds = [AutoSchedule::Manual, AutoSchedule::Interval, AutoSchedule::DailyUtc];
+        let project_label = editing
+            .as_ref()
+            .and_then(|def| def.project.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "No project".into());
+        div()
+            .id("auto-form")
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_col()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        Button::new("auto-form-close")
+                            .ghost()
+                            .h_11()
+                            .icon(icon(kit_icons::X.1))
+                            .accessibility_label("Close automation form")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.auto_editing = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .font_bold()
+                            .child(if is_new { "New automation" } else { "Edit automation" }),
+                    ),
+            )
+            .child(
+                div()
+                    .id("auto-form-body")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .px_4()
+                            .py_3()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("Project: {project_label}")),
+                            )
+                            .child(Input::new(&self.auto_name).aria_label("Automation name").h_11())
+                            .child(Textarea::new(&self.auto_prompt).aria_label("Automation prompt"))
+                            .child(
+                                div().flex().gap_2().children([
+                                    div().flex_1().min_w_0().child(
+                                        Input::new(&self.auto_model).aria_label("Model").h_11(),
+                                    ),
+                                    div().flex_1().min_w_0().child(
+                                        Input::new(&self.auto_effort).aria_label("Effort").h_11(),
+                                    ),
+                                ]),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("auto-schedule-menu")
+                                            .outline()
+                                            .h_11()
+                                            .label(format!("Schedule: {} ▾", schedule.label()))
+                                            .accessibility_label("Schedule")
+                                            .dropdown_caret(true)
+                                            .dropdown_menu_with_anchor(
+                                                Anchor::BottomLeft,
+                                                move |menu, _, _| {
+                                                    kinds.iter().fold(menu, |menu, kind| {
+                                                        let entity = entity.clone();
+                                                        let kind = *kind;
+                                                        menu.item(
+                                                            PopupMenuItem::new(
+                                                                kind.label().to_string(),
+                                                            )
+                                                            .checked(kind == schedule)
+                                                            .on_click(move |_, _, cx| {
+                                                                let _ = entity.update(
+                                                                    cx,
+                                                                    |this, cx| {
+                                                                        this.auto_schedule = kind;
+                                                                        cx.notify();
+                                                                    },
+                                                                );
+                                                            }),
+                                                        )
+                                                    })
+                                                },
+                                            ),
+                                    )
+                                    .when(schedule == AutoSchedule::Interval, |this| {
+                                        this.child(
+                                            div().w_24().child(
+                                                Input::new(&self.auto_minutes)
+                                                    .aria_label("Minutes between runs")
+                                                    .h_11(),
+                                            ),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("auto-worktree-toggle")
+                                            .outline()
+                                            .h_11()
+                                            .flex_1()
+                                            .icon(icon(if self.auto_worktree {
+                                                kit_icons::Check.1
+                                            } else {
+                                                kit_icons::Minus.1
+                                            }))
+                                            .label("Run in worktree")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.auto_worktree = !this.auto_worktree;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("auto-enabled-toggle")
+                                            .outline()
+                                            .h_11()
+                                            .flex_1()
+                                            .icon(icon(if self.auto_enabled {
+                                                kit_icons::Check.1
+                                            } else {
+                                                kit_icons::Minus.1
+                                            }))
+                                            .label("Enabled")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.auto_enabled = !this.auto_enabled;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .p_3()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("auto-form-save")
+                            .primary()
+                            .h_11()
+                            .flex_1()
+                            .label(if is_new { "Create automation" } else { "Save" })
+                            .on_click(cx.listener(|this, _, _, cx| this.save_auto_form(cx))),
                     ),
             )
     }
