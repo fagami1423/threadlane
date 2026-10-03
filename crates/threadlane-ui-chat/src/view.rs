@@ -347,6 +347,7 @@ mod conversation_find;
 mod file_completion;
 #[path = "prompt_navigation.rs"]
 mod prompt_navigation;
+pub use conversation_find::ConversationFindHandoff;
 use conversation_find::*;
 use file_completion::*;
 
@@ -455,6 +456,9 @@ pub struct ChatListView {
     find_source: Option<(Arc<Vec<ChatMessageInfo>>, bool, bool)>,
     find_session: (Option<PathBuf>, Option<String>),
     find_task: Option<Task<()>>,
+    /// Conversation-search result waiting for its session to hydrate before
+    /// seeding the find strip.
+    pending_find_handoff: Option<ConversationFindHandoff>,
 
     prompt_recall: Option<PromptRecallState>,
     outline_open: bool,
@@ -671,6 +675,7 @@ impl ChatListView {
                 }
             }
             cx.notify();
+            this.progress_find_handoff(window, cx);
             this.refresh_conversation_find(false, cx);
         });
 
@@ -861,6 +866,7 @@ impl ChatListView {
             find_source: None,
             find_session: (None, None),
             find_task: None,
+            pending_find_handoff: None,
             prompt_recall: None,
             outline_open: false,
             outline_focus: cx.focus_handle(),

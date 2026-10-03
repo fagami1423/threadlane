@@ -19,6 +19,7 @@ pub mod discovery;
 pub mod events;
 pub mod pairing;
 pub mod project_io;
+pub mod conversation_search;
 pub mod file_search;
 pub mod projection;
 pub mod provider_auth;

@@ -5352,3 +5352,170 @@ fn composer_at_completion_resyncs_when_root_changes(cx: &mut gpui::TestAppContex
         assert!(chat.file_menu_open(cx), "picker stays open across resync");
     });
 }
+
+#[gpui::test]
+fn conversation_find_handoff_waits_for_hydration_then_seeds_find(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui::AppContext as _;
+    use threadlane_ui_state::{actions::AppAction, activate_test_session, controller};
+
+    let dir = tempfile::tempdir().unwrap();
+    let work_dir = dir.path().to_path_buf();
+    let file_a = dir.path().join("session-a.jsonl");
+    let file_b = dir.path().join("session-b.jsonl");
+    std::fs::write(&file_a, "").unwrap();
+    std::fs::write(&file_b, "").unwrap();
+
+    let (chat, model, cx) = mount_chat_with_work_dir(cx, None);
+    model.update(cx, |state, _| {
+        activate_test_session(state, "session-a", &file_a);
+        state.projects[0].sessions.push(threadlane_protocol::daemon::SessionInfo {
+            id: "session-b".into(),
+            title: "session-b".into(),
+            work_dir: work_dir.clone(),
+            runtime_work_dir: work_dir.clone(),
+            session_file: file_b.clone(),
+            updated_at: 0,
+            health: threadlane_protocol::daemon::SessionHealth::Healthy,
+            git_branch: None,
+            github_issue: None,
+            is_worktree: false,
+            worktree_available: true,
+            completion_summary: threadlane_protocol::daemon::SessionCompletionSummary::Unknown,
+        });
+    });
+    model.update(cx, |state, cx| {
+        controller::dispatch(
+            state,
+            AppAction::SelectSession {
+                work_dir: work_dir.clone(),
+                session_id: "session-b".into(),
+            },
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+    model.read_with(cx, |state, _| {
+        assert!(state.active_session_is_loading(), "selection queues hydration");
+    });
+
+    cx.update(|window, cx| {
+        chat.update(cx, |chat, cx| {
+            chat.begin_conversation_find_handoff(
+                super::ConversationFindHandoff {
+                    work_dir: work_dir.clone(),
+                    session_id: "session-b".into(),
+                    query: "needle".into(),
+                },
+                window,
+                cx,
+            );
+        });
+    });
+    chat.read_with(cx, |chat, _| {
+        assert!(chat.pending_find_handoff.is_some(), "handoff waits out hydration");
+        assert!(!chat.find_open);
+    });
+
+    model.update(cx, |state, cx| {
+        let _ = state.take_pending_hydrations();
+        state.finish_session_hydration("session-b", &file_b);
+        state.messages = vec![
+            find_message("m0", MessageRole::User, "the first needle"),
+            find_message("m1", MessageRole::Assistant, "another needle"),
+        ]
+        .into();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, cx| {
+        assert!(chat.pending_find_handoff.is_none(), "handoff applied");
+        assert!(chat.find_open);
+        assert_eq!(chat.find_query, "needle");
+        assert_eq!(chat.find_input.read(cx).value(), "needle");
+        assert_eq!(chat.find_results.len(), 2);
+        assert_eq!(chat.find_selected.as_deref(), Some("m0"));
+    });
+}
+
+#[gpui::test]
+fn conversation_find_handoff_drops_when_session_changes(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    use threadlane_ui_state::{actions::AppAction, activate_test_session, controller};
+
+    let dir = tempfile::tempdir().unwrap();
+    let work_dir = dir.path().to_path_buf();
+    let file_a = dir.path().join("session-a.jsonl");
+    let file_b = dir.path().join("session-b.jsonl");
+    std::fs::write(&file_a, "").unwrap();
+    std::fs::write(&file_b, "").unwrap();
+
+    let (chat, model, cx) = mount_chat_with_work_dir(cx, None);
+    model.update(cx, |state, _| {
+        activate_test_session(state, "session-a", &file_a);
+        state.projects[0].sessions.push(threadlane_protocol::daemon::SessionInfo {
+            id: "session-b".into(),
+            title: "session-b".into(),
+            work_dir: work_dir.clone(),
+            runtime_work_dir: work_dir.clone(),
+            session_file: file_b.clone(),
+            updated_at: 0,
+            health: threadlane_protocol::daemon::SessionHealth::Healthy,
+            git_branch: None,
+            github_issue: None,
+            is_worktree: false,
+            worktree_available: true,
+            completion_summary: threadlane_protocol::daemon::SessionCompletionSummary::Unknown,
+        });
+    });
+    model.update(cx, |state, cx| {
+        controller::dispatch(
+            state,
+            AppAction::SelectSession {
+                work_dir: work_dir.clone(),
+                session_id: "session-b".into(),
+            },
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        chat.update(cx, |chat, cx| {
+            chat.begin_conversation_find_handoff(
+                super::ConversationFindHandoff {
+                    work_dir: work_dir.clone(),
+                    session_id: "session-b".into(),
+                    query: "needle".into(),
+                },
+                window,
+                cx,
+            );
+        });
+    });
+    chat.read_with(cx, |chat, _| {
+        assert!(chat.pending_find_handoff.is_some());
+    });
+
+    // The user picks a different session before hydration lands; the stale
+    // handoff must not seed a find strip for the wrong session.
+    model.update(cx, |state, cx| {
+        controller::dispatch(
+            state,
+            AppAction::SelectSession {
+                work_dir: work_dir.clone(),
+                session_id: "session-a".into(),
+            },
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, _| {
+        assert!(chat.pending_find_handoff.is_none(), "stale handoff dropped");
+        assert!(!chat.find_open);
+        assert!(chat.find_query.is_empty());
+    });
+}

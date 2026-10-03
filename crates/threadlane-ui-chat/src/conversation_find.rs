@@ -10,6 +10,18 @@ actions!(
     ]
 );
 
+/// One-shot handoff from project conversation search: select this session,
+/// then seed the find strip with `query` once the destination transcript has
+/// hydrated. Owned by the view — the pending request is dropped as soon as
+/// the active session diverges from `work_dir`/`session_id` or the user
+/// leaves the Chat tab.
+#[derive(Clone, Debug)]
+pub struct ConversationFindHandoff {
+    pub work_dir: PathBuf,
+    pub session_id: String,
+    pub query: String,
+}
+
 pub(super) fn init_conversation_find(cx: &mut App) {
     let shortcut = if cfg!(target_os = "macos") {
         "cmd-f"
@@ -71,8 +83,82 @@ impl ChatListView {
         cx.notify();
     }
 
+    /// Queue a search result for the named session. Applies immediately when
+    /// that session is already active and hydrated; otherwise it waits for
+    /// the `SelectSession` dispatch and its hydration to settle (the model
+    /// observer re-runs `progress_find_handoff` on every change). Only the
+    /// ordinary selection path runs — no unsnooze, worktree recreation, or
+    /// runtime start beyond what hydration already does.
+    pub fn begin_conversation_find_handoff(
+        &mut self,
+        handoff: ConversationFindHandoff,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_find_handoff = Some(handoff);
+        self.progress_find_handoff(window, cx);
+    }
+
+    pub(super) fn progress_find_handoff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(handoff) = self.pending_find_handoff.clone() else {
+            return;
+        };
+        let (active_session, still_loading) = {
+            let state = self.model.read(cx);
+            (
+                (
+                    state.active_work_dir.clone(),
+                    state.active_session_id.clone(),
+                ),
+                state.active_session_is_loading(),
+            )
+        };
+        if active_session != (Some(handoff.work_dir.clone()), Some(handoff.session_id.clone())) {
+            // The user navigated elsewhere before the handoff landed; drop it.
+            self.pending_find_handoff = None;
+            return;
+        }
+        if still_loading || self.current_tab != CentralTab::Chat {
+            // Wait for hydration; a tab switch cancels via
+            // `clear_conversation_find`.
+            return;
+        }
+        self.pending_find_handoff = None;
+        self.apply_find_handoff(handoff.query, window, cx);
+    }
+
+    /// Opens the find strip pre-seeded with `query` against the now-hydrated
+    /// transcript. `InputState::set_value` does not emit `Change`, so the
+    /// query is stored directly and an explicit refresh is scheduled — its
+    /// completion navigates to the first current match, recomputing matches
+    /// rather than trusting the search row's stale index.
+    fn apply_find_handoff(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.outline_open = false;
+        self.outline_selected_id = None;
+        if !self.find_open {
+            self.find_previous_focus = window.focused(cx);
+            self.find_open = true;
+        }
+        let state = self.model.read(cx);
+        self.find_session = (
+            state.active_work_dir.clone(),
+            state.active_session_id.clone(),
+        );
+        self.find_query = query.clone();
+        self.find_results.clear();
+        self.find_selected = None;
+        self.find_input.update(cx, |input, cx| {
+            input.set_value(query, window, cx);
+            input.focus(window, cx);
+            input.select_all(window, cx);
+        });
+        self.refresh_conversation_find(true, cx);
+        cx.notify();
+    }
+
     pub(super) fn clear_conversation_find(&mut self) {
         self.find_open = false;
+        self.pending_find_handoff = None;
         self.find_generation += 1;
         self.find_task = None;
         self.find_results.clear();
