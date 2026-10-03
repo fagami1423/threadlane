@@ -1,15 +1,18 @@
 # Changelog
 
-## [0.1.39](https://github.com/wheregmis/threadlane/compare/v0.1.38...v0.1.39) (2026-10-02)
+## [0.1.39](https://github.com/wheregmis/threadlane/compare/v0.1.38...v0.1.39) (2026-10-03)
 
 
 ### Features
 
 * add checkout-scoped Find in files navigation ([63ff254](https://github.com/wheregmis/threadlane/commit/63ff2546a4d7737b7741efd72d2c006de7bd6077))
+* search project conversations by message text ([7a7bb3b](https://github.com/wheregmis/threadlane/commit/7a7bb3b27ecb651a9e0137e912801a36d5d6fec3))
+* search project conversations by message text ([fcaf73a](https://github.com/wheregmis/threadlane/commit/fcaf73a7e00165f2b2cdbbcfa54911203543812b)), closes [#378](https://github.com/wheregmis/threadlane/issues/378)
 
 
 ### Bug Fixes
 
+* land find handoff from any tab and restore prepend splice count ([9af918c](https://github.com/wheregmis/threadlane/commit/9af918cfdef71a4aa96476c5ade700308fc22121))
 * reject search root symlinks and reload clean editor tabs ([5d49ee8](https://github.com/wheregmis/threadlane/commit/5d49ee8d956861408d9b0dd9d37ec5210ceb7641))
 
 
