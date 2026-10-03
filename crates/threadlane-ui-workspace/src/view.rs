@@ -32,7 +32,7 @@ use threadlane_ui_sidebar::{BeginNewTask, ToggleSidebar};
 use threadlane_git::GitStatus;
 
 use threadlane_ui_state::{actions::AppAction, controller};
-use threadlane_ui_chat::{ChatListView, TrajectoryView};
+use threadlane_ui_chat::{ChatListView, ConversationFindHandoff, TrajectoryView};
 use threadlane_ui_github::GitHubView;
 use threadlane_ui_automation::AutomationsView;
 use gpui_component::WindowExt;
@@ -53,6 +53,10 @@ use threadlane_ui_state::projection::{
     compute_session_messages,
 };
 use threadlane_updater::UpdateStatus;
+
+#[path = "conversation_search.rs"]
+mod conversation_search;
+use conversation_search::*;
 
 fn close_command_palette(open: &mut bool, previous_focus: &mut Option<FocusHandle>, window: &mut Window, cx: &mut App) {
     *open = false;
@@ -271,6 +275,9 @@ pub struct WorkspaceView {
     command_palette_open: bool,
     command_palette_previous_focus: Option<FocusHandle>,
     command_state: Entity<CommandState>,
+    /// Some while the palette is showing project conversation search
+    /// instead of the commands list; `conversation_search.rs` owns the mode.
+    conversation_search: Option<ConversationSearch>,
     recent_palette_actions: Vec<&'static str>,
     last_git_work_dir: Option<PathBuf>,
     last_git_pr_targets: HashSet<(PathBuf, String)>,
@@ -518,6 +525,7 @@ impl WorkspaceView {
                         this.get_or_create_active_terminal(&work_dir, &work_dir, cx);
                     }
                 }
+                this.invalidate_conversation_search(cx);
                 let _ = model_wake_tx.send(());
                 cx.notify();
             });
@@ -619,6 +627,7 @@ impl WorkspaceView {
                 command_palette_open: false,
                 command_palette_previous_focus: None,
                 command_state,
+                conversation_search: None,
                 recent_palette_actions: Vec::new(),
                 last_git_work_dir: None,
                 last_git_pr_targets: HashSet::new(),
@@ -1184,7 +1193,7 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         if self.command_palette_open {
-            close_command_palette(&mut self.command_palette_open, &mut self.command_palette_previous_focus, window, cx);
+            self.close_command_palette(window, cx);
         } else {
             self.command_palette_previous_focus = window.focused(cx);
             self.command_palette_open = true;
@@ -1271,6 +1280,17 @@ impl WorkspaceView {
                     state.focus(window, cx);
                 });
                 return; // keep palette open
+            }
+            "search_conversations" => {
+                // Reopen the palette in conversation-search mode (the
+                // confirm path already closed it and restored focus).
+                self.command_palette_previous_focus = window.focused(cx);
+                self.command_palette_open = true;
+                self.command_state.update(cx, |state, cx| {
+                    state.focus(window, cx);
+                });
+                self.enter_conversation_search(window, cx);
+                return; // keep palette open in the new mode
             }
             "open_file" => {
                 self.right_panel_visible = true;
@@ -1557,7 +1577,7 @@ impl WorkspaceView {
         let model = self.model.clone();
         let state = model.read(cx);
 
-        let commands: [(&str, &str, &str, Icon, &[&str], &str); 25] = [
+        let commands: [(&str, &str, &str, Icon, &[&str], &str); 26] = [
             (
                 "New Task",
                 "Start a fresh session",
@@ -1612,6 +1632,14 @@ impl WorkspaceView {
                 "find_files",
                 Icon::from(IconName::Search),
                 &["find", "files", "search", "text", "contents"],
+                "",
+            ),
+            (
+                "Search project conversations…",
+                "Find saved messages across this project's sessions",
+                "search_conversations",
+                Icon::from(IconName::Search),
+                &["search", "conversations", "messages", "find", "transcript"],
                 "",
             ),
             (
@@ -1770,10 +1798,17 @@ impl WorkspaceView {
             None => Some("No terminal is visible"),
         };
 
+        // Conversation search scopes to the attached project; with none it
+        // stays listed but disabled, carrying its reason in the subtitle.
+        let no_project = conversation_search_scope(state).is_none();
         let mut commands_group = CommandGroup::new().label("Commands & Actions");
         for (name, desc, action_key, icon, keywords, shortcut) in &commands {
             let name_str = name.to_string();
-            let desc_str = desc.to_string();
+            let desc_str = if *action_key == "search_conversations" && no_project {
+                "Select a project first".to_string()
+            } else {
+                desc.to_string()
+            };
             let shortcut_str = shortcut.to_string();
             let mut item = CommandItem::new()
                 .label(*name)
@@ -1781,6 +1816,9 @@ impl WorkspaceView {
                 .keywords(keywords.iter().copied());
             if *action_key == "add_terminal_selection" {
                 item = item.disabled(excerpt_block.is_some());
+            }
+            if *action_key == "search_conversations" {
+                item = item.disabled(no_project);
             }
             let item = item.child(move |_window, cx| {
                     let colors = cx.theme().colors;
@@ -1836,6 +1874,9 @@ impl WorkspaceView {
                     .keywords(keywords.iter().copied());
                 if *action_key == "add_terminal_selection" {
                     item = item.disabled(excerpt_block.is_some());
+                }
+                if *action_key == "search_conversations" {
+                    item = item.disabled(no_project);
                 }
                 recent_group = recent_group.item(item);
             }
@@ -1928,7 +1969,7 @@ impl WorkspaceView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _event, window, cx| {
-                    close_command_palette(&mut this.command_palette_open, &mut this.command_palette_previous_focus, window, cx);
+                    this.close_command_palette(window, cx);
                     cx.notify();
                 }),
             )
@@ -1954,13 +1995,13 @@ impl WorkspaceView {
                             .group(sessions_group)
                             .on_cancel(move |window, cx| {
                                 let _ = view_cancel.update(cx, |this, cx| {
-                                    close_command_palette(&mut this.command_palette_open, &mut this.command_palette_previous_focus, window, cx);
+                                    this.close_command_palette(window, cx);
                                     cx.notify();
                                 });
                             })
                             .on_confirm(move |index, window, cx| {
                                 let _ = view.update(cx, |this, cx| {
-                                    close_command_palette(&mut this.command_palette_open, &mut this.command_palette_previous_focus, window, cx);
+                                    this.close_command_palette(window, cx);
                                     let sessions_section = if settings_query { 3 } else { 2 };
                                     if index.section == 2 && settings_query {
                                         if let Some(id) = settings_entries.get(index.row) {
@@ -3122,10 +3163,13 @@ impl Render for WorkspaceView {
                         this.toggle_sidebar_action(&ToggleSidebar, window, cx);
                     }))
             }))
-            .children(
-                self.command_palette_open
-                    .then(|| self.render_command_palette(cx)),
-            )
+            .children(self.command_palette_open.then(|| {
+                if self.conversation_search.is_some() {
+                    self.render_conversation_search(cx).into_any_element()
+                } else {
+                    self.render_command_palette(cx).into_any_element()
+                }
+            }))
     }
 }
 

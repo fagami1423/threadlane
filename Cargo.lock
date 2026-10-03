@@ -8881,6 +8881,7 @@ dependencies = [
  "gpui-pre",
  "rfd",
  "threadlane-coding-agent",
+ "threadlane-daemon",
  "threadlane-git",
  "threadlane-protocol",
  "threadlane-ui-automation",
