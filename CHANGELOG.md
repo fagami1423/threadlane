@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.39](https://github.com/wheregmis/threadlane/compare/v0.1.38...v0.1.39) (2026-10-02)
+
+
+### Features
+
+* add checkout-scoped Find in files navigation ([63ff254](https://github.com/wheregmis/threadlane/commit/63ff2546a4d7737b7741efd72d2c006de7bd6077))
+
+
+### Bug Fixes
+
+* reject search root symlinks and reload clean editor tabs ([5d49ee8](https://github.com/wheregmis/threadlane/commit/5d49ee8d956861408d9b0dd9d37ec5210ceb7641))
+
+
+### Performance Improvements
+
+* reuse validated file descriptors during content search ([a2798e9](https://github.com/wheregmis/threadlane/commit/a2798e995ef050f8e357c84e49cf7ac20a0e2d0d))
+
 ## [0.1.38](https://github.com/wheregmis/threadlane/compare/v0.1.37...v0.1.38) (2026-10-01)
 
 
