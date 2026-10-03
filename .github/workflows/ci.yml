@@ -15,14 +15,35 @@ concurrency:
 
 jobs:
   check:
-    name: Compile macOS
+    name: Compile ${{ matrix.platform }}
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
-    runs-on: macos-14
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    strategy:
+      matrix:
+        include:
+          - platform: macOS
+            os: macos-14
+          - platform: Linux
+            os: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config libssl-dev cmake libclang-dev \
+            libfontconfig-dev libwayland-dev wayland-protocols \
+            libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxcb-xkb-dev libxcb-randr0-dev \
+            libxcb-image0-dev libxcb-icccm4-dev libxcb-keysyms1-dev \
+            libxcb-util-dev libvulkan-dev libasound2-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
-          key: gpui-check
+          key: gpui-check-${{ runner.os }}
       - run: cargo check -p threadlane-gpui

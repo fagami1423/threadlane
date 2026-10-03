@@ -8740,8 +8740,11 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "block2 0.6.2",
+ "cairo-rs",
+ "gdkx11",
  "gpui-component",
  "gpui-pre",
+ "gtk",
  "lb-wry",
  "objc2 0.6.4",
  "objc2-core-foundation",
@@ -8760,6 +8763,7 @@ dependencies = [
  "threadlane-ui-theme",
  "tokio",
  "tracing",
+ "webkit2gtk",
 ]
 
 [[package]]

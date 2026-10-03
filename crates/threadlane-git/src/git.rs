@@ -1958,6 +1958,8 @@ pub fn prune_worktrees(repo_path: &Path) -> Result<(), GitError> {
     Ok(())
 }
 
+/// Resolves the remote's default branch name (e.g. `main`) without fetching:
+/// `origin/HEAD`, then `remote show -n`, then `main`/`master` probing.
 fn discover_default_branch(work_dir: &Path) -> Option<String> {
     if let Some(branch) = command(
         work_dir,
@@ -1978,7 +1980,9 @@ fn discover_default_branch(work_dir: &Path) -> Option<String> {
         .and_then(|output| {
             output.lines().find_map(|line| {
                 let branch = line.trim().strip_prefix("HEAD branch: ")?.trim();
-                (!branch.is_empty() && branch != "(unknown)").then(|| branch.to_owned())
+                // Older git prints "(not queried)" here, newer git
+                // "(unknown)" — neither is a real branch name.
+                (!branch.is_empty() && !branch.starts_with('(')).then(|| branch.to_owned())
             })
         })
     {

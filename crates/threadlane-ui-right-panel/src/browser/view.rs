@@ -126,20 +126,44 @@ impl BrowserView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<Entity<super::webview::ComposedWebView>, String> {
-        use raw_window_handle::HasWindowHandle;
-
-        let window_handle = window
-            .window_handle()
-            .map_err(|_| "Browser window is unavailable. Retry Open link…".to_string())?;
         let builder = wry::WebViewBuilder::new();
         #[cfg(debug_assertions)]
         let builder = builder.with_devtools(true);
         let builder = builder.with_initialization_script(super::scripts::console_interceptor_js());
-        let wry_webview = builder.build_as_child(&window_handle).map_err(|_| {
-            "Browser could not start. Retry Open link… or choose Open in default browser."
-                .to_string()
-        })?;
-        let webview = cx.new(|cx| super::webview::ComposedWebView::new(wry_webview, window, cx));
+
+        #[cfg(target_os = "macos")]
+        let webview = {
+            use raw_window_handle::HasWindowHandle;
+
+            let window_handle = window
+                .window_handle()
+                .map_err(|_| "Browser window is unavailable. Retry Open link…".to_string())?;
+            let wry_webview = builder.build_as_child(&window_handle).map_err(|_| {
+                "Browser could not start. Retry Open link… or choose Open in default browser."
+                    .to_string()
+            })?;
+            cx.new(|cx| super::webview::ComposedWebView::new(wry_webview, window, cx))
+        };
+
+        // On Linux the webview must be built as a child of the composition
+        // surface's X window, so the surface is created first; see webview.rs.
+        #[cfg(target_os = "linux")]
+        let webview = {
+            use super::webview as wv;
+
+            wv::ensure_gtk_init()?;
+            wv::ensure_gtk_pump(cx);
+            let surface = window
+                .enable_window_composition()
+                .and_then(|composition| composition.create_native_surface())
+                .ok()
+                // A Wayland surface has no XID to parent into; drop it so the
+                // fallback below can fail cleanly with the X11 requirement.
+                .filter(|surface| wv::surface_xid(surface).is_some());
+            let wry_webview = wv::build_child(builder, surface.as_ref(), window)?;
+            cx.new(|cx| super::webview::ComposedWebView::new(wry_webview, surface, window, cx))
+        };
+
         webview.update(cx, |view, _| view.load_url(url));
         // Inactive tabs stay hidden until selected.
         webview.update(cx, |view, cx| {
@@ -381,6 +405,7 @@ impl BrowserView {
     /// Capture the rendered viewport as JPEG bytes with width and height.
     /// `crop` is an optional `[x, y, w, h]` rect in view points (≈ CSS pixels
     /// at page zoom 1); `None` snapshots the whole viewport.
+    #[cfg(target_os = "macos")]
     pub fn take_snapshot(
         &self,
         crop: Option<[f64; 4]>,
@@ -474,6 +499,45 @@ impl BrowserView {
             }
         }
 
+        Ok(rx)
+    }
+
+    /// Capture the rendered viewport as PNG bytes with width and height.
+    /// `crop` is an optional `[x, y, w, h]` rect in view points; `None`
+    /// snapshots the whole viewport.
+    #[cfg(target_os = "linux")]
+    pub fn take_snapshot(
+        &self,
+        crop: Option<[f64; 4]>,
+        cx: &App,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(Vec<u8>, u32, u32), String>>, String> {
+        use webkit2gtk::WebViewExt as _;
+        use wry::WebViewExtUnix as _;
+
+        let webview = self
+            .active_webview()
+            .ok_or_else(|| "The browser has no active tab.".to_string())?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+        let wk_wv = webview.read(cx).raw().webview();
+
+        // The reply runs on the GTK main context, which the pump spawned in
+        // `spawn_webview` keeps iterating from the UI thread.
+        wk_wv.snapshot(
+            webkit2gtk::SnapshotRegion::Visible,
+            webkit2gtk::SnapshotOptions::NONE,
+            webkit2gtk::gio::Cancellable::NONE,
+            move |result| {
+                let res = result
+                    .map_err(|error| format!("WebKitGTK snapshot failed: {error}"))
+                    .and_then(|surface| snapshot_to_png(&surface, crop));
+                if let Ok(mut slot) = tx.lock() {
+                    if let Some(tx) = slot.take() {
+                        let _ = tx.send(res);
+                    }
+                }
+            },
+        );
         Ok(rx)
     }
 
@@ -713,10 +777,15 @@ impl BrowserView {
             if let Some(snapshot) = snapshot {
                 if let Ok(Ok((bytes, _, _))) = snapshot.await {
                     if !bytes.is_empty() {
+                        // macOS snapshots are JPEG, Linux ones PNG.
+                        #[cfg(target_os = "macos")]
+                        let (ext, mime) = ("jpg", "image/jpeg");
+                        #[cfg(target_os = "linux")]
+                        let (ext, mime) = ("png", "image/png");
                         images.push(threadlane_protocol::ImageAttachment {
-                            display_name: "browser-annotation.jpg".to_string(),
+                            display_name: format!("browser-annotation.{ext}"),
                             data_url: format!(
-                                "data:image/jpeg;base64,{}",
+                                "data:{mime};base64,{}",
                                 base64::Engine::encode(
                                     &base64::engine::general_purpose::STANDARD,
                                     bytes
@@ -1128,6 +1197,45 @@ pub fn format_annotation_note(pick: &serde_json::Value) -> String {
     }
 
     note
+}
+
+/// Rasterize a WebKitGTK snapshot surface to PNG. `crop`, when present, is an
+/// `[x, y, w, h]` rect in the snapshot's coordinate space; a cropped image is
+/// produced by repainting the shifted source into a sized image surface.
+#[cfg(target_os = "linux")]
+fn snapshot_to_png(
+    surface: &cairo::Surface,
+    crop: Option<[f64; 4]>,
+) -> Result<(Vec<u8>, u32, u32), String> {
+    let image = match crop {
+        Some([x, y, w, h]) => {
+            let width = w.round().max(1.) as i32;
+            let height = h.round().max(1.) as i32;
+            let image = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height)
+                .map_err(|error| format!("Snapshot crop surface failed: {error}"))?;
+            let context = cairo::Context::new(&image)
+                .map_err(|error| format!("Snapshot crop context failed: {error}"))?;
+            context
+                .set_source_surface(surface, -x, -y)
+                .map_err(|error| format!("Snapshot crop failed: {error}"))?;
+            context
+                .paint()
+                .map_err(|error| format!("Snapshot crop paint failed: {error}"))?;
+            drop(context);
+            image
+        }
+        None => surface
+            .map_to_image(None)
+            .map_err(|error| format!("Snapshot rasterization failed: {error}"))?
+            .to_owned(),
+    };
+    let width = image.width().max(1) as u32;
+    let height = image.height().max(1) as u32;
+    let mut bytes = Vec::new();
+    image
+        .write_to_png(&mut bytes)
+        .map_err(|error| format!("Snapshot PNG encode failed: {error}"))?;
+    Ok((bytes, width, height))
 }
 
 #[cfg(test)]
