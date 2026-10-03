@@ -44,6 +44,34 @@ fn simplified_cwd(path: &Path) -> PathBuf {
     }
 }
 
+/// Shell programs to try, in order. On Windows, POSIX-style `SHELL` values
+/// (e.g. `/bin/sh` inherited from Git Bash or MSYS) are not spawnable via
+/// CreateProcess, so `SHELL`/`COMSPEC` only qualify when they point at a real
+/// file — and even a real file can fail to spawn (a batch script or data
+/// file), so callers must fall through the list on spawn errors.
+/// Intentionally duplicated in `threadlane-ui-terminal` — keep in sync.
+fn shell_candidates() -> Vec<String> {
+    if cfg!(windows) {
+        let mut candidates = Vec::new();
+        if let Some(shell) = std::env::var("SHELL")
+            .ok()
+            .filter(|shell| Path::new(shell).is_file())
+        {
+            candidates.push(shell);
+        }
+        if let Some(comspec) = std::env::var("COMSPEC")
+            .ok()
+            .filter(|comspec| !comspec.is_empty() && Path::new(comspec).is_file())
+        {
+            candidates.push(comspec);
+        }
+        candidates.push("cmd.exe".into());
+        candidates
+    } else {
+        vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())]
+    }
+}
+
 struct PtyHandle {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
@@ -90,42 +118,36 @@ impl TerminalManager {
                 pixel_height: 0,
             })
             .map_err(|error| format!("could not open pty: {error}"))?;
-        // On Windows, POSIX-style `SHELL` values (e.g. `/bin/sh` inherited
-        // from Git Bash or MSYS) are not spawnable via CreateProcess, so only
-        // honor `SHELL`/`COMSPEC` when they point at a real executable file.
         // Selection logic mirrors `threadlane-ui-terminal` — keep in sync.
-        let shell = std::env::var("SHELL")
-            .ok()
-            .filter(|shell| !cfg!(windows) || Path::new(shell).is_file())
-            .or_else(|| {
-                if cfg!(windows) {
-                    std::env::var("COMSPEC")
-                        .ok()
-                        .filter(|comspec| !comspec.is_empty() && Path::new(comspec).is_file())
-                } else {
-                    None
+        let mut last_spawn_error = None;
+        let mut child = None;
+        for shell in shell_candidates() {
+            let mut command = CommandBuilder::new(shell);
+            #[cfg(windows)]
+            command.cwd(simplified_cwd(cwd));
+            #[cfg(not(windows))]
+            command.cwd(cwd);
+            command.env("TERM", "xterm-256color");
+            if !cfg!(windows) {
+                command.arg("-i");
+            }
+            match pair.slave.spawn_command(command) {
+                Ok(spawned) => {
+                    child = Some(spawned);
+                    break;
                 }
-            })
-            .unwrap_or_else(|| {
-                if cfg!(windows) {
-                    "cmd.exe".into()
-                } else {
-                    "/bin/sh".into()
-                }
-            });
-        let mut command = CommandBuilder::new(shell);
-        #[cfg(windows)]
-        command.cwd(simplified_cwd(cwd));
-        #[cfg(not(windows))]
-        command.cwd(cwd);
-        command.env("TERM", "xterm-256color");
-        if !cfg!(windows) {
-            command.arg("-i");
+                Err(error) => last_spawn_error = Some(error),
+            }
         }
-        let child = pair
-            .slave
-            .spawn_command(command)
-            .map_err(|error| format!("could not spawn shell in {}: {error}", cwd.display()))?;
+        let child = child.ok_or_else(|| {
+            format!(
+                "could not spawn shell in {}: {}",
+                cwd.display(),
+                last_spawn_error
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "no shell candidates".into())
+            )
+        })?;
         let mut reader = pair
             .master
             .try_clone_reader()
