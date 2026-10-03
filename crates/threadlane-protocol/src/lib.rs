@@ -32,7 +32,7 @@ pub use messages::{
     ImageAttachment, PlanItem, PlanItemStatus, ReasoningEffort, SessionPlan, TokenUsage,
 };
 pub use orchestration::OrchestratorMode;
-pub use tool::{ToolExecutor, ToolOutput};
+pub use tool::{ToolExecutionIdentity, ToolExecutor, ToolOutput};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeToolCallFunction {

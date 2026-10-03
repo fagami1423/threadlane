@@ -69,9 +69,15 @@ fn collect_files(
         if name == ".git" || name == "target" || name == ".threadlane" {
             continue;
         }
-        if path.is_dir() {
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        // Match repository-map and fuzzy-path scans: never follow symlinks or
+        // read special files (e.g. a FIFO that could block the tool forever).
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             collect_files(root, &path, glob, out)?;
-        } else if glob
+        } else if file_type.is_file() && glob
             .map(|pattern| {
                 simple_glob(
                     pattern,
@@ -91,7 +97,8 @@ fn collect_files(
 
 fn simple_glob(pattern: &str, value: &str) -> bool {
     match pattern.strip_prefix("**/") {
-        Some(suffix) => value.ends_with(suffix),
+        Some(suffix) if suffix.starts_with("*.") => value.ends_with(&suffix[1..]),
+        Some(suffix) => value == suffix || value.ends_with(&format!("/{suffix}")),
         None if pattern.starts_with("*.") => value.ends_with(&pattern[1..]),
         None => value == pattern,
     }
@@ -153,6 +160,38 @@ mod tests {
         fs::write(dir.path().join("two.txt"), "needle\n").unwrap();
         let result = grep_search(dir.path(), "needle", Some("*.rs")).unwrap();
         assert_eq!(result, "one.rs:1:needle");
+    }
+
+    #[test]
+    fn recursive_globs_match_root_and_nested_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        for path in ["lib.rs", "src/lib.rs", "src/notlib.rs", "src/lib.txt"] {
+            fs::write(dir.path().join(path), "needle\n").unwrap();
+        }
+        assert_eq!(
+            grep_search(dir.path(), "needle", Some("**/*.rs")).unwrap(),
+            "lib.rs:1:needle\nsrc/lib.rs:1:needle\nsrc/notlib.rs:1:needle",
+        );
+        assert_eq!(
+            grep_search(dir.path(), "needle", Some("**/lib.rs")).unwrap(),
+            "lib.rs:1:needle\nsrc/lib.rs:1:needle",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_skips_symlinked_files_and_directories() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("external.txt"), "needle outside\n").unwrap();
+        fs::write(dir.path().join("local.txt"), "needle local\n").unwrap();
+        symlink(outside.path(), dir.path().join("linked-dir")).unwrap();
+        symlink(outside.path().join("external.txt"), dir.path().join("linked-file")).unwrap();
+        assert_eq!(grep_search(dir.path(), "needle", None).unwrap(), "local.txt:1:needle local");
+        symlink(dir.path(), dir.path().join("cycle")).unwrap();
+        assert_eq!(grep_search(dir.path(), "needle", None).unwrap(), "local.txt:1:needle local");
     }
 
     #[test]

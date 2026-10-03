@@ -9,6 +9,39 @@
 
 use crate::messages::{AgentToolCall, AgentToolDefinition, ImageAttachment};
 
+/// Host-owned identity of a tool intent already committed to the session journal.
+/// Call IDs alone are not unique across runs or lanes. This metadata is never
+/// part of a model-visible tool schema or provider message.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolExecutionIdentity {
+    pub session_id: String,
+    pub lane: String,
+    pub run_id: String,
+    pub assistant_entry_id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub result_entry_id: String,
+}
+
+impl ToolExecutionIdentity {
+    pub fn matches_call(&self, call_id: &str, tool_name: &str) -> bool {
+        self.tool_call_id == call_id
+            && self.tool_name == tool_name
+            && [
+                &self.session_id,
+                &self.lane,
+                &self.run_id,
+                &self.assistant_entry_id,
+                &self.tool_call_id,
+                &self.tool_name,
+                &self.result_entry_id,
+            ]
+            .iter()
+            .all(|field| !field.trim().is_empty())
+    }
+}
+
 /// Rich tool output: text plus optional model-visible images. Executors keep
 /// returning plain strings; only image-producing tools build this directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,12 +93,22 @@ pub trait ToolExecutor: Send + Sync {
         self.execute_tool(name, args).await
     }
 
+    /// Canonical dispatch entry point: preserves durable call identity,
+    /// effective arguments, workspace context, and rich output together.
+    /// Executors that need call identity override this; the default retains
+    /// existing workspace/image-aware implementations.
+    /// `identity` comes from committed host intent and is absent for legacy
+    /// execution without a journal. For `dyn`, `call` names the resolved tool
+    /// while the identity still names the model's original declaration.
     async fn execute_tool_with_call(
         &self,
         call: &AgentToolCall,
         args: &str,
-    ) -> Option<Result<String, String>> {
-        self.execute_tool(&call.name, args).await
+        work_dir: Option<&std::path::Path>,
+        _identity: Option<&ToolExecutionIdentity>,
+    ) -> Option<Result<ToolOutput, String>> {
+        self.execute_tool_with_output_in_workspace(&call.name, args, work_dir)
+            .await
     }
 
     /// Rich variant carrying model-visible images alongside text. The default

@@ -10,7 +10,7 @@ use crate::tool_executor::builtin_tool_executor;
 use threadlane_protocol::ToolExecutor;
 use crate::types::ToolExecutionMode;
 use threadlane_protocol::{
-    AgentToolCall, AgentToolDefinition, AgentToolResult, ImageAttachment, ToolOutput,
+    AgentToolCall, AgentToolDefinition, AgentToolResult, ImageAttachment, ToolExecutionIdentity, ToolOutput,
 };
 use crate::utils::AbortOnDrop;
 use serde_json::Value;
@@ -25,7 +25,7 @@ use tracing::{debug, warn};
 
 use futures::FutureExt;
 
-/// Callback invoked after a tool intent is recorded and before execution.
+/// Resolve the auxiliary CLI form through the same executor path in both modes.
 fn dyn_tool_call(run_command_arguments: &str) -> Option<(String, String)> {
     let arguments: Value = serde_json::from_str(run_command_arguments).ok()?;
     let command = arguments.get("command")?.as_str()?.trim();
@@ -33,6 +33,9 @@ fn dyn_tool_call(run_command_arguments: &str) -> Option<(String, String)> {
     let mut parts = input.split_whitespace();
     let tool_name = parts.next()?;
     let remaining = input[tool_name.len()..].trim();
+    let remaining = threadlane_tools::dispatch::strip_matching_outer_quotes(remaining)
+        .unwrap_or(remaining)
+        .trim();
     if tool_name.starts_with('-') || remaining == "--help" || remaining == "-h" {
         return None;
     }
@@ -49,6 +52,7 @@ fn dyn_tool_call(run_command_arguments: &str) -> Option<(String, String)> {
     };
     Some((tool_name.to_owned(), tool_arguments))
 }
+/// Callback invoked after hooks to commit intent before execution.
 pub type ToolIntentRecorder = crate::provider::ToolIntentRecorder;
 /// Callback invoked after tool execution completes.
 pub type ToolCompletionRecorder = crate::provider::ToolCompletionRecorder;
@@ -407,7 +411,20 @@ struct PreparedToolCall {
     tc: ToolCall,
     arguments: String,
     agent_tool_call: AgentToolCall,
+    identity: Option<ToolExecutionIdentity>,
+    intent_arguments: Option<String>,
     context: ToolRunContext,
+}
+
+enum ToolPreparationFailure {
+    Rejected(AgentToolResult),
+    Persistence(AgentError),
+}
+
+fn tool_persistence_error(call_id: &str, phase: &str, error: impl std::fmt::Display) -> AgentError {
+    AgentError::Session(format!(
+        "Tool {call_id} {phase} could not be committed: {error}. Preserve the journal and recover the existing operation; do not replay the original call or continue provider execution with an uncommitted reply"
+    ))
 }
 
 /// Owns the tool executor registry, hook pipeline, and dispatch logic.
@@ -525,7 +542,10 @@ impl ToolDispatcher {
     // ── Tool execution ────────────────────────────────────────────────
 
     /// Executes tools and returns results. Intents are recorded before execution.
-    pub(crate) async fn execute_tools(&self, tool_calls: &[ToolCall]) -> Vec<AgentToolResult> {
+    pub(crate) async fn execute_tools(
+        &self,
+        tool_calls: &[ToolCall],
+    ) -> Result<Vec<AgentToolResult>, AgentError> {
         self.execute_tools_with_options(tool_calls, self.tool_intent_recorder.clone(), false, false)
             .await
     }
@@ -535,7 +555,7 @@ impl ToolDispatcher {
     async fn execute_tools_without_intent_recording(
         &self,
         tool_calls: &[ToolCall],
-    ) -> Vec<AgentToolResult> {
+    ) -> Result<Vec<AgentToolResult>, AgentError> {
         self.execute_tools_with_options(tool_calls, None, false, false)
             .await
     }
@@ -547,7 +567,7 @@ impl ToolDispatcher {
     pub(crate) async fn execute_tools_for_replay(
         &self,
         tool_calls: &[ToolCall],
-    ) -> Vec<AgentToolResult> {
+    ) -> Result<Vec<AgentToolResult>, AgentError> {
         self.execute_tools_with_options(tool_calls, None, true, true)
             .await
     }
@@ -558,7 +578,7 @@ impl ToolDispatcher {
         intent_recorder: Option<ToolIntentRecorder>,
         skip_before_hook: bool,
         skip_repetition_cache: bool,
-    ) -> Vec<AgentToolResult> {
+    ) -> Result<Vec<AgentToolResult>, AgentError> {
         let mut results = Vec::new();
         let tool_routes = self.tool_execution_routes().await;
         let allowed_tool_names = self.allowed_tool_names.clone();
@@ -574,7 +594,7 @@ impl ToolDispatcher {
                         skip_before_hook,
                         skip_repetition_cache,
                     )
-                    .await;
+                    .await?;
                 results.push(res);
             }
         } else {
@@ -596,61 +616,61 @@ impl ToolDispatcher {
                 };
                 match Self::prepare_tool_call(tc.clone(), context).await {
                     Ok(call) => prepared.push((index, call)),
-                    Err(result) => slots[index] = Some(result),
+                    Err(ToolPreparationFailure::Rejected(result)) => slots[index] = Some(result),
+                    Err(ToolPreparationFailure::Persistence(error)) => return Err(error),
                 }
             }
 
             let mut handles = Vec::new();
-            let mut executed_indices = Vec::new();
             for (index, call) in prepared {
                 let fallback_call = call.tc.clone();
                 let handle = AbortOnDrop::new(tokio::spawn(async move {
                     Self::execute_prepared_tool(call).await
                 }));
                 handles.push((index, fallback_call, handle));
-                executed_indices.push(index);
             }
 
+            let mut failure = None;
             for (index, tool_call, handle) in handles {
-                match handle.join().await {
-                    Ok(result) => slots[index] = Some(result),
-                    Err(error) => {
-                        let result = AgentToolResult {
-                            tool_call_id: tool_call.id.clone(),
-                            name: tool_call.function.name.clone(),
-                            content: format!("Tool execution task failed: {error}"),
-                            is_error: true,
-                            terminate: false,
-                            images: Vec::new(),
-                        };
-                        slots[index] = Some(result);
-                    }
-                }
-            }
-            if let Some(recorder) = &self.tool_completion_recorder {
-                for &index in &executed_indices {
-                    let Some(result) = slots[index].as_mut() else {
+                let result = match handle.join().await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(error)) => {
+                        failure.get_or_insert(error);
                         continue;
-                    };
-                    if let Err(error) = recorder(result).await {
-                        result.content = error;
-                        result.is_error = true;
+                    }
+                    Err(error) => AgentToolResult {
+                        tool_call_id: tool_call.id.clone(),
+                        name: tool_call.function.name.clone(),
+                        content: format!("Tool execution task failed: {error}"),
+                        is_error: true,
+                        terminate: false,
+                        images: Vec::new(),
+                    },
+                };
+                if let Some(recorder) = &self.tool_completion_recorder {
+                    if let Err(error) = recorder(&result).await {
+                        failure.get_or_insert_with(|| {
+                            tool_persistence_error(&result.tool_call_id, "result", error)
+                        });
+                        continue;
                     }
                 }
+                let _ = self.event_tx.send(AgentEvent::ToolExecutionEnd {
+                    tool_call_id: result.tool_call_id.clone(),
+                    name: result.name.clone(),
+                    result: result.clone(),
+                });
+                slots[index] = Some(result);
             }
-            for index in executed_indices {
-                if let Some(result) = &slots[index] {
-                    let _ = self.event_tx.send(AgentEvent::ToolExecutionEnd {
-                        tool_call_id: result.tool_call_id.clone(),
-                        name: result.name.clone(),
-                        result: result.clone(),
-                    });
-                }
+            // Settle and commit siblings that have already begun before surfacing
+            // failure. Dropping their handles could discard another tool's effects.
+            if let Some(error) = failure {
+                return Err(error);
             }
             results.extend(slots.into_iter().flatten());
         }
 
-        results
+        Ok(results)
     }
 
     async fn execute_single_tool(
@@ -661,132 +681,105 @@ impl ToolDispatcher {
         intent_recorder: Option<ToolIntentRecorder>,
         skip_before_hook: bool,
         skip_repetition_cache: bool,
-    ) -> AgentToolResult {
-        let result = AssertUnwindSafe(Self::run_tool_with_hooks(
-            tc.clone(),
-            ToolRunContext {
-                hooks: self.hook_registry.clone(),
-                intent_recorder,
-                execution_trace_recorder: self.tool_execution_trace_recorder.clone(),
-                event_tx: self.event_tx.clone(),
-                tool_routes,
-                allowed_tool_names,
-                work_dir: self.work_dir.clone(),
-                skip_before_hook,
-                session_id: self.session_id.clone(),
-                repetition: self.repetition.clone(),
-                skip_repetition_cache,
-            },
-        ))
+    ) -> Result<AgentToolResult, AgentError> {
+        let result = AssertUnwindSafe(async {
+            let call = match Self::prepare_tool_call(
+                tc.clone(),
+                ToolRunContext {
+                    hooks: self.hook_registry.clone(),
+                    intent_recorder,
+                    execution_trace_recorder: self.tool_execution_trace_recorder.clone(),
+                    event_tx: self.event_tx.clone(),
+                    tool_routes,
+                    allowed_tool_names,
+                    work_dir: self.work_dir.clone(),
+                    skip_before_hook,
+                    session_id: self.session_id.clone(),
+                    repetition: self.repetition.clone(),
+                    skip_repetition_cache,
+                },
+            )
+            .await
+            {
+                Ok(call) => call,
+                Err(ToolPreparationFailure::Rejected(result)) => return Ok((result, false)),
+                Err(ToolPreparationFailure::Persistence(error)) => return Err(error),
+            };
+            Self::execute_prepared_tool(call)
+                .await
+                .map(|result| (result, true))
+        })
         .catch_unwind()
         .await;
 
-        match result {
-            Ok(mut result) => {
-                if let Some(recorder) = &self.tool_completion_recorder {
-                    if let Err(error) = recorder(&result).await {
-                        result.content = error;
-                        result.is_error = true;
-                    }
-                }
-                let _ = self.event_tx.send(AgentEvent::ToolExecutionEnd {
-                    tool_call_id: result.tool_call_id.clone(),
-                    name: result.name.clone(),
-                    result: result.clone(),
-                });
-                result
-            }
-            Err(_) => {
-                let mut result = AgentToolResult {
-                    tool_call_id: tc.id.clone(),
-                    name: tc.function.name.clone(),
-                    content: format!(
-                        "Tool '{}' failed: the tool panicked during execution. \
+        let result = match result {
+            Ok(Ok((result, false))) => return Ok(result),
+            Ok(Ok((result, true))) => result,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => AgentToolResult {
+                tool_call_id: tc.id.clone(),
+                name: tc.function.name.clone(),
+                content: format!(
+                    "Tool '{}' failed: the tool panicked during execution. \
                          Please retry the tool or use another approach.",
-                        tc.function.name
-                    ),
-                    is_error: true,
-                    terminate: false,
-                    images: Vec::new(),
-                };
-                if let Some(recorder) = &self.tool_completion_recorder {
-                    if let Err(error) = recorder(&result).await {
-                        result.content = error;
-                        result.is_error = true;
-                    }
-                }
-                let _ = self.event_tx.send(AgentEvent::ToolExecutionEnd {
-                    tool_call_id: tc.id.clone(),
-                    name: tc.function.name.clone(),
-                    result: result.clone(),
-                });
-                result
-            }
+                    tc.function.name
+                ),
+                is_error: true,
+                terminate: false,
+                images: Vec::new(),
+            },
+        };
+        if let Some(recorder) = &self.tool_completion_recorder {
+            recorder(&result)
+                .await
+                .map_err(|error| tool_persistence_error(&tc.id, "result", error))?;
         }
-    }
-
-    async fn run_tool_with_hooks(tc: ToolCall, context: ToolRunContext) -> AgentToolResult {
-        if tc.function.name == "run_command" {
-            if let Some((tool_name, tool_arguments)) = dyn_tool_call(&tc.function.arguments) {
-                let nested = ToolCall {
-                    id: format!("{}:dyn", tc.id),
-                    r#type: "function".into(),
-                    function: threadlane_protocol::RuntimeToolCallFunction {
-                        name: tool_name,
-                        arguments: tool_arguments,
-                    },
-                    thought_signature: None,
-                };
-                let nested_result = Box::pin(Self::run_tool_with_hooks(nested, context)).await;
-                return AgentToolResult {
-                    tool_call_id: tc.id,
-                    name: tc.function.name,
-                    content: if nested_result.is_error {
-                        nested_result.content
-                    } else {
-                        format!(
-                            "Exit Status: exit status: 0\n--- STDOUT ---\n{}\n--- STDERR ---",
-                            nested_result.content
-                        )
-                    },
-                    is_error: nested_result.is_error,
-                    terminate: nested_result.terminate,
-                    images: nested_result.images,
-                };
-            }
-        }
-        match Self::prepare_tool_call(tc, context).await {
-            Ok(call) => Self::execute_prepared_tool(call).await,
-            Err(result) => result,
-        }
+        let _ = self.event_tx.send(AgentEvent::ToolExecutionEnd {
+            tool_call_id: tc.id.clone(),
+            name: tc.function.name.clone(),
+            result: result.clone(),
+        });
+        Ok(result)
     }
 
     async fn prepare_tool_call(
         tc: ToolCall,
         context: ToolRunContext,
-    ) -> Result<PreparedToolCall, AgentToolResult> {
-        let arguments = normalize_tool_arguments(
+    ) -> Result<PreparedToolCall, ToolPreparationFailure> {
+        let mut arguments = normalize_tool_arguments(
             &tc.function.name,
             &tc.function.arguments,
             context.work_dir.as_deref(),
         );
-        let agent_tool_call = AgentToolCall {
+        let mut agent_tool_call = AgentToolCall {
             id: tc.id.clone(),
             name: tc.function.name.clone(),
             arguments: arguments.clone(),
         };
+        let mut intent_arguments = None;
+        while agent_tool_call.name == "run_command" {
+            let Some((name, args)) = dyn_tool_call(&arguments) else {
+                break;
+            };
+            if intent_arguments.is_none() {
+                intent_arguments = Some(std::mem::take(&mut arguments));
+            }
+            arguments = normalize_tool_arguments(&name, &args, context.work_dir.as_deref());
+            agent_tool_call.name = name;
+            agent_tool_call.arguments = arguments.clone();
+        }
 
         if context
             .allowed_tool_names
             .as_ref()
-            .is_some_and(|allowed| !allowed.contains(&tc.function.name))
+            .is_some_and(|allowed| !allowed.contains(&agent_tool_call.name))
         {
             let result = AgentToolResult {
                 tool_call_id: tc.id.clone(),
                 name: tc.function.name.clone(),
                 content: format!(
                     "Tool '{}' is not allowed by the current agent policy",
-                    tc.function.name
+                    agent_tool_call.name
                 ),
                 is_error: true,
                 terminate: false,
@@ -797,7 +790,7 @@ impl ToolDispatcher {
                 name: tc.function.name,
                 result: result.clone(),
             });
-            return Err(result);
+            return Err(ToolPreparationFailure::Rejected(result));
         }
 
         if !context.skip_before_hook {
@@ -806,7 +799,7 @@ impl ToolDispatcher {
                 lane: "main".into(),
                 run_id: None,
                 tool_call_id: Some(tc.id.clone()),
-                tool_name: Some(tc.function.name.clone()),
+                tool_name: Some(agent_tool_call.name.clone()),
                 tool_arguments: Some(arguments.clone()),
                 tool_result_content: None,
                 tool_result_is_error: None,
@@ -830,42 +823,51 @@ impl ToolDispatcher {
                     name: tc.function.name.clone(),
                     result: res.clone(),
                 });
-                return Err(res);
+                return Err(ToolPreparationFailure::Rejected(res));
             }
         }
 
-        if let Some(recorder) = &context.intent_recorder {
-            if let Err(error) = recorder(&tc.id, &tc.function.name, &arguments).await {
-                let result = AgentToolResult {
-                    tool_call_id: tc.id.clone(),
-                    name: tc.function.name.clone(),
-                    content: error,
-                    is_error: true,
-                    terminate: false,
-                    images: Vec::new(),
-                };
-                let _ = context.event_tx.send(AgentEvent::ToolExecutionEnd {
-                    tool_call_id: tc.id,
-                    name: tc.function.name,
-                    result: result.clone(),
-                });
-                return Err(result);
+        let identity = if let Some(recorder) = &context.intent_recorder {
+            let recorded = recorder(
+                &tc.id,
+                &tc.function.name,
+                intent_arguments.as_deref().unwrap_or(&arguments),
+            ).await.and_then(|identity| {
+                if identity.matches_call(&tc.id, &tc.function.name) {
+                    Ok(identity)
+                } else {
+                    Err("Committed tool identity does not match the declared call; execution was not started".into())
+                }
+            });
+            match recorded {
+                Ok(identity) => Some(identity),
+                Err(error) => {
+                    return Err(ToolPreparationFailure::Persistence(tool_persistence_error(
+                        &tc.id, "intent", error,
+                    )));
+                }
             }
-        }
+        } else {
+            None
+        };
 
         Ok(PreparedToolCall {
             tc,
             arguments,
             agent_tool_call,
+            identity,
+            intent_arguments,
             context,
         })
     }
 
-    async fn execute_prepared_tool(call: PreparedToolCall) -> AgentToolResult {
+    async fn execute_prepared_tool(call: PreparedToolCall) -> Result<AgentToolResult, AgentError> {
         let PreparedToolCall {
             tc,
             arguments,
             agent_tool_call,
+            identity,
+            intent_arguments,
             context,
         } = call;
         let start_time = std::time::Instant::now();
@@ -876,7 +878,7 @@ impl ToolDispatcher {
         let executor_kind = context
             .tool_routes
             .iter()
-            .find(|route| route.tool_names.contains(&tc.function.name))
+            .find(|route| route.tool_names.contains(&agent_tool_call.name))
             .map(|route| route.executor.executor_id().to_string())
             .unwrap_or_else(|| "unregistered".to_string());
         if let Some(recorder) = &context.execution_trace_recorder {
@@ -884,19 +886,12 @@ impl ToolDispatcher {
                 tool_call_id: tc.id.clone(),
                 tool_name: tc.function.name.clone(),
                 executor_kind: executor_kind.clone(),
-                effective_arguments: arguments.clone(),
+                effective_arguments: intent_arguments.as_ref().unwrap_or(&arguments).clone(),
                 started_at_ms,
             })
             .await
             {
-                return AgentToolResult {
-                    tool_call_id: tc.id,
-                    name: tc.function.name,
-                    content: format!("Failed to persist tool execution start: {error}"),
-                    is_error: true,
-                    terminate: false,
-                    images: Vec::new(),
-                };
+                return Err(tool_persistence_error(&tc.id, "execution start", error));
             }
         }
         debug!(
@@ -906,7 +901,7 @@ impl ToolDispatcher {
         let _ = context.event_tx.send(AgentEvent::ToolExecutionStart {
             tool_call_id: tc.id.clone(),
             name: tc.function.name.clone(),
-            arguments: arguments.clone(),
+            arguments: intent_arguments.as_ref().unwrap_or(&arguments).clone(),
         });
 
         let mut execution_result = None;
@@ -916,7 +911,7 @@ impl ToolDispatcher {
         let mut served_from_cache = false;
         if !context.skip_repetition_cache {
             if let Some((cached, was_error)) = context.repetition.lookup(
-                &tc.function.name,
+                &agent_tool_call.name,
                 &arguments,
                 context.work_dir.as_deref(),
             ) {
@@ -929,15 +924,16 @@ impl ToolDispatcher {
             if execution_result.is_some() {
                 break;
             }
-            if !route.tool_names.contains(&tc.function.name) {
+            if !route.tool_names.contains(&agent_tool_call.name) {
                 continue;
             }
             if let Some(result) = route
                 .executor
-                .execute_tool_with_output_in_workspace(
-                    &agent_tool_call.name,
+                .execute_tool_with_call(
+                    &agent_tool_call,
                     &arguments,
                     context.work_dir.as_deref(),
+                    identity.as_ref(),
                 )
                 .await
             {
@@ -948,7 +944,7 @@ impl ToolDispatcher {
         let execution_result = execution_result.unwrap_or_else(|| {
             Err(format!(
                 "No registered executor handles tool '{}'. If this is an auxiliary capability, run it via: dyn {} [args]",
-                tc.function.name, tc.function.name
+                agent_tool_call.name, agent_tool_call.name
             ))
         });
         let (content, is_error, images) = match execution_result {
@@ -961,7 +957,7 @@ impl ToolDispatcher {
             // and any later mutation invalidates by version. Cache hits never
             // re-store (that would nest steering notes).
             context.repetition.store(
-                &tc.function.name,
+                &agent_tool_call.name,
                 &arguments,
                 &ToolOutput {
                     content: content.clone(),
@@ -993,11 +989,17 @@ impl ToolDispatcher {
         };
 
         let hook_ctx = HookContext {
-            session_id: context.session_id.clone(),
-            lane: "main".into(),
-            run_id: None,
+            session_id: identity
+                .as_ref()
+                .map(|identity| identity.session_id.clone())
+                .unwrap_or_else(|| context.session_id.clone()),
+            lane: identity
+                .as_ref()
+                .map(|identity| identity.lane.clone())
+                .unwrap_or_else(|| "main".into()),
+            run_id: identity.as_ref().map(|identity| identity.run_id.clone()),
             tool_call_id: Some(tc.id.clone()),
-            tool_name: Some(tc.function.name.clone()),
+            tool_name: Some(agent_tool_call.name.clone()),
             tool_arguments: Some(arguments.clone()),
             tool_result_content: Some(final_result.content.clone()),
             tool_result_is_error: Some(final_result.is_error),
@@ -1021,6 +1023,12 @@ impl ToolDispatcher {
         if let Some(terminate) = hook_run.effect.terminate {
             final_result.terminate = terminate;
         }
+        if intent_arguments.is_some() && !final_result.is_error {
+            final_result.content = format!(
+                "Exit Status: exit status: 0\n--- STDOUT ---\n{}\n--- STDERR ---",
+                final_result.content,
+            );
+        }
 
         if let Some(recorder) = &context.execution_trace_recorder {
             if let Err(error) = recorder(crate::provider::ToolExecutionTraceEvent::Finished {
@@ -1036,12 +1044,11 @@ impl ToolDispatcher {
             })
             .await
             {
-                final_result.content = format!("Failed to persist tool execution finish: {error}");
-                final_result.is_error = true;
+                return Err(tool_persistence_error(&tc.id, "execution finish", error));
             }
         }
 
-        final_result
+        Ok(final_result)
     }
 
     async fn tool_execution_routes(&self) -> Vec<ToolExecutorRoute> {
@@ -1148,10 +1155,12 @@ mod tests {
             &self,
             call: &AgentToolCall,
             _args: &str,
-        ) -> Option<Result<String, String>> {
+            _work_dir: Option<&Path>,
+            _identity: Option<&ToolExecutionIdentity>,
+        ) -> Option<Result<ToolOutput, String>> {
             // Match by name for the stub.
             if self.tools.iter().any(|d| d.name == call.name) {
-                self.result.clone().map(Ok)
+                self.result.clone().map(|result| Ok(result.into()))
             } else {
                 None
             }
@@ -1216,7 +1225,9 @@ mod tests {
             &self,
             _call: &AgentToolCall,
             _args: &str,
-        ) -> Option<Result<String, String>> {
+            _work_dir: Option<&Path>,
+            _identity: Option<&ToolExecutionIdentity>,
+        ) -> Option<Result<ToolOutput, String>> {
             panic!("tool panic")
         }
     }
@@ -1252,7 +1263,7 @@ mod tests {
                 },
                 thought_signature: None,
             }])
-            .await;
+            .await.unwrap();
 
         assert!(results[0].is_error);
         assert!(results[0].content.contains("panicked during execution"));
@@ -1298,6 +1309,532 @@ mod tests {
         }
     }
 
+    struct CallIdentityExecutor {
+        observed: Arc<
+            std::sync::Mutex<
+                Vec<(
+                    AgentToolCall,
+                    Option<PathBuf>,
+                    Option<ToolExecutionIdentity>,
+                )>,
+            >,
+        >,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for CallIdentityExecutor {
+        fn tool_definitions(&self) -> Arc<[AgentToolDefinition]> {
+            vec![stub_tool("identity_probe")].into()
+        }
+
+        async fn execute_tool(&self, _: &str, _: &str) -> Option<Result<String, String>> {
+            Some(Err("call identity was dropped".into()))
+        }
+
+        async fn execute_tool_with_call(
+            &self,
+            call: &AgentToolCall,
+            args: &str,
+            work_dir: Option<&Path>,
+            identity: Option<&ToolExecutionIdentity>,
+        ) -> Option<Result<ToolOutput, String>> {
+            assert_eq!(call.arguments, args);
+            self.observed.lock().unwrap().push((
+                call.clone(),
+                work_dir.map(Path::to_owned),
+                identity.cloned(),
+            ));
+            Some(Ok(ToolOutput {
+                content: call.id.clone(),
+                images: vec![identity_image()],
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatcher_preserves_executor_call_identity() {
+        for mode in [ToolExecutionMode::Sequential, ToolExecutionMode::Parallel] {
+            let (event_tx, _) = broadcast::channel(8);
+            let mut dispatcher = ToolDispatcher::new(event_tx, HookRegistry::default());
+            let directory = tempfile::tempdir().unwrap();
+            dispatcher.work_dir = Some(directory.path().to_owned());
+            dispatcher.tool_execution_mode = mode;
+            let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            dispatcher
+                .register_tool_executor(Arc::new(CallIdentityExecutor {
+                    observed: observed.clone(),
+                }))
+                .unwrap();
+            let results = dispatcher
+                .execute_tools(&[tool_call(
+                    "stable-call",
+                    "identity_probe",
+                    r#"{"z":1, "a":2}"#,
+                )])
+                .await
+                .unwrap();
+            assert_eq!(results[0].tool_call_id, "stable-call");
+            assert_eq!(results[0].content, "stable-call");
+            assert!(!results[0].is_error);
+            assert_eq!(results[0].images, vec![identity_image()]);
+            let observed = observed.lock().unwrap();
+            assert_eq!(observed.len(), 1);
+            assert_eq!(observed[0].0.id, "stable-call");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&observed[0].0.arguments).unwrap(),
+                serde_json::json!({"a":2, "z":1}),
+            );
+            assert!(!observed[0].0.arguments.contains(' '));
+            assert_eq!(observed[0].1.as_deref(), Some(directory.path()));
+            assert_eq!(observed[0].2, None);
+        }
+    }
+
+    struct WorkspaceOutputExecutor;
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for WorkspaceOutputExecutor {
+        fn tool_definitions(&self) -> Arc<[AgentToolDefinition]> {
+            vec![stub_tool("workspace_output")].into()
+        }
+
+        async fn execute_tool(&self, _: &str, _: &str) -> Option<Result<String, String>> {
+            Some(Err("workspace and rich output were dropped".into()))
+        }
+
+        async fn execute_tool_with_output_in_workspace(
+            &self,
+            _: &str,
+            args: &str,
+            work_dir: Option<&Path>,
+        ) -> Option<Result<ToolOutput, String>> {
+            let directory = work_dir.expect("workspace must reach the existing rich override");
+            Some(Ok(ToolOutput {
+                content: std::fs::read_to_string(directory.join(args.trim_matches('"'))).unwrap(),
+                images: vec![identity_image()],
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn call_dispatch_retains_existing_workspace_and_rich_output_overrides() {
+        let (event_tx, _) = broadcast::channel(8);
+        let mut dispatcher = ToolDispatcher::new(event_tx, HookRegistry::default());
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("fixture.txt"), "workspace output").unwrap();
+        dispatcher.work_dir = Some(directory.path().to_owned());
+        dispatcher
+            .register_tool_executor(Arc::new(WorkspaceOutputExecutor))
+            .unwrap();
+        let results = dispatcher
+            .execute_tools(&[tool_call(
+                "rich-call",
+                "workspace_output",
+                r#""fixture.txt""#,
+            )])
+            .await
+            .unwrap();
+        assert_eq!(results[0].tool_call_id, "rich-call");
+        assert_eq!(results[0].content, "workspace output");
+        assert!(!results[0].is_error);
+        assert_eq!(results[0].images, vec![identity_image()]);
+    }
+
+    fn identity_image() -> ImageAttachment {
+        ImageAttachment {
+            display_name: "fixture.png".into(),
+            data_url: "data:image/png;base64,AA==".into(),
+        }
+    }
+
+    async fn dyn_preserves_declared_call(mode: ToolExecutionMode) {
+        let (event_tx, mut events) = broadcast::channel(8);
+        let hooks = HookRegistry::default();
+        hooks
+            .register(
+                HookKind::AfterTool,
+                "resolved-tool",
+                Arc::new(|context| {
+                    Box::pin(async move {
+                        assert_eq!(context.session_id, "session");
+                        assert_eq!(context.lane, "main");
+                        assert_eq!(context.run_id.as_deref(), Some("run"));
+                        assert_eq!(context.tool_call_id.as_deref(), Some("declared-call"));
+                        assert_eq!(context.tool_name.as_deref(), Some("identity_probe"));
+                        assert_eq!(context.tool_arguments.as_deref(), Some(r#"{"x":1}"#));
+                        assert_eq!(
+                            context.tool_result_content.as_deref(),
+                            Some("declared-call")
+                        );
+                        Ok(crate::harness::HookEffect {
+                            append_content: Some("hook reply".into()),
+                            ..Default::default()
+                        })
+                    })
+                }),
+            )
+            .unwrap();
+        let mut dispatcher = ToolDispatcher::new(event_tx, hooks);
+        dispatcher.tool_execution_mode = mode;
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        dispatcher
+            .register_tool_executor(Arc::new(CallIdentityExecutor {
+                observed: observed.clone(),
+            }))
+            .unwrap();
+        let intents = Arc::new(std::sync::Mutex::new(Vec::new()));
+        dispatcher.tool_intent_recorder = Some({
+            let intents = intents.clone();
+            Arc::new(move |id, name, args| {
+                intents
+                    .lock()
+                    .unwrap()
+                    .push((id.to_owned(), name.to_owned(), args.to_owned()));
+                let identity = execution_identity(id, name);
+                Box::pin(async move { Ok(identity) })
+            })
+        });
+        let args = serde_json::json!({"command":"dyn identity_probe {\"x\":1}"}).to_string();
+        let results = dispatcher
+            .execute_tools(&[tool_call("declared-call", "run_command", &args)])
+            .await
+            .unwrap();
+        assert!(!results[0].is_error, "{}", results[0].content);
+        assert_eq!(results[0].tool_call_id, "declared-call");
+        assert_eq!(results[0].name, "run_command");
+        assert!(results[0]
+            .content
+            .contains("--- STDOUT ---\ndeclared-call\n\nhook reply\n--- STDERR ---"));
+        assert_eq!(results[0].images, vec![identity_image()]);
+        assert!(
+            matches!(events.try_recv().unwrap(), AgentEvent::ToolExecutionStart { tool_call_id, name, arguments }
+            if tool_call_id == "declared-call" && name == "run_command" && serde_json::from_str::<Value>(&arguments).unwrap() == serde_json::from_str::<Value>(&args).unwrap())
+        );
+        assert!(
+            matches!(events.try_recv().unwrap(), AgentEvent::ToolExecutionEnd { tool_call_id, name, result }
+            if tool_call_id == "declared-call" && name == "run_command" && result == results[0])
+        );
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].0.id, "declared-call");
+        assert_eq!(observed[0].0.name, "identity_probe");
+        assert_eq!(observed[0].0.arguments, r#"{"x":1}"#);
+        assert_eq!(
+            observed[0].2,
+            Some(execution_identity("declared-call", "run_command"))
+        );
+        let intents = intents.lock().unwrap();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].0, "declared-call");
+        assert_eq!(intents[0].1, "run_command");
+        assert_eq!(
+            serde_json::from_str::<Value>(&intents[0].2).unwrap(),
+            serde_json::from_str::<Value>(&args).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_dyn_preserves_declared_call() {
+        dyn_preserves_declared_call(ToolExecutionMode::Sequential).await;
+    }
+
+    #[tokio::test]
+    async fn parallel_dyn_preserves_declared_call() {
+        dyn_preserves_declared_call(ToolExecutionMode::Parallel).await;
+    }
+
+    fn execution_identity(id: &str, name: &str) -> ToolExecutionIdentity {
+        ToolExecutionIdentity {
+            session_id: "session".into(),
+            lane: "main".into(),
+            run_id: "run".into(),
+            assistant_entry_id: "assistant".into(),
+            tool_call_id: id.into(),
+            tool_name: name.into(),
+            result_entry_id: "result".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_persistence_failure_settles_and_commits_started_siblings() {
+        struct SiblingExecutor {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            finished: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl ToolExecutor for SiblingExecutor {
+            fn tool_definitions(&self) -> Arc<[AgentToolDefinition]> {
+                vec![stub_tool("sibling_probe")].into()
+            }
+            async fn execute_tool(&self, _: &str, args: &str) -> Option<Result<String, String>> {
+                let name = serde_json::from_str::<Value>(args).unwrap()["name"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                if name == "second" {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                self.finished.lock().unwrap().push(name.clone());
+                Some(Ok(name))
+            }
+        }
+        for phase in ["finish", "completion"] {
+            let (event_tx, mut events) = broadcast::channel(8);
+            let mut dispatcher = ToolDispatcher::new(event_tx, HookRegistry::default());
+            dispatcher.tool_execution_mode = ToolExecutionMode::Parallel;
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let finished = Arc::new(std::sync::Mutex::new(Vec::new()));
+            dispatcher
+                .register_tool_executor(Arc::new(SiblingExecutor {
+                    entered: entered.clone(),
+                    release: release.clone(),
+                    finished: finished.clone(),
+                }))
+                .unwrap();
+            dispatcher.tool_execution_trace_recorder = Some({
+                let entered = entered.clone();
+                let release = release.clone();
+                Arc::new(move |event| {
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    Box::pin(async move {
+                        if phase == "finish"
+                            && matches!(event, crate::provider::ToolExecutionTraceEvent::Finished { tool_call_id, .. } if tool_call_id == "first")
+                        {
+                            entered.notified().await;
+                            release.notify_one();
+                            return Err("first trace commit failed".into());
+                        }
+                        Ok(())
+                    })
+                })
+            });
+            let committed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            dispatcher.tool_completion_recorder = Some({
+                let committed = committed.clone();
+                Arc::new(move |result| {
+                    let id = result.tool_call_id.clone();
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    let committed = committed.clone();
+                    Box::pin(async move {
+                        if phase == "completion" && id == "first" {
+                            entered.notified().await;
+                            release.notify_one();
+                            return Err("first result commit failed".into());
+                        }
+                        committed.lock().unwrap().push(id);
+                        Ok(())
+                    })
+                })
+            });
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                dispatcher.execute_tools(&[
+                    tool_call("first", "sibling_probe", r#"{"name":"first"}"#),
+                    tool_call("second", "sibling_probe", r#"{"name":"second"}"#),
+                ]),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(error.to_string().contains("first"));
+            assert_eq!(finished.lock().unwrap().as_slice(), ["first", "second"]);
+            assert_eq!(committed.lock().unwrap().as_slice(), ["second"]);
+            let mut published = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if let AgentEvent::ToolExecutionEnd { tool_call_id, .. } = event {
+                    published.push(tool_call_id);
+                }
+            }
+            assert_eq!(published, ["second"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_does_not_publish_a_tool_completion() {
+        for mode in [ToolExecutionMode::Sequential, ToolExecutionMode::Parallel] {
+            for phase in ["intent", "start", "finish", "completion"] {
+                let (event_tx, mut events) = broadcast::channel(8);
+                let mut dispatcher = ToolDispatcher::new(event_tx, HookRegistry::default());
+                dispatcher.tool_execution_mode = mode;
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                dispatcher
+                    .register_tool_executor(Arc::new(CountingExecutor {
+                        id: "effect-probe".into(),
+                        tools: vec![stub_tool("effect_probe")],
+                        result: "effect performed".into(),
+                        calls: calls.clone(),
+                    }))
+                    .unwrap();
+                dispatcher.tool_intent_recorder = Some(Arc::new(move |id, name, _| {
+                    let identity = execution_identity(id, name);
+                    Box::pin(async move {
+                        if phase == "intent" {
+                            Err("intent storage failed".into())
+                        } else {
+                            Ok(identity)
+                        }
+                    })
+                }));
+                dispatcher.tool_execution_trace_recorder = Some(Arc::new(move |event| {
+                    Box::pin(async move {
+                        match (phase, event) {
+                            ("start", crate::provider::ToolExecutionTraceEvent::Started { .. })
+                            | (
+                                "finish",
+                                crate::provider::ToolExecutionTraceEvent::Finished { .. },
+                            ) => Err("trace storage failed".into()),
+                            _ => Ok(()),
+                        }
+                    })
+                }));
+                let completions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                dispatcher.tool_completion_recorder = Some({
+                    let completions = completions.clone();
+                    Arc::new(move |_| {
+                        completions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Box::pin(async move {
+                            if phase == "completion" {
+                                Err("result storage failed".into())
+                            } else {
+                                Ok(())
+                            }
+                        })
+                    })
+                });
+                let error = dispatcher
+                    .execute_tools(&[tool_call("call", "effect_probe", "{}")])
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, AgentError::Session(_)));
+                assert!(error.to_string().contains("recover the existing operation"));
+                assert_eq!(
+                    calls.load(std::sync::atomic::Ordering::SeqCst),
+                    usize::from(matches!(phase, "finish" | "completion"))
+                );
+                assert_eq!(
+                    completions.load(std::sync::atomic::Ordering::SeqCst),
+                    usize::from(phase == "completion")
+                );
+                while let Ok(event) = events.try_recv() {
+                    assert!(
+                        !matches!(event, AgentEvent::ToolExecutionEnd { .. }),
+                        "mode {mode:?}, phase {phase}: published an uncommitted completion"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_committed_identity_prevents_execution() {
+        for mode in [ToolExecutionMode::Sequential, ToolExecutionMode::Parallel] {
+            for invalid in [
+                "call",
+                "tool",
+                "session",
+                "lane",
+                "run",
+                "assistant",
+                "result",
+            ] {
+                let (event_tx, _) = broadcast::channel(8);
+                let mut dispatcher = ToolDispatcher::new(event_tx, HookRegistry::default());
+                dispatcher.tool_execution_mode = mode;
+                let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+                dispatcher
+                    .register_tool_executor(Arc::new(CallIdentityExecutor {
+                        observed: observed.clone(),
+                    }))
+                    .unwrap();
+                let mut identity = execution_identity("call", "identity_probe");
+                match invalid {
+                    "call" => identity.tool_call_id = "other".into(),
+                    "tool" => identity.tool_name = "other".into(),
+                    "session" => identity.session_id.clear(),
+                    "lane" => identity.lane.clear(),
+                    "run" => identity.run_id.clear(),
+                    "assistant" => identity.assistant_entry_id.clear(),
+                    "result" => identity.result_entry_id = " ".into(),
+                    _ => unreachable!(),
+                }
+                dispatcher.tool_intent_recorder = Some(Arc::new(move |_, _, _| {
+                    let identity = identity.clone();
+                    Box::pin(async move { Ok(identity) })
+                }));
+                let results = dispatcher
+                    .execute_tools(&[tool_call("call", "identity_probe", "{}")])
+                    .await
+                    .unwrap_err();
+                assert!(
+                    results.to_string().contains("execution was not started"),
+                    "mode {mode:?}, invalid {invalid}"
+                );
+                assert!(observed.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn dyn_resolves_quoted_objects_and_preserves_shell_fallbacks() {
+        for args in [r#"{"x":1}"#, r#"'{"x":1}'"#, r#""{"x":1}""#] {
+            assert_eq!(
+                dyn_tool_call(
+                    &serde_json::json!({"command":format!("dyn identity_probe {args}")})
+                        .to_string()
+                ),
+                Some(("identity_probe".into(), r#"{"x":1}"#.into()))
+            );
+        }
+        for command in [
+            "dyn identity_probe --help",
+            "dyn identity_probe -h",
+            "dyn identity_probe {} | cat",
+            "dyn identity_probe []",
+            "dyn identity_probe invalid",
+        ] {
+            assert_eq!(
+                dyn_tool_call(&serde_json::json!({"command":command}).to_string()),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dyn_cannot_bypass_the_resolved_tool_policy() {
+        for mode in [ToolExecutionMode::Sequential, ToolExecutionMode::Parallel] {
+            let (event_tx, _) = broadcast::channel(8);
+            let mut dispatcher = ToolDispatcher::new(event_tx, HookRegistry::default());
+            dispatcher.tool_execution_mode = mode;
+            dispatcher.allowed_tool_names = Some(HashSet::from(["run_command".into()]));
+            let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            dispatcher
+                .register_tool_executor(Arc::new(CallIdentityExecutor {
+                    observed: observed.clone(),
+                }))
+                .unwrap();
+            dispatcher.tool_intent_recorder = Some(Arc::new(|_, _, _| {
+                panic!("policy rejection must precede intent commitment")
+            }));
+            let args = serde_json::json!({"command":"dyn identity_probe '{}'"}).to_string();
+            let results = dispatcher
+                .execute_tools(&[tool_call("call", "run_command", &args)])
+                .await
+                .unwrap();
+            assert!(results[0].is_error);
+            assert!(results[0]
+                .content
+                .contains("'identity_probe' is not allowed"));
+            assert_eq!(results[0].tool_call_id, "call");
+            assert_eq!(results[0].name, "run_command");
+            assert!(observed.lock().unwrap().is_empty());
+        }
+    }
+
     fn call_count(
         counters: &std::collections::HashMap<String, Arc<std::sync::atomic::AtomicUsize>>,
         name: &str,
@@ -1312,8 +1849,8 @@ mod tests {
         let (dispatcher, counters) =
             counting_dispatcher(&[("computer_windows", "win1"), ("browser_act", "ok")]);
         let call = tool_call("call-1", "computer_windows", "{}");
-        let first = dispatcher.execute_tools(&[call.clone()]).await;
-        let second = dispatcher.execute_tools(&[call]).await;
+        let first = dispatcher.execute_tools(&[call.clone()]).await.unwrap();
+        let second = dispatcher.execute_tools(&[call]).await.unwrap();
         assert_eq!(call_count(&counters, "computer_windows"), 1);
         assert_eq!(first[0].content, "win1");
         assert!(
@@ -1330,9 +1867,9 @@ mod tests {
             counting_dispatcher(&[("computer_windows", "win1"), ("browser_act", "ok")]);
         let read = tool_call("call-1", "computer_windows", "{}");
         let write = tool_call("call-2", "browser_act", "{}");
-        dispatcher.execute_tools(&[read.clone()]).await;
-        dispatcher.execute_tools(&[write]).await;
-        dispatcher.execute_tools(&[read]).await;
+        dispatcher.execute_tools(&[read.clone()]).await.unwrap();
+        dispatcher.execute_tools(&[write]).await.unwrap();
+        dispatcher.execute_tools(&[read]).await.unwrap();
         assert_eq!(call_count(&counters, "computer_windows"), 2);
         assert_eq!(call_count(&counters, "browser_act"), 1);
     }
@@ -1341,8 +1878,8 @@ mod tests {
     async fn mutating_tools_always_execute() {
         let (dispatcher, counters) = counting_dispatcher(&[("browser_act", "ok")]);
         let call = tool_call("call-1", "browser_act", "{}");
-        dispatcher.execute_tools(&[call.clone()]).await;
-        dispatcher.execute_tools(&[call]).await;
+        dispatcher.execute_tools(&[call.clone()]).await.unwrap();
+        dispatcher.execute_tools(&[call]).await.unwrap();
         assert_eq!(call_count(&counters, "browser_act"), 2);
     }
 
@@ -1350,9 +1887,9 @@ mod tests {
     async fn clearing_resets_the_repetition_cache() {
         let (dispatcher, counters) = counting_dispatcher(&[("computer_windows", "win1")]);
         let call = tool_call("call-1", "computer_windows", "{}");
-        dispatcher.execute_tools(&[call.clone()]).await;
+        dispatcher.execute_tools(&[call.clone()]).await.unwrap();
         dispatcher.clear_repetition_cache();
-        dispatcher.execute_tools(&[call]).await;
+        dispatcher.execute_tools(&[call]).await.unwrap();
         assert_eq!(call_count(&counters, "computer_windows"), 2);
     }
 
@@ -1360,8 +1897,8 @@ mod tests {
     async fn replay_skips_the_repetition_cache() {
         let (dispatcher, counters) = counting_dispatcher(&[("computer_windows", "win1")]);
         let call = tool_call("call-1", "computer_windows", "{}");
-        dispatcher.execute_tools(&[call.clone()]).await;
-        dispatcher.execute_tools_for_replay(&[call]).await;
+        dispatcher.execute_tools(&[call.clone()]).await.unwrap();
+        dispatcher.execute_tools_for_replay(&[call]).await.unwrap();
         assert_eq!(call_count(&counters, "computer_windows"), 2);
     }
 
@@ -1483,7 +2020,7 @@ mod tests {
                 },
                 thought_signature: None,
             }])
-            .await;
+            .await.unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "world");
@@ -1521,7 +2058,7 @@ mod tests {
                 },
                 thought_signature: None,
             }])
-            .await;
+            .await.unwrap();
 
         assert!(!results[0].is_error);
         let observed = observed.lock().unwrap();
@@ -1601,7 +2138,7 @@ mod tests {
                 },
                 thought_signature: None,
             }])
-            .await;
+            .await.unwrap();
 
         assert_eq!(results.len(), 1);
         assert!(results[0].is_error);
@@ -1622,7 +2159,7 @@ mod tests {
                 },
                 thought_signature: None,
             }])
-            .await;
+            .await.unwrap();
 
         assert_eq!(results.len(), 1);
         assert!(results[0].is_error);

@@ -60,10 +60,13 @@ pub(crate) fn durable_prompt_snapshot(content: &str) -> PromptSnapshot {
 
 pub(crate) fn is_retryable_generation_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
+    // Session errors describe journal/storage failures, even when their text
+    // resembles a transient provider error. Recovery owns their unfinished work.
     // Protocol/validation failures (e.g. Codex "No tool output found for function
     // call") are deterministic: retrying the identical request always fails.
     // Never retry them; surface immediately so the turn can repair history.
-    if lower.contains("no tool output found for function call")
+    if lower.starts_with("session error:")
+        || lower.contains("no tool output found for function call")
         || lower.contains("invalid_request_error")
         || lower.contains("stream_closed_without_terminal_event")
     {
@@ -836,25 +839,38 @@ impl CodingAgent {
             "content": content,
             "tool_calls": tool_calls,
         });
-        for response in self
-            .wasi_extensions
-            .execute_hook_with_effects("assistant_message", &arguments.to_string())
-            .into_iter()
-            .flatten()
-        {
-            let _ = dispatch_hook_requests(
+        for operation in self.wasi_extensions.begin_hook_operations("assistant_message") {
+            let mut operation = match operation {
+                Ok(operation) => operation,
+                Err(error) => {
+                    tracing::warn!("WASI assistant hook stopped: {error}");
+                    continue;
+                }
+            };
+            let response = match operation.invoke(&arguments.to_string()) {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!("WASI assistant hook stopped: {error}");
+                    continue;
+                }
+            };
+            if let Err(error) = dispatch_hook_requests(
                 &self.broker_dispatcher,
                 &self.wasi_extensions,
                 response.host_broker_requests,
             )
-            .await;
+            .await {
+                tracing::warn!("WASI assistant hook broker stopped: {}", error.message);
+            }
         }
-        let _ = dispatch_hook_requests(
+        if let Err(error) = dispatch_hook_requests(
             &self.broker_dispatcher,
             &self.wasi_extensions,
             self.wasi_extensions.take_pending_broker_requests(),
         )
-        .await;
+        .await {
+            tracing::warn!("Pending WASI assistant hook broker stopped: {}", error.message);
+        }
     }
 
     pub(crate) async fn sync_harness_and_dispatch_assistant_hooks(&mut self) {
@@ -1270,7 +1286,7 @@ impl CodingAgent {
             let claimed_safe_tools = journal
                 .claim_safe_replays(&lane.safe_tools)
                 .map_err(&retrying)?;
-            let safe_results = self.replay_safe_tools(&claimed_safe_tools).await;
+            let safe_results = self.replay_safe_tools(&claimed_safe_tools).await.map_err(&retrying)?;
             let safe_messages = safe_results
                 .into_iter()
                 .map(|result| AgentMessage::Tool {
@@ -1466,7 +1482,7 @@ impl CodingAgent {
     pub(crate) async fn replay_safe_tools(
         &self,
         records: &[threadlane_runtime::Record],
-    ) -> Vec<AgentToolResult> {
+    ) -> Result<Vec<AgentToolResult>, String> {
         let calls = records
             .iter()
             .filter_map(|record| match record {
@@ -1489,9 +1505,9 @@ impl CodingAgent {
             })
             .collect::<Vec<_>>();
         if calls.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        self.agent.execute_tools_for_replay(&calls).await
+        self.agent.execute_tools_for_replay(&calls).await.map_err(|error| error.to_string())
     }
 }
 
@@ -1510,6 +1526,18 @@ mod retry_classification_tests {
         assert!(!is_retryable_generation_error(
             "invalid_request_error: missing tool output"
         ));
+    }
+
+    #[test]
+    fn session_commit_failures_are_never_generation_retries() {
+        for detail in [
+            "journal write timed out",
+            "journal service status 503",
+            "connection reset during result commit",
+        ] {
+            let error = threadlane_runtime::error::AgentError::Session(detail.into()).to_string();
+            assert!(!is_retryable_generation_error(&error), "{error}");
+        }
     }
 
     #[test]

@@ -526,13 +526,19 @@ impl AgentRuntime {
         changed
     }
 
-    pub async fn execute_tools_for_replay(&self, calls: &[ToolCall]) -> Vec<AgentToolResult> {
+    pub async fn execute_tools_for_replay(
+        &self,
+        calls: &[ToolCall],
+    ) -> Result<Vec<AgentToolResult>, crate::error::AgentError> {
         self.synced_dispatcher()
             .execute_tools_for_replay(calls)
             .await
     }
 
-    pub async fn execute_tools(&self, calls: &[ToolCall]) -> Vec<AgentToolResult> {
+    pub async fn execute_tools(
+        &self,
+        calls: &[ToolCall],
+    ) -> Result<Vec<AgentToolResult>, crate::error::AgentError> {
         self.synced_dispatcher().execute_tools(calls).await
     }
 

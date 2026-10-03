@@ -1,16 +1,22 @@
 pub mod broker;
+mod checkpoint;
+#[cfg(test)]
+mod checkpoint_tests;
 pub mod packages;
 pub mod settings;
 
 pub use broker::*;
 pub(crate) use packages::validate_extension_id;
 
+use checkpoint::{persist_checkpoint, BrokerIntent, ExtensionCheckpoint};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use threadlane_protocol::AgentToolDefinition;
 use wasmi::{Caller, Engine, Extern, Func, Linker, Memory, Module, Store};
@@ -123,6 +129,20 @@ pub struct WasiExtensionCommandResult {
     pub message: String,
     pub effects: Vec<WasiLegacyEffect>,
     pub host_broker_requests: Vec<HostBrokerRequest>,
+}
+
+impl WasiExtensionInvocationResult {
+    pub fn into_command_result(self) -> Result<WasiExtensionCommandResult, String> {
+        if let Some(error) = self.response.error {
+            return Err(error);
+        }
+        Ok(WasiExtensionCommandResult {
+            api_version: self.api_version,
+            message: self.response.message.unwrap_or_default(),
+            effects: self.response.effects,
+            host_broker_requests: self.host_broker_requests,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -294,10 +314,11 @@ impl WasiExtension {
         Ok(extension)
     }
 
-    fn call_with_policy(
+    fn call_with_policy<T: Serialize>(
         &self,
         export: &str,
-        invocation: &WasiExtensionInvocation,
+        invocation: &T,
+        api_version: u32,
         policy: CapabilityPolicy,
     ) -> Result<WasiExtensionInvocationResult, String> {
         let mut store = Store::new(
@@ -332,7 +353,7 @@ impl WasiExtension {
             .map_err(|e| e.to_string())?;
         let response = read_json_result(&mut store, &instance, result)?;
         Ok(WasiExtensionInvocationResult {
-            api_version: invocation.api_version,
+            api_version,
             response,
             broker_requests: std::mem::take(&mut store.data_mut().requests),
             host_broker_requests: Vec::new(),
@@ -473,10 +494,19 @@ fn extension_state_file_name(extension_name: &str) -> String {
     }
 }
 
-type PendingExtensionEvents = HashMap<Option<String>, HashMap<String, Vec<WasiExtensionEvent>>>;
+fn host_state_file_name(key: &str) -> String {
+    if validate_extension_id(key).is_ok() {
+        format!(".host.{key}.json")
+    } else {
+        format!(".host..encoded-{}.json", encode_state_component(key))
+    }
+}
 
-/// Bound per-extension queued events: an extension that never runs must not
-/// accumulate without limit (oldest evicted first).
+type PendingExtensionEvents =
+    HashMap<Option<String>, HashMap<String, Vec<Arc<WasiExtensionEvent>>>>;
+
+/// Bound published notifications (oldest evicted first). Broker outcomes must
+/// survive until delivery; their lifetime follows the invoking operation.
 const MAX_PENDING_EVENTS_PER_EXTENSION: usize = 256;
 
 /// Cap bytes read back from WASM memory for a JSON result: without a bound,
@@ -484,20 +514,116 @@ const MAX_PENDING_EVENTS_PER_EXTENSION: usize = 256;
 /// can fail.
 const MAX_WASM_JSON_BYTES: usize = 8 * 1024 * 1024;
 
+struct StateOwner {
+    scope: Option<String>,
+    directory: PathBuf,
+    receipts_restored: bool,
+    _lease: fs::File,
+}
+
+#[derive(Debug)]
+pub(crate) struct StateWriteError {
+    message: String,
+    replaced: bool,
+}
+
+impl StateWriteError {
+    fn before(error: impl std::fmt::Display) -> Self {
+        Self {
+            message: error.to_string(),
+            replaced: false,
+        }
+    }
+}
+
+impl std::fmt::Display for StateWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(f)
+    }
+}
+
+enum UnconfirmedState {
+    Extension {
+        name: String,
+        state: Value,
+        events: Vec<Arc<WasiExtensionEvent>>,
+        acknowledged: Vec<Arc<WasiExtensionEvent>>,
+        last_broker_id: u64,
+        intents: Vec<Arc<BrokerIntent>>,
+        unpublished: bool,
+    },
+    Host {
+        key: String,
+        value: Value,
+    },
+}
+
+struct UnconfirmedWrite {
+    path: PathBuf,
+    state: UnconfirmedState,
+    error: String,
+}
+
+impl UnconfirmedWrite {
+    fn blocked_message(&self) -> String {
+        format!("{}; preserve {} and repair storage, then have the owning host call recover_state_commit. Do not retry the original invocation, overwrite the checkpoint, or replay broker operations while its commit is unconfirmed", self.error, self.path.display())
+    }
+}
+
 #[derive(Default)]
 pub struct WasiExtensionManager {
     extensions: RwLock<HashMap<String, Arc<WasiExtension>>>,
     tool_definitions: RwLock<Arc<[AgentToolDefinition]>>,
     states: Mutex<HashMap<String, Value>>,
     host_state: Mutex<HashMap<String, Value>>,
+    /// Serializes storage/cache commits and reloads without holding cache locks over I/O.
+    state_commit: Mutex<()>,
+    /// A scope's caches and checkpoints have one writer, including across processes.
+    state_owner: Mutex<Option<StateOwner>>,
+    /// A replaced file must be confirmed before stale caches can write again.
+    unconfirmed_write: Mutex<Option<UnconfirmedWrite>>,
     subscriptions: Mutex<HashMap<String, HashSet<String>>>,
     pending_events: Mutex<PendingExtensionEvents>,
+    /// A batch remains unacknowledged until its next state checkpoint commits.
+    /// Presence also claims the extension slot, including calls with no events.
+    in_flight_events: Mutex<HashMap<String, Vec<Arc<WasiExtensionEvent>>>>,
+    /// Delivery ends at each checkpoint; call ownership spans broker awaits.
+    active_operations: Mutex<HashSet<String>>,
+    unsettled_broker: Mutex<HashMap<String, Vec<Arc<BrokerIntent>>>>,
+    last_broker_id: AtomicU64,
     pending_broker_requests: Mutex<HashMap<Option<String>, Vec<HostBrokerRequest>>>,
     capability_grant_policy: Mutex<HostCapabilityGrantPolicy>,
     state_dir: Option<PathBuf>,
+    /// Existing work directory anchors directory-entry durability for state storage.
+    project_root: Option<PathBuf>,
     /// Stateful conversational extensions are isolated by the active session.
     /// `None` retains the project-wide scope for callers that explicitly need it.
     session_id: Mutex<Option<String>>,
+}
+
+/// Owns one extension's state slot through an entire call and its continuations.
+/// Keep this guard until broker outcomes commit. Dropping it releases the slot;
+/// durable unsettled receipts still prevent replay after cancellation.
+pub struct WasiExtensionOperation<'a> {
+    manager: &'a WasiExtensionManager,
+    extension: Arc<WasiExtension>,
+    kind: &'static str,
+    name: String,
+}
+
+impl WasiExtensionOperation<'_> {
+    pub fn invoke(&mut self, args: &str) -> Result<WasiExtensionInvocationResult, String> {
+        self.manager
+            .invoke_owned(&self.extension, self.kind, &self.name, args, true)
+    }
+}
+
+impl Drop for WasiExtensionOperation<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.manager.active_operations.lock() {
+            active.remove(&self.extension.manifest.name);
+        }
+    }
 }
 
 impl WasiExtensionManager {
@@ -578,14 +704,41 @@ impl WasiExtensionManager {
             loaded.insert(extension.manifest.name.clone(), Arc::new(extension));
         }
         let loaded_count = loaded.len();
-        let persisted_states = loaded
-            .keys()
-            .filter_map(|name| self.load_state(name).map(|state| (name.clone(), state)))
-            .collect::<Vec<_>>();
+        let _commit = self
+            .state_commit
+            .lock()
+            .map_err(|_| "Extension state commit lock poisoned".to_string())?;
+        self.ensure_storage_confirmed()?;
+        self.ensure_no_in_flight_invocations()?;
+        self.ensure_state_ownership()?;
+        let scope = self.session_scope()?;
+        let mut persisted_states = HashMap::new();
+        let mut restored_events = HashMap::new();
+        let mut unsettled = HashMap::new();
+        let mut last_id = 0;
+        for name in loaded.keys() {
+            if let Some(checkpoint) = self.load_checkpoint_in_scope(name, &scope)? {
+                last_id = last_id.max(checkpoint.last_broker_id);
+                unsettled.insert(
+                    name.clone(),
+                    checkpoint.unsettled.into_iter().map(Arc::new).collect(),
+                );
+                persisted_states.insert(name.clone(), checkpoint.state);
+                restored_events.insert(
+                    name.clone(),
+                    checkpoint.broker_events.into_iter().map(Arc::new).collect(),
+                );
+            }
+        }
         let mut extensions = self
             .extensions
             .write()
             .map_err(|_| "Extension registry lock poisoned".to_string())?;
+        self.last_broker_id.fetch_max(last_id, Ordering::SeqCst);
+        *self
+            .unsettled_broker
+            .lock()
+            .map_err(|_| "Broker intent lock poisoned".to_string())? = unsettled;
         let retired = extensions
             .iter()
             .filter(|(name, previous)| {
@@ -618,6 +771,7 @@ impl WasiExtensionManager {
             for events in pending_events.values_mut() {
                 events.retain(|name, _| !retired.contains(name));
             }
+            Self::replace_broker_events(pending_events.entry(scope).or_default(), restored_events);
         }
         {
             let mut pending_requests = self
@@ -638,6 +792,7 @@ impl WasiExtensionManager {
     fn for_project(project_dir: &Path) -> Self {
         Self {
             state_dir: Some(project_dir.join(".threadlane/state/extensions")),
+            project_root: Some(project_dir.to_path_buf()),
             ..Self::default()
         }
     }
@@ -660,6 +815,7 @@ impl WasiExtensionManager {
     pub fn for_project_session(project_dir: &Path, session_id: impl Into<String>) -> Self {
         Self {
             state_dir: Some(project_dir.join(".threadlane/state/extensions")),
+            project_root: Some(project_dir.to_path_buf()),
             session_id: Mutex::new(Some(session_id.into())),
             ..Self::default()
         }
@@ -672,12 +828,50 @@ impl WasiExtensionManager {
     /// and retaining them grows without bound plus risks delivering a stale
     /// `broker_response` if a session id is ever reused.
     pub fn set_session_scope(&self, session_id: impl Into<String>) -> Result<(), String> {
+        let _commit = self
+            .state_commit
+            .lock()
+            .map_err(|_| "Extension state commit lock poisoned".to_string())?;
+        self.ensure_storage_confirmed()?;
+        self.ensure_no_in_flight_invocations()?;
         let session_id = session_id.into();
         let scope = Some(session_id);
+        let changing_scope = self.session_scope()? != scope;
+        let target_owner = if changing_scope {
+            self.acquire_state_owner(&scope)?
+        } else {
+            self.ensure_state_ownership()?;
+            None
+        };
+        // Prepare every state before changing identity or evicting live queues.
+        let extension_names = self.extension_names()?;
+        let mut states = HashMap::new();
+        let mut restored_events = HashMap::new();
+        let mut unsettled = HashMap::new();
+        let mut last_id = 0;
+        for name in extension_names {
+            if let Some(checkpoint) = self.load_checkpoint_in_scope(&name, &scope)? {
+                last_id = last_id.max(checkpoint.last_broker_id);
+                unsettled.insert(
+                    name.clone(),
+                    checkpoint.unsettled.into_iter().map(Arc::new).collect(),
+                );
+                states.insert(name.clone(), checkpoint.state);
+                restored_events.insert(
+                    name,
+                    checkpoint.broker_events.into_iter().map(Arc::new).collect(),
+                );
+            }
+        }
         *self
             .session_id
             .lock()
             .map_err(|_| "Extension session lock poisoned".to_string())? = scope.clone();
+        self.last_broker_id.fetch_max(last_id, Ordering::SeqCst);
+        *self
+            .unsettled_broker
+            .lock()
+            .map_err(|_| "Broker intent lock poisoned".to_string())? = unsettled;
         // Queued work is session-owned too: switching scope selects a separate
         // queue so one conversation cannot receive another's broker outcomes.
         // Evict every other scope's queues rather than leaking them.
@@ -687,7 +881,7 @@ impl WasiExtensionManager {
                 .lock()
                 .map_err(|_| "Extension event lock poisoned".to_string())?;
             pending.retain(|existing, _| existing == &scope);
-            pending.entry(scope.clone()).or_default();
+            Self::replace_broker_events(pending.entry(scope.clone()).or_default(), restored_events);
         }
         {
             let mut pending = self
@@ -698,61 +892,506 @@ impl WasiExtensionManager {
             pending.entry(scope).or_default();
         }
 
-        let extension_names = self.extension_names()?;
-        let mut states = self
+        *self
             .states
             .lock()
-            .map_err(|_| "Extension state lock poisoned".to_string())?;
-        states.clear();
+            .map_err(|_| "Extension state lock poisoned".to_string())? = states;
         self.host_state
             .lock()
             .map_err(|_| "Host state lock poisoned".to_string())?
             .clear();
-        for name in &extension_names {
-            if let Some(state) = self.load_state(name) {
-                states.insert(name.clone(), state);
-            }
+        if changing_scope {
+            *self
+                .state_owner
+                .lock()
+                .map_err(|_| "Extension state owner lock poisoned".to_string())? = target_owner;
         }
         Ok(())
     }
 
+    /// Called under `state_commit` before accessing a durable scope's caches.
+    fn ensure_state_ownership(&self) -> Result<(), String> {
+        if self.state_dir.is_none() {
+            return Ok(());
+        }
+        let scope = self.session_scope()?;
+        let mut owner = self
+            .state_owner
+            .lock()
+            .map_err(|_| "Extension state owner lock poisoned".to_string())?;
+        if let Some(owner) = owner.as_ref() {
+            return if owner.scope == scope {
+                Ok(())
+            } else {
+                Err("Extension state ownership does not match the active scope; preserve checkpoints and reload the session".into())
+            };
+        }
+        *owner = self.acquire_state_owner(&scope)?;
+        Ok(())
+    }
+
+    fn ensure_storage_confirmed(&self) -> Result<(), String> {
+        let pending = self
+            .unconfirmed_write
+            .lock()
+            .map_err(|_| "Extension commit confirmation lock poisoned".to_string())?;
+        match pending.as_ref() {
+            Some(write) => Err(write.blocked_message()),
+            None => Ok(()),
+        }
+    }
+
+    fn record_state_write_error(
+        &self,
+        path: &Path,
+        error: StateWriteError,
+        state: impl FnOnce() -> UnconfirmedState,
+    ) -> String {
+        if !error.replaced {
+            return error.to_string();
+        }
+        let write = UnconfirmedWrite {
+            path: path.to_owned(),
+            state: state(),
+            error: error.to_string(),
+        };
+        let message = write.blocked_message();
+        match self.unconfirmed_write.lock() {
+            Ok(mut pending) => *pending = Some(write),
+            Err(_) => return format!("{message}; extension commit confirmation lock poisoned"),
+        }
+        message
+    }
+
+    /// Confirms a replaced checkpoint before allowing cached state to write again.
+    /// Only requests never exposed by the failed invocation are marked not dispatched.
+    pub fn recover_state_commit(&self) -> Result<(), String> {
+        let _commit = self
+            .state_commit
+            .lock()
+            .map_err(|_| "Extension state commit lock poisoned".to_string())?;
+        let mut pending = self
+            .unconfirmed_write
+            .lock()
+            .map_err(|_| "Extension commit confirmation lock poisoned".to_string())?;
+        let Some(write) = pending.as_ref() else {
+            return Ok(());
+        };
+        self.ensure_no_active_invocations()?;
+        self.ensure_state_ownership()?;
+        let value = read_json_state(&write.path)?.ok_or_else(|| format!("Unconfirmed replacement {} is missing; preserve state and inspect storage before recovery", write.path.display()))?;
+        let matches = match &write.state {
+            UnconfirmedState::Host {
+                value: expected, ..
+            } => &value == expected,
+            UnconfirmedState::Extension {
+                state,
+                events,
+                intents,
+                last_broker_id,
+                ..
+            } => {
+                let checkpoint = ExtensionCheckpoint::decode(value).map_err(|error| {
+                    format!(
+                        "{}: {error}; preserve the replacement and repair storage before recovery",
+                        write.path.display()
+                    )
+                })?;
+                checkpoint.state == *state
+                    && checkpoint.last_broker_id == *last_broker_id
+                    && checkpoint
+                        .unsettled
+                        .iter()
+                        .eq(intents.iter().map(Arc::as_ref))
+                    && checkpoint.broker_events.iter().eq(events
+                        .iter()
+                        .filter(|event| event.topic == "broker_response")
+                        .map(Arc::as_ref))
+            }
+        };
+        if !matches {
+            return Err(format!("Unconfirmed replacement {} changed; preserve it and inspect storage before recovery. Do not overwrite it or replay broker operations", write.path.display()));
+        }
+        #[cfg(unix)]
+        fs::File::open(&write.path)
+            .and_then(|file| file.sync_all())
+            .and_then(|_| {
+                sync_state_parent(
+                    write.path.parent().ok_or_else(|| {
+                        std::io::Error::other("Unconfirmed state path has no parent")
+                    })?,
+                )
+            })
+            .map_err(|error| {
+                format!(
+                    "{}; confirmation still failed: {error}",
+                    write.blocked_message()
+                )
+            })?;
+
+        // Acquire caches only after I/O; leave the fence intact if a lock fails.
+        let mut states = self
+            .states
+            .lock()
+            .map_err(|_| "Extension state lock poisoned".to_string())?;
+        let mut host_state = self
+            .host_state
+            .lock()
+            .map_err(|_| "Host state lock poisoned".to_string())?;
+        let mut events = self
+            .pending_events
+            .lock()
+            .map_err(|_| "Extension event lock poisoned".to_string())?;
+        let mut unsettled = self
+            .unsettled_broker
+            .lock()
+            .map_err(|_| "Broker intent lock poisoned".to_string())?;
+        let scope = self.session_scope()?;
+        let write = pending
+            .take()
+            .expect("unconfirmed write held under confirmation lock");
+        let mut undispatched = Vec::new();
+        match write.state {
+            UnconfirmedState::Host { key, value } => {
+                host_state.insert(key, value);
+            }
+            UnconfirmedState::Extension {
+                name,
+                state,
+                events: saved,
+                acknowledged,
+                intents,
+                last_broker_id,
+                unpublished,
+            } => {
+                // Identity preserves later arrivals even when their payloads match
+                // events acknowledged or saved by the interrupted commit.
+                let replaced = acknowledged
+                    .iter()
+                    .chain(
+                        saved
+                            .iter()
+                            .filter(|event| event.topic == "broker_response"),
+                    )
+                    .map(Arc::as_ptr)
+                    .collect::<HashSet<_>>();
+                let queue = events
+                    .entry(scope)
+                    .or_default()
+                    .entry(name.clone())
+                    .or_default();
+                queue.retain(|event| !replaced.contains(&Arc::as_ptr(event)));
+                let mut restored = saved
+                    .into_iter()
+                    .filter(|event| event.topic == "broker_response")
+                    .collect::<Vec<_>>();
+                restored.append(queue);
+                *queue = restored;
+                if unpublished {
+                    undispatched = intents
+                        .iter()
+                        .map(|intent| HostBrokerRequest {
+                            invoking_extension: name.clone(),
+                            request: intent.request.clone(),
+                            receipt: Some(intent.receipt.clone()),
+                        })
+                        .collect();
+                }
+                self.last_broker_id
+                    .fetch_max(last_broker_id, Ordering::SeqCst);
+                unsettled.insert(name.clone(), intents);
+                states.insert(name, state);
+            }
+        }
+        drop(unsettled);
+        drop(events);
+        drop(host_state);
+        drop(states);
+        drop(pending);
+        drop(_commit);
+        self.enqueue_broker_results(undispatched.into_iter().map(|request| request.not_dispatched(BrokerError {
+            code: "not_dispatched".into(),
+            message: "The checkpoint directory sync failed before this request was exposed to the broker; no external operation began".into(),
+        })).collect())
+    }
+
+    fn acquire_state_owner(&self, scope: &Option<String>) -> Result<Option<StateOwner>, String> {
+        let Some(directory) = self.state_dir.as_ref() else {
+            return Ok(None);
+        };
+        let directory = match scope {
+            Some(session) => directory
+                .join("sessions")
+                .join(encode_state_component(session)),
+            None => directory.clone(),
+        };
+        let project_root = self
+            .project_root
+            .as_ref()
+            .ok_or("Extension storage has no project root")?;
+        if !directory.starts_with(project_root) {
+            return Err("Extension storage is outside its project root".into());
+        }
+        let root_path = if project_root.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            project_root
+        };
+        let root_metadata = fs::metadata(root_path).map_err(|error| {
+            format!(
+                "Extension project root {} is unavailable: {error}; restore the work directory before opening state",
+                root_path.display()
+            )
+        })?;
+        if !root_metadata.is_dir() {
+            return Err(format!(
+                "Extension project root {} must be an existing work directory",
+                root_path.display()
+            ));
+        }
+        fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        let path = directory.join(".owner.lock");
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "Invalid extension owner lock {}; preserve the file",
+                    path.display()
+                ));
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error.to_string())
+            }
+            _ => {}
+        }
+        let lease = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| error.to_string())?;
+        lease.try_lock().map_err(|error| format!("Extension state {} is owned by another manager/process, or storage is unavailable: {error}; use the owning manager or wait for it to close. Do not replace checkpoints or delete the owner lock", directory.display()))?;
+        // Sync all containing directories, including existing ones: a prior
+        // interrupted creation may have left visible but unsynced entries.
+        #[cfg(unix)]
+        sync_state_directories(&directory, project_root, |path| {
+            fs::File::open(if path.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                path
+            })?
+            .sync_all()
+        })?;
+        Ok(Some(StateOwner {
+            scope: scope.clone(),
+            directory,
+            receipts_restored: false,
+            _lease: lease,
+        }))
+    }
+
+    /// Called under `state_commit`, once before this owner's first allocation.
+    /// Policy reads and non-broker invocations need no receipt inventory scan.
+    fn restore_receipt_counter(&self) -> Result<(), String> {
+        let directory = {
+            let owner = self
+                .state_owner
+                .lock()
+                .map_err(|_| "Extension state owner lock poisoned".to_string())?;
+            let Some(owner) = owner.as_ref() else {
+                return Ok(());
+            };
+            if owner.receipts_restored {
+                return Ok(());
+            }
+            owner.directory.clone()
+        };
+        let high_water = checkpoint::receipt_high_water(&directory)
+            .map_err(|error| format!("Cannot allocate broker receipts: {error}; preserve the checkpoint and do not retry unchanged"))?;
+        self.last_broker_id.fetch_max(high_water, Ordering::SeqCst);
+        if let Some(owner) = self
+            .state_owner
+            .lock()
+            .map_err(|_| "Extension state owner lock poisoned".to_string())?
+            .as_mut()
+        {
+            owner.receipts_restored = true;
+        }
+        Ok(())
+    }
+
+    /// A successor can write before module reload; preserve the saved ledger
+    /// and undelivered outcomes rather than starting from empty cache entries.
+    fn hydrate_extension_checkpoint(&self, name: &str) -> Result<(), String> {
+        if self
+            .states
+            .lock()
+            .map_err(|_| "Extension state lock poisoned".to_string())?
+            .contains_key(name)
+            || self
+                .unsettled_broker
+                .lock()
+                .map_err(|_| "Broker intent lock poisoned".to_string())?
+                .contains_key(name)
+        {
+            return Ok(());
+        }
+        let scope = self.session_scope()?;
+        let Some(checkpoint) = self.load_checkpoint_in_scope(name, &scope)? else {
+            self.unsettled_broker
+                .lock()
+                .map_err(|_| "Broker intent lock poisoned".to_string())?
+                .insert(name.into(), Vec::new());
+            return Ok(());
+        };
+        self.last_broker_id
+            .fetch_max(checkpoint.last_broker_id, Ordering::SeqCst);
+        self.unsettled_broker
+            .lock()
+            .map_err(|_| "Broker intent lock poisoned".to_string())?
+            .insert(
+                name.into(),
+                checkpoint.unsettled.into_iter().map(Arc::new).collect(),
+            );
+        let mut pending = self
+            .pending_events
+            .lock()
+            .map_err(|_| "Extension event lock poisoned".to_string())?;
+        Self::replace_broker_events(
+            pending.entry(scope).or_default(),
+            HashMap::from([(
+                name.to_owned(),
+                checkpoint.broker_events.into_iter().map(Arc::new).collect(),
+            )]),
+        );
+        drop(pending);
+        self.states
+            .lock()
+            .map_err(|_| "Extension state lock poisoned".to_string())?
+            .insert(name.into(), checkpoint.state);
+        Ok(())
+    }
+
+    fn ensure_no_in_flight_invocations(&self) -> Result<(), String> {
+        self.ensure_no_active_invocations()?;
+        if self
+            .unsettled_broker
+            .lock()
+            .map_err(|_| "Broker intent lock poisoned".to_string())?
+            .values()
+            .any(|intents| !intents.is_empty())
+        {
+            return Err("Broker outcomes are unsettled; reconcile the original operations before reloading or switching scope. Do not replay them".into());
+        }
+        Ok(())
+    }
+
+    fn ensure_no_active_invocations(&self) -> Result<(), String> {
+        if !self
+            .active_operations
+            .lock()
+            .map_err(|_| "Extension operation lock poisoned".to_string())?
+            .is_empty()
+        {
+            return Err("An extension call is active; wait for its broker work to finish before reloading or switching scope".into());
+        }
+        if !self
+            .in_flight_events
+            .lock()
+            .map_err(|_| "Extension delivery lock poisoned".to_string())?
+            .is_empty()
+        {
+            return Err("An extension invocation is in flight; wait for it to finish before reloading or switching scope".into());
+        }
+        Ok(())
+    }
+
+    fn replace_broker_events(
+        pending: &mut HashMap<String, Vec<Arc<WasiExtensionEvent>>>,
+        checkpoints: HashMap<String, Vec<Arc<WasiExtensionEvent>>>,
+    ) {
+        for (name, mut restored) in checkpoints {
+            let queue = pending.entry(name).or_default();
+            queue.retain(|event| event.topic != "broker_response");
+            restored.append(queue);
+            *queue = restored;
+        }
+    }
+
     /// Returns the current persisted/in-memory state for an extension.
     pub fn extension_state(&self, extension_name: &str) -> Option<Value> {
+        self.ensure_storage_confirmed().ok()?;
         self.states.lock().ok()?.get(extension_name).cloned()
     }
 
     /// Updates only the state owned by the invoking extension.
     pub fn set_extension_state(&self, extension_name: &str, state: Value) -> Result<(), String> {
+        let _commit = self
+            .state_commit
+            .lock()
+            .map_err(|_| "Extension state commit lock poisoned".to_string())?;
+        self.ensure_state_ownership()?;
+        self.hydrate_extension_checkpoint(extension_name)?;
+        self.persist_state(extension_name, &state)?;
         self.states
             .lock()
             .map_err(|_| "Extension state lock poisoned".to_string())?
-            .insert(extension_name.to_string(), state.clone());
-        self.persist_state(extension_name, &state)
+            .insert(extension_name.to_string(), state);
+        Ok(())
     }
 
     /// Returns host-owned state in the active session scope without relying on
-    /// any extension identity or schema.
-    pub fn host_state(&self, key: &str) -> Option<Value> {
-        if let Ok(state) = self.host_state.lock() {
-            if let Some(value) = state.get(key) {
-                return Some(value.clone());
-            }
-        }
-        let value = self.load_host_state(key)?;
-        self.host_state
+    /// any extension identity or schema. Only absent files return `Ok(None)`;
+    /// unreadable or malformed files return an error instead of a default.
+    pub fn host_state(&self, key: &str) -> Result<Option<Value>, String> {
+        self.ensure_storage_confirmed()?;
+        if let Some(value) = self
+            .host_state
             .lock()
-            .ok()?
-            .insert(key.to_string(), value.clone());
-        Some(value)
-    }
-
-    /// Persists host-owned state in the active session scope.
-    pub fn set_host_state(&self, key: &str, value: Value) -> Result<(), String> {
+            .map_err(|_| "Host state lock poisoned".to_string())?
+            .get(key)
+            .cloned()
+        {
+            return Ok(Some(value));
+        }
+        let _commit = self
+            .state_commit
+            .lock()
+            .map_err(|_| "Extension state commit lock poisoned".to_string())?;
+        self.ensure_state_ownership()?;
+        // A writer may have committed while this reader waited for the gate.
+        if let Some(value) = self
+            .host_state
+            .lock()
+            .map_err(|_| "Host state lock poisoned".to_string())?
+            .get(key)
+            .cloned()
+        {
+            return Ok(Some(value));
+        }
+        let Some(value) = self.load_host_state(key)? else {
+            return Ok(None);
+        };
         self.host_state
             .lock()
             .map_err(|_| "Host state lock poisoned".to_string())?
             .insert(key.to_string(), value.clone());
-        self.persist_host_state(key, &value)
+        Ok(Some(value))
+    }
+
+    /// Persists host-owned state in the active session scope.
+    pub fn set_host_state(&self, key: &str, value: Value) -> Result<(), String> {
+        let _commit = self
+            .state_commit
+            .lock()
+            .map_err(|_| "Extension state commit lock poisoned".to_string())?;
+        self.ensure_state_ownership()?;
+        self.persist_host_state(key, &value)?;
+        self.host_state
+            .lock()
+            .map_err(|_| "Host state lock poisoned".to_string())?
+            .insert(key.to_string(), value);
+        Ok(())
     }
 
     /// Subscribe an extension to a topic. Delivery is queued until its next invocation.
@@ -770,15 +1409,18 @@ impl WasiExtensionManager {
     }
 
     pub fn publish_event(&self, topic: String, payload: Value) -> Result<(), String> {
+        if topic == "broker_response" {
+            return Err("broker_response is reserved for host broker outcomes".into());
+        }
         let scope = self.session_scope()?;
         let subscribers = self
             .subscriptions
             .lock()
             .map_err(|_| "Extension subscription lock poisoned".to_string())?;
-        let event = WasiExtensionEvent {
+        let event = Arc::new(WasiExtensionEvent {
             topic: topic.clone(),
             payload,
-        };
+        });
         let mut pending = self
             .pending_events
             .lock()
@@ -787,10 +1429,20 @@ impl WasiExtensionManager {
         for (extension, topics) in subscribers.iter() {
             if topics.contains(&topic) {
                 let queue = pending.entry(extension.clone()).or_default();
-                // Bound per-extension queues: an extension that never runs
-                // must not accumulate events without limit.
-                if queue.len() >= MAX_PENDING_EVENTS_PER_EXTENSION {
-                    queue.remove(0);
+                // Notifications must never evict an already-consumed protocol reply.
+                if queue.len() >= MAX_PENDING_EVENTS_PER_EXTENSION
+                    && queue
+                        .iter()
+                        .filter(|event| event.topic != "broker_response")
+                        .count()
+                        >= MAX_PENDING_EVENTS_PER_EXTENSION
+                {
+                    if let Some(oldest) = queue
+                        .iter()
+                        .position(|event| event.topic != "broker_response")
+                    {
+                        queue.remove(oldest);
+                    }
                 }
                 queue.push(event.clone());
             }
@@ -798,21 +1450,57 @@ impl WasiExtensionManager {
         Ok(())
     }
 
-    /// Removes events queued for one extension, matching the next-invocation delivery path.
-    fn drain_events_for(&self, extension_name: &str) -> Result<Vec<WasiExtensionEvent>, String> {
-        let scope = self.session_scope()?;
+    /// Takes one delivery batch; `invoke` restores it if execution or commit fails.
+    fn drain_events_for(
+        &self,
+        extension_name: &str,
+        scope: &Option<String>,
+    ) -> Result<Vec<Arc<WasiExtensionEvent>>, String> {
         Ok(self
             .pending_events
             .lock()
             .map_err(|_| "Extension event lock poisoned".to_string())?
-            .entry(scope)
-            .or_default()
-            .remove(extension_name)
+            .get_mut(scope)
+            .and_then(|pending| pending.remove(extension_name))
             .unwrap_or_default())
     }
 
-    /// Location used for session-owned extension state. This is public so UI
-    /// code can render persisted state without duplicating the naming scheme.
+    fn restore_events_for(
+        &self,
+        extension_name: &str,
+        scope: &Option<String>,
+        mut events: Vec<Arc<WasiExtensionEvent>>,
+    ) -> Result<(), String> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut pending = self
+            .pending_events
+            .lock()
+            .map_err(|_| "Extension event lock poisoned".to_string())?;
+        // Scope switches retire their queues; a late failure must not resurrect one.
+        let Some(pending) = pending.get_mut(scope) else {
+            return Ok(());
+        };
+        let queue = pending.entry(extension_name.to_string()).or_default();
+        events.append(queue);
+        // Retried notifications keep priority over arrivals during the failed call.
+        // Preserve all broker outcomes and retain the existing notification bound.
+        let mut notifications = 0;
+        events.retain(|event| {
+            if event.topic == "broker_response" {
+                true
+            } else {
+                notifications += 1;
+                notifications <= MAX_PENDING_EVENTS_PER_EXTENSION
+            }
+        });
+        *queue = events;
+        Ok(())
+    }
+
+    /// Location of the session-owned checkpoint. Its versioned envelope is
+    /// internal; use `extension_state` after reload to render the state value.
     pub fn session_state_path(
         project_dir: &Path,
         session_id: &str,
@@ -851,16 +1539,119 @@ impl WasiExtensionManager {
             .join(extension_state_file_name(extension_name))
     }
 
-    fn load_state(&self, extension_name: &str) -> Option<Value> {
-        let path = self.state_path(extension_name)?;
-        serde_json::from_slice(&fs::read(path).ok()?).ok()
+    #[cfg(test)]
+    fn load_state(&self, extension_name: &str) -> Result<Option<Value>, String> {
+        Ok(self
+            .load_checkpoint_in_scope(extension_name, &self.session_scope()?)?
+            .map(|checkpoint| checkpoint.state))
+    }
+
+    fn load_checkpoint_in_scope(
+        &self,
+        extension_name: &str,
+        scope: &Option<String>,
+    ) -> Result<Option<ExtensionCheckpoint>, String> {
+        let Some(directory) = self.state_dir.as_ref() else {
+            return Ok(None);
+        };
+        let path = match scope {
+            Some(session_id) => {
+                Self::session_state_path_from_dir(directory, session_id, extension_name)
+            }
+            None => directory.join(extension_state_file_name(extension_name)),
+        };
+        let checkpoint = read_json_state(&path)?
+            .map(ExtensionCheckpoint::decode)
+            .transpose()
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        if checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint
+                .unsettled
+                .iter()
+                .any(|intent| &intent.receipt.scope != scope)
+        }) {
+            return Err(format!(
+                "{}: broker intent belongs to another session; preserve the file",
+                path.display()
+            ));
+        }
+        Ok(checkpoint)
     }
 
     fn persist_state(&self, extension_name: &str, state: &Value) -> Result<(), String> {
+        self.persist_state_and_events(extension_name, state, true, None)
+    }
+
+    fn persist_state_and_events(
+        &self,
+        extension_name: &str,
+        state: &Value,
+        include_in_flight: bool,
+        unsettled: Option<&[Arc<BrokerIntent>]>,
+    ) -> Result<(), String> {
+        self.ensure_storage_confirmed()?;
         let Some(path) = self.state_path(extension_name) else {
-            return Ok(());
+            return if self.state_dir.is_none() {
+                Ok(())
+            } else {
+                Err("Extension session lock poisoned".into())
+            };
         };
-        persist_json_state(&path, state)
+        let scope = self.session_scope()?;
+        let mut events = if include_in_flight {
+            self.in_flight_events
+                .lock()
+                .map_err(|_| "Extension delivery lock poisoned".to_string())?
+                .get(extension_name)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+        if let Some(queued) = self
+            .pending_events
+            .lock()
+            .map_err(|_| "Extension event lock poisoned".to_string())?
+            .get(&scope)
+            .and_then(|pending| pending.get(extension_name))
+        {
+            events.extend(queued.iter().cloned());
+        }
+        let existing;
+        let unsettled = if let Some(unsettled) = unsettled {
+            unsettled
+        } else {
+            existing = self
+                .unsettled_broker
+                .lock()
+                .map_err(|_| "Broker intent lock poisoned".to_string())?
+                .get(extension_name)
+                .cloned()
+                .unwrap_or_default();
+            &existing
+        };
+        let acknowledged = if include_in_flight {
+            vec![]
+        } else {
+            self.in_flight_events
+                .lock()
+                .map_err(|_| "Extension delivery lock poisoned".to_string())?
+                .get(extension_name)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let last_broker_id = self.last_broker_id.load(Ordering::SeqCst);
+        persist_checkpoint(&path, state, &events, last_broker_id, unsettled).map_err(|error| {
+            self.record_state_write_error(&path, error, || UnconfirmedState::Extension {
+                name: extension_name.into(),
+                state: state.clone(),
+                events,
+                acknowledged,
+                last_broker_id,
+                intents: unsettled.to_vec(),
+                unpublished: !include_in_flight,
+            })
+        })
     }
 
     fn host_state_path(&self, key: &str) -> Option<PathBuf> {
@@ -870,23 +1661,40 @@ impl WasiExtensionManager {
             Some(session_id) => directory
                 .join("sessions")
                 .join(encode_state_component(&session_id))
-                .join(format!(".host.{key}.json")),
-            None => directory.join(format!(".host.{key}.json")),
+                .join(host_state_file_name(key)),
+            None => directory.join(host_state_file_name(key)),
         })
     }
 
-    fn load_host_state(&self, key: &str) -> Option<Value> {
-        let path = self.host_state_path(key)?;
-        serde_json::from_slice(&fs::read(path).ok()?).ok()
+    fn load_host_state(&self, key: &str) -> Result<Option<Value>, String> {
+        if self.state_dir.is_none() {
+            return Ok(None);
+        }
+        let path = self
+            .host_state_path(key)
+            .ok_or("Extension session lock poisoned")?;
+        read_json_state(&path)
     }
 
     fn persist_host_state(&self, key: &str, value: &Value) -> Result<(), String> {
+        self.ensure_storage_confirmed()?;
         let Some(path) = self.host_state_path(key) else {
-            return Ok(());
+            return if self.state_dir.is_none() {
+                Ok(())
+            } else {
+                Err("Extension session lock poisoned".into())
+            };
         };
-        persist_json_state(&path, value)
+        persist_json_state(&path, value).map_err(|error| {
+            self.record_state_write_error(&path, error, || UnconfirmedState::Host {
+                key: key.into(),
+                value: value.clone(),
+            })
+        })
     }
 
+    /// Single VM invocation. Hosts driving broker work must hold
+    /// `begin_tool_operation` through dispatch, outcome commit, and continuations.
     pub fn execute_tool_with_broker_requests(
         &self,
         name: &str,
@@ -895,31 +1703,95 @@ impl WasiExtensionManager {
         self.execute_response("tool", name, args)
     }
 
+    pub fn begin_tool_operation(
+        &self,
+        name: &str,
+    ) -> Option<Result<WasiExtensionOperation<'_>, String>> {
+        self.begin_response_operation("tool", name)
+    }
+
+    pub fn begin_command_operation(
+        &self,
+        name: &str,
+    ) -> Option<Result<WasiExtensionOperation<'_>, String>> {
+        self.begin_response_operation("command", name)
+    }
+
+    /// Acquire each hook only when visited, preserving name order without
+    /// reserving unrelated extensions during another hook's broker dispatch.
+    pub fn begin_hook_operations(
+        &self,
+        name: &str,
+    ) -> impl Iterator<Item = Result<WasiExtensionOperation<'_>, String>> {
+        let name = name.to_owned();
+        self.find_hook_extensions(&name)
+            .into_iter()
+            .map(move |extension| self.claim_operation(extension, "hook", &name))
+    }
+
+    fn begin_response_operation(
+        &self,
+        kind: &'static str,
+        name: &str,
+    ) -> Option<Result<WasiExtensionOperation<'_>, String>> {
+        let extension = self.find_response_extension(kind, name)?;
+        Some(self.claim_operation(extension, kind, name))
+    }
+
+    fn claim_operation(
+        &self,
+        extension: Arc<WasiExtension>,
+        kind: &'static str,
+        name: &str,
+    ) -> Result<WasiExtensionOperation<'_>, String> {
+        let _commit = self
+            .state_commit
+            .lock()
+            .map_err(|_| "Extension state commit lock poisoned".to_string())?;
+        self.ensure_state_ownership()?;
+        self.ensure_storage_confirmed()?;
+        if !self
+            .extensions
+            .read()
+            .map_err(|_| "Extension registry lock poisoned".to_string())?
+            .get(&extension.manifest.name)
+            .is_some_and(|current| Arc::ptr_eq(current, &extension))
+        {
+            return Err(
+                "Extension inventory changed while selecting the call; use the current inventory"
+                    .into(),
+            );
+        }
+        let mut active = self
+            .active_operations
+            .lock()
+            .map_err(|_| "Extension operation lock poisoned".to_string())?;
+        if active.contains(&extension.manifest.name)
+            || self
+                .in_flight_events
+                .lock()
+                .map_err(|_| "Extension delivery lock poisoned".to_string())?
+                .contains_key(&extension.manifest.name)
+        {
+            return Err(format!("Extension `{}` already has an active call; wait for it to finish and do not restart its broker work", extension.manifest.name));
+        }
+        active.insert(extension.manifest.name.clone());
+        Ok(WasiExtensionOperation {
+            manager: self,
+            extension,
+            kind,
+            name: name.to_owned(),
+        })
+    }
+
+    /// Single VM invocation; use `begin_command_operation` across broker work.
     pub fn execute_command_with_effects(
         &self,
         name: &str,
         args: &str,
     ) -> Option<Result<WasiExtensionCommandResult, String>> {
-        self.execute_response("command", name, args).map(|result| {
-            result.map(|mut result| {
-                let broker_requests = self.take_broker_requests(&mut result);
-                let host_broker_requests = self.filter_granted_requests(
-                    broker_requests
-                        .into_iter()
-                        .map(|request| HostBrokerRequest {
-                            request,
-                            invoking_extension: result.invoking_extension.clone(),
-                        })
-                        .collect(),
-                );
-                WasiExtensionCommandResult {
-                    api_version: result.api_version,
-                    message: result.response.message.unwrap_or_default(),
-                    effects: result.response.effects,
-                    host_broker_requests,
-                }
-            })
-        })
+        self.execute_response("command", name, args)
+            .map(|result| result.and_then(WasiExtensionInvocationResult::into_command_result))
     }
 
     pub fn take_pending_broker_requests(&self) -> Vec<HostBrokerRequest> {
@@ -935,41 +1807,131 @@ impl WasiExtensionManager {
         self.filter_granted_requests(requests)
     }
 
-    /// Queues broker outcomes for delivery in a later invocation.
-    pub fn enqueue_broker_results(&self, results: Vec<BrokerOperationResult>) {
-        let Ok(scope) = self.session_scope() else {
-            return;
-        };
-        if let Ok(mut pending) = self.pending_events.lock() {
+    /// Commits broker outcomes before acknowledging delivery to the producer.
+    /// On storage failure, retain them in memory and report the failed commit;
+    /// callers must not repeat the external operation to repair the checkpoint.
+    pub fn enqueue_broker_results(
+        &self,
+        results: Vec<BrokerOperationResult>,
+    ) -> Result<(), String> {
+        if results.is_empty() {
+            return Ok(());
+        }
+        let _commit = self
+            .state_commit
+            .lock()
+            .map_err(|_| "Extension state commit lock poisoned".to_string())?;
+        self.ensure_state_ownership()?;
+        for result in &results {
+            self.hydrate_extension_checkpoint(&result.invoking_extension)?;
+        }
+        let scope = self.session_scope()?;
+        let mut affected = HashSet::new();
+        {
+            let unsettled = self
+                .unsettled_broker
+                .lock()
+                .map_err(|_| "Broker intent lock poisoned".to_string())?;
+            let mut seen = HashSet::new();
+            for result in &results {
+                if let Some(receipt) = &result.receipt {
+                    let matches =
+                        unsettled
+                            .get(&result.invoking_extension)
+                            .is_some_and(|intents| {
+                                intents.iter().any(|intent| {
+                                    intent.receipt == *receipt && intent.request == result.request
+                                })
+                            });
+                    if receipt.scope != scope || !seen.insert(receipt.id) || !matches {
+                        return Err("Broker outcome does not match an unsettled receipt, or is a duplicate; preserve the checkpoint and do not replay the operation".into());
+                    }
+                }
+            }
+        }
+        {
+            let mut pending = self
+                .pending_events
+                .lock()
+                .map_err(|_| "Extension event lock poisoned".to_string())?;
             let pending = pending.entry(scope).or_default();
             for result in results {
-                let payload = match result.error {
-                    Some(error) => serde_json::json!({
-                        "api_version": BROKER_API_VERSION,
-                        "capability": result.request.capability,
-                        "operation": result.request.operation,
-                        "arguments": result.request.arguments,
-                        "ok": false,
-                        "error": {"code": error.code, "message": error.message},
-                    }),
-                    None => serde_json::json!({
-                        "api_version": BROKER_API_VERSION,
-                        "capability": result.request.capability,
-                        "operation": result.request.operation,
-                        "arguments": result.request.arguments,
-                        "ok": true,
-                        "value": result.value,
-                    }),
-                };
+                affected.insert(result.invoking_extension.clone());
+                let mut payload = serde_json::json!({
+                    "api_version": BROKER_API_VERSION,
+                    "ok": result.error.is_none(),
+                });
+                payload["capability"] = result.request.capability.into();
+                payload["operation"] = result.request.operation.into();
+                // JSON's macro serializes its arguments; assign owned values
+                // directly so large protocol replies are moved, not copied.
+                payload["arguments"] = result.request.arguments;
+                if let Some(receipt) = result.receipt {
+                    payload["receipt_id"] = receipt.id.into();
+                }
+                match result.error {
+                    Some(error) => {
+                        payload["error"] =
+                            serde_json::json!({"code": error.code, "message": error.message})
+                    }
+                    None => payload["value"] = result.value,
+                }
                 pending
                     .entry(result.invoking_extension)
                     .or_default()
-                    .push(WasiExtensionEvent {
+                    .push(Arc::new(WasiExtensionEvent {
                         topic: "broker_response".into(),
                         payload,
-                    });
+                    }));
             }
         }
+        for name in affected {
+            let state = self
+                .states
+                .lock()
+                .map_err(|_| "Extension state lock poisoned".to_string())?
+                .get(&name)
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            self.commit_retained_outcomes(&name, &state, true).map_err(|error| format!("Broker outcomes for `{name}` were retained in memory but could not be committed: {error}; do not repeat the broker operations"))?;
+        }
+        Ok(())
+    }
+
+    /// Recommit a received outcome after storage recovers, without re-running it.
+    fn commit_retained_outcomes(
+        &self,
+        extension_name: &str,
+        state: &Value,
+        force: bool,
+    ) -> Result<(), String> {
+        let mut remaining = self
+            .unsettled_broker
+            .lock()
+            .map_err(|_| "Broker intent lock poisoned".to_string())?
+            .get(extension_name)
+            .cloned()
+            .unwrap_or_default();
+        let before = remaining.len();
+        let scope = self.session_scope()?;
+        let queued = self
+            .pending_events
+            .lock()
+            .map_err(|_| "Extension event lock poisoned".to_string())?
+            .get(&scope)
+            .and_then(|queues| queues.get(extension_name))
+            .cloned()
+            .unwrap_or_default();
+        remaining.retain(|intent| !queued.iter().any(|event| intent.matches_event(event)));
+        if !force && remaining.len() == before {
+            return Ok(());
+        }
+        self.persist_state_and_events(extension_name, state, true, Some(&remaining))?;
+        self.unsettled_broker
+            .lock()
+            .map_err(|_| "Broker intent lock poisoned".to_string())?
+            .insert(extension_name.into(), remaining);
+        Ok(())
     }
 
     fn session_scope(&self) -> Result<Option<String>, String> {
@@ -1043,6 +2005,7 @@ impl WasiExtensionManager {
         extensions
     }
 
+    /// Single VM invocation per hook; use `begin_hook_operations` across dispatch.
     pub fn execute_hook_with_broker_requests(
         &self,
         name: &str,
@@ -1072,11 +2035,63 @@ impl WasiExtensionManager {
         Some(self.invoke(&extension, kind, name, args))
     }
 
-    fn take_broker_requests(
+    fn begin_delivery(
         &self,
-        result: &mut WasiExtensionInvocationResult,
-    ) -> Vec<BrokerRequest> {
-        std::mem::take(&mut result.broker_requests)
+        extension_name: &str,
+        owns_operation: bool,
+    ) -> Result<(Value, Option<String>, Vec<Arc<WasiExtensionEvent>>), String> {
+        let _commit = self
+            .state_commit
+            .lock()
+            .map_err(|_| "Extension state commit lock poisoned".to_string())?;
+        self.ensure_state_ownership()?;
+        self.ensure_storage_confirmed()?;
+        self.hydrate_extension_checkpoint(extension_name)?;
+        if !owns_operation
+            && self
+                .active_operations
+                .lock()
+                .map_err(|_| "Extension operation lock poisoned".to_string())?
+                .contains(extension_name)
+        {
+            return Err(format!("Extension `{extension_name}` already has an active call; wait for it to finish and do not restart its broker work"));
+        }
+        if self
+            .in_flight_events
+            .lock()
+            .map_err(|_| "Extension delivery lock poisoned".to_string())?
+            .contains_key(extension_name)
+        {
+            return Err(format!("Extension `{extension_name}` is already executing; wait for that invocation to finish instead of restarting its broker operations"));
+        }
+        let state = self
+            .states
+            .lock()
+            .map_err(|_| "Extension state lock poisoned".to_string())?
+            .get(extension_name)
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let scope = self.session_scope()?;
+        self.commit_retained_outcomes(extension_name, &state, false)?;
+        if self
+            .unsettled_broker
+            .lock()
+            .map_err(|_| "Broker intent lock poisoned".to_string())?
+            .get(extension_name)
+            .is_some_and(|intents| !intents.is_empty())
+        {
+            let path = self
+                .state_path(extension_name)
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "in-memory checkpoint".into());
+            return Err(format!("Extension `{extension_name}` has unsettled broker operations that may already have executed; do not retry or replay them. Inspect `{path}` and reconcile the original outcomes before continuing"));
+        }
+        let events = self.drain_events_for(extension_name, &scope)?;
+        self.in_flight_events
+            .lock()
+            .map_err(|_| "Extension delivery lock poisoned".to_string())?
+            .insert(extension_name.to_string(), events.clone());
+        Ok((state, scope, events))
     }
 
     fn invoke(
@@ -1086,62 +2101,144 @@ impl WasiExtensionManager {
         name: &str,
         args: &str,
     ) -> Result<WasiExtensionInvocationResult, String> {
-        let state = self
-            .states
-            .lock()
-            .map_err(|_| "Extension state lock poisoned".to_string())?
-            .get(&extension.manifest.name)
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
+        self.invoke_owned(extension, kind, name, args, false)
+    }
+
+    fn invoke_owned(
+        &self,
+        extension: &WasiExtension,
+        kind: &str,
+        name: &str,
+        args: &str,
+        owns_operation: bool,
+    ) -> Result<WasiExtensionInvocationResult, String> {
         let arguments =
             serde_json::from_str(args).unwrap_or_else(|_| serde_json::json!({ "raw": args }));
-        let events = self.drain_events_for(&extension.manifest.name)?;
-        let invocation = WasiExtensionInvocation {
-            api_version: extension.manifest.api_version,
-            kind: kind.into(),
-            name: name.into(),
-            arguments,
-            state,
-            events,
-        };
         let policy = self.effective_capability_policy(extension)?;
-        let result = match kind {
-            "tool" => extension.call_with_policy("execute_tool", &invocation, policy),
-            "hook" => extension.call_with_policy("handle_hook", &invocation, policy),
-            _ => extension.call_with_policy("execute_command", &invocation, policy),
-        }?;
-        if let Some(state) = result.response.state.clone() {
-            self.states
-                .lock()
-                .map_err(|_| "Extension state lock poisoned".to_string())?
-                .insert(extension.manifest.name.clone(), state.clone());
-            self.persist_state(&extension.manifest.name, &state)?;
-        } else {
-            // A terminal response without state resets the slot to the
-            // stable default instead of leaving a stale transient phase
-            // behind: the next call must not start in a phase it cannot
-            // handle. Continuations disambiguate via `broker_response`
-            // events, never via a leftover phase string.
-            let stable = serde_json::json!({});
-            self.states
-                .lock()
-                .map_err(|_| "Extension state lock poisoned".to_string())?
-                .insert(extension.manifest.name.clone(), stable.clone());
-            self.persist_state(&extension.manifest.name, &stable)?;
+        let (state, scope, events) =
+            self.begin_delivery(&extension.manifest.name, owns_operation)?;
+        #[derive(Serialize)]
+        struct Invocation<'a> {
+            api_version: u32,
+            kind: &'a str,
+            name: &'a str,
+            arguments: &'a Value,
+            state: &'a Value,
+            events: Vec<&'a WasiExtensionEvent>,
         }
-        let mut result = result;
-        result.invoking_extension = extension.manifest.name.clone();
-        result.host_broker_requests = self.filter_granted_requests(
-            result
-                .broker_requests
-                .iter()
-                .cloned()
-                .map(|request| HostBrokerRequest {
-                    request,
-                    invoking_extension: result.invoking_extension.clone(),
+        let invocation = Invocation {
+            api_version: extension.manifest.api_version,
+            kind,
+            name,
+            arguments: &arguments,
+            state: &state,
+            events: events.iter().map(Arc::as_ref).collect(),
+        };
+        let result = match kind {
+            "tool" => extension.call_with_policy(
+                "execute_tool",
+                &invocation,
+                invocation.api_version,
+                policy,
+            ),
+            "hook" => extension.call_with_policy(
+                "handle_hook",
+                &invocation,
+                invocation.api_version,
+                policy,
+            ),
+            _ => extension.call_with_policy(
+                "execute_command",
+                &invocation,
+                invocation.api_version,
+                policy,
+            ),
+        }
+        .and_then(|mut result| {
+            // Missing state resets stale transient phases to the stable default.
+            // Commit before acknowledging events or exposing broker work to the host.
+            let _commit = self
+                .state_commit
+                .lock()
+                .map_err(|_| "Extension state commit lock poisoned".to_string())?;
+            let state = result
+                .response
+                .state
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let mut requests = if result.response.error.is_none() {
+                self.filter_granted_requests(
+                    std::mem::take(&mut result.broker_requests)
+                        .into_iter()
+                        .map(|request| HostBrokerRequest {
+                            request,
+                            invoking_extension: extension.manifest.name.clone(),
+                            receipt: None,
+                        })
+                        .collect(),
+                )
+            } else {
+                vec![]
+            };
+            if !requests.is_empty() {
+                self.restore_receipt_counter()?;
+            }
+            let count = u64::try_from(requests.len())
+                .map_err(|_| "Broker receipt batch is too large".to_string())?;
+            let previous_id = self
+                .last_broker_id
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| {
+                    id.checked_add(count)
                 })
-                .collect(),
-        );
+                .map_err(|_| "Broker receipt ID exhausted".to_string())?;
+            let mut intents = Vec::with_capacity(requests.len());
+            for (index, request) in requests.iter_mut().enumerate() {
+                let id = previous_id + index as u64 + 1;
+                let receipt = BrokerReceipt {
+                    id,
+                    scope: scope.clone(),
+                };
+                intents.push(Arc::new(BrokerIntent {
+                    receipt: receipt.clone(),
+                    request: request.request.clone(),
+                }));
+                request.receipt = Some(receipt);
+            }
+            self.persist_state_and_events(&extension.manifest.name, &state, false, Some(&intents))?;
+            self.unsettled_broker
+                .lock()
+                .map_err(|_| "Broker intent lock poisoned".to_string())?
+                .insert(extension.manifest.name.clone(), intents);
+            result.host_broker_requests = requests;
+            self.states
+                .lock()
+                .map_err(|_| "Extension state lock poisoned".to_string())?
+                .insert(extension.manifest.name.clone(), state);
+            self.in_flight_events
+                .lock()
+                .map_err(|_| "Extension delivery lock poisoned".to_string())?
+                .remove(&extension.manifest.name);
+            Ok(result)
+        });
+        let mut result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let _commit = self
+                    .state_commit
+                    .lock()
+                    .map_err(|_| "Extension state commit lock poisoned".to_string())?;
+                self.in_flight_events
+                    .lock()
+                    .map_err(|_| "Extension delivery lock poisoned".to_string())?
+                    .remove(&extension.manifest.name);
+                self.restore_events_for(&extension.manifest.name, &scope, events)
+                    .map_err(|restore_error| {
+                        format!("{error}; could not restore undelivered events: {restore_error}")
+                    })?;
+                return Err(error);
+            }
+        };
+        result.invoking_extension = extension.manifest.name.clone();
         Ok(result)
     }
 
@@ -1166,11 +2263,93 @@ impl WasiExtensionManager {
     }
 }
 
-fn persist_json_state(path: &Path, state: &Value) -> Result<(), String> {
-    let parent = path.parent().ok_or("Extension state path has no parent")?;
-    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let bytes = serde_json::to_vec_pretty(state).map_err(|error| error.to_string())?;
-    fs::write(path, bytes).map_err(|error| error.to_string())
+fn read_json_state(path: &Path) -> Result<Option<Value>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Cannot inspect extension state {}: {error}",
+                path.display()
+            ))
+        }
+    };
+    if !metadata.is_file() {
+        return Err(format!(
+            "Extension state {} must be a regular file, not a symlink or directory",
+            path.display()
+        ));
+    }
+    let bytes = fs::read(path)
+        .map_err(|error| format!("Cannot read extension state {}: {error}", path.display()))?;
+    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+        format!(
+            "Invalid extension state {}: {error}; preserve the file and repair it before reloading",
+            path.display()
+        )
+    })
+}
+
+#[cfg(unix)]
+fn sync_state_directories(
+    directory: &Path,
+    project_root: &Path,
+    mut sync: impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    if !directory.starts_with(project_root) {
+        return Err("Extension storage is outside its project root".into());
+    }
+    for path in directory.ancestors() {
+        sync(path).map_err(|error| format!("Cannot sync extension storage directory {}: {error}; preserve state and repair storage before retrying", path.display()))?;
+        if path == project_root {
+            return Ok(());
+        }
+    }
+    Err("Extension storage is outside its project root".into())
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static FAIL_NEXT_STATE_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(unix)]
+fn sync_state_parent(parent: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_STATE_DIRECTORY_SYNC.with(|fault| fault.replace(false)) {
+        return Err(std::io::Error::other(
+            "injected directory sync failure after replacement",
+        ));
+    }
+    fs::File::open(parent)?.sync_all()
+}
+
+fn persist_json_state<T: Serialize>(path: &Path, state: &T) -> Result<(), StateWriteError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| StateWriteError::before("Extension state path has no parent"))?;
+    fs::create_dir_all(parent).map_err(StateWriteError::before)?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent).map_err(StateWriteError::before)?;
+    {
+        // Keep pretty JSON without allocating another checkpoint-sized buffer.
+        let mut writer = BufWriter::new(staged.as_file_mut());
+        serde_json::to_writer_pretty(&mut writer, state).map_err(StateWriteError::before)?;
+        writer.flush().map_err(StateWriteError::before)?;
+    }
+    staged
+        .as_file()
+        .sync_all()
+        .map_err(StateWriteError::before)?;
+    staged.persist(path).map_err(StateWriteError::before)?;
+    #[cfg(unix)]
+    sync_state_parent(parent).map_err(|error| StateWriteError {
+        message: format!(
+            "Replacement {} is visible but its directory sync failed: {error}",
+            path.display()
+        ),
+        replaced: true,
+    })?;
+    Ok(())
 }
 
 impl WasiExtensionManager {
@@ -1202,6 +2381,593 @@ impl WasiExtensionManager {
             .read()
             .map(|tools| tools.clone())
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod state_commit_tests {
+    use super::{
+        persist_json_state, BrokerOperationResult, BrokerRequest, WasiExtension,
+        WasiExtensionManager, MAX_PENDING_EVENTS_PER_EXTENSION,
+    };
+    use serde_json::json;
+    use std::fs;
+    #[cfg(unix)]
+    use std::path::Path;
+
+    #[test]
+    fn state_reader_distinguishes_absence_from_invalid_storage() {
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("state.json");
+        assert_eq!(super::read_json_state(&path).unwrap(), None);
+        for value in [json!({"phase":"waiting"}), json!("legacy"), json!(null)] {
+            fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            assert_eq!(super::read_json_state(&path).unwrap(), Some(value));
+        }
+        fs::write(&path, b"{incomplete state").unwrap();
+        let error = super::read_json_state(&path).unwrap_err();
+        assert!(error.contains("preserve the file"), "{error}");
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(super::read_json_state(&path)
+            .unwrap_err()
+            .contains("regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_reader_rejects_symlinks_including_dangling_ones() {
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("state.json");
+        let target = project.path().join("target.json");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(super::read_json_state(&path).is_err());
+        fs::write(&target, b"{}").unwrap();
+        assert!(super::read_json_state(&path).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn scope_switch_preserves_the_active_scope_on_invalid_state() {
+        let project = tempfile::tempdir().unwrap();
+        let manager = WasiExtensionManager::for_project_session(project.path(), "a");
+        let extension = WasiExtension::load_from_bytes(b"\0asm\x01\0\0\0".to_vec()).unwrap();
+        let name = extension.manifest.name.clone();
+        manager.register_extension(extension).unwrap();
+        manager
+            .set_extension_state(&name, json!({"phase":"waiting"}))
+            .unwrap();
+        manager
+            .set_host_state("tools.policy", json!("read_only"))
+            .unwrap();
+        manager.subscribe_event(&name, "updates".into()).unwrap();
+        manager
+            .publish_event("updates".into(), json!("kept"))
+            .unwrap();
+        let path = WasiExtensionManager::session_state_path(project.path(), "b", &name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"{incomplete state").unwrap();
+        let error = manager.set_session_scope("b").unwrap_err();
+        assert!(error.contains("state"), "{error}");
+        assert_eq!(manager.active_session_scope().unwrap(), Some("a".into()));
+        assert_eq!(
+            manager.extension_state(&name),
+            Some(json!({"phase":"waiting"}))
+        );
+        assert_eq!(
+            manager.host_state("tools.policy").unwrap(),
+            Some(json!("read_only"))
+        );
+        assert_eq!(
+            manager.drain_events_for(&name, &Some("a".into())).unwrap()[0].payload,
+            json!("kept")
+        );
+        assert_eq!(fs::read(path).unwrap(), b"{incomplete state");
+    }
+
+    #[test]
+    fn reload_preserves_the_live_registry_and_state_on_invalid_storage() {
+        let project = tempfile::tempdir().unwrap();
+        let manifest = r#"{"name":"test","version":"1","description":"test"}"#;
+        let module = format!(
+            r#"(module
+            (memory (export "memory") 1)
+            (data (i32.const 0) "{}")
+            (func (export "extension_info") (result i64) (i64.const {})))"#,
+            manifest.replace('"', "\\\""),
+            manifest.len()
+        );
+        let path = project.path().join(".threadlane/extensions/test.wasm");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, module).unwrap();
+        let manager = WasiExtensionManager::for_project(project.path());
+        assert_eq!(
+            manager
+                .reload_from_roots(None, Some(project.path()))
+                .unwrap(),
+            1
+        );
+        manager
+            .set_extension_state("test", json!({"phase":"waiting"}))
+            .unwrap();
+        manager.subscribe_event("test", "updates".into()).unwrap();
+        manager
+            .publish_event("updates".into(), json!("kept"))
+            .unwrap();
+        let state = manager.state_path("test").unwrap();
+        fs::write(&state, b"{incomplete state").unwrap();
+        assert!(manager
+            .reload_from_roots(None, Some(project.path()))
+            .is_err());
+        assert!(manager.extension_manifest("test").is_some());
+        assert_eq!(
+            manager.extension_state("test"),
+            Some(json!({"phase":"waiting"}))
+        );
+        assert_eq!(
+            manager.drain_events_for("test", &None).unwrap()[0].payload,
+            json!("kept")
+        );
+        assert_eq!(fs::read(state).unwrap(), b"{incomplete state");
+    }
+
+    #[test]
+    fn failed_writes_preserve_cached_state() {
+        let project = tempfile::tempdir().unwrap();
+        let manager = WasiExtensionManager::for_project(project.path());
+        manager.set_extension_state("planner", json!(1)).unwrap();
+        manager.set_host_state("tools.policy", json!(1)).unwrap();
+        for path in [
+            manager.state_path("planner"),
+            manager.host_state_path("tools.policy"),
+        ] {
+            let path = path.unwrap();
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+        }
+        assert!(manager.set_extension_state("planner", json!(2)).is_err());
+        assert_eq!(manager.extension_state("planner"), Some(json!(1)));
+        assert!(manager.set_host_state("tools.policy", json!(2)).is_err());
+        assert_eq!(manager.host_state("tools.policy").unwrap(), Some(json!(1)));
+        assert_eq!(
+            fs::read_dir(manager.state_dir.as_ref().unwrap())
+                .unwrap()
+                .count(),
+            3 // two preserved destinations plus the stable owner lock
+        );
+    }
+
+    #[test]
+    fn unsafe_host_keys_are_single_distinct_file_names() {
+        let project = tempfile::tempdir().unwrap();
+        let manager = WasiExtensionManager::for_project_session(project.path(), "session/../a");
+        let parent = manager
+            .host_state_path("tools.policy")
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned();
+        let keys = [
+            "tools.policy",
+            "../../escaped",
+            "a/b",
+            "a\\b",
+            "",
+            ".encoded-612f62",
+        ];
+        let mut paths = std::collections::HashSet::new();
+        for key in keys {
+            let path = manager.host_state_path(key).unwrap();
+            assert_eq!(path.parent(), Some(parent.as_path()), "{key}: {path:?}");
+            assert!(paths.insert(path));
+            manager.set_host_state(key, json!(key)).unwrap();
+        }
+        drop(manager);
+        let reloaded = WasiExtensionManager::for_project_session(project.path(), "session/../a");
+        for key in keys {
+            assert_eq!(reloaded.host_state(key).unwrap(), Some(json!(key)));
+        }
+    }
+
+    #[test]
+    fn atomic_replacement_keeps_previous_inode_intact() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        persist_json_state(&path, &json!({"old": "durable"})).unwrap();
+        let old = fs::read(&path).unwrap();
+        let previous = directory.path().join("previous.json");
+        fs::hard_link(&path, &previous).unwrap();
+        persist_json_state(&path, &json!({"new": "durable"})).unwrap();
+        assert_eq!(fs::read(previous).unwrap(), old);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(path).unwrap()).unwrap(),
+            json!({"new": "durable"})
+        );
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn cold_state_ownership_requires_an_existing_work_directory() {
+        let project = tempfile::tempdir().unwrap();
+        let missing = project.path().join("missing");
+        let manager = WasiExtensionManager::for_project_session(&missing, "a");
+        let error = manager
+            .set_extension_state("probe", json!({"saved": true}))
+            .unwrap_err();
+        assert!(error.contains("restore the work directory"), "{error}");
+        assert!(!missing.exists());
+        assert!(manager.state_owner.lock().unwrap().is_none());
+        assert!(manager.extension_state("probe").is_none());
+        fs::create_dir(&missing).unwrap();
+        manager
+            .set_extension_state("probe", json!({"saved": true}))
+            .unwrap();
+        assert_eq!(
+            manager.load_state("probe").unwrap(),
+            Some(json!({"saved": true}))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scope_directory_sync_retries_existing_ancestors_after_failure() {
+        let project = tempfile::tempdir().unwrap();
+        let manager = WasiExtensionManager::for_project_session(project.path(), "a");
+        manager
+            .set_extension_state("probe", json!({"saved": true}))
+            .unwrap();
+        let directory = manager
+            .state_path("probe")
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned();
+        let expected = [
+            project
+                .path()
+                .join(".threadlane/state/extensions/sessions/61"),
+            project.path().join(".threadlane/state/extensions/sessions"),
+            project.path().join(".threadlane/state/extensions"),
+            project.path().join(".threadlane/state"),
+            project.path().join(".threadlane"),
+            project.path().to_owned(),
+        ];
+        let mut attempted = Vec::new();
+        let error = super::sync_state_directories(&directory, project.path(), |path| {
+            attempted.push(path.to_owned());
+            if path == expected[3] {
+                return Err(std::io::Error::other("injected sync failure"));
+            }
+            fs::File::open(path)?.sync_all()
+        })
+        .unwrap_err();
+        assert_eq!(attempted, expected[..4]);
+        assert!(
+            error.contains(&expected[3].display().to_string()),
+            "{error}"
+        );
+        assert!(error.contains("preserve state"), "{error}");
+        assert!(expected.iter().all(|path| path.is_dir()));
+
+        attempted.clear();
+        super::sync_state_directories(&directory, project.path(), |path| {
+            attempted.push(path.to_owned());
+            fs::File::open(path)?.sync_all()
+        })
+        .unwrap();
+        assert_eq!(attempted, expected);
+        drop(manager);
+        let successor = WasiExtensionManager::for_project_session(project.path(), "a");
+        assert_eq!(
+            successor.load_state("probe").unwrap(),
+            Some(json!({"saved": true}))
+        );
+    }
+
+    #[test]
+    fn streamed_state_matches_pretty_json_and_preserves_target_after_partial_serialization() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let text = "source 🦀\n\"quoted\"\\\t".repeat(10_000);
+        let state = json!({"documents": [{"text": text, "version": 1}], "optional": null});
+        let expected = serde_json::to_vec_pretty(&state).unwrap();
+        persist_json_state(&path, &state).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), expected);
+
+        struct FailsAfterPrefix<'a>(&'a str);
+        impl serde::Serialize for FailsAfterPrefix<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeSeq;
+                let mut sequence = serializer.serialize_seq(Some(2))?;
+                sequence.serialize_element(self.0)?;
+                Err(serde::ser::Error::custom(
+                    "injected partial serialization failure",
+                ))
+            }
+        }
+        let error = persist_json_state(&path, &FailsAfterPrefix(&text)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected partial serialization failure"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scope_directory_sync_stays_within_the_project_anchor() {
+        let mut attempted = Vec::new();
+        let error = super::sync_state_directories(
+            Path::new("/other/state"),
+            Path::new("/project"),
+            |path| {
+                attempted.push(path.to_owned());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("outside its project root"), "{error}");
+        assert!(attempted.is_empty());
+        for root in [Path::new("."), Path::new("")] {
+            attempted.clear();
+            super::sync_state_directories(&root.join(".threadlane/state"), root, |path| {
+                attempted.push(path.to_owned());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(attempted.last().unwrap(), root);
+            assert_eq!(attempted.len(), 3);
+        }
+    }
+
+    #[test]
+    fn invocation_does_not_publish_state_when_storage_fails() {
+        let project = tempfile::tempdir().unwrap();
+        let manager = WasiExtensionManager::for_project(project.path());
+        let response = r#"{"state":{"phase":"requesting"},"continue_after_broker":true}"#;
+        let wasm = format!(
+            r#"(module
+            (memory (export "memory") 1)
+            (data (i32.const 0) "{}")
+            (func (export "alloc") (param i32) (result i32) (i32.const 8192))
+            (func (export "execute_tool") (param i32 i32) (result i64) (i64.const {})))"#,
+            response.replace('"', "\\\""),
+            response.len()
+        );
+        let extension = WasiExtension::load_from_bytes(wasm.into_bytes()).unwrap();
+        let name = &extension.manifest.name;
+        manager.subscribe_event(name, "updates".into()).unwrap();
+        manager.publish_event("updates".into(), json!(1)).unwrap();
+        manager
+            .enqueue_broker_results(vec![BrokerOperationResult {
+                receipt: None,
+                invoking_extension: name.clone(),
+                request: BrokerRequest {
+                    api_version: 2,
+                    capability: "process".into(),
+                    operation: "recv".into(),
+                    arguments: json!({}),
+                },
+                value: json!({"reply":"already consumed from the process"}),
+                error: None,
+            }])
+            .unwrap();
+        let expected = manager.pending_events.lock().unwrap()[&None][name].clone();
+        manager
+            .set_extension_state(name, json!({"phase":"ready"}))
+            .unwrap();
+        let path = manager.state_path(name).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(manager.invoke(&extension, "tool", "test", "{}").is_err());
+        assert_eq!(
+            manager.extension_state(name),
+            Some(json!({"phase":"ready"}))
+        );
+        assert_eq!(
+            manager.pending_events.lock().unwrap()[&None][name],
+            expected
+        );
+        fs::remove_dir(path).unwrap();
+        assert!(manager.invoke(&extension, "tool", "test", "{}").is_ok());
+        assert!(manager.drain_events_for(name, &None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn trapped_invocations_preserve_their_events() {
+        let manager = WasiExtensionManager::new();
+        let extension = WasiExtension::load_from_bytes(
+            br#"(module
+            (memory (export "memory") 1)
+            (func (export "alloc") (param i32) (result i32) (i32.const 0))
+            (func (export "execute_tool") (param i32 i32) (result i64) unreachable))"#
+                .to_vec(),
+        )
+        .unwrap();
+        let name = &extension.manifest.name;
+        manager.subscribe_event(name, "updates".into()).unwrap();
+        manager.publish_event("updates".into(), json!(1)).unwrap();
+        let expected = manager.pending_events.lock().unwrap()[&None][name].clone();
+        for _ in 0..2 {
+            let error = manager
+                .invoke(&extension, "tool", "test", "{}")
+                .unwrap_err();
+            assert!(error.contains("unreachable"), "{error}");
+            assert_eq!(
+                manager.pending_events.lock().unwrap()[&None][name],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn notification_flood_preserves_broker_outcomes() {
+        let manager = WasiExtensionManager::new();
+        manager.subscribe_event("test", "updates".into()).unwrap();
+        manager
+            .enqueue_broker_results(vec![BrokerOperationResult {
+                receipt: None,
+                invoking_extension: "test".into(),
+                request: BrokerRequest {
+                    api_version: 2,
+                    capability: "process".into(),
+                    operation: "recv".into(),
+                    arguments: json!({}),
+                },
+                value: json!("protocol reply"),
+                error: None,
+            }])
+            .unwrap();
+        for n in 0..MAX_PENDING_EVENTS_PER_EXTENSION + 10 {
+            manager.publish_event("updates".into(), json!(n)).unwrap();
+        }
+        let events = manager.drain_events_for("test", &None).unwrap();
+        assert_eq!(events.len(), MAX_PENDING_EVENTS_PER_EXTENSION + 1);
+        assert_eq!(events[0].topic, "broker_response");
+        assert_eq!(events[0].payload["value"], json!("protocol reply"));
+        assert_eq!(events[1].payload, json!(10));
+        assert!(manager
+            .publish_event("broker_response".into(), json!({}))
+            .is_err());
+    }
+
+    #[test]
+    fn restored_batches_precede_new_events_and_do_not_revive_retired_scopes() {
+        let manager = WasiExtensionManager::new();
+        manager.set_session_scope("a").unwrap();
+        manager.subscribe_event("test", "updates".into()).unwrap();
+        manager
+            .publish_event("updates".into(), json!("old"))
+            .unwrap();
+        let scope = Some("a".into());
+        let batch = manager.drain_events_for("test", &scope).unwrap();
+        manager
+            .publish_event("updates".into(), json!("new"))
+            .unwrap();
+        manager.restore_events_for("test", &scope, batch).unwrap();
+        let batch = manager.drain_events_for("test", &scope).unwrap();
+        assert_eq!(
+            batch.iter().map(|event| &event.payload).collect::<Vec<_>>(),
+            vec![&json!("old"), &json!("new")]
+        );
+        manager.set_session_scope("b").unwrap();
+        manager.restore_events_for("test", &scope, batch).unwrap();
+        assert!(!manager.pending_events.lock().unwrap().contains_key(&scope));
+        assert!(manager
+            .drain_events_for("test", &Some("b".into()))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn failed_batches_preserve_the_notification_bound() {
+        let manager = WasiExtensionManager::new();
+        manager.subscribe_event("test", "updates".into()).unwrap();
+        for n in 0..MAX_PENDING_EVENTS_PER_EXTENSION {
+            manager.publish_event("updates".into(), json!(n)).unwrap();
+        }
+        let batch = manager.drain_events_for("test", &None).unwrap();
+        for n in 0..MAX_PENDING_EVENTS_PER_EXTENSION {
+            manager
+                .publish_event(
+                    "updates".into(),
+                    json!(n + MAX_PENDING_EVENTS_PER_EXTENSION),
+                )
+                .unwrap();
+        }
+        manager.restore_events_for("test", &None, batch).unwrap();
+        let restored = manager.drain_events_for("test", &None).unwrap();
+        assert_eq!(restored.len(), MAX_PENDING_EVENTS_PER_EXTENSION);
+        assert_eq!(restored.first().unwrap().payload, json!(0));
+        assert_eq!(
+            restored.last().unwrap().payload,
+            json!(MAX_PENDING_EVENTS_PER_EXTENSION - 1)
+        );
+    }
+
+    #[test]
+    fn broker_event_queue_moves_large_values_without_copying() {
+        let manager = WasiExtensionManager::new();
+        let value = serde_json::Value::String("reply".repeat(100_000));
+        let arguments = serde_json::Value::String("input".repeat(100_000));
+        let value_ptr = value.as_str().unwrap().as_ptr();
+        let arguments_ptr = arguments.as_str().unwrap().as_ptr();
+        manager
+            .enqueue_broker_results(vec![BrokerOperationResult {
+                receipt: None,
+                invoking_extension: "test".into(),
+                request: BrokerRequest {
+                    api_version: 2,
+                    capability: "process".into(),
+                    operation: "recv".into(),
+                    arguments,
+                },
+                value,
+                error: None,
+            }])
+            .unwrap();
+        let events = manager.drain_events_for("test", &None).unwrap();
+        assert_eq!(
+            events[0].payload["value"].as_str().unwrap().as_ptr(),
+            value_ptr
+        );
+        assert_eq!(
+            events[0].payload["arguments"].as_str().unwrap().as_ptr(),
+            arguments_ptr
+        );
+    }
+
+    #[test]
+    fn concurrent_commits_reload_and_match_the_cache() {
+        let project = tempfile::tempdir().unwrap();
+        let manager = WasiExtensionManager::for_project_session(project.path(), "a");
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|threads| {
+            for writer in 0..4 {
+                let manager = &manager;
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    barrier.wait();
+                    for sequence in 0..8 {
+                        let value = json!({"writer":writer,"sequence":sequence});
+                        manager
+                            .set_extension_state("planner", value.clone())
+                            .unwrap();
+                        manager.set_host_state("tools.policy", value).unwrap();
+                    }
+                });
+            }
+        });
+        let expected_state = manager.extension_state("planner");
+        let expected_policy = manager.host_state("tools.policy").unwrap();
+        manager.set_session_scope("b").unwrap();
+        let reloaded = WasiExtensionManager::for_project_session(project.path(), "a");
+        assert_eq!(reloaded.load_state("planner").unwrap(), expected_state);
+        assert_eq!(
+            reloaded.host_state("tools.policy").unwrap(),
+            expected_policy
+        );
+        drop(reloaded);
+        assert_eq!(manager.host_state("tools.policy").unwrap(), None);
+        manager.set_host_state("tools.policy", json!("b")).unwrap();
+        manager.set_session_scope("a").unwrap();
+        assert_eq!(manager.host_state("tools.policy").unwrap(), expected_policy);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_state_symlink_preserves_its_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let external = directory.path().join("external.json");
+        fs::write(&external, b"external content").unwrap();
+        let state = directory.path().join("state.json");
+        std::os::unix::fs::symlink(&external, &state).unwrap();
+        persist_json_state(&state, &json!({"stored":true})).unwrap();
+        assert_eq!(fs::read(external).unwrap(), b"external content");
+        assert!(fs::symlink_metadata(state).unwrap().is_file());
     }
 }
 
@@ -1265,7 +3031,12 @@ mod reload_tests {
         };
 
         let error = extension
-            .call_with_policy("execute_command", &invocation, CapabilityPolicy::default())
+            .call_with_policy(
+                "execute_command",
+                &invocation,
+                invocation.api_version,
+                CapabilityPolicy::default(),
+            )
             .unwrap_err();
 
         assert_eq!(error, "Memory export not found");
@@ -1308,6 +3079,7 @@ mod reload_tests {
             .entry(None)
             .or_default()
             .push(HostBrokerRequest {
+                receipt: None,
                 invoking_extension: extension_name.clone(),
                 request: BrokerRequest {
                     api_version: BROKER_API_VERSION,
@@ -1455,6 +3227,7 @@ mod scope_safety_tests {
             .entry(Some("session-a".into()))
             .or_default()
             .push(HostBrokerRequest {
+                receipt: None,
                 request: BrokerRequest {
                     api_version: 1,
                     capability: "process".into(),

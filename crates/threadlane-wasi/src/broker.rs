@@ -12,6 +12,26 @@ pub const BROKER_API_VERSION: u32 = 2;
 pub struct HostBrokerRequest {
     pub(crate) request: BrokerRequest,
     pub(crate) invoking_extension: String,
+    pub(crate) receipt: Option<BrokerReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct BrokerReceipt {
+    pub id: u64,
+    pub scope: Option<String>,
+}
+
+impl HostBrokerRequest {
+    /// Resolve a request the host knows was never physically dispatched.
+    pub fn not_dispatched(self, error: BrokerError) -> BrokerOperationResult {
+        BrokerOperationResult {
+            invoking_extension: self.invoking_extension,
+            receipt: self.receipt,
+            request: self.request,
+            value: Value::Null,
+            error: Some(error),
+        }
+    }
 }
 
 #[async_trait]
@@ -83,6 +103,7 @@ impl BrokerResponse {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BrokerOperationResult {
     pub(crate) invoking_extension: String,
+    pub(crate) receipt: Option<BrokerReceipt>,
     pub request: BrokerRequest,
     pub value: Value,
     pub error: Option<BrokerError>,
@@ -119,6 +140,7 @@ impl CapabilityDispatcher {
                 .map(|request| HostBrokerRequest {
                     request,
                     invoking_extension: String::new(),
+                    receipt: None,
                 })
                 .collect(),
         )
@@ -156,7 +178,8 @@ impl CapabilityDispatcher {
             };
             result.operation_results.push(BrokerOperationResult {
                 invoking_extension: envelope.invoking_extension,
-                request: request.clone(),
+                receipt: envelope.receipt,
+                request: envelope.request,
                 value,
                 error,
             });

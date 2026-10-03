@@ -1057,7 +1057,13 @@ impl<'a> TurnDriver<'a> {
             let mut dispatcher = self.tool_dispatcher.clone();
             dispatcher.tool_execution_mode = ToolExecutionMode::Parallel;
 
-            let tool_results = dispatcher.execute_tools(&captured_tool_calls).await;
+            let tool_results = match dispatcher.execute_tools(&captured_tool_calls).await {
+                Ok(results) => results,
+                Err(error) => {
+                    self.emit_event(AgentEvent::AgentError { error: error.to_string() });
+                    return total_usage;
+                }
+            };
 
             // Persist tool results before they can affect the continuation
             // request. Tool lifecycle recorders may enrich the same durable

@@ -145,6 +145,7 @@ impl CodingSessionHarness {
             .await?;
         self.append_tool_intent_after_hook(run_id, tool_call_id, tool_name, effective_args)
             .await
+            .map(|_| ())
     }
 
     #[cfg(test)]

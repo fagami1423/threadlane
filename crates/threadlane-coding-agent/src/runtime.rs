@@ -842,7 +842,10 @@ impl CodingAgent {
         let global_threadlane_dir = default_global_threadlane_dir();
         let loaded_ext_count = wasi_extensions
             .reload_from_roots(global_threadlane_dir.as_deref(), Some(&options.work_dir))
-            .unwrap_or_default();
+            .unwrap_or_else(|error| {
+                tracing::warn!("Cannot reload extensions: {error}");
+                0
+            });
         let agent_catalog = render_agent_catalog(&options.work_dir);
         let initial_tool_policy = restored_tool_policy(&wasi_extensions);
         let tool_policy = Arc::new(tokio::sync::Mutex::new(initial_tool_policy));
@@ -1821,10 +1824,14 @@ impl CodingAgent {
                 return Some(Ok(output));
             }
 
-            if let Some(res) = self
-                .wasi_extensions
-                .execute_command_with_effects(cmd_name, &cmd_args)
-            {
+            let command_extensions = self.wasi_extensions.clone();
+            if let Some(operation) = command_extensions.begin_command_operation(cmd_name) {
+                let mut operation = match operation {
+                    Ok(operation) => operation,
+                    Err(error) => return Some(Err(format!("WASI Extension Error: {error}"))),
+                };
+                let res = operation.invoke(&cmd_args)
+                    .and_then(|result| result.into_command_result());
                 let visible_prompt = AgentMessage::user(input, images.clone());
                 let harness_run_id = match self.begin_harness_run(visible_prompt).await {
                     Ok(run_id) => run_id,
@@ -1907,8 +1914,20 @@ impl CodingAgent {
                                     (Err(error), _) | (_, Err(error)) => Some(Err(error)),
                                 }
                             });
-                        self.wasi_extensions
-                            .enqueue_broker_results(dispatch.operation_results);
+                        if let Err(error) = self
+                            .wasi_extensions
+                            .enqueue_broker_results(dispatch.operation_results)
+                        {
+                            let _ = self
+                                .finish_harness_run(
+                                    harness_run_id.as_ref().map(|run| run.run_id.as_str()),
+                                    OperationOutcome::Failed,
+                                    Some(error.clone()),
+                                )
+                                .await;
+                            return Some(Err(error));
+                        }
+                        drop(operation);
                         if result.api_version == 1 {
                             for effect in result.effects {
                                 match effect {
@@ -2340,6 +2359,199 @@ impl CodingAgent {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tool_identity_tests {
+    use super::{CodingAgent, CodingAgentOptions};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use threadlane_prompt::SystemPromptConfig;
+    use threadlane_protocol::browser::BrowserBridge;
+    use threadlane_protocol::{
+        AgentMessage, AgentToolCall, AgentToolDefinition, ImageAttachment, RuntimeToolCall,
+        RuntimeToolCallFunction, ToolExecutionIdentity, ToolExecutor, ToolOutput,
+    };
+    use threadlane_runtime::harness::{JsonlStore, OperationOutcome, Record, SessionStore};
+
+    struct CommittedIntentProbe {
+        path: PathBuf,
+        observed: Arc<Mutex<Vec<ToolExecutionIdentity>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for CommittedIntentProbe {
+        fn tool_definitions(&self) -> Arc<[AgentToolDefinition]> {
+            vec![AgentToolDefinition::new(
+                "committed_probe",
+                "",
+                serde_json::json!({"type":"object","properties":{}}),
+            )]
+            .into()
+        }
+
+        async fn execute_tool(&self, _: &str, _: &str) -> Option<Result<String, String>> {
+            panic!("canonical dispatch must retain the committed intent")
+        }
+
+        async fn execute_tool_with_call(
+            &self,
+            call: &AgentToolCall,
+            args: &str,
+            _: Option<&Path>,
+            identity: Option<&ToolExecutionIdentity>,
+        ) -> Option<Result<ToolOutput, String>> {
+            let identity = identity.expect("durable execution requires a committed intent");
+            assert_eq!(call.id, identity.tool_call_id);
+            assert_eq!(call.name, "committed_probe");
+            assert_eq!(call.arguments, args);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(args).unwrap(),
+                serde_json::json!({"x":1})
+            );
+            // Reopen the real journal at the physical execution boundary.
+            let store = JsonlStore::open(&self.path).unwrap();
+            assert_eq!(store.session_id(), identity.session_id);
+            let (lane, tool) = store
+                .tool_state_for_call(&identity.run_id, &call.id)
+                .unwrap();
+            assert_eq!(lane, identity.lane);
+            assert_eq!(tool.assistant_entry_id, identity.assistant_entry_id);
+            assert_eq!(tool.tool_name, identity.tool_name);
+            assert_eq!(tool.result_entry_id, identity.result_entry_id);
+            assert!(!tool.completed);
+            self.observed.lock().unwrap().push(identity.clone());
+            Some(Ok(ToolOutput {
+                content: "committed reply".into(),
+                images: vec![ImageAttachment {
+                    display_name: "fixture.png".into(),
+                    data_url: "data:image/png;base64,AA==".into(),
+                }],
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_identity_matches_committed_intent_and_result_across_runs() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut agent = CodingAgent::new(CodingAgentOptions {
+            api_key: "test-key".into(),
+            account_id: None,
+            model: "test-model".into(),
+            work_dir: directory.path().to_owned(),
+            session_file: Some(path.clone()),
+            system_prompt: SystemPromptConfig::default(),
+            agent_config: None,
+            coding_config: None,
+            browser: BrowserBridge::unavailable(),
+        });
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        agent
+            .agent
+            .register_tool_executor(Arc::new(CommittedIntentProbe {
+                path: path.clone(),
+                observed: observed.clone(),
+            }))
+            .unwrap();
+        agent.agent.set_allowed_tool_names(None);
+        for dyn_form in [false, true] {
+            let accepted = agent
+                .begin_harness_run(AgentMessage::user("probe", vec![]))
+                .await
+                .unwrap()
+                .unwrap();
+            let name = if dyn_form {
+                "run_command"
+            } else {
+                "committed_probe"
+            };
+            let arguments = if dyn_form {
+                serde_json::json!({"command":"dyn committed_probe '{\"x\":1}'"}).to_string()
+            } else {
+                r#"{"x":1}"#.into()
+            };
+            let call = RuntimeToolCall {
+                id: "reused-call".into(),
+                r#type: "function".into(),
+                function: RuntimeToolCallFunction {
+                    name: name.into(),
+                    arguments: arguments.clone(),
+                },
+                thought_signature: None,
+            };
+            let assistant = agent
+                .harness
+                .as_mut()
+                .unwrap()
+                .append_message(AgentMessage::Assistant {
+                    content: None,
+                    tool_calls: Some(vec![call.clone()]),
+                    stop_reason: None,
+                    deferred_handle: None,
+                })
+                .unwrap();
+            let results = agent.agent.execute_tools(&[call]).await.unwrap();
+            assert!(!results[0].is_error, "{}", results[0].content);
+            assert_eq!(results[0].tool_call_id, "reused-call");
+            assert_eq!(results[0].name, name);
+            assert_eq!(results[0].images.len(), 1);
+            assert!(results[0].content.contains("committed reply"));
+            agent
+                .finish_harness_run(Some(&accepted.run_id), OperationOutcome::Completed, None)
+                .await
+                .unwrap();
+            let store = JsonlStore::open(&path).unwrap();
+            let identity = observed.lock().unwrap().last().unwrap().clone();
+            assert_eq!(identity.run_id, accepted.run_id);
+            assert_eq!(identity.assistant_entry_id, assistant);
+            assert_eq!(identity.tool_name, name);
+            let (lane, tool) = store
+                .tool_state_for_call(&accepted.run_id, "reused-call")
+                .unwrap();
+            assert_eq!(lane, "main");
+            assert!(tool.completed);
+            let entry = store.entry(&identity.result_entry_id).unwrap();
+            assert!(
+                matches!(&entry.message, AgentMessage::Tool { tool_call_id, name: result_name, content, images, .. }
+                if tool_call_id == "reused-call" && result_name == name && content == &results[0].content && images == &results[0].images)
+            );
+            let intents = store
+                .records()
+                .iter()
+                .filter_map(|record| match record {
+                    Record::ToolStarted {
+                        run_id,
+                        tool_call_id,
+                        tool_name,
+                        effective_args,
+                        ..
+                    } if run_id == &accepted.run_id => {
+                        Some((tool_call_id, tool_name, effective_args))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(intents.len(), 1);
+            assert_eq!(intents[0].0, "reused-call");
+            assert_eq!(intents[0].1, name);
+            let mut expected_arguments =
+                serde_json::from_str::<serde_json::Value>(&arguments).unwrap();
+            if dyn_form {
+                expected_arguments["cwd"] = directory.path().to_string_lossy().into_owned().into();
+            }
+            assert_eq!(intents[0].2, &expected_arguments);
+        }
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].session_id, observed[1].session_id);
+        assert_ne!(observed[0].run_id, observed[1].run_id);
+        assert_ne!(
+            observed[0].assistant_entry_id,
+            observed[1].assistant_entry_id
+        );
+        assert_ne!(observed[0].result_entry_id, observed[1].result_entry_id);
     }
 }
 
@@ -2964,6 +3176,81 @@ mod compaction_sync_tests {
         fn provider_kind(&self, _: &str) -> &'static str {
             "test"
         }
+    }
+
+    #[tokio::test]
+    async fn failed_tool_result_commit_stops_provider_and_preserves_unfinished_intent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        std::fs::write(directory.path().join("proof.rs"), "evidence").unwrap();
+        let provider = Arc::new(ProjectMemoryProvider {
+            requests: Mutex::new(Vec::new()),
+            update: Some(serde_json::json!({"action":"remember", "key":"commit-proof", "content":"Physical tool execution happened.", "sources":[{"path":"proof.rs", "sha256":crate::durable::sha256_hex(b"evidence")}]}).to_string()),
+        });
+        let mut agent = CodingAgent::new_with_provider(
+            CodingAgentOptions {
+                api_key: "test-key".into(),
+                account_id: None,
+                model: "test-model".into(),
+                work_dir: directory.path().to_owned(),
+                session_file: Some(path.clone()),
+                system_prompt: SystemPromptConfig::default(),
+                agent_config: None,
+                coding_config: None,
+                browser: BrowserBridge::unavailable(),
+            },
+            provider.clone(),
+        );
+        let mut events = agent.subscribe();
+        let accepted = agent
+            .begin_harness_run(AgentMessage::user("Remember a fact", vec![]))
+            .await
+            .unwrap()
+            .unwrap();
+        agent.agent.tool_dispatcher.tool_completion_recorder = Some(Arc::new(|result| {
+            assert!(!result.is_error, "{}", result.content);
+            Box::pin(async { Err("injected result journal failure".into()) })
+        }));
+        agent.execute_accepted_run(&accepted).await.unwrap();
+        assert_eq!(provider.requests.lock().unwrap().len(), 1);
+        assert!(directory.path().join(".threadlane/memory.json").exists());
+        assert!(!agent
+            .agent
+            .messages()
+            .await
+            .iter()
+            .any(|message| matches!(message, AgentMessage::Tool { .. })));
+        let mut failures = 0;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                threadlane_protocol::AgentEvent::AgentError { error } => {
+                    assert!(error.contains("injected result journal failure"), "{error}");
+                    failures += 1;
+                }
+                threadlane_protocol::AgentEvent::ToolExecutionEnd { .. }
+                | threadlane_protocol::AgentEvent::TurnEnd { .. } => {
+                    panic!("uncommitted completion was published")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(failures, 1);
+        drop(agent);
+        let store = JsonlStore::open_read_only(&path).unwrap();
+        let (_, tool) = store
+            .tool_state_for_call(&accepted.run_id, "memory-1")
+            .unwrap();
+        assert!(!tool.completed);
+        assert!(store.entry(&tool.result_entry_id).is_none());
+        assert_eq!(
+            store.open_operation_lane(&accepted.run_id).unwrap().0,
+            "main"
+        );
+        assert!(!store
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry.message, AgentMessage::Tool { .. })));
+        assert!(!store.records().iter().any(|record| matches!(record, Record::ToolFinished { run_id, .. } if run_id == &accepted.run_id)));
     }
 
     fn memory_messages(messages: &[AgentMessage]) -> Vec<&str> {

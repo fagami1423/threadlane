@@ -338,14 +338,30 @@ pub fn read_transcript_page(
 }
 
 fn complete_jsonl_end(file: &mut fs::File, path: &Path, end: u64) -> io::Result<u64> {
+    let Some((tail_start, tail)) = read_unterminated_tail(file, end)? else {
+        return Ok(end);
+    };
+    if parse_transcript_line(path, tail_start, &tail, true)?.is_some() {
+        Ok(end)
+    } else {
+        Ok(tail_start)
+    }
+}
+
+/// Normal appends and transcript reads inspect one byte. Recovery scans the
+/// entire last line, since valid records can exceed a single probe window.
+fn read_unterminated_tail(
+    file: &mut (impl Read + Seek),
+    end: u64,
+) -> io::Result<Option<(u64, Vec<u8>)>> {
     if end == 0 {
-        return Ok(0);
+        return Ok(None);
     }
     file.seek(SeekFrom::Start(end - 1))?;
     let mut final_byte = [0];
     file.read_exact(&mut final_byte)?;
     if final_byte[0] == b'\n' {
-        return Ok(end);
+        return Ok(None);
     }
     let mut scan_end = end;
     let tail_start = loop {
@@ -364,11 +380,7 @@ fn complete_jsonl_end(file: &mut fs::File, path: &Path, end: u64) -> io::Result<
     let mut tail = vec![0; (end - tail_start) as usize];
     file.seek(SeekFrom::Start(tail_start))?;
     file.read_exact(&mut tail)?;
-    if parse_transcript_line(path, tail_start, &tail, true)?.is_some() {
-        Ok(end)
-    } else {
-        Ok(tail_start)
-    }
+    Ok(Some((tail_start, tail)))
 }
 
 fn parse_transcript_line(
@@ -725,6 +737,16 @@ impl JsonlStore {
         self.reduction.has_tool_started(run_id, tool_call_id)
     }
 
+    /// The canonical committed tool slot, including its owning lane. Uses the
+    /// same incremental index as `has_tool_started`, including after reload.
+    pub fn tool_state_for_call(
+        &self,
+        run_id: &str,
+        tool_call_id: &str,
+    ) -> Option<(&str, &super::types::ToolState)> {
+        self.reduction.tool_state_for_call(run_id, tool_call_id)
+    }
+
     /// Latest entry on `lane` whose message equals `message`.
     pub fn find_entry_by_message(
         &self,
@@ -748,6 +770,24 @@ impl JsonlStore {
             .and_then(|id| self.entry(id))
     }
 
+    /// Lane and start sequence of a committed, currently open operation.
+    /// Uses the incremental projection without cloning or scanning history.
+    pub fn open_operation_lane(&self, run_id: &str) -> Option<(&str, u64)> {
+        self.reduction.open_operation_lane(run_id)
+    }
+
+    /// Latest declaration for this call in the owning operation. A matching
+    /// call ID on another lane or before this run started is not its identity.
+    pub fn assistant_entry_for_run_call(
+        &self,
+        run_id: &str,
+        tool_call_id: &str,
+    ) -> Option<&Entry> {
+        let (lane, start_seq) = self.open_operation_lane(run_id)?;
+        self.assistant_entry_for_call(Some(lane), tool_call_id)
+            .filter(|entry| entry.seq > start_seq)
+    }
+
     /// Latest assistant entry on `lane`.
     pub fn last_assistant_entry(&self, lane: &str) -> Option<&Entry> {
         self.reduction
@@ -762,6 +802,9 @@ impl SessionStore for JsonlStore {
     }
     fn reduced_state(&self) -> Option<super::types::ReducedState> {
         Some(self.reduced_state())
+    }
+    fn open_operation_lane(&self, run_id: &str) -> Option<(&str, u64)> {
+        JsonlStore::open_operation_lane(self, run_id)
     }
     fn next_sequence(&self) -> u64 {
         self.next_seq()
@@ -1213,28 +1256,11 @@ fn append_session_json_line_with_policy<T: serde::Serialize>(
 
 fn prepare_append_boundary(file: &mut fs::File) -> io::Result<()> {
     let len = file.metadata()?.len();
-    if len == 0 {
+    let Some((_, tail_line)) = read_unterminated_tail(file, len)? else {
         return Ok(());
-    }
-    // Hot-path fix: only inspect the tail instead of reading the whole file.
-    const TAIL_PROBE: u64 = 64 * 1024;
-    let probe_len = len.min(TAIL_PROBE);
-    file.seek(SeekFrom::End(-(probe_len as i64)))?;
-    let mut tail_buf = vec![0u8; probe_len as usize];
-    file.read_exact(&mut tail_buf)?;
-    if tail_buf.last() == Some(&b'\n') {
-        return Ok(());
-    }
-    let tail_line = tail_buf
-        .rsplit(|byte| *byte == b'\n')
-        .next()
-        .unwrap_or(&tail_buf);
-    // If the probe window truncated a long line (no newline in window but
-    // file is larger), still quarantine: a missing trailing newline means
-    // the previous write did not finish cleanly.
-    let truncated = !tail_buf.contains(&b'\n') && len > probe_len;
-    let payload = atomic_frame_payload(tail_line).unwrap_or(tail_line);
-    if truncated || serde_json::from_slice::<serde_json::Value>(payload).is_err() {
+    };
+    let payload = atomic_frame_payload(&tail_line).unwrap_or(&tail_line);
+    if serde_json::from_slice::<serde_json::Value>(payload).is_err() {
         // Quarantine any torn tail (atomic fragment or torn single-line
         // JSON) so the next strict read can skip it instead of bricking
         // the whole session.
@@ -2848,6 +2874,86 @@ mod tests {
         std::fs::write(&path, entry).unwrap();
         assert_eq!(JsonlStore::open_read_only(&path).unwrap().entries().len(), 1);
         assert_eq!(read_transcript_page(&path, None, 1).unwrap().messages().len(), 1);
+    }
+
+    #[test]
+    fn terminated_tail_probe_reads_only_one_byte() {
+        struct Probe(std::io::Cursor<Vec<u8>>);
+        impl std::io::Read for Probe {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                assert_eq!(bytes.len(), 1, "normal probes must not scan the journal");
+                std::io::Read::read(&mut self.0, bytes)
+            }
+        }
+        impl std::io::Seek for Probe {
+            fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+                std::io::Seek::seek(&mut self.0, position)
+            }
+        }
+        let mut bytes = vec![b'x'; 128 * 1024];
+        bytes.push(b'\n');
+        let len = bytes.len() as u64;
+        let mut probe = Probe(std::io::Cursor::new(bytes));
+        assert!(super::read_unterminated_tail(&mut probe, len)
+            .unwrap()
+            .is_none());
+        assert!(super::read_unterminated_tail(&mut probe, 0)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn long_unterminated_tail_survives_the_next_append() {
+        let entry = transcript_entry(1, assistant("result 🦀".repeat(20_000)));
+        for atomic in [false, true] {
+            let mut encoded = if atomic {
+                let frame = AtomicBatchLine {
+                    atomic_batch: vec![AtomicBatchItem::Entry(entry.clone())],
+                };
+                let mut bytes = ATOMIC_FRAME_SENTINEL.as_bytes().to_vec();
+                bytes.extend(serde_json::to_vec(&frame).unwrap());
+                bytes
+            } else {
+                serde_json::to_vec(&entry).unwrap()
+            };
+            assert!(encoded.len() > 64 * 1024);
+            for torn in [false, true] {
+                if torn {
+                    // Include a cut inside UTF-8, well beyond the old probe window.
+                    let cut = encoded.iter().rposition(|byte| *byte == 0xa6).unwrap();
+                    encoded.truncate(cut);
+                }
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("long-tail.jsonl");
+                std::fs::write(&path, &encoded).unwrap();
+                let mut store = JsonlStore::open(&path).unwrap();
+                assert_eq!(store.entries().len(), usize::from(!torn));
+                if atomic {
+                    store
+                        .append_actions_atomically(&[EffectAction::AppendEntry {
+                            entry: user_entry("after", "main"),
+                        }])
+                        .unwrap();
+                } else {
+                    store.append_entry(user_entry("after", "main")).unwrap();
+                }
+                drop(store);
+                let durable = std::fs::read(&path).unwrap();
+                assert!(durable.starts_with(&encoded));
+                let reloaded = JsonlStore::open(&path).unwrap();
+                assert_eq!(reloaded.entries().len(), 1 + usize::from(!torn));
+                if !torn {
+                    assert_eq!(reloaded.entries()[0], entry);
+                }
+                assert_eq!(
+                    read_transcript_page(&path, None, 2)
+                        .unwrap()
+                        .messages()
+                        .len(),
+                    1 + usize::from(!torn),
+                );
+            }
+        }
     }
 
     #[test]
