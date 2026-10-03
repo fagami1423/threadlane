@@ -264,13 +264,14 @@ impl WorkspaceView {
         };
         let state = self.model.read(cx);
         let Some((work_dir, targets)) = conversation_search_scope(state) else {
-            // No attached project: hand back to Commands mode on next render.
-            self.conversation_search = None;
+            // No attached project: run the same cleanup as a manual exit so
+            // the scan cancels and the palette resets to Commands mode.
+            self.exit_conversation_search_deferred(cx);
             cx.notify();
             return;
         };
         if work_dir != search.work_dir {
-            self.conversation_search = None;
+            self.exit_conversation_search_deferred(cx);
             cx.notify();
             return;
         }
@@ -289,6 +290,25 @@ impl WorkspaceView {
                 });
             });
         }
+    }
+
+    /// `invalidate_conversation_search` runs inside a model observer without
+    /// a window, so the CommandState reset hops through the window handle.
+    fn exit_conversation_search_deferred(&mut self, cx: &mut Context<Self>) {
+        let Some(search) = self.conversation_search.take() else {
+            return;
+        };
+        search.cancelled.store(true, Ordering::Relaxed);
+        let command_state = self.command_state.clone();
+        let window_handle = self.window_handle;
+        cx.defer(move |cx| {
+            let _ = window_handle.update(cx, |_, window, cx| {
+                command_state.update(cx, |state, cx| {
+                    state.set_loading(false, window, cx);
+                    state.set_query("", window, cx);
+                });
+            });
+        });
     }
 
     /// Confirm a search row: only rows tagged with the current
@@ -329,6 +349,9 @@ impl WorkspaceView {
             cx.notify();
         });
         self.chat_list.update(cx, |chat, cx| {
+            // The handoff only lands on the Chat tab; switch there first so a
+            // palette confirmed from Editor still reaches the destination.
+            chat.set_tab(threadlane_ui_chat::CentralTab::Chat, cx);
             chat.begin_conversation_find_handoff(
                 ConversationFindHandoff {
                     work_dir,

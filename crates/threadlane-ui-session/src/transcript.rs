@@ -128,7 +128,7 @@ impl TranscriptState {
         } else if working_changed {
             self.list.splice(new_row_count..old_row_count, 0);
         } else if prepended {
-            self.list.splice(0..0, new_row_count - old_message_count);
+            self.list.splice(0..0, new_row_count - old_row_count);
         } else if appended {
             self.list
                 .splice(old_row_count..old_row_count, new_row_count - old_row_count);
