@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -205,6 +205,11 @@ enum PtyEvent {
     Frame(TerminalFrame),
     Closed,
     Error(String),
+    /// Bytes the emulator must write back to the pty. Host-side queries
+    /// (e.g. ConPTY's `ESC[6n` startup probe, which stalls the shell until
+    /// answered) flow through the same parse path as output, so replies ride
+    /// this event to the session's writer.
+    ReplyToHost(Vec<u8>),
     /// Bounded result descriptors for one find generation. `revealed` is set
     /// only when this reply also moved the viewport (settled query or
     /// navigation), so the view can trust it as the selected match.
@@ -407,6 +412,10 @@ fn start_parser_worker(
             // channel instead of exiting with the shell.
             let mut output_disconnected = false;
             let mut link_epoch = 0;
+            // Tail bytes carried across reads so a host query split between
+            // two chunks still matches (a 4-byte sequence needs a 3-byte
+            // carry).
+            let mut query_tail: Vec<u8> = Vec::with_capacity(3);
 
             loop {
                 let mut commands_open = true;
@@ -580,6 +589,11 @@ fn start_parser_worker(
                         parsed_bytes = parsed_bytes.saturating_add(bytes.len());
                         saturated = terminal_parse_budget_exhausted(parsed_bytes, parse_budget);
                         parser.process(&bytes);
+                        for reply in terminal_host_replies(&mut query_tail, &bytes, &parser) {
+                            if event_tx.send(PtyEvent::ReplyToHost(reply)).is_err() {
+                                break;
+                            }
+                        }
                         // vt100 bumps the view offset as rows scroll into
                         // history, so the visible content stays put.
                         if find.is_some() && find_rescan_at.is_none() {
@@ -608,6 +622,28 @@ fn start_parser_worker(
             }
         })?;
     Ok((output_tx, command_tx))
+}
+
+/// Status queries the pty host expects the emulator to answer, as raw reply
+/// bytes. `ESC[5n` gets a generic "operating normally" (`ESC[0n`); `ESC[6n`
+/// gets the parser's live cursor position as a CPR report. `tail` carries up
+/// to three trailing bytes into the next chunk so a query split across reads
+/// still matches — it can never double-report, since it is shorter than the
+/// four-byte sequences it feeds.
+fn terminal_host_replies(tail: &mut Vec<u8>, bytes: &[u8], parser: &vt100::Parser) -> Vec<Vec<u8>> {
+    let mut haystack = std::mem::take(tail);
+    haystack.extend_from_slice(bytes);
+    let mut replies = Vec::new();
+    for window in haystack.windows(4) {
+        if window == b"\x1b[5n" {
+            replies.push(b"\x1b[0n".to_vec());
+        } else if window == b"\x1b[6n" {
+            let (row, col) = parser.screen().cursor_position();
+            replies.push(format!("\x1b[{};{}R", row + 1, col + 1).into_bytes());
+        }
+    }
+    tail.extend_from_slice(&haystack[haystack.len().saturating_sub(3)..]);
+    replies
 }
 
 fn selection_bounds(
@@ -1083,6 +1119,11 @@ impl TerminalView {
                     }
                 }
             }
+            PtyEvent::ReplyToHost(bytes) => {
+                if let Some(session) = &self.session {
+                    session.write(&bytes);
+                }
+            }
             PtyEvent::Closed => {
                 if self.session.is_some() {
                     self.status = Some("Shell exited. Select Restart to open a new shell.".into());
@@ -1391,8 +1432,12 @@ impl TerminalView {
             if self.alt_screen {
                 return menu.label("Links unavailable in full-screen terminal applications");
             }
-            if !cfg!(target_os = "macos") {
-                menu = menu.label("Threadlane browser is available on macOS only");
+            if cfg!(not(any(
+                target_os = "macos",
+                target_os = "linux",
+                target_os = "windows"
+            ))) {
+                menu = menu.label("Threadlane browser is not available on this platform");
             }
             if let Some(url) = &self.retry_url {
                 menu = menu.label("Navigation could not start — retry or open externally");
@@ -2555,6 +2600,18 @@ impl Render for TerminalView {
     }
 }
 
+/// `std::fs::canonicalize` returns verbatim `\\?\` paths on Windows, which
+/// children (cmd.exe most visibly) cannot use as a working directory, so
+/// downgrade the common drive-letter form back to a plain path.
+#[cfg(windows)]
+fn simplified_cwd(path: &Path) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    match text.strip_prefix("\\\\?\\") {
+        Some(rest) if rest.len() >= 2 && rest.as_bytes()[1] == b':' => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
 fn spawn_shell(
     project: &PathBuf,
     rows: u16,
@@ -2568,11 +2625,37 @@ fn spawn_shell(
         pixel_width: 0,
         pixel_height: 0,
     })?;
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    // On Windows, POSIX-style `SHELL` values (e.g. `/bin/sh` inherited
+    // from Git Bash or MSYS) are not spawnable via CreateProcess, so only
+    // honor `SHELL`/`COMSPEC` when they point at a real executable.
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|shell| !cfg!(windows) || Path::new(shell).exists())
+        .or_else(|| {
+            if cfg!(windows) {
+                std::env::var("COMSPEC")
+                    .ok()
+                    .filter(|comspec| !comspec.is_empty() && Path::new(comspec).exists())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "cmd.exe".into()
+            } else {
+                "/bin/sh".into()
+            }
+        });
     let mut command = CommandBuilder::new(shell);
+    #[cfg(windows)]
+    command.cwd(simplified_cwd(project));
+    #[cfg(not(windows))]
     command.cwd(project);
     command.env("TERM", "xterm-256color");
-    command.arg("-i");
+    if !cfg!(windows) {
+        command.arg("-i");
+    }
 
     let child = pair.slave.spawn_command(command)?;
     let mut reader = pair.master.try_clone_reader()?;

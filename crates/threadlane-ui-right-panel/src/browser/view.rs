@@ -1,10 +1,9 @@
-//! Embedded browser surface for the right panel (macOS only).
+//! Embedded browser surface for the right panel.
 //!
-//! Thin wrapper over `wry`: real `WKWebView`s reparented into GPUI window
-//! composition surfaces (see `webview.rs`), so deferred overlays — dialogs,
-//! sheets, menus, tooltips, notifications — paint above the page. Safari-style
-//! address bar, multiple tabs, and a click-to-annotate picker whose picks land
-//! in the chat composer.
+//! Thin wrapper over `wry`: native webviews hosted per platform (see
+//! `webview.rs` — WKWebView on macOS, WebKitGTK on Linux/X11, WebView2 on
+//! Windows). Safari-style address bar, multiple tabs, and a click-to-annotate
+//! picker whose picks land in the chat composer.
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -141,6 +140,23 @@ impl BrowserView {
             let wry_webview = builder.build_as_child(&window_handle).map_err(|_| {
                 "Browser could not start. Retry Open link… or choose Open in default browser."
                     .to_string()
+            })?;
+            cx.new(|cx| super::webview::ComposedWebView::new(wry_webview, window, cx))
+        };
+
+        // On Windows the WebView2 controller is a child HWND of the GPUI
+        // window — composition surfaces are DirectComposition visuals an
+        // HWND can't join, so there is no reparenting step.
+        #[cfg(target_os = "windows")]
+        let webview = {
+            use raw_window_handle::HasWindowHandle;
+
+            let window_handle = HasWindowHandle::window_handle(window)
+                .map_err(|_| "Browser window is unavailable. Retry Open link…".to_string())?;
+            let wry_webview = builder.build_as_child(&window_handle).map_err(|error| {
+                format!(
+                    "Browser could not start. Retry Open link… or choose Open in default browser. ({error})"
+                )
             })?;
             cx.new(|cx| super::webview::ComposedWebView::new(wry_webview, window, cx))
         };
@@ -541,6 +557,51 @@ impl BrowserView {
         Ok(rx)
     }
 
+    /// Capture the rendered viewport as PNG bytes with width and height.
+    /// `crop` is an optional `[x, y, w, h]` rect in view points; `None`
+    /// snapshots the whole viewport. Screenshots go through the DevTools
+    /// protocol because `wry` exposes no `CapturePreview` wrapper; the reply
+    /// is base64 PNG data.
+    #[cfg(target_os = "windows")]
+    pub fn take_snapshot(
+        &self,
+        crop: Option<[f64; 4]>,
+        cx: &App,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(Vec<u8>, u32, u32), String>>, String> {
+        use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
+        use wry::WebViewExtWindows as _;
+
+        let webview = self
+            .active_webview()
+            .ok_or_else(|| "The browser has no active tab.".to_string())?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+        let wv2 = webview.read(cx).raw().webview();
+
+        let handler =
+            CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |result, json| {
+                let res = result
+                    .map_err(|error| format!("WebView2 screenshot failed: {error}"))
+                    .and_then(|()| decode_capture_response(&json))
+                    .and_then(|image| encode_cropped_png(&image, crop));
+                if let Ok(mut slot) = tx.lock() {
+                    if let Some(tx) = slot.take() {
+                        let _ = tx.send(res);
+                    }
+                }
+                Ok(())
+            }));
+        unsafe {
+            wv2.CallDevToolsProtocolMethod(
+                windows_core::w!("Page.captureScreenshot"),
+                windows_core::w!(r#"{"format":"png","captureBeyondViewport":false}"#),
+                &handler,
+            )
+            .map_err(|error| format!("WebView2 screenshot failed to start: {error}"))?;
+        }
+        Ok(rx)
+    }
+
     pub fn go_back(&mut self, cx: &mut Context<Self>) {
         if let Some(webview) = self.active_webview() {
             webview.update(cx, |view, _| {
@@ -777,10 +838,10 @@ impl BrowserView {
             if let Some(snapshot) = snapshot {
                 if let Ok(Ok((bytes, _, _))) = snapshot.await {
                     if !bytes.is_empty() {
-                        // macOS snapshots are JPEG, Linux ones PNG.
+                        // macOS snapshots are JPEG, Linux/Windows ones PNG.
                         #[cfg(target_os = "macos")]
                         let (ext, mime) = ("jpg", "image/jpeg");
-                        #[cfg(target_os = "linux")]
+                        #[cfg(not(target_os = "macos"))]
                         let (ext, mime) = ("png", "image/png");
                         images.push(threadlane_protocol::ImageAttachment {
                             display_name: format!("browser-annotation.{ext}"),
@@ -1234,6 +1295,53 @@ fn snapshot_to_png(
     let mut bytes = Vec::new();
     image
         .write_to_png(&mut bytes)
+        .map_err(|error| format!("Snapshot PNG encode failed: {error}"))?;
+    Ok((bytes, width, height))
+}
+
+/// Decode the base64 PNG inside a `Page.captureScreenshot` JSON reply.
+#[cfg(target_os = "windows")]
+fn decode_capture_response(json: &str) -> Result<image::DynamicImage, String> {
+    let data = serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("data")
+                .and_then(|data| data.as_str())
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| "WebView2 screenshot returned no image data.".to_string())?;
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &data)
+        .map_err(|error| format!("WebView2 screenshot data is not base64: {error}"))?;
+    image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+        .map_err(|error| format!("WebView2 screenshot is not a PNG: {error}"))
+}
+
+/// Re-encode a screenshot as PNG, cropped to `crop` (`[x, y, w, h]` in the
+/// screenshot's pixel space) when given. Out-of-bounds rects are clamped.
+#[cfg(target_os = "windows")]
+fn encode_cropped_png(
+    image: &image::DynamicImage,
+    crop: Option<[f64; 4]>,
+) -> Result<(Vec<u8>, u32, u32), String> {
+    let image = match crop {
+        Some([x, y, w, h]) => {
+            let left = x.round().max(0.).min(image.width() as f64 - 1.) as u32;
+            let top = y.round().max(0.).min(image.height() as f64 - 1.) as u32;
+            let width = w.round().max(1.).min(image.width() as f64 - left as f64) as u32;
+            let height = h.round().max(1.).min(image.height() as f64 - top as f64) as u32;
+            image.crop_imm(left, top, width, height)
+        }
+        None => image.clone(),
+    };
+    let width = image.width().max(1);
+    let height = image.height().max(1);
+    let mut bytes = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
         .map_err(|error| format!("Snapshot PNG encode failed: {error}"))?;
     Ok((bytes, width, height))
 }

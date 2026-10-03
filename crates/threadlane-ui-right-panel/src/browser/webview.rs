@@ -15,6 +15,11 @@
 //!   cannot host a GTK view — callers get a clean error. GTK has no main loop
 //!   here, so a pump task drains `gtk::main_iteration_do` on a timer; without
 //!   it the webview never draws or answers IPC.
+//! - Windows: `lb-wry` builds the WebView2 controller as a child `HWND` of
+//!   the GPUI window. GPUI's composition surfaces are `IDCompositionVisual`s,
+//!   which an `HWND`-hosted webview cannot join, so the browser stays in the
+//!   direct-child fallback: GPUI overlays clip against the page's bounds
+//!   instead of painting above it.
 
 use std::rc::Rc;
 
@@ -221,6 +226,18 @@ impl ComposedWebView {
             focus_handle: cx.focus_handle(),
             webview: Rc::new(webview),
             surface,
+        }
+    }
+
+    /// Wraps a WebView2 controller already built as a child `HWND` of the
+    /// GPUI window. `wry`'s `focus_parent` `SetFocus`es that `HWND`, so
+    /// keyboard input returns to GPUI without extra bookkeeping.
+    #[cfg(target_os = "windows")]
+    pub fn new(webview: wry::WebView, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self {
+            focus_handle: cx.focus_handle(),
+            webview: Rc::new(webview),
+            surface: None,
         }
     }
 

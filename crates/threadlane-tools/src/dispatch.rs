@@ -449,14 +449,27 @@ pub fn try_execute_tool_in_workspace_with(
                 return execute_dyn_cli(dyn_args, &validated_cwd);
             }
 
-            let mut cmd = Command::new("sh");
-            cmd.arg("-c").arg(cmd_str);
-            cmd.current_dir(&validated_cwd);
-            if let Some(target_dir) = worktree_cargo_target_dir(workspace_root) {
-                cmd.env("CARGO_TARGET_DIR", target_dir);
-            }
+            let build_command = |program: &str, flag: &str| {
+                let mut cmd = Command::new(program);
+                cmd.arg(flag).arg(cmd_str);
+                cmd.current_dir(&validated_cwd);
+                if let Some(target_dir) = worktree_cargo_target_dir(workspace_root) {
+                    cmd.env("CARGO_TARGET_DIR", target_dir);
+                }
+                cmd
+            };
+            let output = build_command("sh", "-c").output();
+            // Git-for-Windows `sh` is not on PATH outside Git Bash; fall back
+            // to cmd.exe so run_command still works in a plain Windows env.
+            #[cfg(target_os = "windows")]
+            let output = output.or_else(|error| {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(error);
+                }
+                build_command("cmd.exe", "/C").output()
+            });
 
-            match cmd.output() {
+            match output {
                 Ok(output) => {
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     let stderr = String::from_utf8_lossy(&output.stderr);

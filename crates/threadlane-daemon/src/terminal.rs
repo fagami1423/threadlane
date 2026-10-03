@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,18 @@ const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
 const OUTPUT_FLUSH_WINDOW: Duration = Duration::from_millis(12);
 /// Reader drain size; matches the client's terminal read chunk.
 const READ_CHUNK_BYTES: usize = 8192;
+
+/// `std::fs::canonicalize` returns verbatim `\\?\` paths on Windows, which
+/// children (cmd.exe most visibly) cannot use as a working directory, so
+/// downgrade the common drive-letter form back to a plain path.
+#[cfg(windows)]
+fn simplified_cwd(path: &Path) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    match text.strip_prefix("\\\\?\\") {
+        Some(rest) if rest.len() >= 2 && rest.as_bytes()[1] == b':' => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
+}
 
 struct PtyHandle {
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -76,14 +88,32 @@ impl TerminalManager {
                 pixel_height: 0,
             })
             .map_err(|error| format!("could not open pty: {error}"))?;
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| {
-            if cfg!(windows) {
-                "cmd.exe".into()
-            } else {
-                "/bin/sh".into()
-            }
-        });
+        // On Windows, POSIX-style `SHELL` values (e.g. `/bin/sh` inherited
+        // from Git Bash or MSYS) are not spawnable via CreateProcess, so only
+        // honor `SHELL`/`COMSPEC` when they point at a real executable.
+        let shell = std::env::var("SHELL")
+            .ok()
+            .filter(|shell| !cfg!(windows) || Path::new(shell).exists())
+            .or_else(|| {
+                if cfg!(windows) {
+                    std::env::var("COMSPEC")
+                        .ok()
+                        .filter(|comspec| !comspec.is_empty() && Path::new(comspec).exists())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                if cfg!(windows) {
+                    "cmd.exe".into()
+                } else {
+                    "/bin/sh".into()
+                }
+            });
         let mut command = CommandBuilder::new(shell);
+        #[cfg(windows)]
+        command.cwd(simplified_cwd(cwd));
+        #[cfg(not(windows))]
         command.cwd(cwd);
         command.env("TERM", "xterm-256color");
         if !cfg!(windows) {

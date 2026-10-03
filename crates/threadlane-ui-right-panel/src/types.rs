@@ -120,7 +120,7 @@ pub enum Surface {
 impl Surface {
     pub(crate) fn all() -> Vec<Self> {
         let mut surfaces = vec![Self::Trajectory, Self::Agents, Self::Review, Self::Files];
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         surfaces.push(Self::Browser);
         surfaces
     }

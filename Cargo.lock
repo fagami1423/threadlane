@@ -8745,6 +8745,7 @@ dependencies = [
  "gpui-component",
  "gpui-pre",
  "gtk",
+ "image",
  "lb-wry",
  "objc2 0.6.4",
  "objc2-core-foundation",
@@ -8764,6 +8765,8 @@ dependencies = [
  "tokio",
  "tracing",
  "webkit2gtk",
+ "webview2-com",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
