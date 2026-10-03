@@ -12,6 +12,7 @@ pub mod orchestration;
 pub mod repo;
 pub mod projection;
 pub mod tool;
+pub mod transcript;
 
 pub use acp::{
     apply_pending_config_values, config_option_for, AcpConfigOption, AcpConfigOptionChoice,

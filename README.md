@@ -53,6 +53,31 @@ requires a connected protocol-v6 daemon and never falls back to client disk.
 Changing project, session, checkout, or daemon invalidates the dialog; reopen it
 for the new scope. Refresh / Retry reruns a failed or outdated search.
 
+## Search project conversations
+
+Choose **Search project conversations…** in the workspace command palette; with
+no attached project it stays disabled with the reason "Select a project first."
+Type a literal, case-insensitive query of at least two non-whitespace
+characters. The palette switches into a dedicated mode that lists one row per
+matching session — title, project/branch context, and a bounded plain-text
+excerpt from that session's first chronologically matching message — ordered by
+session recency.
+
+Search reads saved user and assistant message text across the attached
+project's discovered sessions only: no other projects, no tool output,
+reasoning, composer drafts, or pending queue text, and no model calls,
+persistent index, or background indexing. Confirming a row selects that
+session, waits for its transcript to load, seeds the existing **Find in
+conversation** strip with the same query, and navigates to the first current
+match recomputed in that destination. Escape cancels and restores focus;
+leaving the Chat tab or switching sessions drops a pending handoff.
+
+Missing, unreadable, corrupt, or oversized transcripts never count as "no
+matches" — the footer reports scanned/total coverage and each skipped
+category, capped scans say so, and the last row offers a retry. Scans stop at
+100 conversation results, 32 MiB per session file, 256 MiB total reads, or five
+seconds of work.
+
 ## Quick Start
 
 ### Prerequisites

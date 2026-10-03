@@ -11,7 +11,7 @@ mod transcript;
 mod view;
 
 pub use trajectory_view::TrajectoryView;
-pub use view::{init, CentralTab, ChatListView};
+pub use view::{init, CentralTab, ChatListView, ConversationFindHandoff};
 
 // Owned by the surface that offers it; the workspace handles panel navigation.
 gpui::actions!(
