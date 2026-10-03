@@ -153,15 +153,17 @@ mod linux {
         window_xid(window).and_then(foreign_window)
     }
 
-    /// GTK initialisation, once per process. `GDK_BACKEND=x11` forces GTK to
-    /// open the X11 display even inside a Wayland session, which is what lets
-    /// wry wrap the XID of the XWayland-backed composition surface.
+    /// GTK initialisation, once per process. `set_allowed_backends` forces
+    /// GTK to open the X11 display even inside a Wayland session, which is
+    /// what lets wry wrap the XID of the XWayland-backed composition surface.
     pub fn ensure_gtk_init() -> Result<(), String> {
         static INIT: Once = Once::new();
         static READY: AtomicBool = AtomicBool::new(false);
         INIT.call_once(|| {
+            // `set_var` here would race `getenv` callers on other threads; an
+            // explicit GDK_BACKEND still overrides this, as before.
             if std::env::var_os("GDK_BACKEND").is_none() {
-                unsafe { std::env::set_var("GDK_BACKEND", "x11") };
+                gtk::gdk::set_allowed_backends("x11");
             }
             READY.store(gtk::init().is_ok(), Ordering::SeqCst);
         });
