@@ -177,6 +177,9 @@ fn qr_grid(data: &str) -> AnyElement {
         // The QR spec requires a quiet zone of ≥4 modules around the
         // code for scanners to detect it reliably.
         .p(px(QR_CELL * 4.0))
+        // Audited exception to theme tokens: scanners need dark modules on a
+        // light field with maximum contrast, and many cannot read inverted
+        // codes, so the QR stays literal black-on-white in every theme.
         .bg(rgb(0xffffff))
         .rounded_md()
         .flex()

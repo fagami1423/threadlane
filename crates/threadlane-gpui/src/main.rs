@@ -95,8 +95,13 @@ fn main() {
                 size(px(1440.0), px(900.0)),
                 cx,
             ))),
+            // Floor below which the shell cannot degrade gracefully: the
+            // workspace already auto-hides the sidebar under ~28rem of center
+            // content, but the 35rem command palette and the titlebar
+            // controls still need room, so never let the window go smaller.
+            window_min_size: Some(size(px(600.0), px(480.0))),
             titlebar: Some(TitlebarOptions {
-                title: Some("Threadlane (GPUI)".into()),
+                title: Some("Threadlane".into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(12.0), px(12.0))),
             }),

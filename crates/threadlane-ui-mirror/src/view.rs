@@ -78,6 +78,28 @@ const PANEL_INITIAL_HEIGHT: Pixels = px(230.0);
 const PANEL_MIN_WIDTH: Pixels = px(200.0);
 const PANEL_MIN_HEIGHT: Pixels = px(140.0);
 
+// Audited exception to "tokens before values": every colour below is painted
+// *over the mirrored screenshot*, whose pixels come from another app and
+// ignore our theme. Theme tokens would make the cursor/caption vanish on a
+// matching backdrop, so these stay fixed high-contrast values, defined once.
+/// Click/drag/scroll marker ink: saturated amber that reads on light and dark pages.
+fn overlay_ink() -> Hsla {
+    hsla(0.13, 0.95, 0.55, 1.0)
+}
+/// Near-black rim around markers and the cursor dot.
+fn overlay_rim(alpha: f32) -> Hsla {
+    hsla(0.0, 0.0, 0.05, alpha)
+}
+/// Near-white fill for the cursor dot, capture flash, and caption text.
+fn overlay_light(alpha: f32) -> Hsla {
+    hsla(0.0, 0.0, 1.0, alpha)
+}
+/// Caption chip backdrop; same intent as the theme scrim, kept local because
+/// this crate must not depend on `threadlane-ui-theme`.
+fn overlay_caption_bg() -> Hsla {
+    hsla(0.0, 0.0, 0.0, 0.62)
+}
+
 /// Drag payload for the top-left resize grip.
 struct ResizeDrag;
 /// Drag payload for moving the panel by its header. The serial is minted per
@@ -751,8 +773,8 @@ fn markers(frame: &LiveFrame, overlays: &[Arc<LiveOverlay>], now: u128) -> Vec<M
 
 fn paint_marker(marker: &Marker, at: Point<Pixels>, scale: f32, window: &mut Window) {
     let fade = 1.0 - marker.progress;
-    let ink = hsla(0.13, 0.95, 0.55, 1.0);
-    let rim = hsla(0.0, 0.0, 0.05, 1.0);
+    let ink = overlay_ink();
+    let rim = overlay_rim(1.0);
     match marker.kind {
         LiveOverlayKind::Click | LiveOverlayKind::DoubleClick => {
             let rings = if marker.kind == LiveOverlayKind::DoubleClick {
@@ -830,10 +852,10 @@ fn paint_marker(marker: &Marker, at: Point<Pixels>, scale: f32, window: &mut Win
 fn paint_cursor(at: Point<Pixels>, window: &mut Window) {
     let radius = px(5.0);
     window.paint_quad(
-        fill(circle(at, radius), hsla(0.0, 0.0, 1.0, 0.95))
+        fill(circle(at, radius), overlay_light(0.95))
             .corner_radii(Corners::all(radius))
             .border_widths(Edges::all(px(1.5)))
-            .border_color(hsla(0.0, 0.0, 0.05, 0.9)),
+            .border_color(overlay_rim(0.9)),
     );
 }
 
@@ -956,7 +978,7 @@ impl Render for MirrorView {
                             window.paint_quad(
                                 outline(
                                     image_bounds,
-                                    hsla(0.0, 0.0, 1.0, 0.9 * strength),
+                                    overlay_light(0.9 * strength),
                                     BorderStyle::Solid,
                                 )
                                 .border_widths(Edges::all(px(3.0))),
@@ -1096,9 +1118,9 @@ impl Render for MirrorView {
                         .px_2()
                         .py_1()
                         .rounded_md()
-                        .bg(hsla(0.0, 0.0, 0.0, 0.62))
+                        .bg(overlay_caption_bg())
                         .text_xs()
-                        .text_color(hsla(0.0, 0.0, 1.0, 0.95))
+                        .text_color(overlay_light(0.95))
                         .child(caption),
                 )
             });

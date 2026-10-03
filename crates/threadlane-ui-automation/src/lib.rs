@@ -382,7 +382,14 @@ impl Render for AutomationsView {
             );
             let page = self.page.min(runs.len().saturating_sub(1) / 25);
             if runs.is_empty() {
-                content = content.child(div().text_color(muted).child("No runs yet"));
+                // Name the way out: an empty history is only useful if it
+                // says how a run gets created.
+                let hint = if selected.is_some() {
+                    "No runs yet. Choose Run now above, or wait for the next scheduled run."
+                } else {
+                    "No runs yet. Runs appear here when an automation fires or you choose Run now."
+                };
+                content = content.child(div().text_color(muted).child(hint));
             }
             for run in runs.iter().skip(page * 25).take(25) {
                 let id = run.id.clone();

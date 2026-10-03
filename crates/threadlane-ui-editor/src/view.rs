@@ -430,7 +430,7 @@ impl EditorView {
                     project_dir.join(relative_path).display(),
                     error
                 );
-                self.set_status(format!("Unable to open {relative_path}: {error}"), true);
+                self.set_status(format!("Couldn't open {relative_path}: {error}. Check that the file still exists and is readable, then open it again from Files."), true);
             }
         }
         cx.notify();
@@ -745,7 +745,7 @@ impl EditorView {
                             file_path.display(),
                             err
                         );
-                        this.set_status(format!("Error saving {file_name}: {err}"), true);
+                        this.set_status(format!("Couldn't save {file_name}: {err}. Your edits are kept — fix the problem and save again."), true);
                     }
                 }
                 cx.notify();
