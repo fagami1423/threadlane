@@ -13,7 +13,7 @@
 
 Threadlane brings project workspaces, persistent conversation sessions, coding-agent execution, and developer tools into one native application. Its Rust workspace includes provider integrations, external ACP agents, MCP support, and sandboxed WASI extensions.
 
-> **Release status:** The release workflow currently builds signed Apple Silicon macOS artifacts. The application also builds and runs on Linux, and CI compiles `threadlane-gpui` on both macOS and Linux.
+> **Release status:** The release workflow currently builds signed Apple Silicon macOS artifacts. The application also builds and runs on Linux, and CI compiles `threadlane-gpui` on both macOS and Linux. The embedded browser works on Linux/X11 via WebKitGTK.
 
 <p align="center">
   <a href="assets/images/threadlane-workspace.png">
@@ -95,8 +95,13 @@ seconds of work.
     libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
     libxcb-xfixes0-dev libxcb-xkb-dev libxcb-randr0-dev \
     libxcb-image0-dev libxcb-icccm4-dev libxcb-keysyms1-dev \
-    libxcb-util-dev libvulkan-dev libasound2-dev
+    libxcb-util-dev libvulkan-dev libasound2-dev \
+    libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev \
+    libjavascriptcoregtk-4.1-dev
   ```
+
+  The GTK/WebKitGTK packages power the embedded browser surface, which currently
+  requires an X11 session (Wayland is not supported yet).
 
 ### Build and run
 

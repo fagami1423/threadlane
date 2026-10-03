@@ -1434,7 +1434,7 @@ impl RightPanelView {
         if self.is_dirty {
             return Err("Save or discard the editor's changes, then retry Open link…".into());
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             let browser = self.ensure_browser(window, cx);
             browser.update(cx, |browser, cx| browser.try_open_tab(url, window, cx))?;
@@ -1443,11 +1443,11 @@ impl RightPanelView {
             browser.update(cx, |browser, cx| browser.focus_address(window, cx));
             Ok(())
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = (url, window, cx);
             Err(
-                "Threadlane browser is available on macOS only. Choose Open in default browser."
+                "Threadlane browser is not supported on this platform. Choose Open in default browser."
                     .into(),
             )
         }
@@ -1489,13 +1489,14 @@ impl RightPanelView {
         if std::fs::create_dir_all(&dir).is_err() {
             return (None, data_url);
         }
+        let ext = snapshot_file_ext(bytes);
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let path = dir.join(format!("browser-{stamp}.jpg"));
+        let path = dir.join(format!("browser-{stamp}.{ext}"));
         let _ = std::fs::write(&path, bytes);
-        let _ = std::fs::write(dir.join("latest-browser.jpg"), bytes);
+        let _ = std::fs::write(dir.join(format!("latest-browser.{ext}")), bytes);
         (Some(path.display().to_string()), data_url)
     }
 
@@ -1507,12 +1508,12 @@ impl RightPanelView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<String, String> {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = (command, window, cx);
-            return Err("The embedded browser is available on macOS only.".to_string());
+            return Err("The embedded browser is not supported on this platform.".to_string());
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             use super::browser::{AddressTarget, resolve_address, search_url};
             use threadlane_protocol::browser::BrowserCommand;
@@ -5805,7 +5806,7 @@ fn start_browser_request(
     panel.ensure_browser(window, cx);
     match command {
         BrowserCommand::Screenshot => {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             {
                 panel.open_surface(Surface::Browser, cx);
                 let Some(browser) = panel.browser.clone() else {
@@ -5816,10 +5817,10 @@ fn start_browser_request(
                     Err(err) => BrowserReply::Ready(Err(err)),
                 }
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {
                 BrowserReply::Ready(Err(
-                    "The embedded browser is available on macOS only.".to_string()
+                    "The embedded browser is not supported on this platform.".to_string()
                 ))
             }
         }
@@ -5926,10 +5927,25 @@ fn finalize_browser_eval(payload: &str) -> String {
     format!("{head}\n[... browser result truncated to {MAX_BROWSER_EVAL_CHARS} characters ...]")
 }
 
+/// WebKitGTK snapshots are PNG, WKWebView's are JPEG — name files and data
+/// URLs after the actual bytes rather than the producing platform.
+fn snapshot_file_ext(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "png"
+    } else {
+        "jpg"
+    }
+}
+
 fn base64_data_url(bytes: &[u8]) -> String {
     use base64::Engine as _;
+    let mime = if snapshot_file_ext(bytes) == "png" {
+        "image/png"
+    } else {
+        "image/jpeg"
+    };
     format!(
-        "data:image/jpeg;base64,{}",
+        "data:{mime};base64,{}",
         base64::engine::general_purpose::STANDARD.encode(bytes)
     )
 }
