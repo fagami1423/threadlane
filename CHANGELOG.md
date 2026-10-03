@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.1.40](https://github.com/wheregmis/threadlane/compare/v0.1.39...v0.1.40) (2026-10-03)
+
+
+### Features
+
+* embedded browser on Linux/X11 via WebKitGTK ([1a25156](https://github.com/wheregmis/threadlane/commit/1a25156ae2617c43da5119c4683674822b04a62e))
+* support Linux as a desktop platform ([57cc3ee](https://github.com/wheregmis/threadlane/commit/57cc3ee6d5c62ab53bb198ef2bad097b118bef5d))
+* support Linux as a desktop platform ([fd47e7d](https://github.com/wheregmis/threadlane/commit/fd47e7dfb8a9d8da2e8776a08c22720c9d66d0af))
+* Windows platform support (browser, terminal, tools) ([d413ab9](https://github.com/wheregmis/threadlane/commit/d413ab9dd57a06ab98cdcbd445f33e561e2441f0))
+* Windows support for app, terminal, and embedded browser ([3919c2b](https://github.com/wheregmis/threadlane/commit/3919c2b26c18d5a7049548d7a7e92f2eb3d57676))
+
+
+### Bug Fixes
+
+* select X11 backend via gdk::set_allowed_backends ([3675994](https://github.com/wheregmis/threadlane/commit/367599416bab1c4f64592dfe5e233fc2105f303b))
+
+
+### CI
+
+* address review — arm64 zip check, installable Linux desktop entry ([f15091c](https://github.com/wheregmis/threadlane/commit/f15091c9865fa8b59a4b75cc63176dbfb31b4953))
+* build Linux and Windows packages in the release workflow ([a4949a3](https://github.com/wheregmis/threadlane/commit/a4949a313b0d42e2732d90efbe0e4154d5d034e1))
+* release packages for Linux and Windows ([cc983da](https://github.com/wheregmis/threadlane/commit/cc983dac291efa0d075d902df3c3a98335da9e77))
+
+
+### Maintenance
+
+* **main:** release 0.1.39 ([08c1ff8](https://github.com/wheregmis/threadlane/commit/08c1ff8e394ee4512ea3c47a0f8a26538b51117d))
+* **main:** release 0.1.39 ([16ee79c](https://github.com/wheregmis/threadlane/commit/16ee79c733bc3df6bbd6a661cfda3d4a5ca65027))
+
 ## [0.1.39](https://github.com/wheregmis/threadlane/compare/v0.1.38...v0.1.39) (2026-10-03)
 
 
