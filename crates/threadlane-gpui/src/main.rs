@@ -61,6 +61,15 @@ fn main() {
         registry.init();
     }
 
+    // GPUI's DirectComposition swapchain sits on a visual created topmost, so
+    // it paints over every child HWND — including the WebView2 the right
+    // panel hosts. Fall back to the HWND swapchain unless the user opted in
+    // to DirectComposition explicitly.
+    #[cfg(target_os = "windows")]
+    if std::env::var_os("GPUI_DISABLE_DIRECT_COMPOSITION").is_none() {
+        std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "1");
+    }
+
     let app = gpui_platform::application().with_assets(Assets);
 
     let shutdown_log = diagnostics.clone();

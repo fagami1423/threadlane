@@ -942,62 +942,66 @@ impl SettingsView {
                             ),
                     ),
             )
-            .child(
-                div()
-                    .rounded_xl()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.title_bar)
-                    .p_4()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(theme.foreground)
-                                            .child("Application updates"),
-                                    )
-                                    .child(
-                                        Tag::new()
-                                            .child(update_status_label)
-                                            .with_variant(TagVariant::Secondary)
-                                            .small(),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .mt_1()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child("Signed native desktop application release channel."),
-                            ),
-                    )
-                    .child(
-                        Button::new("settings-update")
-                            .label(update_action_label)
-                            .accessibility_label(update_action_label)
-                            .tooltip(update_action_label)
-                            .outline()
-                            .small()
-                            .flex_none()
-                            .loading(update_busy)
-                            .disabled(update_busy)
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(crate::ActivateUpdate), cx);
-                            }),
-                    ),
-            )
+            // Update installation only supports a packaged macOS .app bundle;
+            // on Linux and Windows the controls can only fail, so hide them.
+            .when(cfg!(target_os = "macos"), |element| {
+                element.child(
+                    div()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.title_bar)
+                        .p_4()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(theme.foreground)
+                                                .child("Application updates"),
+                                        )
+                                        .child(
+                                            Tag::new()
+                                                .child(update_status_label)
+                                                .with_variant(TagVariant::Secondary)
+                                                .small(),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .mt_1()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("Signed native desktop application release channel."),
+                                ),
+                        )
+                        .child(
+                            Button::new("settings-update")
+                                .label(update_action_label)
+                                .accessibility_label(update_action_label)
+                                .tooltip(update_action_label)
+                                .outline()
+                                .small()
+                                .flex_none()
+                                .loading(update_busy)
+                                .disabled(update_busy)
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(crate::ActivateUpdate), cx);
+                                }),
+                        ),
+                )
+            })
             .child(
                 div()
                     .rounded_xl()

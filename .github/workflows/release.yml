@@ -34,62 +34,99 @@ env:
   RELEASE_TAG: ${{ inputs.release_tag || inputs.tag || github.ref_name }}
 
 jobs:
-#  linux:
-#    name: Linux ${{ matrix.arch }}
-#    strategy:
-#      fail-fast: false
-#      matrix:
-#        include:
-#          - runner: ubuntu-24.04
-#            arch: x86_64
-#          - runner: ubuntu-24.04-arm
-#            arch: aarch64
-#    runs-on: ${{ matrix.runner }}
-#    timeout-minutes: 90
-#    steps:
-#      - uses: actions/checkout@v7
-#        with:
-#          ref: ${{ env.RELEASE_TAG }}
-#
-#      - uses: dtolnay/rust-toolchain@1.95.0
-#
-#      - name: Verify release tag
-#        shell: bash
-#        run: |
-#          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "threadlane-gpui") | .version')
-#          if [[ "$RELEASE_TAG" != "v$version" ]]; then
-#            echo "::error::Tag $RELEASE_TAG does not match threadlane-gpui version v$version"
-#            exit 1
-#          fi
-#
-#      - uses: Swatinem/rust-cache@v2
-#        with:
-#          key: gpui-release-${{ matrix.arch }}
-#
-#      - name: Install Linux dependencies
-#        run: |
-#          sudo apt-get update
-#          sudo apt-get install --yes \
-#            clang \
-#            cmake \
-#            libasound2-dev \
-#            libfontconfig-dev \
-#            libssl-dev \
-#            libvulkan1 \
-#            libwayland-dev \
-#            libx11-xcb-dev \
-#            libxkbcommon-x11-dev \
-#            pkg-config \
-#            xdg-desktop-portal
-#
-#      - name: Bundle
-#        run: ./scripts/bundle-gpui-linux.sh
-#
-#      - uses: actions/upload-artifact@v7.0.1
-#        with:
-#          name: linux-${{ matrix.arch }}
-#          path: target/release/threadlane-*.tar.gz
-#          if-no-files-found: error
+  linux:
+    name: Linux ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Verify release tag
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "threadlane-gpui") | .version')
+          if [[ "$RELEASE_TAG" != "v$version" ]]; then
+            echo "::error::Tag $RELEASE_TAG does not match threadlane-gpui version v$version"
+            exit 1
+          fi
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gpui-release-linux-${{ matrix.arch }}
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config libssl-dev cmake libclang-dev \
+            libfontconfig-dev libwayland-dev wayland-protocols \
+            libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxcb-xkb-dev libxcb-randr0-dev \
+            libxcb-image0-dev libxcb-icccm4-dev libxcb-keysyms1-dev \
+            libxcb-util-dev libvulkan-dev libasound2-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev
+
+      - name: Bundle
+        env:
+          THREADLANE_UPDATER_PUBLIC_KEY: ${{ vars.THREADLANE_UPDATER_PUBLIC_KEY }}
+        run: ./scripts/bundle-gpui-linux.sh
+
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: linux-${{ matrix.arch }}
+          path: target/release/Threadlane-*-linux-*.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Verify release tag
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object { $_.name -eq 'threadlane-gpui' }).version
+          if ($env:RELEASE_TAG -ne "v$version") {
+            Write-Error "Tag $env:RELEASE_TAG does not match threadlane-gpui version v$version"
+            exit 1
+          }
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gpui-release-windows-x86_64
+
+      - name: Bundle
+        env:
+          THREADLANE_UPDATER_PUBLIC_KEY: ${{ vars.THREADLANE_UPDATER_PUBLIC_KEY }}
+        shell: pwsh
+        run: ./scripts/bundle-gpui-windows.ps1
+
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: windows-x86_64
+          path: target/release/Threadlane-*-windows-*.zip
+          if-no-files-found: error
 
   macos:
     name: macOS Apple Silicon
@@ -154,7 +191,7 @@ jobs:
 
   draft-release:
     name: Draft GitHub release
-    needs: [macos]
+    needs: [linux, windows, macos]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -176,11 +213,16 @@ jobs:
           test -f artifacts/Threadlane.app.tar.gz
           test -f artifacts/Threadlane.app.tar.gz.sig
           test -n "$(find artifacts -maxdepth 1 -name 'Threadlane-*.dmg' -print -quit)"
-          test -n "$(find artifacts -maxdepth 1 -name 'Threadlane-*.zip' -print -quit)"
+          test -n "$(find artifacts -maxdepth 1 -name 'Threadlane-*-arm64.zip' -print -quit)"
+          test -n "$(find artifacts -maxdepth 1 -name 'Threadlane-*-linux-x86_64.tar.gz' -print -quit)"
+          test -n "$(find artifacts -maxdepth 1 -name 'Threadlane-*-linux-aarch64.tar.gz' -print -quit)"
+          test -n "$(find artifacts -maxdepth 1 -name 'Threadlane-*-windows-x86_64.zip' -print -quit)"
           version="${RELEASE_TAG#v}"
           signature=$(cat artifacts/Threadlane.app.tar.gz.sig)
           notes=$(gh release view "$RELEASE_TAG" --json body --jq '.body' 2>/dev/null || printf 'Threadlane %s' "$RELEASE_TAG")
           url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/Threadlane.app.tar.gz"
+          # The updater only installs into signed .app bundles, so the manifest
+          # stays macOS-only even though Linux and Windows artifacts ship here.
           jq -n \
             --arg version "$version" \
             --arg notes "$notes" \

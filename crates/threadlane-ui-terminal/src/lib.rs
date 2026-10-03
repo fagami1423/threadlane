@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -205,6 +205,11 @@ enum PtyEvent {
     Frame(TerminalFrame),
     Closed,
     Error(String),
+    /// Bytes the emulator must write back to the pty. Host-side queries
+    /// (e.g. ConPTY's `ESC[6n` startup probe, which stalls the shell until
+    /// answered) flow through the same parse path as output, so replies ride
+    /// this event to the session's writer.
+    ReplyToHost(Vec<u8>),
     /// Bounded result descriptors for one find generation. `revealed` is set
     /// only when this reply also moved the viewport (settled query or
     /// navigation), so the view can trust it as the selected match.
@@ -407,6 +412,10 @@ fn start_parser_worker(
             // channel instead of exiting with the shell.
             let mut output_disconnected = false;
             let mut link_epoch = 0;
+            // Tail bytes carried across reads so a host query split between
+            // two chunks still matches (a 4-byte sequence needs a 3-byte
+            // carry).
+            let mut query_tail: Vec<u8> = Vec::with_capacity(3);
 
             loop {
                 let mut commands_open = true;
@@ -579,7 +588,26 @@ fn start_parser_worker(
                     Ok(bytes) => {
                         parsed_bytes = parsed_bytes.saturating_add(bytes.len());
                         saturated = terminal_parse_budget_exhausted(parsed_bytes, parse_budget);
-                        parser.process(&bytes);
+                        let queries = terminal_host_queries(&mut query_tail, &bytes);
+                        let mut start = 0;
+                        for (end, kind) in queries {
+                            // Feed output only up to each query so the reply
+                            // reports the cursor position as of the query,
+                            // not as of the end of the chunk.
+                            parser.process(&bytes[start..end]);
+                            start = end;
+                            let reply = match kind {
+                                HostQuery::Status => b"\x1b[0n".to_vec(),
+                                HostQuery::Cursor => {
+                                    let (row, col) = parser.screen().cursor_position();
+                                    format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()
+                                }
+                            };
+                            if event_tx.send(PtyEvent::ReplyToHost(reply)).is_err() {
+                                break;
+                            }
+                        }
+                        parser.process(&bytes[start..]);
                         // vt100 bumps the view offset as rows scroll into
                         // history, so the visible content stays put.
                         if find.is_some() && find_rescan_at.is_none() {
@@ -608,6 +636,40 @@ fn start_parser_worker(
             }
         })?;
     Ok((output_tx, command_tx))
+}
+
+/// Host status queries the emulator must answer: `ESC[5n` gets a generic
+/// "operating normally" report (`ESC[0n`), `ESC[6n` a cursor position report.
+enum HostQuery {
+    Status,
+    Cursor,
+}
+
+/// Locate host queries in `bytes`, returning `(end_offset_in_bytes, kind)`
+/// pairs in order so the caller can feed output segment-by-segment and reply
+/// with the parser state at each query. `tail` carries up to three trailing
+/// bytes into the next chunk so a query split across reads still matches —
+/// those bytes were already fed to the parser, so only `bytes` is scanned and
+/// a full query can never sit inside the tail alone.
+fn terminal_host_queries(tail: &mut Vec<u8>, bytes: &[u8]) -> Vec<(usize, HostQuery)> {
+    let mut haystack = std::mem::take(tail);
+    let tail_len = haystack.len();
+    haystack.extend_from_slice(bytes);
+    let mut queries = Vec::new();
+    for (index, window) in haystack.windows(4).enumerate() {
+        let kind = if window == b"\x1b[5n" {
+            HostQuery::Status
+        } else if window == b"\x1b[6n" {
+            HostQuery::Cursor
+        } else {
+            continue;
+        };
+        // A 4-byte match always ends at or past the tail boundary, so the
+        // offset lands inside `bytes`.
+        queries.push((index + 4 - tail_len, kind));
+    }
+    tail.extend_from_slice(&haystack[haystack.len().saturating_sub(3)..]);
+    queries
 }
 
 fn selection_bounds(
@@ -1083,6 +1145,11 @@ impl TerminalView {
                     }
                 }
             }
+            PtyEvent::ReplyToHost(bytes) => {
+                if let Some(session) = &self.session {
+                    session.write(&bytes);
+                }
+            }
             PtyEvent::Closed => {
                 if self.session.is_some() {
                     self.status = Some("Shell exited. Select Restart to open a new shell.".into());
@@ -1391,8 +1458,12 @@ impl TerminalView {
             if self.alt_screen {
                 return menu.label("Links unavailable in full-screen terminal applications");
             }
-            if !cfg!(target_os = "macos") {
-                menu = menu.label("Threadlane browser is available on macOS only");
+            if cfg!(not(any(
+                target_os = "macos",
+                target_os = "linux",
+                target_os = "windows"
+            ))) {
+                menu = menu.label("Threadlane browser is not available on this platform");
             }
             if let Some(url) = &self.retry_url {
                 menu = menu.label("Navigation could not start — retry or open externally");
@@ -2555,6 +2626,49 @@ impl Render for TerminalView {
     }
 }
 
+/// `std::fs::canonicalize` returns verbatim `\\?\` paths on Windows, which
+/// children (cmd.exe most visibly) cannot use as a working directory, so
+/// downgrade the common drive-letter form back to a plain path.
+/// Intentionally duplicated in `threadlane-daemon::terminal`: this leaf UI
+/// crate takes no dependency on server-side crates, and the helper is small
+/// enough to keep in sync by hand.
+#[cfg(windows)]
+fn simplified_cwd(path: &Path) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    match text.strip_prefix("\\\\?\\") {
+        Some(rest) if rest.len() >= 2 && rest.as_bytes()[1] == b':' => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Shell programs to try, in order. On Windows, POSIX-style `SHELL` values
+/// (e.g. `/bin/sh` inherited from Git Bash or MSYS) are not spawnable via
+/// CreateProcess, so `SHELL`/`COMSPEC` only qualify when they point at a real
+/// file — and even a real file can fail to spawn (a batch script or data
+/// file), so callers must fall through the list on spawn errors.
+/// Intentionally duplicated in `threadlane-daemon::terminal` — keep in sync.
+fn shell_candidates() -> Vec<String> {
+    if cfg!(windows) {
+        let mut candidates = Vec::new();
+        if let Some(shell) = std::env::var("SHELL")
+            .ok()
+            .filter(|shell| Path::new(shell).is_file())
+        {
+            candidates.push(shell);
+        }
+        if let Some(comspec) = std::env::var("COMSPEC")
+            .ok()
+            .filter(|comspec| !comspec.is_empty() && Path::new(comspec).is_file())
+        {
+            candidates.push(comspec);
+        }
+        candidates.push("cmd.exe".into());
+        candidates
+    } else {
+        vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())]
+    }
+}
+
 fn spawn_shell(
     project: &PathBuf,
     rows: u16,
@@ -2568,13 +2682,36 @@ fn spawn_shell(
         pixel_width: 0,
         pixel_height: 0,
     })?;
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    let mut command = CommandBuilder::new(shell);
-    command.cwd(project);
-    command.env("TERM", "xterm-256color");
-    command.arg("-i");
-
-    let child = pair.slave.spawn_command(command)?;
+    // Selection logic mirrors `threadlane-daemon::terminal` — keep in sync.
+    let mut last_spawn_error = None;
+    let mut child = None;
+    for shell in shell_candidates() {
+        let mut command = CommandBuilder::new(shell);
+        #[cfg(windows)]
+        command.cwd(simplified_cwd(project));
+        #[cfg(not(windows))]
+        command.cwd(project);
+        command.env("TERM", "xterm-256color");
+        if !cfg!(windows) {
+            command.arg("-i");
+        }
+        match pair.slave.spawn_command(command) {
+            Ok(spawned) => {
+                child = Some(spawned);
+                break;
+            }
+            Err(error) => last_spawn_error = Some(error),
+        }
+    }
+    let child = child.ok_or_else(|| {
+        format!(
+            "could not spawn shell in {}: {}",
+            project.display(),
+            last_spawn_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "no shell candidates".into())
+        )
+    })?;
     let mut reader = pair.master.try_clone_reader()?;
     let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
     drop(pair.slave);

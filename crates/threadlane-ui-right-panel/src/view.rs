@@ -1437,7 +1437,7 @@ impl RightPanelView {
         if self.is_dirty {
             return Err("Save or discard the editor's changes, then retry Open link…".into());
         }
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         {
             let browser = self.ensure_browser(window, cx);
             browser.update(cx, |browser, cx| browser.try_open_tab(url, window, cx))?;
@@ -1446,7 +1446,7 @@ impl RightPanelView {
             browser.update(cx, |browser, cx| browser.focus_address(window, cx));
             Ok(())
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             let _ = (url, window, cx);
             Err(
@@ -1516,12 +1516,12 @@ impl RightPanelView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<String, String> {
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             let _ = (command, window, cx);
             return Err("The embedded browser is not supported on this platform.".to_string());
         }
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         {
             use super::browser::{AddressTarget, resolve_address, search_url};
             use threadlane_protocol::browser::BrowserCommand;
@@ -5820,7 +5820,7 @@ fn start_browser_request(
     panel.ensure_browser(window, cx);
     match command {
         BrowserCommand::Screenshot => {
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
             {
                 panel.open_surface(Surface::Browser, cx);
                 let Some(browser) = panel.browser.clone() else {
@@ -5831,7 +5831,7 @@ fn start_browser_request(
                     Err(err) => BrowserReply::Ready(Err(err)),
                 }
             }
-            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
             {
                 BrowserReply::Ready(Err(
                     "The embedded browser is not supported on this platform.".to_string()
