@@ -213,7 +213,7 @@ jobs:
           test -f artifacts/Threadlane.app.tar.gz
           test -f artifacts/Threadlane.app.tar.gz.sig
           test -n "$(find artifacts -maxdepth 1 -name 'Threadlane-*.dmg' -print -quit)"
-          test -n "$(find artifacts -maxdepth 1 -name 'Threadlane-*-aarch64.zip' -print -quit)"
+          test -n "$(find artifacts -maxdepth 1 -name 'Threadlane-*-arm64.zip' -print -quit)"
           test -n "$(find artifacts -maxdepth 1 -name 'Threadlane-*-linux-x86_64.tar.gz' -print -quit)"
           test -n "$(find artifacts -maxdepth 1 -name 'Threadlane-*-linux-aarch64.tar.gz' -print -quit)"
           test -n "$(find artifacts -maxdepth 1 -name 'Threadlane-*-windows-x86_64.zip' -print -quit)"
