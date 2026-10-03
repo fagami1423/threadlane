@@ -1978,7 +1978,9 @@ fn discover_default_branch(work_dir: &Path) -> Option<String> {
         .and_then(|output| {
             output.lines().find_map(|line| {
                 let branch = line.trim().strip_prefix("HEAD branch: ")?.trim();
-                (!branch.is_empty() && branch != "(unknown)").then(|| branch.to_owned())
+                // Older git prints "(not queried)" here, newer git
+                // "(unknown)" — neither is a real branch name.
+                (!branch.is_empty() && !branch.starts_with('(')).then(|| branch.to_owned())
             })
         })
     {

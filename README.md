@@ -13,7 +13,7 @@
 
 Threadlane brings project workspaces, persistent conversation sessions, coding-agent execution, and developer tools into one native application. Its Rust workspace includes provider integrations, external ACP agents, MCP support, and sandboxed WASI extensions.
 
-> **Release status:** The release workflow currently builds signed Apple Silicon macOS artifacts. The application can also be built from source on platforms supported by its dependencies.
+> **Release status:** The release workflow currently builds signed Apple Silicon macOS artifacts. The application also builds and runs on Linux, and CI compiles `threadlane-gpui` on both macOS and Linux.
 
 <p align="center">
   <a href="assets/images/threadlane-workspace.png">
@@ -85,6 +85,18 @@ seconds of work.
 - Rust 1.95.0 or later. The repository pins this version in [`rust-toolchain.toml`](rust-toolchain.toml); CI and release packaging use the same pin.
 - The WASI target: `rustup target add wasm32-wasip1`.
 - A native C toolchain, such as Xcode Command Line Tools on macOS or `build-essential` on Ubuntu.
+- On Linux, the GPUI stack also needs the Wayland/X11, font, audio, and OpenSSL development packages. On Ubuntu:
+
+  ```bash
+  sudo apt-get install -y \
+    build-essential pkg-config libssl-dev cmake libclang-dev \
+    libfontconfig-dev libwayland-dev wayland-protocols \
+    libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev \
+    libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+    libxcb-xfixes0-dev libxcb-xkb-dev libxcb-randr0-dev \
+    libxcb-image0-dev libxcb-icccm4-dev libxcb-keysyms1-dev \
+    libxcb-util-dev libvulkan-dev libasound2-dev
+  ```
 
 ### Build and run
 
