@@ -103,6 +103,8 @@ mod linux {
             .and_then(|handle| raw_xid(*handle))
     }
 
+    /// The GPUI window's own X11 id — the fallback parent when no
+    /// composition surface is available.
     pub fn window_xid(window: &Window) -> Option<u64> {
         // UFCS: `Window::window_handle()` is an inherent method returning
         // `AnyWindowHandle`; the raw XID lives behind the `HasWindowHandle`

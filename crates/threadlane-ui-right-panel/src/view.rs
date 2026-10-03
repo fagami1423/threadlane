@@ -1410,6 +1410,7 @@ impl RightPanelView {
         cx.notify();
     }
 
+    /// Returns the live browser view, creating it on first use.
     fn ensure_browser(
         &mut self,
         window: &mut Window,
@@ -1424,7 +1425,9 @@ impl RightPanelView {
         browser
     }
 
-    /// Human terminal navigation uses a new tab, never the address/search resolver.
+    /// Human terminal navigation uses a new tab, never the address/search
+    /// resolver. Opens in the embedded browser where supported, else errors
+    /// so the caller can fall back to the system browser.
     pub fn open_terminal_url(
         &mut self,
         url: &str,
@@ -1459,6 +1462,8 @@ impl RightPanelView {
         self.sync_browser_visibility(cx);
     }
 
+    /// Shows the browser's webviews only while the Browser surface is
+    /// active and the panel is open; hides them otherwise.
     fn sync_browser_visibility(&mut self, cx: &mut Context<Self>) {
         let Some(browser) = self.browser.clone() else {
             return;
@@ -1480,6 +1485,8 @@ impl RightPanelView {
         browser.update(cx, |browser, cx| browser.evaluate_script(script, cx))
     }
 
+    /// Writes a browser snapshot into `.threadlane/previews/` and returns
+    /// the saved path (if any) plus a base64 data URL for the reply.
     fn save_browser_screenshot(&self, bytes: &[u8]) -> (Option<String>, String) {
         let data_url = base64_data_url(bytes);
         let Some(project) = &self.project else {
@@ -1500,8 +1507,9 @@ impl RightPanelView {
         (Some(path.display().to_string()), data_url)
     }
 
-    /// Apply one agent browser command on the UI thread. Called from the
-    /// bridge pump, never from a tool worker directly.
+    /// Apply one agent `BrowserCommand` on the UI thread; called from the
+    /// bridge pump, never from a tool worker directly. Unsupported
+    /// platforms return a user-facing error.
     fn apply_browser_command(
         &mut self,
         command: threadlane_protocol::browser::BrowserCommand,
@@ -1601,6 +1609,8 @@ impl RightPanelView {
         }
     }
 
+    /// Renders the browser surface, or the platform-stub message where the
+    /// embedded browser is unavailable.
     fn render_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let browser = self.ensure_browser(window, cx);
         self.sync_browser_visibility(cx);
@@ -5777,6 +5787,8 @@ enum BrowserReply {
 /// front so a cut tail still orients the model.
 const MAX_BROWSER_EVAL_CHARS: usize = 8_000;
 
+/// Whether a browser command should force the panel open on the Browser
+/// surface (commands that visibly change the page).
 // Keep this aligned with the surface switches in the browser command handlers.
 fn browser_command_reveals_surface(command: &threadlane_protocol::browser::BrowserCommand) -> bool {
     use threadlane_protocol::browser::{BrowserCommand, BrowserTabAction};
@@ -5789,6 +5801,8 @@ fn browser_command_reveals_surface(command: &threadlane_protocol::browser::Brows
     )
 }
 
+/// Dispatches a `BrowserCommand` from the agent bridge: immediate replies,
+/// or a pending eval/snapshot/wait the pump resolves later.
 fn start_browser_request(
     panel: &mut RightPanelView,
     command: threadlane_protocol::browser::BrowserCommand,
@@ -5888,6 +5902,8 @@ fn start_browser_request(
     }
 }
 
+/// Shapes a script-eval reply for the agent: pretty-prints the captured
+/// console-log ring buffer and truncates oversized payloads.
 fn finalize_browser_eval(payload: &str) -> String {
     let inner = super::browser::unwrap_callback_payload(payload);
     // Format console logs if this payload is from drain_console_logs_js
@@ -5937,6 +5953,8 @@ fn snapshot_file_ext(bytes: &[u8]) -> &'static str {
     }
 }
 
+/// A `data:` URL for snapshot bytes, with the mime sniffed from the
+/// image magic bytes rather than assumed per platform.
 fn base64_data_url(bytes: &[u8]) -> String {
     use base64::Engine as _;
     let mime = if snapshot_file_ext(bytes) == "png" {
