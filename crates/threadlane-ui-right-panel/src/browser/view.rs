@@ -558,14 +558,14 @@ impl BrowserView {
     }
 
     /// Capture the rendered viewport as PNG bytes with width and height.
-    /// `crop` is an optional `[x, y, w, h]` rect in view points; `None`
-    /// snapshots the whole viewport. Screenshots go through the DevTools
-    /// protocol because `wry` exposes no `CapturePreview` wrapper; the reply
-    /// is base64 PNG data.
+    /// `crop` is an optional `([x, y, w, h], viewport_w, viewport_h)` tuple in
+    /// CSS pixels; `None` snapshots the whole viewport. Screenshots go through
+    /// the DevTools protocol because `wry` exposes no `CapturePreview`
+    /// wrapper; the reply is base64 PNG data.
     #[cfg(target_os = "windows")]
     pub fn take_snapshot(
         &self,
-        crop: Option<[f64; 4]>,
+        crop: Option<([f64; 4], f64, f64)>,
         cx: &App,
     ) -> Result<tokio::sync::oneshot::Receiver<Result<(Vec<u8>, u32, u32), String>>, String> {
         use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
@@ -578,19 +578,31 @@ impl BrowserView {
         let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
         let wv2 = webview.read(cx).raw().webview();
 
+        // WebView2 dispatches completion callbacks on the UI thread, so the
+        // handler only forwards the raw reply; base64 and PNG work happens on
+        // a worker thread instead of stalling the GPUI message pump.
+        let (raw_tx, raw_rx) = std::sync::mpsc::channel();
         let handler =
             CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |result, json| {
-                let res = result
-                    .map_err(|error| format!("WebView2 screenshot failed: {error}"))
-                    .and_then(|()| decode_capture_response(&json))
-                    .and_then(|image| encode_cropped_png(&image, crop));
-                if let Ok(mut slot) = tx.lock() {
-                    if let Some(tx) = slot.take() {
-                        let _ = tx.send(res);
-                    }
-                }
+                let _ = raw_tx.send(
+                    result
+                        .map_err(|error| format!("WebView2 screenshot failed: {error}"))
+                        .map(|()| json.to_string()),
+                );
                 Ok(())
             }));
+        std::thread::spawn(move || {
+            let res = raw_rx
+                .recv()
+                .map_err(|_| "WebView2 screenshot callback dropped.".to_string())
+                .and_then(|result| result)
+                .and_then(|json| decode_capture_response(&json, crop));
+            if let Ok(mut slot) = tx.lock() {
+                if let Some(tx) = slot.take() {
+                    let _ = tx.send(res);
+                }
+            }
+        });
         unsafe {
             wv2.CallDevToolsProtocolMethod(
                 windows_core::w!("Page.captureScreenshot"),
@@ -827,9 +839,22 @@ impl BrowserView {
         let note = format_annotation_note(&pick);
         // Snapshot cropped to the annotated element union so the attachment
         // shows context around the target instead of the whole viewport.
+        #[cfg(not(target_os = "windows"))]
         let crop = pick.get("crop").and_then(|rect| {
             let get = |key: &str| rect.get(key).and_then(|value| value.as_f64());
             Some([get("x")?, get("y")?, get("w")?, get("h")?])
+        });
+        // Windows PNGs come back in device pixels, so the CSS-pixel rect
+        // travels with the viewport it was measured in for scaling.
+        #[cfg(target_os = "windows")]
+        let crop = pick.get("crop").and_then(|rect| {
+            let get = |key: &str| rect.get(key).and_then(|value| value.as_f64());
+            let viewport = pick.get("viewport")?;
+            Some((
+                [get("x")?, get("y")?, get("w")?, get("h")?],
+                viewport.get("w").and_then(|w| w.as_f64())?,
+                viewport.get("h").and_then(|h| h.as_f64())?,
+            ))
         });
         let snapshot = self.take_snapshot(crop, cx).ok();
         let model = self.model.clone();
@@ -1300,8 +1325,15 @@ fn snapshot_to_png(
 }
 
 /// Decode the base64 PNG inside a `Page.captureScreenshot` JSON reply.
+/// `crop` pairs the rect with the CSS-pixel viewport it was measured in; the
+/// rect is scaled into the screenshot's pixel space, which differs under
+/// display scaling or page zoom. Uncropped shots skip the PNG decode
+/// entirely: the dimensions come straight from the IHDR header.
 #[cfg(target_os = "windows")]
-fn decode_capture_response(json: &str) -> Result<image::DynamicImage, String> {
+fn decode_capture_response(
+    json: &str,
+    crop: Option<([f64; 4], f64, f64)>,
+) -> Result<(Vec<u8>, u32, u32), String> {
     let data = serde_json::from_str::<serde_json::Value>(json)
         .ok()
         .and_then(|value| {
@@ -1313,37 +1345,64 @@ fn decode_capture_response(json: &str) -> Result<image::DynamicImage, String> {
         .ok_or_else(|| "WebView2 screenshot returned no image data.".to_string())?;
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &data)
         .map_err(|error| format!("WebView2 screenshot data is not base64: {error}"))?;
-    image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
-        .map_err(|error| format!("WebView2 screenshot is not a PNG: {error}"))
+    match crop {
+        None => png_dimensions(&bytes).map(|(width, height)| (bytes, width, height)),
+        Some((rect, viewport_w, viewport_h)) => {
+            encode_cropped_png(&bytes, rect, viewport_w, viewport_h)
+        }
+    }
 }
 
-/// Re-encode a screenshot as PNG, cropped to `crop` (`[x, y, w, h]` in the
-/// screenshot's pixel space) when given. Out-of-bounds rects are clamped.
+/// Read `width`/`height` from a PNG's IHDR chunk without decoding pixels.
+#[cfg(target_os = "windows")]
+fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
+    let ok = bytes.len() >= 24
+        && bytes.starts_with(&[137, b'P', b'N', b'G', 13, 10, 26, 10])
+        && bytes[12..16] == *b"IHDR";
+    if !ok {
+        return Err("WebView2 screenshot is not a PNG.".to_string());
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap_or_default());
+    let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap_or_default());
+    Ok((width, height))
+}
+
+/// Re-encode screenshot `bytes` as PNG, cropped to `rect` (`[x, y, w, h]` in
+/// CSS pixels inside a `viewport_w`x`viewport_h` viewport — scaled to the
+/// screenshot's pixel space). Out-of-bounds rects are clamped.
 #[cfg(target_os = "windows")]
 fn encode_cropped_png(
-    image: &image::DynamicImage,
-    crop: Option<[f64; 4]>,
+    bytes: &[u8],
+    rect: [f64; 4],
+    viewport_w: f64,
+    viewport_h: f64,
 ) -> Result<(Vec<u8>, u32, u32), String> {
-    let image = match crop {
-        Some([x, y, w, h]) => {
-            let left = x.round().max(0.).min(image.width() as f64 - 1.) as u32;
-            let top = y.round().max(0.).min(image.height() as f64 - 1.) as u32;
-            let width = w.round().max(1.).min(image.width() as f64 - left as f64) as u32;
-            let height = h.round().max(1.).min(image.height() as f64 - top as f64) as u32;
-            image.crop_imm(left, top, width, height)
-        }
-        None => image.clone(),
-    };
-    let width = image.width().max(1);
-    let height = image.height().max(1);
-    let mut bytes = Vec::new();
-    image
+    let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+        .map_err(|error| format!("WebView2 screenshot is not a PNG: {error}"))?;
+    let scale_x = image.width() as f64 / viewport_w.max(1.);
+    let scale_y = image.height() as f64 / viewport_h.max(1.);
+    let [x, y, w, h] = rect;
+    let left = (x * scale_x).round().max(0.).min(image.width() as f64 - 1.) as u32;
+    let top = (y * scale_y).round().max(0.).min(image.height() as f64 - 1.) as u32;
+    let width = (w * scale_x)
+        .round()
+        .max(1.)
+        .min(image.width() as f64 - left as f64) as u32;
+    let height = (h * scale_y)
+        .round()
+        .max(1.)
+        .min(image.height() as f64 - top as f64) as u32;
+    let cropped = image.crop_imm(left, top, width, height);
+    let width = cropped.width().max(1);
+    let height = cropped.height().max(1);
+    let mut out = Vec::new();
+    cropped
         .write_to(
-            &mut std::io::Cursor::new(&mut bytes),
+            &mut std::io::Cursor::new(&mut out),
             image::ImageFormat::Png,
         )
         .map_err(|error| format!("Snapshot PNG encode failed: {error}"))?;
-    Ok((bytes, width, height))
+    Ok((out, width, height))
 }
 
 #[cfg(test)]

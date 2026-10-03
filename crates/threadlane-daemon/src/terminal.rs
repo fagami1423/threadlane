@@ -33,6 +33,8 @@ const READ_CHUNK_BYTES: usize = 8192;
 /// `std::fs::canonicalize` returns verbatim `\\?\` paths on Windows, which
 /// children (cmd.exe most visibly) cannot use as a working directory, so
 /// downgrade the common drive-letter form back to a plain path.
+/// Intentionally duplicated in `threadlane-ui-terminal`: that leaf UI crate
+/// takes no dependency on server-side crates — keep the copies in sync.
 #[cfg(windows)]
 fn simplified_cwd(path: &Path) -> PathBuf {
     let text = path.as_os_str().to_string_lossy();
@@ -90,15 +92,16 @@ impl TerminalManager {
             .map_err(|error| format!("could not open pty: {error}"))?;
         // On Windows, POSIX-style `SHELL` values (e.g. `/bin/sh` inherited
         // from Git Bash or MSYS) are not spawnable via CreateProcess, so only
-        // honor `SHELL`/`COMSPEC` when they point at a real executable.
+        // honor `SHELL`/`COMSPEC` when they point at a real executable file.
+        // Selection logic mirrors `threadlane-ui-terminal` — keep in sync.
         let shell = std::env::var("SHELL")
             .ok()
-            .filter(|shell| !cfg!(windows) || Path::new(shell).exists())
+            .filter(|shell| !cfg!(windows) || Path::new(shell).is_file())
             .or_else(|| {
                 if cfg!(windows) {
                     std::env::var("COMSPEC")
                         .ok()
-                        .filter(|comspec| !comspec.is_empty() && Path::new(comspec).exists())
+                        .filter(|comspec| !comspec.is_empty() && Path::new(comspec).is_file())
                 } else {
                     None
                 }

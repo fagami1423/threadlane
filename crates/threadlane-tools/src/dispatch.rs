@@ -451,6 +451,17 @@ pub fn try_execute_tool_in_workspace_with(
 
             let build_command = |program: &str, flag: &str| {
                 let mut cmd = Command::new(program);
+                // cmd.exe parses its own /C tail and does not use MSVC argv
+                // quoting, so the command line must go through raw_arg;
+                // POSIX shells take the standard escaped argument.
+                #[cfg(target_os = "windows")]
+                if program == "cmd.exe" {
+                    use std::os::windows::process::CommandExt;
+                    cmd.arg(flag).raw_arg(cmd_str);
+                } else {
+                    cmd.arg(flag).arg(cmd_str);
+                }
+                #[cfg(not(target_os = "windows"))]
                 cmd.arg(flag).arg(cmd_str);
                 cmd.current_dir(&validated_cwd);
                 if let Some(target_dir) = worktree_cargo_target_dir(workspace_root) {
