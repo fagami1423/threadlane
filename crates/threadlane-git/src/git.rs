@@ -1958,6 +1958,8 @@ pub fn prune_worktrees(repo_path: &Path) -> Result<(), GitError> {
     Ok(())
 }
 
+/// Resolves the remote's default branch name (e.g. `main`) without fetching:
+/// `origin/HEAD`, then `remote show -n`, then `main`/`master` probing.
 fn discover_default_branch(work_dir: &Path) -> Option<String> {
     if let Some(branch) = command(
         work_dir,
