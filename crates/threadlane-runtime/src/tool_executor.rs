@@ -1,8 +1,6 @@
 use threadlane_protocol::{AgentToolDefinition, ToolExecutor};
-use std::sync::Arc;
-use threadlane_tools::{
-    get_available_tools, get_codex_tools, try_execute_tool, try_execute_tool_in_workspace,
-};
+use std::sync::{Arc, OnceLock};
+use threadlane_tools::{get_available_tools, try_execute_tool, try_execute_tool_in_workspace};
 
 /// Executor for the built-in Threadlane tools.
 ///
@@ -24,14 +22,18 @@ impl ToolExecutor for BuiltinToolExecutor {
     }
 
     fn tool_definitions(&self) -> Arc<[AgentToolDefinition]> {
-        let mut seen = std::collections::HashSet::new();
-        get_available_tools()
-            .into_iter()
-            .chain(get_codex_tools())
-            .filter_map(|schema| AgentToolDefinition::from_provider_schema(&schema).ok())
-            .filter(|definition| seen.insert(definition.name.clone()))
-            .collect::<Vec<_>>()
-            .into()
+        // Builtins are static literals; provider formats wrap the same list.
+        // Extension executors retain their own live inventories.
+        static DEFINITIONS: OnceLock<Arc<[AgentToolDefinition]>> = OnceLock::new();
+        DEFINITIONS
+            .get_or_init(|| {
+                get_available_tools()
+                    .into_iter()
+                    .filter_map(|schema| AgentToolDefinition::from_provider_schema(&schema).ok())
+                    .collect::<Vec<_>>()
+                    .into()
+            })
+            .clone()
     }
 
     async fn execute_tool(&self, name: &str, args: &str) -> Option<Result<String, String>> {
@@ -58,7 +60,29 @@ pub(crate) fn builtin_tool_executor() -> Arc<dyn ToolExecutor> {
 #[cfg(test)]
 mod tests {
     use super::{BuiltinToolExecutor, ToolExecutor};
+    use std::sync::Arc;
     use tempfile::tempdir;
+
+    #[test]
+    fn builtin_inventory_is_shared_and_preserves_both_provider_formats() {
+        let first = BuiltinToolExecutor::new().tool_definitions();
+        let second = BuiltinToolExecutor::new().tool_definitions();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "static builtin inventory must not be rebuilt per instance/batch"
+        );
+        for schemas in [
+            threadlane_tools::get_available_tools(),
+            threadlane_tools::get_codex_tools(),
+        ] {
+            let expected = schemas
+                .iter()
+                .map(threadlane_protocol::AgentToolDefinition::from_provider_schema)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(first.as_ref(), expected.as_slice());
+        }
+    }
 
     #[tokio::test]
     async fn builtin_executor_preserves_tool_failure_status() {

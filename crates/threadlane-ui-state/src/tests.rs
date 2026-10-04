@@ -3905,36 +3905,46 @@ fn inactive_session_stream_events_replay_after_switching_back() {
     );
     assert!(state.deferred_stream_events.is_empty());
 }
-#[test]
-fn stream_drain_preserves_events_beyond_one_frame_budget() {
+#[tokio::test]
+async fn stream_drain_preserves_events_beyond_one_frame_budget() {
+    use threadlane_daemon::next_event_batch_capped;
+
     let mut state = AppState::load_from_registry(Vec::new());
     state.messages_mut().clear();
     state.active_work_dir = Some(std::env::temp_dir().join("threadlane-stream-budget"));
     state.active_session_id = Some("session".into());
     state.is_new_task = false;
 
+    // Startup services share state.stream_rx. Use a controlled stream so the
+    // frame budget is spent only on the fixture's ordered agent updates.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     for index in 0..130 {
-        state
-            .stream_tx
-            .send(SessionEvent::Agent {
-                session_id: "session".into(),
-                event: AgentEvent::MessageUpdate {
-                    text_delta: Some(format!("{index},")),
-                    reasoning_delta: None,
-                    tool_call_name: None,
-                },
-            })
-            .unwrap();
+        tx.send(SessionEvent::Agent {
+            session_id: "session".into(),
+            event: AgentEvent::MessageUpdate {
+                text_delta: Some(format!("{index},")),
+                reasoning_delta: None,
+                tool_call_name: None,
+            },
+        })
+        .unwrap();
     }
+    drop(tx);
 
-    let events = take_stream_events(&mut state, 128);
+    let events = next_event_batch_capped(&mut rx, 128).await.unwrap();
+    assert_eq!(events.len(), 128);
     assert!(state.drain_chat_stream(events));
     assert_eq!(state.messages.len(), 1);
     assert_eq!(state.messages[0].content.matches(',').count(), 128);
-    let events = take_stream_events(&mut state, 128);
+    let events = next_event_batch_capped(&mut rx, 128).await.unwrap();
     assert_eq!(events.len(), 2);
     assert!(state.drain_chat_stream(events));
     assert_eq!(state.messages[0].content.matches(',').count(), 130);
+    assert_eq!(
+        state.messages[0].content,
+        (0..130).map(|index| format!("{index},")).collect::<String>()
+    );
+    assert!(next_event_batch_capped(&mut rx, 128).await.is_none());
 }
 
 #[test]
@@ -4864,12 +4874,7 @@ fn worktree_setup_failure_and_cancellation_are_scoped_to_the_session() {
         .is_err());
     assert!(file.exists());
     // Simulate creation finishing after cancellation but before the worker acknowledgement.
-    run_git(&setup.project, &["init", "-q", "-b", "main"]);
-    run_git(
-        &setup.project,
-        &["config", "user.email", "test@example.com"],
-    );
-    run_git(&setup.project, &["config", "user.name", "Test"]);
+    init_test_repo(&root);
     run_git(
         &setup.project,
         &["commit", "--allow-empty", "-qm", "initial"],
@@ -4889,11 +4894,12 @@ fn worktree_setup_failure_and_cancellation_are_scoped_to_the_session() {
         .unwrap();
     }
     std::fs::write(setup.worktree.join("user.txt"), "keep me").unwrap();
-    assert!(crate::worktree_setup::cleanup_cancelled(&setup).is_err());
+    let error = crate::worktree_setup::cleanup_cancelled(&setup).unwrap_err();
+    assert!(error.contains("user.txt"), "{error}");
     assert!(file.exists());
     std::fs::remove_file(setup.worktree.join("user.txt")).unwrap();
     state.finish_worktree_setup(&id, Err("late result".into()));
-    assert!(!file.exists());
+    assert!(!file.exists(), "cleanup status: {:?}", state.session_status);
     assert!(!setup.worktree.exists());
     assert!(discover_sessions_in_project(&setup.project).is_empty());
     assert!(!threadlane_git::worktree_bases(&setup.project)

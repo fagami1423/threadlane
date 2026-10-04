@@ -6,6 +6,7 @@ pub mod packages;
 pub mod settings;
 
 pub use broker::*;
+use checkpoint::SavedToolReply;
 pub(crate) use packages::validate_extension_id;
 
 use checkpoint::{persist_checkpoint, BrokerIntent, ExtensionCheckpoint};
@@ -18,7 +19,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use threadlane_protocol::AgentToolDefinition;
+use threadlane_protocol::{AgentToolDefinition, ToolExecutionIdentity};
 use wasmi::{Caller, Engine, Extern, Func, Linker, Memory, Module, Store};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -518,6 +519,7 @@ struct StateOwner {
     scope: Option<String>,
     directory: PathBuf,
     receipts_restored: bool,
+    replies_restored: bool,
     _lease: fs::File,
 }
 
@@ -551,6 +553,7 @@ enum UnconfirmedState {
         last_broker_id: u64,
         intents: Vec<Arc<BrokerIntent>>,
         unpublished: bool,
+        terminal_reply: Option<Arc<SavedToolReply>>,
     },
     Host {
         key: String,
@@ -590,6 +593,7 @@ pub struct WasiExtensionManager {
     /// Delivery ends at each checkpoint; call ownership spans broker awaits.
     active_operations: Mutex<HashSet<String>>,
     unsettled_broker: Mutex<HashMap<String, Vec<Arc<BrokerIntent>>>>,
+    terminal_replies: Mutex<HashMap<String, Arc<SavedToolReply>>>,
     last_broker_id: AtomicU64,
     pending_broker_requests: Mutex<HashMap<Option<String>, Vec<HostBrokerRequest>>>,
     capability_grant_policy: Mutex<HostCapabilityGrantPolicy>,
@@ -614,7 +618,74 @@ pub struct WasiExtensionOperation<'a> {
 impl WasiExtensionOperation<'_> {
     pub fn invoke(&mut self, args: &str) -> Result<WasiExtensionInvocationResult, String> {
         self.manager
-            .invoke_owned(&self.extension, self.kind, &self.name, args, true)
+            .invoke_owned(&self.extension, self.kind, &self.name, args, true, None)
+    }
+
+    pub fn invoke_for_execution(
+        &mut self,
+        args: &str,
+        identity: &ToolExecutionIdentity,
+    ) -> Result<WasiExtensionInvocationResult, String> {
+        self.manager.invoke_owned(
+            &self.extension,
+            self.kind,
+            &self.name,
+            args,
+            true,
+            Some(identity),
+        )
+    }
+
+    pub fn invoke_after_tool(
+        &mut self,
+        args: &str,
+        identity: &ToolExecutionIdentity,
+    ) -> Result<WasiExtensionInvocationResult, String> {
+        if self.kind != "hook" || self.name != "after_tool_call" {
+            return Err("Only the owning after-tool hook may retain a saved tool reply".into());
+        }
+        self.manager.invoke_owned(
+            &self.extension,
+            self.kind,
+            &self.name,
+            args,
+            true,
+            Some(identity),
+        )
+    }
+
+    /// Settle requests proven not dispatched and save a host terminal failure
+    /// in that same checkpoint, without entering the extension again.
+    pub fn finish_with_error(
+        &mut self,
+        args: &str,
+        identity: &ToolExecutionIdentity,
+        results: Vec<BrokerOperationResult>,
+        error: String,
+    ) -> Result<(), String> {
+        if self.kind != "tool"
+            || !identity.matches_call(&identity.tool_call_id, &identity.tool_name)
+        {
+            return Err("Terminal failure requires its committed tool identity".into());
+        }
+        if results
+            .iter()
+            .any(|result| result.invoking_extension != self.extension.manifest.name)
+        {
+            return Err("Terminal failure outcomes belong to another extension".into());
+        }
+        let reply = Arc::new(SavedToolReply {
+            identity: identity.clone(),
+            extension_name: self.extension.manifest.name.clone(),
+            tool_name: self.name.clone(),
+            arguments: serde_json::from_str(args)
+                .unwrap_or_else(|_| serde_json::json!({"raw":args})),
+            result: Err(error),
+            broker_receipt_ids: vec![],
+            canonical_result: None,
+        });
+        self.manager
+            .enqueue_broker_results_with_reply(results, Some(&reply))
     }
 }
 
@@ -715,9 +786,13 @@ impl WasiExtensionManager {
         let mut persisted_states = HashMap::new();
         let mut restored_events = HashMap::new();
         let mut unsettled = HashMap::new();
+        let mut terminal_replies = HashMap::new();
         let mut last_id = 0;
         for name in loaded.keys() {
             if let Some(checkpoint) = self.load_checkpoint_in_scope(name, &scope)? {
+                if let Some(reply) = checkpoint.terminal_reply {
+                    terminal_replies.insert(name.clone(), Arc::new(reply));
+                }
                 last_id = last_id.max(checkpoint.last_broker_id);
                 unsettled.insert(
                     name.clone(),
@@ -739,6 +814,10 @@ impl WasiExtensionManager {
             .unsettled_broker
             .lock()
             .map_err(|_| "Broker intent lock poisoned".to_string())? = unsettled;
+        self.terminal_replies
+            .lock()
+            .map_err(|_| "Extension reply lock poisoned".to_string())?
+            .extend(terminal_replies);
         let retired = extensions
             .iter()
             .filter(|(name, previous)| {
@@ -837,6 +916,17 @@ impl WasiExtensionManager {
         let session_id = session_id.into();
         let scope = Some(session_id);
         let changing_scope = self.session_scope()? != scope;
+        self.ensure_state_ownership()?;
+        self.restore_terminal_reply_inventory()?;
+        if changing_scope
+            && !self
+                .terminal_replies
+                .lock()
+                .map_err(|_| "Extension reply lock poisoned".to_string())?
+                .is_empty()
+        {
+            return Err("Finished extension replies are unacknowledged; commit their original tool results before switching scope".into());
+        }
         let target_owner = if changing_scope {
             self.acquire_state_owner(&scope)?
         } else {
@@ -848,9 +938,13 @@ impl WasiExtensionManager {
         let mut states = HashMap::new();
         let mut restored_events = HashMap::new();
         let mut unsettled = HashMap::new();
+        let mut terminal_replies = HashMap::new();
         let mut last_id = 0;
         for name in extension_names {
             if let Some(checkpoint) = self.load_checkpoint_in_scope(&name, &scope)? {
+                if let Some(reply) = checkpoint.terminal_reply {
+                    terminal_replies.insert(name.clone(), Arc::new(reply));
+                }
                 last_id = last_id.max(checkpoint.last_broker_id);
                 unsettled.insert(
                     name.clone(),
@@ -872,6 +966,10 @@ impl WasiExtensionManager {
             .unsettled_broker
             .lock()
             .map_err(|_| "Broker intent lock poisoned".to_string())? = unsettled;
+        *self
+            .terminal_replies
+            .lock()
+            .map_err(|_| "Extension reply lock poisoned".to_string())? = terminal_replies;
         // Queued work is session-owned too: switching scope selects a separate
         // queue so one conversation cannot receive another's broker outcomes.
         // Evict every other scope's queues rather than leaking them.
@@ -989,6 +1087,7 @@ impl WasiExtensionManager {
                 events,
                 intents,
                 last_broker_id,
+                terminal_reply,
                 ..
             } => {
                 let checkpoint = ExtensionCheckpoint::decode(value).map_err(|error| {
@@ -998,6 +1097,7 @@ impl WasiExtensionManager {
                     )
                 })?;
                 checkpoint.state == *state
+                    && checkpoint.terminal_reply.as_ref() == terminal_reply.as_deref()
                     && checkpoint.last_broker_id == *last_broker_id
                     && checkpoint
                         .unsettled
@@ -1063,6 +1163,7 @@ impl WasiExtensionManager {
                 intents,
                 last_broker_id,
                 unpublished,
+                terminal_reply,
             } => {
                 // Identity preserves later arrivals even when their payloads match
                 // events acknowledged or saved by the interrupted commit.
@@ -1100,6 +1201,15 @@ impl WasiExtensionManager {
                 self.last_broker_id
                     .fetch_max(last_broker_id, Ordering::SeqCst);
                 unsettled.insert(name.clone(), intents);
+                let mut replies = self
+                    .terminal_replies
+                    .lock()
+                    .map_err(|_| "Extension reply lock poisoned".to_string())?;
+                if let Some(reply) = terminal_reply {
+                    replies.insert(name.clone(), reply);
+                } else {
+                    replies.remove(&name);
+                }
                 states.insert(name, state);
             }
         }
@@ -1186,6 +1296,7 @@ impl WasiExtensionManager {
             scope: scope.clone(),
             directory,
             receipts_restored: false,
+            replies_restored: false,
             _lease: lease,
         }))
     }
@@ -1220,6 +1331,281 @@ impl WasiExtensionManager {
         Ok(())
     }
 
+    /// Read the preserved inventory once per scope, including disabled modules.
+    /// Called under state_commit; only terminal metadata is retained from scans.
+    fn restore_terminal_reply_inventory(&self) -> Result<(), String> {
+        let directory = {
+            let owner = self
+                .state_owner
+                .lock()
+                .map_err(|_| "Extension owner lock poisoned".to_string())?;
+            let Some(owner) = owner.as_ref() else {
+                return Ok(());
+            };
+            if owner.replies_restored {
+                return Ok(());
+            }
+            owner.directory.clone()
+        };
+        let mut restored = HashMap::new();
+        let mut high_water = 0;
+        let scope = self.session_scope()?;
+        checkpoint::visit_checkpoints(&directory, |path, checkpoint| {
+            high_water = high_water.max(checkpoint.last_broker_id);
+            if let Some(reply) = checkpoint.terminal_reply {
+                if self.state_path(&reply.extension_name).as_deref() != Some(path)
+                    || scope.as_deref() != Some(reply.identity.session_id.as_str())
+                {
+                    return Err(format!(
+                        "Saved reply ownership disagrees with {}; preserve the checkpoint",
+                        path.display()
+                    ));
+                }
+                restored.insert(reply.extension_name.clone(), Arc::new(reply));
+            }
+            Ok(())
+        })?;
+        self.terminal_replies
+            .lock()
+            .map_err(|_| "Extension reply lock poisoned".to_string())?
+            .extend(restored);
+        // The same scan establishes the receipt floor; avoid rereading every
+        // preserved checkpoint before this owner's first broker allocation.
+        self.last_broker_id.fetch_max(high_water, Ordering::SeqCst);
+        if let Some(owner) = self
+            .state_owner
+            .lock()
+            .map_err(|_| "Extension owner lock poisoned".to_string())?
+            .as_mut()
+        {
+            owner.replies_restored = true;
+            owner.receipts_restored = true;
+        }
+        Ok(())
+    }
+
+    pub fn pending_tool_reply_identities(&self) -> Result<Vec<ToolExecutionIdentity>, String> {
+        let _commit = self
+            .state_commit
+            .lock()
+            .map_err(|_| "Extension state commit lock poisoned".to_string())?;
+        self.ensure_state_ownership()?;
+        self.ensure_storage_confirmed()?;
+        self.restore_terminal_reply_inventory()?;
+        Ok(self
+            .terminal_replies
+            .lock()
+            .map_err(|_| "Extension reply lock poisoned".to_string())?
+            .values()
+            .map(|reply| reply.identity.clone())
+            .collect())
+    }
+
+    /// Pure reply delivery: never enters the VM or dispatches a broker request.
+    pub fn recover_tool_reply(
+        &self,
+        identity: &ToolExecutionIdentity,
+        tool_name: &str,
+        args: &str,
+    ) -> Result<Option<Result<String, String>>, String> {
+        let _commit = self
+            .state_commit
+            .lock()
+            .map_err(|_| "Extension state commit lock poisoned".to_string())?;
+        self.ensure_state_ownership()?;
+        self.ensure_storage_confirmed()?;
+        self.restore_terminal_reply_inventory()?;
+        let reply = self
+            .terminal_replies
+            .lock()
+            .map_err(|_| "Extension reply lock poisoned".to_string())?
+            .values()
+            .find(|reply| &reply.identity == identity)
+            .cloned();
+        let Some(reply) = reply else { return Ok(None) };
+        let arguments =
+            serde_json::from_str(args).unwrap_or_else(|_| serde_json::json!({"raw":args}));
+        if reply.tool_name != tool_name || reply.arguments != arguments {
+            return Err("Saved terminal reply belongs to different tool arguments; preserve it and reconcile the original declaration, do not execute the tool again".into());
+        }
+        self.hydrate_extension_checkpoint(&reply.extension_name)?;
+        self.settle_reply_outcomes(&reply.extension_name)?;
+        let scope = self.session_scope()?;
+        let events = self
+            .pending_events
+            .lock()
+            .map_err(|_| "Extension event lock poisoned".to_string())?
+            .get(&scope)
+            .and_then(|events| events.get(&reply.extension_name))
+            .cloned()
+            .unwrap_or_default();
+        Ok(Some(reply.result(&events)?))
+    }
+
+    /// Recommit retained, known outcomes, never redispatch them. Called under
+    /// state_commit; unknown original or hook effects keep reply delivery fenced.
+    fn settle_reply_outcomes(&self, extension_name: &str) -> Result<(), String> {
+        let state = self
+            .states
+            .lock()
+            .map_err(|_| "Extension state lock poisoned".to_string())?
+            .get(extension_name)
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        self.commit_retained_outcomes(extension_name, &state, false)?;
+        if self
+            .unsettled_broker
+            .lock()
+            .map_err(|_| "Broker intent lock poisoned".to_string())?
+            .get(extension_name)
+            .is_some_and(|intents| !intents.is_empty())
+        {
+            return Err("Tool or after-tool broker outcomes remain unsettled; preserve the reply and reconcile the original outcomes without replaying the tool or hook".into());
+        }
+        Ok(())
+    }
+
+    /// Saves the prepared host reply before committing the canonical result.
+    pub fn prepare_tool_reply(
+        &self,
+        identity: &ToolExecutionIdentity,
+        result: &threadlane_protocol::AgentToolResult,
+    ) -> Result<(), String> {
+        if !identity.matches_call(&result.tool_call_id, &result.name) {
+            return Err("Canonical tool reply disagrees with its committed identity".into());
+        }
+        let _commit = self
+            .state_commit
+            .lock()
+            .map_err(|_| "Extension state commit lock poisoned".to_string())?;
+        self.ensure_state_ownership()?;
+        self.ensure_storage_confirmed()?;
+        self.restore_terminal_reply_inventory()?;
+        let reply = self
+            .terminal_replies
+            .lock()
+            .map_err(|_| "Extension reply lock poisoned".to_string())?
+            .values()
+            .find(|reply| &reply.identity == identity)
+            .cloned();
+        let Some(reply) = reply else { return Ok(()) };
+        self.hydrate_extension_checkpoint(&reply.extension_name)?;
+        self.settle_reply_outcomes(&reply.extension_name)?;
+        if let Some(prepared) = &reply.canonical_result {
+            return if prepared == result {
+                Ok(())
+            } else {
+                Err("Saved canonical reply is already prepared; preserve it instead of replacing the original result".into())
+            };
+        }
+        let scope = self.session_scope()?;
+        let events = self
+            .pending_events
+            .lock()
+            .map_err(|_| "Extension event lock poisoned".to_string())?
+            .get(&scope)
+            .and_then(|events| events.get(&reply.extension_name))
+            .cloned()
+            .unwrap_or_default();
+        let _ = reply.result(&events)?;
+        let mut prepared = (*reply).clone();
+        prepared.canonical_result = Some(result.clone());
+        let prepared = Arc::new(prepared);
+        let state = self
+            .states
+            .lock()
+            .map_err(|_| "Extension state lock poisoned".to_string())?
+            .get(&reply.extension_name)
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        self.persist_state_events_reply(
+            &reply.extension_name,
+            &state,
+            true,
+            None,
+            Some(&prepared),
+        )?;
+        self.terminal_replies
+            .lock()
+            .map_err(|_| "Extension reply lock poisoned".to_string())?
+            .insert(reply.extension_name.clone(), prepared);
+        Ok(())
+    }
+
+    /// Reads a prepared reply, restoring preserved checkpoints without invoking WASM.
+    pub fn recovered_canonical_reply(
+        &self,
+        identity: &ToolExecutionIdentity,
+    ) -> Result<Option<threadlane_protocol::AgentToolResult>, String> {
+        let _commit = self
+            .state_commit
+            .lock()
+            .map_err(|_| "Extension state commit lock poisoned".to_string())?;
+        self.ensure_state_ownership()?;
+        self.ensure_storage_confirmed()?;
+        self.restore_terminal_reply_inventory()?;
+        Ok(self
+            .terminal_replies
+            .lock()
+            .map_err(|_| "Extension reply lock poisoned".to_string())?
+            .values()
+            .find(|reply| &reply.identity == identity)
+            .and_then(|reply| reply.canonical_result.clone()))
+    }
+
+    pub fn acknowledge_tool_reply(&self, identity: &ToolExecutionIdentity) -> Result<(), String> {
+        let _commit = self
+            .state_commit
+            .lock()
+            .map_err(|_| "Extension state commit lock poisoned".to_string())?;
+        self.ensure_state_ownership()?;
+        self.ensure_storage_confirmed()?;
+        self.restore_terminal_reply_inventory()?;
+        let reply = self
+            .terminal_replies
+            .lock()
+            .map_err(|_| "Extension reply lock poisoned".to_string())?
+            .values()
+            .find(|reply| &reply.identity == identity)
+            .cloned();
+        let Some(reply) = reply else { return Ok(()) };
+        if self
+            .active_operations
+            .lock()
+            .map_err(|_| "Extension operation lock poisoned".to_string())?
+            .contains(&reply.extension_name)
+        {
+            return Err(
+                "Cannot acknowledge a reply while its extension call is still active".into(),
+            );
+        }
+        self.hydrate_extension_checkpoint(&reply.extension_name)?;
+        self.settle_reply_outcomes(&reply.extension_name)?;
+        let scope = self.session_scope()?;
+        let queued = self
+            .pending_events
+            .lock()
+            .map_err(|_| "Extension event lock poisoned".to_string())?
+            .get(&scope)
+            .and_then(|events| events.get(&reply.extension_name))
+            .cloned()
+            .unwrap_or_default();
+        let _ = reply.result(&queued)?;
+        let state = self
+            .states
+            .lock()
+            .map_err(|_| "Extension state lock poisoned".to_string())?
+            .get(&reply.extension_name)
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        self.persist_state_events_reply(&reply.extension_name, &state, true, None, None)?;
+        self.terminal_replies
+            .lock()
+            .map_err(|_| "Extension reply lock poisoned".to_string())?
+            .remove(&reply.extension_name);
+        Ok(())
+    }
+
     /// A successor can write before module reload; preserve the saved ledger
     /// and undelivered outcomes rather than starting from empty cache entries.
     fn hydrate_extension_checkpoint(&self, name: &str) -> Result<(), String> {
@@ -1244,6 +1630,12 @@ impl WasiExtensionManager {
                 .insert(name.into(), Vec::new());
             return Ok(());
         };
+        if let Some(reply) = checkpoint.terminal_reply {
+            self.terminal_replies
+                .lock()
+                .map_err(|_| "Extension reply lock poisoned".to_string())?
+                .insert(name.into(), Arc::new(reply));
+        }
         self.last_broker_id
             .fetch_max(checkpoint.last_broker_id, Ordering::SeqCst);
         self.unsettled_broker
@@ -1332,6 +1724,14 @@ impl WasiExtensionManager {
             .map_err(|_| "Extension state commit lock poisoned".to_string())?;
         self.ensure_state_ownership()?;
         self.hydrate_extension_checkpoint(extension_name)?;
+        if self
+            .terminal_replies
+            .lock()
+            .map_err(|_| "Extension reply lock poisoned".to_string())?
+            .contains_key(extension_name)
+        {
+            return Err("This extension has a saved terminal reply awaiting its canonical tool result; recover and acknowledge that reply, do not execute the extension again".into());
+        }
         self.persist_state(extension_name, &state)?;
         self.states
             .lock()
@@ -1589,6 +1989,29 @@ impl WasiExtensionManager {
         include_in_flight: bool,
         unsettled: Option<&[Arc<BrokerIntent>]>,
     ) -> Result<(), String> {
+        let reply = self
+            .terminal_replies
+            .lock()
+            .map_err(|_| "Extension reply lock poisoned".to_string())?
+            .get(extension_name)
+            .cloned();
+        self.persist_state_events_reply(
+            extension_name,
+            state,
+            include_in_flight,
+            unsettled,
+            reply.as_ref(),
+        )
+    }
+
+    fn persist_state_events_reply(
+        &self,
+        extension_name: &str,
+        state: &Value,
+        include_in_flight: bool,
+        unsettled: Option<&[Arc<BrokerIntent>]>,
+        terminal_reply: Option<&Arc<SavedToolReply>>,
+    ) -> Result<(), String> {
         self.ensure_storage_confirmed()?;
         let Some(path) = self.state_path(extension_name) else {
             return if self.state_dir.is_none() {
@@ -1641,7 +2064,15 @@ impl WasiExtensionManager {
                 .unwrap_or_default()
         };
         let last_broker_id = self.last_broker_id.load(Ordering::SeqCst);
-        persist_checkpoint(&path, state, &events, last_broker_id, unsettled).map_err(|error| {
+        persist_checkpoint(
+            &path,
+            state,
+            &events,
+            last_broker_id,
+            unsettled,
+            terminal_reply.map(Arc::as_ref),
+        )
+        .map_err(|error| {
             self.record_state_write_error(&path, error, || UnconfirmedState::Extension {
                 name: extension_name.into(),
                 state: state.clone(),
@@ -1650,6 +2081,7 @@ impl WasiExtensionManager {
                 last_broker_id,
                 intents: unsettled.to_vec(),
                 unpublished: !include_in_flight,
+                terminal_reply: terminal_reply.cloned(),
             })
         })
     }
@@ -1814,6 +2246,14 @@ impl WasiExtensionManager {
         &self,
         results: Vec<BrokerOperationResult>,
     ) -> Result<(), String> {
+        self.enqueue_broker_results_with_reply(results, None)
+    }
+
+    fn enqueue_broker_results_with_reply(
+        &self,
+        results: Vec<BrokerOperationResult>,
+        terminal_reply: Option<&Arc<SavedToolReply>>,
+    ) -> Result<(), String> {
         if results.is_empty() {
             return Ok(());
         }
@@ -1828,6 +2268,10 @@ impl WasiExtensionManager {
         let scope = self.session_scope()?;
         let mut affected = HashSet::new();
         {
+            let pending = self
+                .pending_events
+                .lock()
+                .map_err(|_| "Extension event lock poisoned".to_string())?;
             let unsettled = self
                 .unsettled_broker
                 .lock()
@@ -1843,7 +2287,20 @@ impl WasiExtensionManager {
                                     intent.receipt == *receipt && intent.request == result.request
                                 })
                             });
-                    if receipt.scope != scope || !seen.insert(receipt.id) || !matches {
+                    let already_queued = pending
+                        .get(&scope)
+                        .and_then(|queues| queues.get(&result.invoking_extension))
+                        .is_some_and(|events| {
+                            events.iter().any(|event| {
+                                event.topic == "broker_response"
+                                    && event.payload["receipt_id"].as_u64() == Some(receipt.id)
+                            })
+                        });
+                    if receipt.scope != scope
+                        || !seen.insert(receipt.id)
+                        || already_queued
+                        || !matches
+                    {
                         return Err("Broker outcome does not match an unsettled receipt, or is a duplicate; preserve the checkpoint and do not replay the operation".into());
                     }
                 }
@@ -1893,7 +2350,7 @@ impl WasiExtensionManager {
                 .get(&name)
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
-            self.commit_retained_outcomes(&name, &state, true).map_err(|error| format!("Broker outcomes for `{name}` were retained in memory but could not be committed: {error}; do not repeat the broker operations"))?;
+            self.commit_retained_outcomes_with_reply(&name, &state, true, terminal_reply.filter(|reply| reply.extension_name == name)).map_err(|error| format!("Broker outcomes for `{name}` were retained in memory but could not be committed: {error}; do not repeat the broker operations"))?;
         }
         Ok(())
     }
@@ -1904,6 +2361,16 @@ impl WasiExtensionManager {
         extension_name: &str,
         state: &Value,
         force: bool,
+    ) -> Result<(), String> {
+        self.commit_retained_outcomes_with_reply(extension_name, state, force, None)
+    }
+
+    fn commit_retained_outcomes_with_reply(
+        &self,
+        extension_name: &str,
+        state: &Value,
+        force: bool,
+        terminal_reply: Option<&Arc<SavedToolReply>>,
     ) -> Result<(), String> {
         let mut remaining = self
             .unsettled_broker
@@ -1926,7 +2393,21 @@ impl WasiExtensionManager {
         if !force && remaining.len() == before {
             return Ok(());
         }
-        self.persist_state_and_events(extension_name, state, true, Some(&remaining))?;
+        if let Some(reply) = terminal_reply {
+            self.persist_state_events_reply(
+                extension_name,
+                state,
+                true,
+                Some(&remaining),
+                Some(reply),
+            )?;
+            self.terminal_replies
+                .lock()
+                .map_err(|_| "Extension reply lock poisoned".to_string())?
+                .insert(extension_name.into(), reply.clone());
+        } else {
+            self.persist_state_and_events(extension_name, state, true, Some(&remaining))?;
+        }
         self.unsettled_broker
             .lock()
             .map_err(|_| "Broker intent lock poisoned".to_string())?
@@ -2039,6 +2520,7 @@ impl WasiExtensionManager {
         &self,
         extension_name: &str,
         owns_operation: bool,
+        reply_owner: Option<&ToolExecutionIdentity>,
     ) -> Result<(Value, Option<String>, Vec<Arc<WasiExtensionEvent>>), String> {
         let _commit = self
             .state_commit
@@ -2047,6 +2529,44 @@ impl WasiExtensionManager {
         self.ensure_state_ownership()?;
         self.ensure_storage_confirmed()?;
         self.hydrate_extension_checkpoint(extension_name)?;
+        let saved = self
+            .terminal_replies
+            .lock()
+            .map_err(|_| "Extension reply lock poisoned".to_string())?
+            .get(extension_name)
+            .cloned();
+        if let Some(saved) = saved {
+            if reply_owner != Some(&saved.identity) || saved.canonical_result.is_some() {
+                return Err("This extension has a saved terminal reply awaiting its canonical tool result; recover and acknowledge that reply, do not execute the extension again".into());
+            }
+            // Seal the known reply before its own after hook consumes broker
+            // events. A crash during the hook must never require replaying it.
+            let scope = self.session_scope()?;
+            let events = self
+                .pending_events
+                .lock()
+                .map_err(|_| "Extension event lock poisoned".to_string())?
+                .get(&scope)
+                .and_then(|queues| queues.get(extension_name))
+                .cloned()
+                .unwrap_or_default();
+            let mut sealed = (*saved).clone();
+            sealed.result = saved.result(&events)?;
+            sealed.broker_receipt_ids.clear();
+            let sealed = Arc::new(sealed);
+            let state = self
+                .states
+                .lock()
+                .map_err(|_| "Extension state lock poisoned".to_string())?
+                .get(extension_name)
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            self.persist_state_events_reply(extension_name, &state, true, None, Some(&sealed))?;
+            self.terminal_replies
+                .lock()
+                .map_err(|_| "Extension reply lock poisoned".to_string())?
+                .insert(extension_name.into(), sealed);
+        }
         if !owns_operation
             && self
                 .active_operations
@@ -2101,7 +2621,7 @@ impl WasiExtensionManager {
         name: &str,
         args: &str,
     ) -> Result<WasiExtensionInvocationResult, String> {
-        self.invoke_owned(extension, kind, name, args, false)
+        self.invoke_owned(extension, kind, name, args, false, None)
     }
 
     fn invoke_owned(
@@ -2111,12 +2631,44 @@ impl WasiExtensionManager {
         name: &str,
         args: &str,
         owns_operation: bool,
+        identity: Option<&ToolExecutionIdentity>,
     ) -> Result<WasiExtensionInvocationResult, String> {
+        if let Some(identity) = identity {
+            if !identity.matches_call(&identity.tool_call_id, &identity.tool_name)
+                || self.state_dir.is_none()
+                || self.session_scope()?.as_deref() != Some(identity.session_id.as_str())
+                || !(kind == "tool" || kind == "hook" && name == "after_tool_call")
+            {
+                return Err("Durable extension execution requires a valid committed tool identity and checkpoint storage".into());
+            }
+            if kind == "tool" {
+                if let Some(reply) = self.recover_tool_reply(identity, name, args)? {
+                    return Ok(WasiExtensionInvocationResult {
+                        api_version: extension.manifest.api_version,
+                        response: match reply {
+                            Ok(message) => WasiExtensionResponse {
+                                message: Some(message),
+                                ..Default::default()
+                            },
+                            Err(error) => WasiExtensionResponse {
+                                error: Some(error),
+                                ..Default::default()
+                            },
+                        },
+                        invoking_extension: extension.manifest.name.clone(),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
         let arguments =
             serde_json::from_str(args).unwrap_or_else(|_| serde_json::json!({ "raw": args }));
         let policy = self.effective_capability_policy(extension)?;
-        let (state, scope, events) =
-            self.begin_delivery(&extension.manifest.name, owns_operation)?;
+        let (state, scope, events) = self.begin_delivery(
+            &extension.manifest.name,
+            owns_operation,
+            identity.filter(|_| kind == "hook"),
+        )?;
         #[derive(Serialize)]
         struct Invocation<'a> {
             api_version: u32,
@@ -2180,6 +2732,13 @@ impl WasiExtensionManager {
             } else {
                 vec![]
             };
+            if result.response.continue_after_broker && requests.is_empty() {
+                result.response.continue_after_broker = false;
+                result.response.error = Some(format!(
+                    "WASI tool `{name}` requested a broker continuation without any requests; \
+                     check capability grants and clear `continue_after_broker` when finished"
+                ));
+            }
             if !requests.is_empty() {
                 self.restore_receipt_counter()?;
             }
@@ -2204,7 +2763,48 @@ impl WasiExtensionManager {
                 }));
                 request.receipt = Some(receipt);
             }
-            self.persist_state_and_events(&extension.manifest.name, &state, false, Some(&intents))?;
+            let terminal_reply = if kind == "hook" {
+                self.terminal_replies
+                    .lock()
+                    .map_err(|_| "Extension reply lock poisoned".to_string())?
+                    .get(&extension.manifest.name)
+                    .cloned()
+            } else {
+                identity
+                    .filter(|_| !result.response.continue_after_broker)
+                    .map(|identity| {
+                        Arc::new(SavedToolReply {
+                            identity: identity.clone(),
+                            extension_name: extension.manifest.name.clone(),
+                            tool_name: name.into(),
+                            arguments: arguments.clone(),
+                            result: match &result.response.error {
+                                Some(error) => Err(error.clone()),
+                                None => Ok(result.response.message.clone().unwrap_or_default()),
+                            },
+                            broker_receipt_ids: requests
+                                .iter()
+                                .filter_map(|request| {
+                                    request.receipt.as_ref().map(|receipt| receipt.id)
+                                })
+                                .collect(),
+                            canonical_result: None,
+                        })
+                    })
+            };
+            self.persist_state_events_reply(
+                &extension.manifest.name,
+                &state,
+                false,
+                Some(&intents),
+                terminal_reply.as_ref(),
+            )?;
+            if let Some(reply) = terminal_reply {
+                self.terminal_replies
+                    .lock()
+                    .map_err(|_| "Extension reply lock poisoned".to_string())?
+                    .insert(extension.manifest.name.clone(), reply);
+            }
             self.unsettled_broker
                 .lock()
                 .map_err(|_| "Broker intent lock poisoned".to_string())?

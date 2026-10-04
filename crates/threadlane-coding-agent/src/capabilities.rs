@@ -18,8 +18,10 @@ use threadlane_mcp::McpManager;
 use threadlane_permission::{PermissionHandle, PermissionManager};
 use threadlane_plan::{SessionPlanStore, UpdatePlanToolExecutor};
 use threadlane_protocol::browser::BrowserBridge;
+use threadlane_protocol::RecoveredToolReply;
 use threadlane_protocol::{
-    AgentEvent, AgentToolCall, AgentToolDefinition, ToolExecutionIdentity, ToolExecutor, ToolOutput,
+    AgentEvent, AgentToolCall, AgentToolDefinition, ToolExecutionError, ToolExecutionIdentity,
+    ToolExecutor, ToolOutput,
 };
 use threadlane_question::{AskQuestionToolExecutor, QuestionHandle};
 use threadlane_runtime::Capability;
@@ -764,10 +766,14 @@ impl ToolExecutor for SubagentToolExecutor {
         args: &str,
         _work_dir: Option<&Path>,
         _identity: Option<&ToolExecutionIdentity>,
-    ) -> Option<Result<ToolOutput, String>> {
+    ) -> Option<Result<ToolOutput, ToolExecutionError>> {
         self.execute_tool_impl(&call.name, args, Some(call.id.clone()))
             .await
-            .map(|result| result.map(ToolOutput::from))
+            .map(|result| {
+                result
+                    .map(ToolOutput::from)
+                    .map_err(ToolExecutionError::Failed)
+            })
     }
 }
 
@@ -873,16 +879,13 @@ pub(crate) async fn dispatch_hook_requests(
     extensions: &WasiExtensionManager,
     requests: Vec<HostBrokerRequest>,
 ) -> Result<(), BrokerError> {
-    for request in requests {
-        let dispatch = dispatcher.dispatch_envelopes(vec![request]).await?;
-        extensions
-            .enqueue_broker_results(dispatch.operation_results)
-            .map_err(|message| BrokerError {
-                code: "state_persistence_failed".into(),
-                message,
-            })?;
-    }
-    Ok(())
+    let dispatch = dispatcher.dispatch_envelopes(requests).await?;
+    extensions
+        .enqueue_broker_results(dispatch.operation_results)
+        .map_err(|message| BrokerError {
+            code: "state_persistence_failed".into(),
+            message,
+        })
 }
 
 async fn dispatch_hook_requests_isolated(
@@ -891,10 +894,8 @@ async fn dispatch_hook_requests_isolated(
     requests: Vec<HostBrokerRequest>,
     label: &str,
 ) {
-    for request in requests {
-        if let Err(error) = dispatch_hook_requests(dispatcher, extensions, vec![request]).await {
-            warn!("{label}: {}", error.message);
-        }
+    if let Err(error) = dispatch_hook_requests(dispatcher, extensions, requests).await {
+        warn!("{label}: {}", error.message);
     }
 }
 
@@ -1058,7 +1059,11 @@ pub(crate) fn create_after_tool_hook_handler(
                         continue;
                     }
                 };
-                match operation.invoke(&arguments.to_string()) {
+                let invocation = match context.tool_execution_identity.as_ref() {
+                    Some(identity) => operation.invoke_after_tool(&arguments.to_string(), identity),
+                    None => operation.invoke(&arguments.to_string()),
+                };
+                match invocation {
                     Ok(response) => {
                         match broker_dispatcher
                             .dispatch_envelopes(response.host_broker_requests)
@@ -1114,54 +1119,144 @@ impl ToolExecutor for BrokerAwareWasiToolExecutor {
     }
 
     async fn execute_tool(&self, name: &str, args: &str) -> Option<Result<String, String>> {
+        self.execute_tool_impl(name, args, None)
+            .await
+            .map(|result| result.map_err(|error| error.to_string()))
+    }
+
+    async fn execute_tool_with_call(
+        &self,
+        call: &AgentToolCall,
+        args: &str,
+        _: Option<&Path>,
+        identity: Option<&ToolExecutionIdentity>,
+    ) -> Option<Result<ToolOutput, ToolExecutionError>> {
+        self.execute_tool_impl(&call.name, args, identity)
+            .await
+            .map(|result| result.map(ToolOutput::from))
+    }
+
+    async fn recover_tool_reply(
+        &self,
+        call: &AgentToolCall,
+        args: &str,
+        _: Option<&Path>,
+        identity: &ToolExecutionIdentity,
+    ) -> Option<Result<RecoveredToolReply, ToolExecutionError>> {
+        match self
+            .extensions
+            .recover_tool_reply(identity, &call.name, args)
+        {
+            Ok(Some(reply)) => match self.extensions.recovered_canonical_reply(identity) {
+                Ok(Some(result)) => Some(Ok(RecoveredToolReply::Canonical(result))),
+                Ok(None) => Some(
+                    reply
+                        .map(ToolOutput::from)
+                        .map(RecoveredToolReply::Extension)
+                        .map_err(ToolExecutionError::Failed),
+                ),
+                Err(error) => Some(Err(ToolExecutionError::RecoveryRequired(error))),
+            },
+            Ok(None) => None,
+            Err(error) => Some(Err(ToolExecutionError::RecoveryRequired(error))),
+        }
+    }
+
+    async fn acknowledge_tool_reply(&self, identity: &ToolExecutionIdentity) -> Result<(), String> {
+        self.extensions.acknowledge_tool_reply(identity)
+    }
+
+    async fn prepare_tool_reply(
+        &self,
+        identity: &ToolExecutionIdentity,
+        result: &threadlane_protocol::AgentToolResult,
+    ) -> Result<(), ToolExecutionError> {
+        self.extensions
+            .prepare_tool_reply(identity, result)
+            .map_err(ToolExecutionError::RecoveryRequired)
+    }
+}
+
+impl BrokerAwareWasiToolExecutor {
+    async fn execute_tool_impl(
+        &self,
+        name: &str,
+        args: &str,
+        identity: Option<&ToolExecutionIdentity>,
+    ) -> Option<Result<String, ToolExecutionError>> {
+        let persistence_error = |error| {
+            if identity.is_some() {
+                ToolExecutionError::RecoveryRequired(error)
+            } else {
+                ToolExecutionError::Failed(error)
+            }
+        };
+        if let Some(identity) = identity {
+            match self.extensions.recover_tool_reply(identity, name, args) {
+                Ok(Some(reply)) => return Some(reply.map_err(ToolExecutionError::Failed)),
+                Ok(None) => {}
+                Err(error) => return Some(Err(persistence_error(error))),
+            }
+        }
+
         let mut operation = match self.extensions.begin_tool_operation(name)? {
             Ok(operation) => operation,
-            Err(error) => return Some(Err(error)),
+            Err(error) => return Some(Err(persistence_error(error))),
         };
         let mut continuation_rounds = 0;
         loop {
-            let invocation = match operation.invoke(args) {
+            let invocation = match match identity {
+                Some(identity) => operation.invoke_for_execution(args, identity),
+                None => operation.invoke(args),
+            } {
                 Ok(invocation) => invocation,
-                Err(error) => return Some(Err(error)),
+                Err(error) => return Some(Err(persistence_error(error))),
             };
             if let Some(error) = invocation.response.error {
-                return Some(Err(error));
+                return Some(Err(ToolExecutionError::Failed(error)));
             }
             let continue_after_broker = invocation.response.continue_after_broker;
             let immediate_message = invocation.response.message.unwrap_or_default();
             let requests = invocation.host_broker_requests;
             if requests.is_empty() {
                 if continue_after_broker {
-                    return Some(Err(format!(
+                    return Some(Err(ToolExecutionError::Failed(format!(
                         "WASI tool `{name}` requested a broker continuation without any requests; \
                          check capability grants and clear `continue_after_broker` when finished"
-                    )));
+                    ))));
                 }
                 return Some(Ok(immediate_message));
             }
             if continue_after_broker && continuation_rounds >= MAX_BROKER_CONTINUATION_ROUNDS {
+                let message = format!(
+                    "WASI tool `{name}` exceeded the broker continuation limit of \
+                     {MAX_BROKER_CONTINUATION_ROUNDS} rounds; clear `continue_after_broker` after \
+                     processing `broker_response` events"
+                );
                 let outcomes = requests.into_iter().map(|request| request.not_dispatched(BrokerError {
                     code: "continuation_limit".into(),
                     message: "Host continuation budget exhausted before dispatch".into(),
                 })).collect();
-                if let Err(error) = self.extensions.enqueue_broker_results(outcomes) {
-                    return Some(Err(error));
+                let persisted = match identity {
+                    Some(identity) => {
+                        operation.finish_with_error(args, identity, outcomes, message.clone())
+                    }
+                    None => self.extensions.enqueue_broker_results(outcomes),
+                };
+                if let Err(error) = persisted {
+                    return Some(Err(persistence_error(error)));
                 }
-                return Some(Err(format!(
-                    "WASI tool `{name}` exceeded the broker continuation limit of \
-                     {MAX_BROKER_CONTINUATION_ROUNDS} rounds; clear `continue_after_broker` after \
-                     processing `broker_response` events"
-                )));
+                return Some(Err(ToolExecutionError::Failed(message)));
             }
 
             let dispatch = match self.broker_dispatcher.dispatch_envelopes(requests).await {
                 Ok(dispatch) => dispatch,
-                Err(error) => return Some(Err(error.message)),
+                Err(error) => return Some(Err(persistence_error(error.message))),
             };
             let operation_results = dispatch.operation_results;
             if continue_after_broker {
                 if let Err(error) = self.extensions.enqueue_broker_results(operation_results) {
-                    return Some(Err(error));
+                    return Some(Err(persistence_error(error)));
                 }
                 continuation_rounds += 1;
                 continue;
@@ -1173,9 +1268,9 @@ impl ToolExecutor for BrokerAwareWasiToolExecutor {
             {
                 let message = error.message.clone();
                 if let Err(error) = self.extensions.enqueue_broker_results(operation_results) {
-                    return Some(Err(format!("{message}; {error}")));
+                    return Some(Err(persistence_error(format!("{message}; {error}"))));
                 }
-                return Some(Err(message));
+                return Some(Err(ToolExecutionError::Failed(message)));
             }
 
             let broker_message = operation_results
@@ -1193,7 +1288,7 @@ impl ToolExecutor for BrokerAwareWasiToolExecutor {
                         .map(str::to_owned)
                 });
             if let Err(error) = self.extensions.enqueue_broker_results(operation_results) {
-                return Some(Err(error));
+                return Some(Err(persistence_error(error)));
             }
             return Some(Ok(broker_message.unwrap_or(immediate_message)));
         }
@@ -1220,6 +1315,103 @@ mod broker_continuation_tests {
     struct RoundCounter {
         manager: Arc<WasiExtensionManager>,
         rounds: AtomicUsize,
+    }
+
+    struct FailingOutcomeStorage {
+        checkpoint: std::path::PathBuf,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CapabilityHandler for FailingOutcomeStorage {
+        fn handle(&self, _: &BrokerRequest) -> Result<serde_json::Value, BrokerError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                std::fs::rename(&self.checkpoint, self.checkpoint.with_extension("backup"))
+                    .unwrap();
+                std::fs::create_dir(&self.checkpoint).unwrap();
+            }
+            Ok(serde_json::json!("executed once"))
+        }
+    }
+
+    async fn hook_batch_retains_all_outcomes(isolated: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        crate::runtime::broker_repair_tests::install_fixture(directory.path());
+        let manager = WasiExtensionManager::for_project_session(directory.path(), "batch");
+        manager
+            .reload_from_roots(None, Some(directory.path()))
+            .unwrap();
+        let requests = {
+            let mut hook = manager
+                .begin_hook_operations("before_tool_call")
+                .next()
+                .unwrap()
+                .unwrap();
+            hook.invoke("{}").unwrap().host_broker_requests
+        };
+        assert_eq!(requests.len(), 2);
+        let handler = Arc::new(FailingOutcomeStorage {
+            checkpoint: WasiExtensionManager::session_state_path(
+                directory.path(),
+                "batch",
+                "receipt_probe",
+            ),
+            calls: AtomicUsize::new(0),
+        });
+        let mut dispatcher = CapabilityDispatcher::new();
+        dispatcher.register("tools", handler.clone());
+        let dispatcher = Arc::new(dispatcher);
+        if isolated {
+            super::dispatch_hook_requests_isolated(&dispatcher, &manager, requests, "test").await;
+        } else {
+            let error = super::dispatch_hook_requests(&dispatcher, &manager, requests)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "state_persistence_failed");
+        }
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 2);
+        std::fs::remove_dir(&handler.checkpoint).unwrap();
+        std::fs::rename(
+            handler.checkpoint.with_extension("backup"),
+            &handler.checkpoint,
+        )
+        .unwrap();
+        {
+            let mut hook = manager
+                .begin_hook_operations("before_tool_call")
+                .next()
+                .unwrap()
+                .unwrap();
+            let result = hook.invoke("{}").unwrap();
+            assert!(result.host_broker_requests.is_empty());
+        }
+        assert_eq!(
+            manager.extension_state("receipt_probe"),
+            Some(serde_json::json!({"phase":"ready"}))
+        );
+        manager
+            .reload_from_roots(None, Some(directory.path()))
+            .unwrap();
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 2);
+        drop(manager);
+        let recovered = WasiExtensionManager::for_project_session(directory.path(), "batch");
+        recovered
+            .reload_from_roots(None, Some(directory.path()))
+            .unwrap();
+        assert_eq!(
+            recovered.extension_state("receipt_probe"),
+            Some(serde_json::json!({"phase":"ready"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_batch_preserves_suffix_when_outcome_storage_fails() {
+        hook_batch_retains_all_outcomes(false).await;
+    }
+
+    #[tokio::test]
+    async fn isolated_hook_batch_preserves_suffix_when_outcome_storage_fails() {
+        hook_batch_retains_all_outcomes(true).await;
     }
 
     #[async_trait]
@@ -1415,6 +1607,101 @@ mod broker_continuation_tests {
         let (result, rounds) = run_fixture(false, false).await;
         assert!(result.unwrap_err().contains("without any requests"));
         assert_eq!(rounds, 0);
+    }
+
+    #[tokio::test]
+    async fn durable_broker_protocol_failures_save_terminal_replies_without_replaying_rounds() {
+        use threadlane_protocol::{AgentToolCall, ToolExecutionIdentity};
+        for emit_request in [false, true] {
+            let (directory, old) = fixture(false, emit_request);
+            drop(old);
+            let manager = Arc::new(WasiExtensionManager::for_project_session(
+                directory.path(),
+                "durable",
+            ));
+            manager
+                .reload_from_roots(None, Some(directory.path()))
+                .unwrap();
+            let counter = Arc::new(RoundCounter {
+                manager: manager.clone(),
+                rounds: AtomicUsize::new(0),
+            });
+            let mut dispatcher = CapabilityDispatcher::new();
+            dispatcher.register("tools", counter.clone());
+            let executor = BrokerAwareWasiToolExecutor {
+                extensions: manager.clone(),
+                broker_dispatcher: Arc::new(dispatcher),
+            };
+            let identity = ToolExecutionIdentity {
+                session_id: "durable".into(),
+                lane: "main".into(),
+                run_id: "run".into(),
+                assistant_entry_id: "assistant".into(),
+                tool_call_id: "call".into(),
+                tool_name: "rounds".into(),
+                result_entry_id: "result".into(),
+            };
+            let call = AgentToolCall {
+                id: "call".into(),
+                name: "rounds".into(),
+                arguments: "{}".into(),
+            };
+            let error = executor
+                .execute_tool_with_call(&call, "{}", None, Some(&identity))
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(if emit_request {
+                    "continuation limit"
+                } else {
+                    "without any requests"
+                }),
+                "{error}"
+            );
+            assert_eq!(
+                counter.rounds.load(Ordering::SeqCst),
+                if emit_request {
+                    MAX_BROKER_CONTINUATION_ROUNDS
+                } else {
+                    0
+                }
+            );
+            assert_eq!(
+                manager
+                    .recover_tool_reply(&identity, "rounds", "{}")
+                    .unwrap(),
+                Some(Err(error.clone()))
+            );
+            // Even another execution entry cannot repeat the completed broker loop.
+            assert_eq!(
+                executor
+                    .execute_tool_with_call(&call, "{}", None, Some(&identity))
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string(),
+                error
+            );
+            assert_eq!(
+                counter.rounds.load(Ordering::SeqCst),
+                if emit_request {
+                    MAX_BROKER_CONTINUATION_ROUNDS
+                } else {
+                    0
+                }
+            );
+            let result = threadlane_protocol::AgentToolResult::external(
+                "call",
+                "rounds",
+                format!("Tool executor error: {error}"),
+                true,
+            );
+            manager.prepare_tool_reply(&identity, &result).unwrap();
+            manager.acknowledge_tool_reply(&identity).unwrap();
+            assert!(manager.pending_tool_reply_identities().unwrap().is_empty());
+        }
     }
 }
 

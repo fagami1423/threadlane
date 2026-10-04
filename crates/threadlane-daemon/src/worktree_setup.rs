@@ -235,13 +235,18 @@ pub fn cleanup_cancelled(setup: &WorktreeSetup) -> Result<(), String> {
         if facts.get("worktree_setup_commit") != commit.first().map(|c| &c.sha) {
             return Err("The checkout has changed; keep it for manual cleanup".into());
         }
-        let dirty = threadlane_git::inspect(&setup.worktree)
-            .map_err(|e| e.to_string())?
-            .files
+        let files = threadlane_git::inspect_files(&setup.worktree).map_err(|e| e.to_string())?;
+        let dirty: Vec<_> = files
             .iter()
-            .any(|file| !(file.is_untracked() && file.path.starts_with(".threadlane/")));
-        if dirty {
-            return Err("The checkout contains changes; keep it for manual cleanup".into());
+            .filter(|file| !(file.is_untracked() && file.path.starts_with(".threadlane/")))
+            .take(3)
+            .map(|file| file.path.as_str())
+            .collect();
+        if !dirty.is_empty() {
+            return Err(format!(
+                "The checkout contains changes ({}); keep it for manual cleanup",
+                dirty.join(", ")
+            ));
         }
         threadlane_git::remove_worktree(&setup.project, &setup.worktree, true)
             .map_err(|e| e.to_string())?;

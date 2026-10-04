@@ -1579,6 +1579,9 @@ impl CodingAgent {
         images: Vec<ImageAttachment>,
     ) -> Option<Result<String, String>> {
         self.cancellation.clear_cancellation_guard();
+        if let Err(error) = self.recover_saved_extension_replies().await {
+            return Some(Err(format!("Harness Error: {error}")));
+        }
         if let Err(error) = self.recover_interrupted_subagent_lanes().await {
             return Some(Err(error));
         }
@@ -1830,13 +1833,14 @@ impl CodingAgent {
                     Ok(operation) => operation,
                     Err(error) => return Some(Err(format!("WASI Extension Error: {error}"))),
                 };
-                let res = operation.invoke(&cmd_args)
-                    .and_then(|result| result.into_command_result());
                 let visible_prompt = AgentMessage::user(input, images.clone());
                 let harness_run_id = match self.begin_harness_run(visible_prompt).await {
                     Ok(run_id) => run_id,
                     Err(error) => return Some(Err(format!("Harness Error: {error}"))),
                 };
+                let res = operation
+                    .invoke(&cmd_args)
+                    .and_then(|result| result.into_command_result());
                 let parent_leaf = self.prompt_parent_leaf(
                     AgentMessage::user(input, images.clone()),
                     harness_run_id.is_some(),
@@ -2363,6 +2367,10 @@ impl CodingAgent {
 }
 
 #[cfg(test)]
+#[path = "broker_repair_tests.rs"]
+pub(crate) mod broker_repair_tests;
+
+#[cfg(test)]
 mod tool_identity_tests {
     use super::{CodingAgent, CodingAgentOptions};
     use std::path::{Path, PathBuf};
@@ -2371,13 +2379,403 @@ mod tool_identity_tests {
     use threadlane_protocol::browser::BrowserBridge;
     use threadlane_protocol::{
         AgentMessage, AgentToolCall, AgentToolDefinition, ImageAttachment, RuntimeToolCall,
-        RuntimeToolCallFunction, ToolExecutionIdentity, ToolExecutor, ToolOutput,
+        RuntimeToolCallFunction, ToolExecutionError, ToolExecutionIdentity, ToolExecutor,
+        ToolOutput,
     };
     use threadlane_runtime::harness::{JsonlStore, OperationOutcome, Record, SessionStore};
 
     struct CommittedIntentProbe {
         path: PathBuf,
         observed: Arc<Mutex<Vec<ToolExecutionIdentity>>>,
+    }
+
+    #[cfg(unix)]
+    fn install_terminal_broker_tool(directory: &Path) {
+        let manifest = serde_json::json!({"api_version":2,"name":"reply_probe","version":"1","description":"test","capabilities":["process"],"tools":[{"name":"reply_probe","description":"test","parameters":{}}],"hooks":["after_tool_call"]}).to_string();
+        let response = r#"{"state":{"finished":true},"message":"raw reply"}"#;
+        let request = serde_json::json!({"api_version":2,"capability":"process","operation":"run","arguments":{"program":"sh","args":["-c","printf effect >> effects.log; printf broker-reply"]}}).to_string();
+        let hook_request = serde_json::json!({"api_version":2,"capability":"process","operation":"run","arguments":{"program":"sh","args":["-c","printf hook >> hooks.log"]}}).to_string();
+        let escape = |value: &str| value.replace('"', "\\\"");
+        let wasm = format!(
+            r#"(module
+            (import "threadlane_host" "request" (func $request (param i32 i32 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 0) "{}")
+            (data (i32.const 1024) "{}")
+            (data (i32.const 2048) "{}")
+            (data (i32.const 3072) "{}")
+            (func (export "extension_info") (result i64) (i64.const {}))
+            (func (export "alloc") (param i32) (result i32) (i32.const 8192))
+            (func (export "execute_tool") (param i32 i32) (result i64)
+                (drop (call $request (i32.const 2048) (i32.const {}) (i32.const 4096) (i32.const 1024)))
+                (i64.const {}))
+            (func (export "handle_hook") (param i32 i32) (result i64)
+                (drop (call $request (i32.const 3072) (i32.const {}) (i32.const 4096) (i32.const 1024)))
+                (i64.const {})))"#,
+            escape(&manifest),
+            escape(response),
+            escape(&request),
+            escape(&hook_request),
+            manifest.len(),
+            request.len(),
+            (1024u64 << 32) | response.len() as u64,
+            hook_request.len(),
+            (1024u64 << 32) | response.len() as u64
+        );
+        let path = directory.join(".threadlane/extensions/reply_probe.wasm");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, wasm).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn reply_probe_options(directory: &Path, path: &Path) -> CodingAgentOptions {
+        CodingAgentOptions {
+            api_key: "test".into(),
+            account_id: None,
+            model: "test-model".into(),
+            work_dir: directory.to_owned(),
+            session_file: Some(path.to_owned()),
+            system_prompt: SystemPromptConfig::default(),
+            agent_config: None,
+            coding_config: None,
+            browser: BrowserBridge::unavailable(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_reply_recovery_preserves_unknown_after_hook_effects_without_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        install_terminal_broker_tool(directory.path());
+        let path = directory.path().join("session.jsonl");
+        let mut agent = CodingAgent::new(reply_probe_options(directory.path(), &path));
+        let accepted = agent
+            .begin_harness_run(AgentMessage::user("probe", vec![]))
+            .await
+            .unwrap()
+            .unwrap();
+        let call = RuntimeToolCall {
+            id: "original-call".into(),
+            r#type: "function".into(),
+            function: RuntimeToolCallFunction {
+                name: "reply_probe".into(),
+                arguments: "{}".into(),
+            },
+            thought_signature: None,
+        };
+        agent
+            .harness
+            .as_mut()
+            .unwrap()
+            .append_message(AgentMessage::Assistant {
+                content: None,
+                tool_calls: Some(vec![call]),
+                stop_reason: None,
+                deferred_handle: None,
+            })
+            .unwrap();
+        let identity = agent
+            .harness
+            .as_mut()
+            .unwrap()
+            .append_tool_intent_after_hook(
+                &accepted.run_id,
+                "original-call",
+                "reply_probe",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        let mut operation = agent
+            .wasi_extensions
+            .begin_tool_operation("reply_probe")
+            .unwrap()
+            .unwrap();
+        let terminal = operation.invoke_for_execution("{}", &identity).unwrap();
+        let dispatch = agent
+            .broker_dispatcher
+            .dispatch_envelopes(terminal.host_broker_requests)
+            .await
+            .unwrap();
+        agent
+            .wasi_extensions
+            .enqueue_broker_results(dispatch.operation_results)
+            .unwrap();
+        drop(operation);
+        let mut hook = agent
+            .wasi_extensions
+            .begin_hook_operations("after_tool_call")
+            .next()
+            .unwrap()
+            .unwrap();
+        let invocation = hook.invoke_after_tool("{}", &identity).unwrap();
+        let dispatch = agent
+            .broker_dispatcher
+            .dispatch_envelopes(invocation.host_broker_requests)
+            .await
+            .unwrap();
+        assert!(dispatch
+            .operation_results
+            .iter()
+            .all(|result| result.error.is_none()));
+        // The physical hook completed, but its outcome was lost before persistence.
+        drop(dispatch);
+        drop(hook);
+        drop(agent);
+        std::fs::remove_file(
+            directory
+                .path()
+                .join(".threadlane/extensions/reply_probe.wasm"),
+        )
+        .unwrap();
+        let mut recovered = CodingAgent::new(reply_probe_options(directory.path(), &path));
+        let before = std::fs::read(&path).unwrap();
+        let error = recovered
+            .recover_saved_extension_replies()
+            .await
+            .unwrap_err();
+        assert!(error.contains("remain unsettled"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            recovered
+                .wasi_extensions
+                .pending_tool_reply_identities()
+                .unwrap(),
+            vec![identity.clone()]
+        );
+        assert!(
+            !JsonlStore::open(&path)
+                .unwrap()
+                .tool_state_for_call(&identity.run_id, "original-call")
+                .unwrap()
+                .1
+                .completed
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("effects.log")).unwrap(),
+            b"effect"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("hooks.log")).unwrap(),
+            b"hook"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_reply_recovers_original_journal_result_without_tool_or_hook_replay() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use threadlane_runtime::harness::{HookEffect, HookKind};
+
+        for dyn_form in [false, true] {
+            for committed_state in [0, 1, 2, 3] {
+                let already_committed = matches!(committed_state, 1 | 2);
+                let directory = tempfile::tempdir().unwrap();
+                install_terminal_broker_tool(directory.path());
+                let path = directory.path().join("session.jsonl");
+                let options = || reply_probe_options(directory.path(), &path);
+                let mut agent = CodingAgent::new(options());
+                agent.agent.set_allowed_tool_names(None);
+                let hooks = Arc::new(AtomicUsize::new(0));
+                let hook_count = hooks.clone();
+                agent
+                    .agent
+                    .hook_registry
+                    .register(
+                        HookKind::AfterTool,
+                        "reply-marker",
+                        Arc::new(move |_| {
+                            let hooks = hook_count.clone();
+                            Box::pin(async move {
+                                hooks.fetch_add(1, Ordering::SeqCst);
+                                if committed_state == 3 {
+                                    panic!("after-hook panic");
+                                }
+                                let mut effect = HookEffect::default();
+                                effect.append_content = Some("hook reply".into());
+                                Ok(effect)
+                            })
+                        }),
+                    )
+                    .unwrap();
+                let accepted = agent
+                    .begin_harness_run(AgentMessage::user("probe", vec![]))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let name = if dyn_form {
+                    "run_command"
+                } else {
+                    "reply_probe"
+                };
+                let call = RuntimeToolCall {
+                    id: "original-call".into(),
+                    r#type: "function".into(),
+                    function: RuntimeToolCallFunction {
+                        name: name.into(),
+                        arguments: if dyn_form {
+                            serde_json::json!({"command":"dyn reply_probe '{}'"}).to_string()
+                        } else {
+                            "{}".into()
+                        },
+                    },
+                    thought_signature: None,
+                };
+                agent
+                    .harness
+                    .as_mut()
+                    .unwrap()
+                    .append_message(AgentMessage::Assistant {
+                        content: None,
+                        tool_calls: Some(vec![call.clone()]),
+                        stop_reason: None,
+                        deferred_handle: None,
+                    })
+                    .unwrap();
+                agent.set_tool_completion_recorder(Some(Arc::new(|_| {
+                    Box::pin(async { Err("injected result commit failure".into()) })
+                })));
+                let failure = agent
+                    .agent
+                    .execute_tools(&[call.clone()])
+                    .await
+                    .unwrap_err();
+                assert!(
+                    failure.to_string().contains(if committed_state == 3 {
+                        "execution task"
+                    } else {
+                        "result commit failure"
+                    }),
+                    "{failure}"
+                );
+                assert_eq!(hooks.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    std::fs::read(directory.path().join("effects.log")).unwrap(),
+                    b"effect"
+                );
+                assert_eq!(
+                    std::fs::read(directory.path().join("hooks.log")).unwrap(),
+                    b"hook"
+                );
+                let identities = agent
+                    .wasi_extensions
+                    .pending_tool_reply_identities()
+                    .unwrap();
+                assert_eq!(identities.len(), 1);
+                let identity = &identities[0];
+                assert_eq!(identity.run_id, accepted.run_id);
+                assert_eq!(identity.tool_call_id, "original-call");
+                assert_eq!(identity.tool_name, name);
+                let prepared = agent
+                    .wasi_extensions
+                    .recovered_canonical_reply(identity)
+                    .unwrap();
+                assert_eq!(prepared.is_some(), committed_state != 3);
+                let expected = match prepared {
+                    Some(result) => result,
+                    None => agent
+                        .agent
+                        .recover_tool_reply(&call, identity)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                };
+                assert!(expected.content.contains("broker-reply"));
+                assert_eq!(
+                    expected.content.contains("hook reply"),
+                    committed_state != 3
+                );
+                assert_eq!(expected.content.starts_with("Exit Status:"), dyn_form);
+                assert!(!expected.is_error);
+                if already_committed {
+                    let mut committed = expected.clone();
+                    if committed_state == 2 {
+                        committed.content.push_str("different reply");
+                    }
+                    agent
+                        .harness
+                        .as_mut()
+                        .unwrap()
+                        .record_tool_result(&identity.run_id, &committed)
+                        .unwrap();
+                }
+                drop(agent);
+                std::fs::remove_file(
+                    directory
+                        .path()
+                        .join(".threadlane/extensions/reply_probe.wasm"),
+                )
+                .unwrap();
+                let mut recovered = CodingAgent::new(options());
+                // The original executor module is absent. Recovery cannot enter its VM.
+                if committed_state == 2 {
+                    let before = std::fs::read(&path).unwrap();
+                    let error = recovered
+                        .recover_saved_extension_replies()
+                        .await
+                        .unwrap_err();
+                    assert!(error.contains("replies disagree"), "{error}");
+                    assert_eq!(std::fs::read(&path).unwrap(), before);
+                    assert_eq!(
+                        recovered
+                            .wasi_extensions
+                            .pending_tool_reply_identities()
+                            .unwrap(),
+                        identities
+                    );
+                    assert_eq!(
+                        std::fs::read(directory.path().join("effects.log")).unwrap(),
+                        b"effect"
+                    );
+                    assert_eq!(
+                        std::fs::read(directory.path().join("hooks.log")).unwrap(),
+                        b"hook"
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    recovered.recover_saved_extension_replies().await.unwrap(),
+                    usize::from(!already_committed)
+                );
+                assert_eq!(
+                    recovered.recover_saved_extension_replies().await.unwrap(),
+                    0
+                );
+                assert!(recovered
+                    .wasi_extensions
+                    .pending_tool_reply_identities()
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(hooks.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    std::fs::read(directory.path().join("effects.log")).unwrap(),
+                    b"effect"
+                );
+                assert_eq!(
+                    std::fs::read(directory.path().join("hooks.log")).unwrap(),
+                    b"hook"
+                );
+                let store = JsonlStore::open(&path).unwrap();
+                let (_, tool) = store
+                    .tool_state_for_call(&identity.run_id, "original-call")
+                    .unwrap();
+                assert!(tool.completed);
+                assert_eq!(tool.result_entry_id, identity.result_entry_id);
+                let AgentMessage::Tool {
+                    content,
+                    tool_call_id,
+                    name: result_name,
+                    ..
+                } = &store.entry(&identity.result_entry_id).unwrap().message
+                else {
+                    panic!("missing canonical result")
+                };
+                assert_eq!(content, &expected.content);
+                assert_eq!(tool_call_id, "original-call");
+                assert_eq!(result_name, name);
+                assert_eq!(store.records().iter().filter(|record| matches!(record, Record::ToolFinished { tool_call_id, .. } if tool_call_id == "original-call")).count(), 1);
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -2401,7 +2799,7 @@ mod tool_identity_tests {
             args: &str,
             _: Option<&Path>,
             identity: Option<&ToolExecutionIdentity>,
-        ) -> Option<Result<ToolOutput, String>> {
+        ) -> Option<Result<ToolOutput, ToolExecutionError>> {
             let identity = identity.expect("durable execution requires a committed intent");
             assert_eq!(call.id, identity.tool_call_id);
             assert_eq!(call.name, "committed_probe");
@@ -3106,8 +3504,9 @@ mod compaction_sync_tests {
 
     struct LongToolLoopProvider {
         attempts: AtomicUsize,
-        max_request_estimate: AtomicUsize,
+        request_estimates: Mutex<Vec<usize>>,
         previous_serialized_request: Mutex<Option<String>>,
+        use_cache: bool,
     }
 
     #[derive(Default)]
@@ -3873,10 +4272,6 @@ mod compaction_sync_tests {
         fn attempts(&self) -> usize {
             self.attempts.load(Ordering::SeqCst)
         }
-
-        fn max_request_estimate(&self) -> usize {
-            self.max_request_estimate.load(Ordering::SeqCst)
-        }
     }
 
     #[async_trait]
@@ -3917,19 +4312,34 @@ mod compaction_sync_tests {
                 *previous = Some(serialized_request);
                 repeated_prefix_bytes / 4
             };
-            self.max_request_estimate
-                .fetch_max(estimate, Ordering::SeqCst);
+            self.request_estimates.lock().unwrap().push(estimate);
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
             let tool_calls = if attempt < 280 {
-                vec![RuntimeToolCall {
-                    id: format!("loop-{attempt}"),
-                    r#type: "function".into(),
-                    function: RuntimeToolCallFunction {
-                        name: threadlane_skills::LOAD_SKILL_TOOL_NAME.into(),
-                        arguments: serde_json::json!({ "name": "reported-shape" }).to_string(),
-                    },
-                    thought_signature: None,
-                }]
+                (0..if self.use_cache { 2 } else { 1 })
+                    .map(|slot| RuntimeToolCall {
+                        id: if self.use_cache {
+                            format!("loop-{attempt}-{slot}")
+                        } else {
+                            format!("loop-{attempt}")
+                        },
+                        r#type: "function".into(),
+                        function: RuntimeToolCallFunction {
+                            name: if self.use_cache {
+                                "grep_search"
+                            } else {
+                                threadlane_skills::LOAD_SKILL_TOOL_NAME
+                            }
+                            .into(),
+                            arguments: if self.use_cache {
+                                serde_json::json!({"pattern": "segment", "glob": "reported.txt"})
+                            } else {
+                                serde_json::json!({ "name": "reported-shape" })
+                            }
+                            .to_string(),
+                        },
+                        thought_signature: None,
+                    })
+                    .collect()
             } else {
                 Vec::new()
             };
@@ -3972,10 +4382,21 @@ mod compaction_sync_tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn long_cached_tool_loop_compacts_before_budget() {
+        assert_long_tool_loop_compacts_before_budget(true).await;
+    }
+
+    #[tokio::test]
+    async fn long_uncached_skill_loop_compacts_before_budget() {
+        assert_long_tool_loop_compacts_before_budget(false).await;
+    }
+
+    async fn assert_long_tool_loop_compacts_before_budget(use_cache: bool) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("reported-session-shape.jsonl");
+        // Journal appends must not change the searched tree and invalidate its cache.
+        let journal_dir = tempfile::tempdir().unwrap();
+        let path = journal_dir.path().join("reported-session-shape.jsonl");
         let skill_dir = dir.path().join(".agents/skills/reported-shape");
         std::fs::create_dir_all(&skill_dir).unwrap();
         let skill_body = "segment ".repeat(1_000);
@@ -3986,10 +4407,12 @@ mod compaction_sync_tests {
             ),
         )
         .unwrap();
+        std::fs::write(dir.path().join("reported.txt"), &skill_body).unwrap();
         let provider = Arc::new(LongToolLoopProvider {
             attempts: AtomicUsize::new(0),
-            max_request_estimate: AtomicUsize::new(0),
+            request_estimates: Mutex::new(Vec::new()),
             previous_serialized_request: Mutex::new(None),
+            use_cache,
         });
         let mut agent = CodingAgent::new_with_provider(
             CodingAgentOptions {
@@ -3999,8 +4422,10 @@ mod compaction_sync_tests {
                 work_dir: dir.path().to_path_buf(),
                 session_file: Some(path.clone()),
                 system_prompt: SystemPromptConfig::default(),
-                // This synthetic provider repeats one identical call 279
-                // times to stress compaction; the loop guard would rightly
+                // This provider requests 279 batches. The cached case repeats
+                // a search within each batch on the current-thread test executor;
+                // cache entries intentionally reset between provider turns.
+                // The loop guard would rightly
                 // trip it in production, so it stays off here. The loop is
                 // long enough that request-scoped tool-output pruning alone
                 // cannot keep the view under the adaptive budget, so an
@@ -4039,7 +4464,28 @@ mod compaction_sync_tests {
             })
             .next_back()
             .unwrap();
-        assert!(provider.max_request_estimate() < emitted_context_limit);
+        let requests = provider.request_estimates.lock().unwrap();
+        let manifests: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record {
+                Record::ContextManifestCaptured {
+                    context_limit,
+                    total_estimated_tokens,
+                    ..
+                } => Some((context_limit.unwrap(), total_estimated_tokens.unwrap())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(requests.len(), 280);
+        assert_eq!(manifests.len(), requests.len());
+        for (index, (request, (limit, manifest))) in requests.iter().zip(&manifests).enumerate() {
+            assert!(*request < *limit, "request {index}: {request} >= {limit}");
+            assert!(
+                (*manifest as usize) < *limit,
+                "manifest {index}: {manifest} >= {limit}"
+            );
+        }
+        drop(requests);
 
         let cumulative_processed = records
             .iter()
@@ -4057,9 +4503,9 @@ mod compaction_sync_tests {
             "processed={cumulative_processed}, limit={emitted_context_limit}"
         );
 
-        let (compaction_seq, generation) = records
+        let compactions = records
             .iter()
-            .find_map(|record| match record {
+            .filter_map(|record| match record {
                 Record::ContextCompacted {
                     seq,
                     generation,
@@ -4068,66 +4514,82 @@ mod compaction_sync_tests {
                 } => Some((*seq, *generation)),
                 _ => None,
             })
-            .expect("adaptive compaction telemetry");
-        let (manifest_seq, manifest_generation, manifest_tokens) = records
-            .iter()
-            .filter_map(|record| match record {
-                Record::ContextManifestCaptured {
-                    seq,
-                    compaction_generation,
-                    total_estimated_tokens,
-                    ..
-                } if *seq > compaction_seq => {
-                    Some((*seq, *compaction_generation, *total_estimated_tokens))
-                }
-                _ => None,
-            })
-            .next()
-            .expect("post-compaction context manifest");
-        let next_provider_start_seq = records
-            .iter()
-            .filter_map(|record| match record {
-                Record::ProviderRequestStarted { seq, .. } if *seq > compaction_seq => Some(*seq),
-                _ => None,
-            })
-            .next()
-            .expect("post-compaction provider request");
-        assert_eq!(manifest_generation, generation);
-        assert!(manifest_tokens.unwrap() < emitted_context_limit as u32);
+            .collect::<Vec<_>>();
+        assert!(!compactions.is_empty(), "adaptive compaction telemetry");
+        let mut previous_compaction_seq = 0;
+        for (compaction_seq, generation) in compactions {
+            let (manifest_seq, manifest_generation, manifest_tokens, manifest_limit) = records
+                .iter()
+                .filter_map(|record| match record {
+                    Record::ContextManifestCaptured {
+                        seq,
+                        compaction_generation,
+                        total_estimated_tokens,
+                        context_limit,
+                        ..
+                    } if *seq > compaction_seq => Some((
+                        *seq,
+                        *compaction_generation,
+                        *total_estimated_tokens,
+                        context_limit.unwrap(),
+                    )),
+                    _ => None,
+                })
+                .next()
+                .expect("post-compaction context manifest");
+            let next_provider_start_seq = records
+                .iter()
+                .filter_map(|record| match record {
+                    Record::ProviderRequestStarted { seq, .. } if *seq > compaction_seq => {
+                        Some(*seq)
+                    }
+                    _ => None,
+                })
+                .next()
+                .expect("post-compaction provider request");
+            assert_eq!(manifest_generation, generation);
+            assert!((manifest_tokens.unwrap() as usize) < manifest_limit);
 
-        // The checkpoint summary, compaction telemetry, provider start, and
-        // request manifest are all recovered from the durable journal in order.
-        let checkpoint_seq = store
-            .entries()
-            .iter()
-            .filter_map(|entry| match &entry.message {
-                AgentMessage::Custom { custom_type, .. }
-                    if custom_type == "compaction_summary" && entry.seq < compaction_seq =>
-                {
-                    Some(entry.seq)
-                }
-                _ => None,
-            })
-            .next_back()
-            .expect("durable checkpoint preceding adaptive compaction");
-        assert!(
-            checkpoint_seq < compaction_seq
-                && compaction_seq < next_provider_start_seq
-                && next_provider_start_seq < manifest_seq,
-            "checkpoint={checkpoint_seq}, compaction={compaction_seq}, provider_start={next_provider_start_seq}, manifest={manifest_seq}"
-        );
+            // The checkpoint summary, compaction telemetry, provider start, and
+            // request manifest are all recovered from the durable journal in order.
+            let checkpoint_seq = store
+                .entries()
+                .iter()
+                .filter_map(|entry| match &entry.message {
+                    AgentMessage::Custom { custom_type, .. }
+                        if custom_type == "compaction_summary" && entry.seq < compaction_seq =>
+                    {
+                        Some(entry.seq)
+                    }
+                    _ => None,
+                })
+                .next_back()
+                .expect("durable checkpoint preceding adaptive compaction");
+            assert!(
+                previous_compaction_seq < checkpoint_seq
+                    && checkpoint_seq < compaction_seq
+                    && compaction_seq < next_provider_start_seq
+                    && next_provider_start_seq < manifest_seq,
+                "checkpoint={checkpoint_seq}, compaction={compaction_seq}, provider_start={next_provider_start_seq}, manifest={manifest_seq}"
+            );
+            previous_compaction_seq = compaction_seq;
+        }
 
         // The reopened branch selects the latest durable checkpoint and a descendant leaf.
         let model_context = store.model_context("main").unwrap();
         let checkpoint = model_context.checkpoint.expect("durable checkpoint");
-        assert!(model_context
-            .leaf_id
-            .as_deref()
-            .is_some_and(|leaf| leaf != checkpoint.entry_id));
-        assert!(model_context
-            .entries
-            .iter()
-            .any(|entry| entry.id == checkpoint.entry_id));
+        assert!(
+            model_context
+                .leaf_id
+                .as_deref()
+                .is_some_and(|leaf| leaf != checkpoint.entry_id)
+        );
+        assert!(
+            model_context
+                .entries
+                .iter()
+                .any(|entry| entry.id == checkpoint.entry_id)
+        );
 
         let page = read_transcript_page(&path, None, 1_000).unwrap();
         assert!(!page.has_older);
@@ -4153,63 +4615,106 @@ mod compaction_sync_tests {
             AgentMessage::Assistant { content: Some(content), .. } if content == "complete"
         )));
 
+        let batch_size = if use_cache { 2 } else { 1 };
         let mut correlated_pairs = Vec::new();
         let mut call_ids = HashSet::new();
         let mut result_ids = HashSet::new();
+        let mut actual_results = 0;
         for (index, message) in messages.iter().enumerate() {
             match message {
                 AgentMessage::Assistant {
                     tool_calls: Some(calls),
                     ..
                 } if !calls.is_empty() => {
-                    let [call] = calls.as_slice() else {
-                        panic!("assistant at index {index} must contain exactly one tool call");
-                    };
-                    assert!(
-                        call_ids.insert(call.id.clone()),
-                        "duplicate tool call {}",
-                        call.id
-                    );
-                    let Some(AgentMessage::Tool {
-                        tool_call_id,
-                        content,
-                        ..
-                    }) = messages.get(index + 1)
-                    else {
-                        panic!("tool call {} was not followed by its result", call.id);
-                    };
-                    assert_eq!(tool_call_id, &call.id);
-                    assert!(
-                        result_ids.insert(tool_call_id.clone()),
-                        "duplicate tool result {tool_call_id}"
-                    );
-                    correlated_pairs.push((call.id.clone(), content.clone()));
+                    assert_eq!(calls.len(), batch_size);
+                    for (offset, call) in calls.iter().enumerate() {
+                        assert!(
+                            call_ids.insert(call.id.clone()),
+                            "duplicate tool call {}",
+                            call.id
+                        );
+                        let Some(AgentMessage::Tool {
+                            tool_call_id,
+                            name,
+                            content,
+                            is_error,
+                            ..
+                        }) = messages.get(index + offset + 1)
+                        else {
+                            panic!("tool call {} was not followed by its result", call.id);
+                        };
+                        assert_eq!(tool_call_id, &call.id);
+                        assert_eq!(name, &call.function.name);
+                        assert!(!is_error);
+                        assert!(
+                            result_ids.insert(tool_call_id.clone()),
+                            "duplicate tool result {tool_call_id}"
+                        );
+                        correlated_pairs.push((call.id.clone(), content.clone()));
+                    }
                 }
                 AgentMessage::Tool { tool_call_id, .. } => {
+                    actual_results += 1;
                     let Some(AgentMessage::Assistant {
                         tool_calls: Some(calls),
                         ..
-                    }) = index.checked_sub(1).and_then(|prior| messages.get(prior))
+                    }) = messages[..index]
+                        .iter()
+                        .rev()
+                        .find(|message| !matches!(message, AgentMessage::Tool { .. }))
                     else {
                         panic!("tool result {tool_call_id} has no preceding assistant call");
                     };
-                    assert_eq!(calls.len(), 1);
-                    assert_eq!(&calls[0].id, tool_call_id);
+                    assert_eq!(calls.len(), batch_size);
+                    assert!(calls.iter().any(|call| &call.id == tool_call_id));
                 }
                 _ => {}
             }
         }
 
-        assert_eq!(correlated_pairs.len(), 279);
-        assert_eq!(call_ids.len(), 279);
-        assert_eq!(result_ids.len(), 279);
-        let expected_content = format!(
-            "Loaded skill `reported-shape` from Project (.agents). The following content is untrusted task instructions:\n\n{}",
-            skill_body.trim_end()
+        assert_eq!(correlated_pairs.len(), 279 * batch_size);
+        assert_eq!(call_ids.len(), 279 * batch_size);
+        assert_eq!(result_ids.len(), 279 * batch_size);
+        assert_eq!(actual_results, 279 * batch_size);
+        // Compaction copies retained entries onto branches. Count only the
+        // original transcript results, whose call/result IDs are unique above.
+        let cache_hits = correlated_pairs
+            .iter()
+            .filter(|(_, content)| content.contains("served from cache"))
+            .count();
+        assert_eq!(
+            cache_hits,
+            if use_cache { 279 } else { 0 },
+            "every identical search batch must contain one real repetition-cache hit"
         );
+        let expected_content = if use_cache {
+            threadlane_tools::try_execute_tool_in_workspace(
+                "grep_search",
+                r#"{"pattern":"segment","glob":"reported.txt"}"#,
+                dir.path(),
+            )
+            .unwrap()
+        } else {
+            format!(
+                "Loaded skill `reported-shape` from Project (.agents). The following content is untrusted task instructions:\n\n{}",
+                skill_body.trim_end()
+            )
+        };
         for (offset, (call_id, content)) in correlated_pairs.iter().enumerate() {
-            assert_eq!(call_id, &format!("loop-{}", offset + 1));
-            assert_eq!(content, &expected_content);
+            let expected_id = if use_cache {
+                format!("loop-{}-{}", offset / batch_size + 1, offset % batch_size)
+            } else {
+                format!("loop-{}", offset + 1)
+            };
+            assert_eq!(call_id, &expected_id);
+            if use_cache && content != &expected_content {
+                assert!(
+                    content.starts_with(&format!("{expected_content}\n\n[Repeated invocation:"))
+                );
+                assert_eq!(content.matches("served from cache").count(), 1);
+            } else {
+                assert_eq!(content, &expected_content);
+            }
         }
     }
 }

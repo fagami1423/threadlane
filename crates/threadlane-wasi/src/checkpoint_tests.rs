@@ -10,6 +10,273 @@ use std::{
 
 const NAME: &str = "checkpoint_probe";
 
+fn reply_identity() -> threadlane_protocol::ToolExecutionIdentity {
+    threadlane_protocol::ToolExecutionIdentity {
+        session_id: "a".into(),
+        lane: "main".into(),
+        run_id: "run".into(),
+        assistant_entry_id: "assistant".into(),
+        tool_call_id: "call".into(),
+        tool_name: "probe".into(),
+        result_entry_id: "result".into(),
+    }
+}
+
+#[test]
+fn terminal_reply_commits_with_state_and_broker_acknowledgment() {
+    let project = tempfile::tempdir().unwrap();
+    let manager = emitting_manager(project.path());
+    let identity = reply_identity();
+    let mut operation = manager.begin_tool_operation("probe").unwrap().unwrap();
+    let mut wrong_scope = identity.clone();
+    wrong_scope.session_id = "b".into();
+    assert!(operation.invoke_for_execution("{}", &wrong_scope).is_err());
+    assert!(!project.path().join("effects.log").exists());
+    let pending = operation.invoke_for_execution("{}", &identity).unwrap();
+    manager
+        .enqueue_broker_results(dispatch_once(
+            project.path(),
+            &manager,
+            pending.host_broker_requests,
+        ))
+        .unwrap();
+    let done = operation.invoke_for_execution("{}", &identity).unwrap();
+    assert_eq!(done.response.message.as_deref(), Some("done"));
+    let checkpoint: Value =
+        serde_json::from_slice(&fs::read(manager.state_path(NAME).unwrap()).unwrap()).unwrap();
+    assert_eq!(checkpoint["state"]["phase"], "ready");
+    assert!(checkpoint["broker_events"].as_array().unwrap().is_empty());
+    assert_eq!(
+        checkpoint["terminal_reply"]["identity"],
+        serde_json::to_value(&identity).unwrap()
+    );
+    assert_eq!(checkpoint["terminal_reply"]["result"], json!({"Ok":"done"}));
+    assert_eq!(
+        fs::read(project.path().join("effects.log")).unwrap(),
+        b"effect\n"
+    );
+    drop(operation);
+    let path = manager.state_path(NAME).unwrap();
+    let saved = fs::read(&path).unwrap();
+    assert!(manager
+        .set_extension_state(NAME, json!({"overwrite":true}))
+        .is_err());
+    assert!(manager
+        .execute_tool_with_broker_requests("probe", "{}")
+        .unwrap()
+        .is_err());
+    assert_eq!(fs::read(&path).unwrap(), saved);
+    drop(manager);
+    fs::remove_file(project.path().join(".threadlane/extensions/probe.wasm")).unwrap();
+    let recovered = WasiExtensionManager::for_project_session(project.path(), "a");
+    assert_eq!(
+        recovered
+            .reload_from_roots(None, Some(project.path()))
+            .unwrap(),
+        0
+    );
+    assert!(recovered.set_session_scope("b").is_err());
+    assert_eq!(
+        recovered
+            .recover_tool_reply(&identity, "probe", "{}")
+            .unwrap(),
+        Some(Ok("done".into()))
+    );
+    assert!(recovered
+        .recover_tool_reply(&identity, "probe", r#"{"changed":true}"#)
+        .is_err());
+    let mut wrong_run = identity.clone();
+    wrong_run.run_id = "later-run".into();
+    assert_eq!(
+        recovered
+            .recover_tool_reply(&wrong_run, "probe", "{}")
+            .unwrap(),
+        None
+    );
+    recovered.acknowledge_tool_reply(&wrong_run).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), saved);
+    assert!(recovered.set_session_scope("b").is_err());
+    recovered.acknowledge_tool_reply(&identity).unwrap();
+    assert!(recovered
+        .pending_tool_reply_identities()
+        .unwrap()
+        .is_empty());
+    let checkpoint: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(checkpoint.get("terminal_reply").is_none());
+    assert_eq!(checkpoint["state"]["phase"], "ready");
+    assert_eq!(
+        fs::read(project.path().join("effects.log")).unwrap(),
+        b"effect\n"
+    );
+}
+
+#[test]
+fn canonical_reply_lookup_restores_a_cold_removed_extension_checkpoint() {
+    let project = tempfile::tempdir().unwrap();
+    let manager = emitting_manager(project.path());
+    let identity = reply_identity();
+    let mut operation = manager.begin_tool_operation("probe").unwrap().unwrap();
+    let pending = operation.invoke_for_execution("{}", &identity).unwrap();
+    manager
+        .enqueue_broker_results(dispatch_once(
+            project.path(),
+            &manager,
+            pending.host_broker_requests,
+        ))
+        .unwrap();
+    operation.invoke_for_execution("{}", &identity).unwrap();
+    drop(operation);
+    let mut prepared =
+        threadlane_protocol::AgentToolResult::external("call", "probe", "done plus hook", false);
+    prepared.terminate = true;
+    prepared.images.push(threadlane_protocol::ImageAttachment {
+        display_name: "fixture.png".into(),
+        data_url: "data:image/png;base64,AA==".into(),
+    });
+    manager.prepare_tool_reply(&identity, &prepared).unwrap();
+    let checkpoint = manager.state_path(NAME).unwrap();
+    let before = fs::read(&checkpoint).unwrap();
+    let competing = WasiExtensionManager::for_project_session(project.path(), "a");
+    assert!(competing
+        .recovered_canonical_reply(&identity)
+        .unwrap_err()
+        .contains("owned"));
+    drop(competing);
+    drop(manager);
+    fs::remove_file(project.path().join(".threadlane/extensions/probe.wasm")).unwrap();
+    let recovered = WasiExtensionManager::for_project_session(project.path(), "a");
+    assert_eq!(
+        recovered.recovered_canonical_reply(&identity).unwrap(),
+        Some(prepared.clone())
+    );
+    assert_eq!(
+        recovered.recovered_canonical_reply(&identity).unwrap(),
+        Some(prepared)
+    );
+    let mut other = identity.clone();
+    other.run_id = "another-run".into();
+    assert_eq!(recovered.recovered_canonical_reply(&other).unwrap(), None);
+    assert_eq!(fs::read(&checkpoint).unwrap(), before);
+    assert_eq!(
+        fs::read(project.path().join("effects.log")).unwrap(),
+        b"effect\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_reply_sync_uncertainty_recovers_without_redelivery_or_effect_replay() {
+    let project = tempfile::tempdir().unwrap();
+    let manager = emitting_manager(project.path());
+    let identity = reply_identity();
+    let mut operation = manager.begin_tool_operation("probe").unwrap().unwrap();
+    let pending = operation.invoke_for_execution("{}", &identity).unwrap();
+    manager
+        .enqueue_broker_results(dispatch_once(
+            project.path(),
+            &manager,
+            pending.host_broker_requests,
+        ))
+        .unwrap();
+    fail_next_directory_sync();
+    assert!(operation
+        .invoke_for_execution("{}", &identity)
+        .unwrap_err()
+        .contains("recover_state_commit"));
+    drop(operation);
+    assert!(manager
+        .recover_tool_reply(&identity, "probe", "{}")
+        .is_err());
+    manager.recover_state_commit().unwrap();
+    assert_eq!(
+        manager
+            .recover_tool_reply(&identity, "probe", "{}")
+            .unwrap(),
+        Some(Ok("done".into()))
+    );
+    let mut result =
+        threadlane_protocol::AgentToolResult::external("call", "probe", "done plus hook", false);
+    result.terminate = true;
+    result.images.push(threadlane_protocol::ImageAttachment {
+        display_name: "fixture.png".into(),
+        data_url: "data:image/png;base64,AA==".into(),
+    });
+    manager.prepare_tool_reply(&identity, &result).unwrap();
+    assert_eq!(
+        manager.recovered_canonical_reply(&identity).unwrap(),
+        Some(result.clone())
+    );
+    let before = fs::read(manager.state_path(NAME).unwrap()).unwrap();
+    manager.prepare_tool_reply(&identity, &result).unwrap();
+    let mut changed = result.clone();
+    changed.content.push_str("changed");
+    assert!(manager.prepare_tool_reply(&identity, &changed).is_err());
+    assert_eq!(fs::read(manager.state_path(NAME).unwrap()).unwrap(), before);
+    fail_next_directory_sync();
+    assert!(manager
+        .acknowledge_tool_reply(&identity)
+        .unwrap_err()
+        .contains("recover_state_commit"));
+    manager.recover_state_commit().unwrap();
+    assert!(manager.pending_tool_reply_identities().unwrap().is_empty());
+    assert_eq!(
+        fs::read(project.path().join("effects.log")).unwrap(),
+        b"effect\n"
+    );
+}
+
+#[test]
+fn terminal_broker_reply_waits_for_known_outcomes_and_preserves_success_or_failure() {
+    for failed in [false, true] {
+        let project = tempfile::tempdir().unwrap();
+        let manager = emitting_manager_with_continuation(project.path(), false);
+        let identity = reply_identity();
+        let mut operation = manager.begin_tool_operation("probe").unwrap().unwrap();
+        let terminal = operation.invoke_for_execution("{}", &identity).unwrap();
+        assert!(!terminal.response.continue_after_broker);
+        drop(operation);
+        let path = manager.state_path(NAME).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(manager
+            .recover_tool_reply(&identity, "probe", "{}")
+            .is_err());
+        assert!(manager.acknowledge_tool_reply(&identity).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let mut outcomes = dispatch_once(project.path(), &manager, terminal.host_broker_requests);
+        if failed {
+            outcomes[0].error = Some(BrokerError {
+                code: "fixture".into(),
+                message: "known broker failure".into(),
+            });
+        } else {
+            outcomes[0].value = json!({"output":"known broker reply"});
+        }
+        manager.enqueue_broker_results(outcomes).unwrap();
+        drop(manager);
+        fs::remove_file(project.path().join(".threadlane/extensions/probe.wasm")).unwrap();
+        let recovered = WasiExtensionManager::for_project_session(project.path(), "a");
+        assert_eq!(
+            recovered
+                .recover_tool_reply(&identity, "probe", "{}")
+                .unwrap(),
+            Some(if failed {
+                Err("known broker failure".into())
+            } else {
+                Ok("known broker reply".into())
+            })
+        );
+        recovered.acknowledge_tool_reply(&identity).unwrap();
+        assert!(recovered
+            .pending_tool_reply_identities()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            fs::read(project.path().join("effects.log")).unwrap(),
+            b"effect\n"
+        );
+    }
+}
+
 #[cfg(unix)]
 fn fail_next_directory_sync() {
     super::FAIL_NEXT_STATE_DIRECTORY_SYNC.with(|fault| fault.set(true));
@@ -239,7 +506,7 @@ fn checkpoint_write_profile() {
     for _ in 0..7 {
         let start = Instant::now();
         for _ in 0..25 {
-            super::checkpoint::persist_checkpoint(black_box(&path), &state, &events, 0, &[])
+            super::checkpoint::persist_checkpoint(black_box(&path), &state, &events, 0, &[], None)
                 .unwrap();
         }
         samples.push(start.elapsed().as_nanos() / 25);
@@ -389,7 +656,7 @@ fn writes_during_delivery_keep_in_flight_outcomes_in_the_checkpoint() {
     initial
         .enqueue_broker_results(vec![outcome("first")])
         .unwrap();
-    let (_, _, batch) = initial.begin_delivery(NAME, false).unwrap();
+    let (_, _, batch) = initial.begin_delivery(NAME, false, None).unwrap();
     assert_eq!(batch.len(), 1);
     initial
         .enqueue_broker_results(vec![outcome("second")])
@@ -536,8 +803,13 @@ fn checkpoints_validate_outcome_shapes_and_accept_successful_null_results() {
 }
 
 fn emitting_manager(project: &Path) -> WasiExtensionManager {
+    emitting_manager_with_continuation(project, true)
+}
+
+fn emitting_manager_with_continuation(project: &Path, continuation: bool) -> WasiExtensionManager {
     let manifest = json!({"api_version":2,"name":NAME,"version":"1","description":"test","capabilities":["process"],"tools":[{"name":"probe","description":"test","parameters":{}}],"commands":[{"name":"probe_command","description":"test"}],"hooks":["before_tool_call"]}).to_string();
-    let pending = r#"{"state":{"phase":"waiting"},"continue_after_broker":true}"#;
+    let pending =
+        json!({"state":{"phase":"waiting"},"continue_after_broker":continuation}).to_string();
     let done = r#"{"state":{"phase":"ready"},"message":"done"}"#;
     let request = r#"{"api_version":2,"capability":"process","operation":"run","arguments":{"command":"effect"}}"#;
     let escape = |text: &str| text.replace('"', "\\\"");
@@ -563,7 +835,7 @@ fn emitting_manager(project: &Path) -> WasiExtensionManager {
         (drop (call $request (i32.const 3072) (i32.const {}) (i32.const 4096) (i32.const 1024)))
         (i64.const {})))"#,
         escape(&manifest),
-        escape(pending),
+        escape(&pending),
         escape(done),
         escape(request),
         manifest.len(),
@@ -941,6 +1213,36 @@ fn state_owner_blocks_other_processes_and_releases_after_process_death() {
     if let Some(project) = std::env::var_os(PROBE) {
         let project = Path::new(&project);
         let owner = emitting_manager(project);
+        if std::env::var_os("THREADLANE_TEST_TERMINAL_REPLY").is_some() {
+            let identity = reply_identity();
+            let mut operation = owner.begin_tool_operation("probe").unwrap().unwrap();
+            let invocation = operation.invoke_for_execution("{}", &identity).unwrap();
+            owner
+                .enqueue_broker_results(dispatch_once(
+                    project,
+                    &owner,
+                    invocation.host_broker_requests,
+                ))
+                .unwrap();
+            operation.invoke_for_execution("{}", &identity).unwrap();
+            drop(operation);
+            owner
+                .prepare_tool_reply(
+                    &identity,
+                    &threadlane_protocol::AgentToolResult::external(
+                        "call",
+                        "probe",
+                        "done plus hook",
+                        false,
+                    ),
+                )
+                .unwrap();
+            println!("owner-ready");
+            std::io::stdout().flush().unwrap();
+            let mut byte = [0];
+            std::io::Read::read(&mut std::io::stdin(), &mut byte).unwrap();
+            return;
+        }
         let invocation = owner
             .execute_tool_with_broker_requests("probe", "{}")
             .unwrap()
@@ -1030,6 +1332,64 @@ fn state_owner_blocks_other_processes_and_releases_after_process_death() {
     blocked_b
         .set_host_state("tools.policy", json!("read_only"))
         .unwrap();
+}
+
+#[test]
+fn terminal_reply_survives_process_death_and_module_removal() {
+    use std::io::BufRead;
+    use std::process::{Command, Stdio};
+    let project = tempfile::tempdir().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "checkpoint_tests::state_owner_blocks_other_processes_and_releases_after_process_death",
+            "--nocapture",
+        ])
+        .env("THREADLANE_TEST_STATE_OWNER_PROJECT", project.path())
+        .env("THREADLANE_TEST_TERMINAL_REPLY", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+    loop {
+        let mut line = String::new();
+        assert_ne!(
+            output.read_line(&mut line).unwrap(),
+            0,
+            "child stopped before terminal reply committed"
+        );
+        if line.trim() == "owner-ready" {
+            break;
+        }
+    }
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    fs::remove_file(project.path().join(".threadlane/extensions/probe.wasm")).unwrap();
+    let recovered = WasiExtensionManager::for_project_session(project.path(), "a");
+    assert_eq!(
+        recovered
+            .recover_tool_reply(&reply_identity(), "probe", "{}")
+            .unwrap(),
+        Some(Ok("done".into()))
+    );
+    assert_eq!(
+        recovered
+            .recovered_canonical_reply(&reply_identity())
+            .unwrap()
+            .unwrap()
+            .content,
+        "done plus hook"
+    );
+    recovered.acknowledge_tool_reply(&reply_identity()).unwrap();
+    assert!(recovered
+        .pending_tool_reply_identities()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        fs::read(project.path().join("effects.log")).unwrap(),
+        b"effect\n"
+    );
 }
 
 #[test]
@@ -1416,6 +1776,46 @@ fn known_outcomes_recommit_after_storage_failure_without_rerunning_effects() {
     );
     drop(initial);
     assert!(values(&emitting_manager(project.path())).is_empty());
+}
+
+#[test]
+fn duplicate_outcome_after_failed_commit_is_rejected_before_recovery() {
+    let project = tempfile::tempdir().unwrap();
+    let mut initial = emitting_manager(project.path());
+    let invocation = initial
+        .execute_tool_with_broker_requests("probe", "{}")
+        .unwrap()
+        .unwrap();
+    let outcomes = dispatch_once(project.path(), &initial, invocation.host_broker_requests);
+    let duplicate = outcomes.clone();
+    let original_root = initial.state_dir.clone();
+    let blocked = project.path().join("blocked");
+    fs::write(&blocked, b"not a directory").unwrap();
+    initial.state_dir = Some(blocked.join("state"));
+    assert!(initial.enqueue_broker_results(outcomes).is_err());
+    initial.state_dir = original_root;
+    let error = initial.enqueue_broker_results(duplicate).unwrap_err();
+    assert!(error.contains("duplicate"), "{error}");
+    assert_eq!(values(&initial), vec![json!("executed once")]);
+    {
+        let _commit = initial.state_commit.lock().unwrap();
+        initial
+            .commit_retained_outcomes(NAME, &initial.extension_state(NAME).unwrap(), true)
+            .unwrap();
+    }
+    drop(initial);
+    let recovered = emitting_manager(project.path());
+    assert_eq!(values(&recovered), vec![json!("executed once")]);
+    assert!(recovered
+        .execute_tool_with_broker_requests("probe", "{}")
+        .unwrap()
+        .unwrap()
+        .host_broker_requests
+        .is_empty());
+    assert_eq!(
+        fs::read(project.path().join("effects.log")).unwrap(),
+        b"effect\n"
+    );
 }
 
 #[test]

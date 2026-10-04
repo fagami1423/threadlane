@@ -11,10 +11,13 @@ hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath/hotpath-alloc"]
 
 [dependencies]
+async-trait.workspace = true
 hotpath.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 threadlane-mcp.workspace = true
+threadlane-protocol.workspace = true
+threadlane-provider.workspace = true
 threadlane-runtime.workspace = true
 threadlane-tools.workspace = true
 tokio = { workspace = true, features = ["full"] }

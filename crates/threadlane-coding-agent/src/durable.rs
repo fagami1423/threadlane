@@ -259,6 +259,7 @@ impl CodingAgent {
         if let Some(harness) = self.harness.as_ref() {
             harness.validate_accepted_run(accepted)?;
         }
+        self.recover_saved_extension_replies().await?;
         self.sync_turn_from_model_context().await?;
         let last_prompt = {
             let turn = self.agent.turn.lock().await;
@@ -489,6 +490,7 @@ impl CodingAgent {
             tool_arguments: None,
             tool_result_content: None,
             tool_result_is_error: None,
+            tool_execution_identity: None,
         };
         for failure in journal
             .store
@@ -672,6 +674,7 @@ impl CodingAgent {
                 tool_arguments: None,
                 tool_result_content: None,
                 tool_result_is_error: None,
+                tool_execution_identity: None,
             };
             for failure in journal
                 .store
@@ -1096,6 +1099,114 @@ impl CodingAgent {
             )?;
         }
         Ok(())
+    }
+
+    pub(crate) async fn recover_saved_extension_replies(&mut self) -> Result<usize, String> {
+        let identities = self.wasi_extensions.pending_tool_reply_identities()?;
+        let mut recovered = 0;
+        for identity in identities {
+            let (completed, call) = {
+                let harness = self
+                    .harness
+                    .as_mut()
+                    .ok_or("Saved extension reply requires its original session journal")?;
+                harness.ensure_fresh()?;
+                if harness.tool_execution_identity(&identity.run_id, &identity.tool_call_id)?
+                    != identity
+                {
+                    return Err("Saved extension reply does not match the canonical committed intent; preserve both journals".into());
+                }
+                let (_, tool) = harness
+                    .store
+                    .store()
+                    .tool_state_for_call(&identity.run_id, &identity.tool_call_id)
+                    .ok_or("Saved reply has no canonical tool intent")?;
+                let completed = tool.completed;
+                let arguments = harness
+                    .store
+                    .records()
+                    .iter()
+                    .rev()
+                    .find_map(|record| match record {
+                        HarnessRecord::ToolStarted {
+                            run_id,
+                            tool_call_id,
+                            result_entry_id,
+                            effective_args,
+                            ..
+                        } if run_id == &identity.run_id
+                            && tool_call_id == &identity.tool_call_id
+                            && result_entry_id == &identity.result_entry_id =>
+                        {
+                            Some(effective_args.to_string())
+                        }
+                        _ => None,
+                    })
+                    .ok_or("Saved reply has no original effective arguments")?;
+                (
+                    completed,
+                    threadlane_protocol::RuntimeToolCall {
+                        id: identity.tool_call_id.clone(),
+                        r#type: "function".into(),
+                        function: threadlane_protocol::RuntimeToolCallFunction {
+                            name: identity.tool_name.clone(),
+                            arguments,
+                        },
+                        thought_signature: None,
+                    },
+                )
+            };
+            let result = self
+                .agent
+                .recover_tool_reply(&call, &identity)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or("Saved extension reply could not be delivered; preserve its checkpoint")?;
+            if completed {
+                let entry = self
+                    .harness
+                    .as_ref()
+                    .unwrap()
+                    .store
+                    .entry(&identity.result_entry_id)
+                    .ok_or("Completed saved reply has no canonical result entry")?;
+                let AgentMessage::Tool {
+                    tool_call_id,
+                    name,
+                    content,
+                    is_error,
+                    terminate,
+                    images,
+                } = &entry.message
+                else {
+                    return Err("Saved reply's result entry is not a canonical tool result".into());
+                };
+                let committed = AgentToolResult {
+                    tool_call_id: tool_call_id.clone(),
+                    name: name.clone(),
+                    content: content.clone(),
+                    is_error: *is_error,
+                    terminate: *terminate,
+                    images: images.clone(),
+                };
+                if committed != result {
+                    return Err("Saved and committed tool replies disagree; preserve both checkpoints and reconcile the original result".into());
+                }
+            } else {
+                self.harness
+                    .as_mut()
+                    .unwrap()
+                    .record_tool_result(&identity.run_id, &result)?;
+                let _ = self.agent.event_tx.send(AgentEvent::ToolExecutionEnd {
+                    tool_call_id: result.tool_call_id.clone(),
+                    name: result.name.clone(),
+                    result,
+                });
+                recovered += 1;
+            }
+            self.wasi_extensions.acknowledge_tool_reply(&identity)?;
+        }
+        Ok(recovered)
     }
 
     pub(crate) async fn recover_interrupted_subagent_lanes(&mut self) -> Result<usize, String> {

@@ -164,6 +164,7 @@ impl CodingSessionHarness {
             tool_arguments: None,
             tool_result_content: None,
             tool_result_is_error: None,
+            tool_execution_identity: None,
         };
         self.store
             .hooks()

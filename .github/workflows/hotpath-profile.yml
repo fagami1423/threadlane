@@ -31,6 +31,18 @@ jobs:
           - suite: runtime
             mode: alloc
             features: hotpath,hotpath-alloc
+          - suite: provider
+            mode: timing
+            features: hotpath
+          - suite: provider
+            mode: alloc
+            features: hotpath,hotpath-alloc
+          - suite: dispatch
+            mode: timing
+            features: hotpath
+          - suite: dispatch
+            mode: alloc
+            features: hotpath,hotpath-alloc
           - suite: tools
             mode: timing
             features: hotpath
@@ -62,7 +74,9 @@ jobs:
         env:
           HOTPATH_OUTPUT_FORMAT: json
           HOTPATH_OUTPUT_PATH: /tmp/metrics/${{ matrix.suite }}-${{ matrix.mode }}/head.json
-        run: cargo run -p threadlane-benchmarks --release --bin ${{ matrix.suite }} --features '${{ matrix.features }}'
+        run: |
+          sha256sum 'crates/threadlane-benchmarks/src/bin/${{ matrix.suite }}.rs' | cut -d ' ' -f 1 > /tmp/metrics/${{ matrix.suite }}-${{ matrix.mode }}/head_fixture.sha256
+          cargo run -p threadlane-benchmarks --release --bin ${{ matrix.suite }} --features '${{ matrix.features }}'
       - name: Benchmark base
         env:
           HOTPATH_OUTPUT_FORMAT: json
@@ -70,6 +84,7 @@ jobs:
         run: |
           git checkout --force '${{ github.event.pull_request.base.sha }}'
           if test -f 'crates/threadlane-benchmarks/src/bin/${{ matrix.suite }}.rs'; then
+            sha256sum 'crates/threadlane-benchmarks/src/bin/${{ matrix.suite }}.rs' | cut -d ' ' -f 1 > /tmp/metrics/${{ matrix.suite }}-${{ matrix.mode }}/base_fixture.sha256
             cargo run -p threadlane-benchmarks --release --bin ${{ matrix.suite }} --features '${{ matrix.features }}'
           else
             echo "Base branch has no centralized Hotpath benchmark yet"

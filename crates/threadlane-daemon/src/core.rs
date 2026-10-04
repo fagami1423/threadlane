@@ -159,13 +159,16 @@ impl DaemonCore {
     fn start_automation_bridge(self: &Arc<Self>) {
         let service = crate::automation::AutomationService::shared();
         let mut events = service.subscribe();
-        let ingest_tx = self.ingest_tx.clone();
+        let this = Arc::downgrade(self);
         if let Ok(executor) = crate::chat::executor() {
             executor.spawn(async move {
                 loop {
                     match events.recv().await {
                         Ok(event) => {
-                            if ingest_tx.send(event).is_err() {
+                            let Some(this) = this.upgrade() else {
+                                break;
+                            };
+                            if this.ingest_tx.send(event).is_err() {
                                 break;
                             }
                         }
@@ -176,13 +179,18 @@ impl DaemonCore {
             });
         }
         let mut projections = service.projection.clone();
-        let this = self.clone();
+        // The process-wide service must not keep a closed host's runtimes
+        // (and their extension ownership leases) alive while awaiting updates.
+        let this = Arc::downgrade(self);
         if let Ok(executor) = crate::chat::executor() {
             executor.spawn(async move {
                 loop {
                     if projections.changed().await.is_err() {
                         break;
                     }
+                    let Some(this) = this.upgrade() else {
+                        break;
+                    };
                     let projection = projections.borrow_and_update().clone();
                     if let Some(runtime) = &projection.active_runtime {
                         let session_file = runtime.session_file().to_path_buf();
@@ -1569,6 +1577,14 @@ mod composer_tests {
     use super::{canonical_session_file, DaemonCore};
     use threadlane_protocol::daemon::{CommandResponse, SessionCommand};
     use threadlane_protocol::{OrchestratorMode, ReasoningEffort};
+
+    #[test]
+    fn automation_bridge_does_not_retain_its_host_core() {
+        let core = DaemonCore::new().unwrap();
+        let weak = std::sync::Arc::downgrade(&core);
+        drop(core);
+        assert!(weak.upgrade().is_none(), "automation bridge retained its host");
+    }
 
     #[tokio::test]
     async fn drafts_require_attached_projects_and_composer_settings_are_acknowledged() {

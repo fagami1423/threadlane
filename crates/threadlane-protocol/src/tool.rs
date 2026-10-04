@@ -7,7 +7,7 @@
 //! implement tools without depending on `threadlane-runtime`; the runtime
 //! re-exports them for backward compatibility.
 
-use crate::messages::{AgentToolCall, AgentToolDefinition, ImageAttachment};
+use crate::messages::{AgentToolCall, AgentToolDefinition, AgentToolResult, ImageAttachment};
 
 /// Host-owned identity of a tool intent already committed to the session journal.
 /// Call IDs alone are not unique across runs or lanes. This metadata is never
@@ -40,6 +40,35 @@ impl ToolExecutionIdentity {
             .iter()
             .all(|field| !field.trim().is_empty())
     }
+}
+
+/// A tool failure can be reported to the model. An unconfirmed durable
+/// execution must stop the turn until the owning host reconciles its result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolExecutionError {
+    Failed(String),
+    RecoveryRequired(String),
+}
+
+impl From<String> for ToolExecutionError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl std::fmt::Display for ToolExecutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(error) | Self::RecoveryRequired(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ToolExecutionError {}
+
+pub enum RecoveredToolReply {
+    Extension(ToolOutput),
+    Canonical(AgentToolResult),
 }
 
 /// Rich tool output: text plus optional model-visible images. Executors keep
@@ -106,9 +135,39 @@ pub trait ToolExecutor: Send + Sync {
         args: &str,
         work_dir: Option<&std::path::Path>,
         _identity: Option<&ToolExecutionIdentity>,
-    ) -> Option<Result<ToolOutput, String>> {
+    ) -> Option<Result<ToolOutput, ToolExecutionError>> {
         self.execute_tool_with_output_in_workspace(&call.name, args, work_dir)
             .await
+            .map(|result| result.map_err(ToolExecutionError::Failed))
+    }
+
+    /// Retrieves a previously committed reply without executing the tool.
+    /// Recovery can visit executors even when their old tool is no longer listed.
+    async fn recover_tool_reply(
+        &self,
+        _call: &AgentToolCall,
+        _args: &str,
+        _work_dir: Option<&std::path::Path>,
+        _identity: &ToolExecutionIdentity,
+    ) -> Option<Result<RecoveredToolReply, ToolExecutionError>> {
+        None
+    }
+
+    /// Saves the finished host reply before the canonical journal commit.
+    async fn prepare_tool_reply(
+        &self,
+        _identity: &ToolExecutionIdentity,
+        _result: &AgentToolResult,
+    ) -> Result<(), ToolExecutionError> {
+        Ok(())
+    }
+
+    /// Called only after the host commits the canonical tool result.
+    async fn acknowledge_tool_reply(
+        &self,
+        _identity: &ToolExecutionIdentity,
+    ) -> Result<(), String> {
+        Ok(())
     }
 
     /// Rich variant carrying model-visible images alongside text. The default

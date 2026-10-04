@@ -7,11 +7,7 @@ use crate::error::AgentError;
 use threadlane_protocol::AgentEvent;
 use crate::harness::{HookContext, HookRegistry};
 use crate::tool_executor::builtin_tool_executor;
-use threadlane_protocol::ToolExecutor;
 use crate::types::ToolExecutionMode;
-use threadlane_protocol::{
-    AgentToolCall, AgentToolDefinition, AgentToolResult, ImageAttachment, ToolExecutionIdentity, ToolOutput,
-};
 use crate::utils::AbortOnDrop;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -20,6 +16,10 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use threadlane_protocol::RuntimeToolCall as ToolCall;
+use threadlane_protocol::{
+    AgentToolCall, AgentToolDefinition, AgentToolResult, ImageAttachment, RecoveredToolReply,
+    ToolExecutionError, ToolExecutionIdentity, ToolExecutor, ToolOutput,
+};
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
@@ -52,6 +52,33 @@ fn dyn_tool_call(run_command_arguments: &str) -> Option<(String, String)> {
     };
     Some((tool_name.to_owned(), tool_arguments))
 }
+fn resolve_tool_call(
+    tc: &ToolCall,
+    work_dir: Option<&Path>,
+) -> (AgentToolCall, String, Option<String>) {
+    let mut arguments =
+        normalize_tool_arguments(&tc.function.name, &tc.function.arguments, work_dir);
+    let mut agent_tool_call = AgentToolCall {
+        id: tc.id.clone(),
+        name: tc.function.name.clone(),
+        arguments: arguments.clone(),
+    };
+    let mut intent_arguments = None;
+    while agent_tool_call.name == "run_command" {
+        let Some((name, args)) = dyn_tool_call(&arguments) else {
+            break;
+        };
+        if intent_arguments.is_none() {
+            intent_arguments = Some(std::mem::take(&mut arguments));
+        }
+        arguments = normalize_tool_arguments(&name, &args, work_dir);
+        agent_tool_call.name = name;
+        agent_tool_call.arguments = arguments.clone();
+    }
+
+    (agent_tool_call, arguments, intent_arguments)
+}
+
 /// Callback invoked after hooks to commit intent before execution.
 pub type ToolIntentRecorder = crate::provider::ToolIntentRecorder;
 /// Callback invoked after tool execution completes.
@@ -80,8 +107,8 @@ struct ToolRunContext {
 }
 
 /// Deduplicates identical tool calls within one turn: the 37×-identical-read
-/// failure mode. A global version counter invalidates every entry whenever a
-/// potentially-mutating tool runs, so cached reads can never go stale.
+/// failure mode. A mutation revision fences validation and insertion while
+/// filesystem probes run outside the shared lock.
 /// Cloned dispatchers share one cache through the `Arc`.
 #[derive(Clone, Default)]
 struct RepetitionCacheHandle {
@@ -90,12 +117,11 @@ struct RepetitionCacheHandle {
 
 #[derive(Default)]
 struct RepetitionCache {
-    version: u64,
-    entries: std::collections::HashMap<(String, String), CachedToolResult>,
+    revision: u64,
+    entries: std::collections::HashMap<(String, String), Arc<CachedToolResult>>,
 }
 
 struct CachedToolResult {
-    version: u64,
     content: String,
     is_error: bool,
     images: Vec<ImageAttachment>,
@@ -105,7 +131,7 @@ struct CachedToolResult {
     path: Option<PathBuf>,
     /// File size + mtime at cache time, for external-mutation validation.
     fingerprint: Option<FileFingerprint>,
-    /// Canonicalized workspace root plus a bounded recursive sample, for
+    /// Canonicalized workspace root plus a complete, bounded fingerprint, for
     /// workspace-wide reads (`grep_search`, `list_dir`, `get_repo_map`)
     /// whose inputs are the whole tree rather than one file.
     tree: Option<(PathBuf, TreeFingerprint)>,
@@ -120,6 +146,9 @@ struct FileFingerprint {
 
 fn fingerprint_file(path: &Path) -> Option<FileFingerprint> {
     let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
     let modified = metadata.modified().ok()?;
     let duration = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
     Some(FileFingerprint {
@@ -129,12 +158,9 @@ fn fingerprint_file(path: &Path) -> Option<FileFingerprint> {
     })
 }
 
-/// Bounded recursive sample of a workspace tree: at most
-/// `TREE_FINGERPRINT_BUDGET` entries (relative path, size, mtime) hashed.
-/// A full walk of a huge repo per cache hit is unaffordable; a bounded
-/// sample still catches any external edit that touches a sampled path, and
-/// the version guard already covers in-loop mutations. Deterministic:
-/// entries sort before hashing.
+/// Complete fingerprint of a workspace tree, bounded by
+/// `TREE_FINGERPRINT_BUDGET` files and directories. Partial or unreadable scans
+/// verify nothing and must not enable caching. Entries sort before hashing.
 const TREE_FINGERPRINT_BUDGET: usize = 2048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,47 +172,44 @@ struct TreeFingerprint {
 fn fingerprint_tree(root: &Path) -> Option<TreeFingerprint> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    // An unreadable root verifies nothing: report None so lookups evict
-    // rather than serve a tree that can no longer be sampled.
-    std::fs::metadata(&root).ok()?;
+    let root = root.canonicalize().ok()?;
+    if !std::fs::metadata(&root).ok()?.is_dir() {
+        return None;
+    }
     let mut stack = vec![root.clone()];
-    let mut samples: Vec<(PathBuf, u64, u64, u32)> = Vec::new();
+    let mut samples: Vec<(PathBuf, bool, u64, u64, u32)> = Vec::new();
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries {
             if samples.len() >= TREE_FINGERPRINT_BUDGET {
-                break;
+                return None;
             }
+            let entry = entry.ok()?;
             let path = entry.path();
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
+            let metadata = entry.metadata().ok()?;
             if metadata.is_dir() {
-                stack.push(path);
-                continue;
+                stack.push(path.clone());
             }
-            let (secs, nanos) = metadata
+            let modified = metadata
                 .modified()
-                .ok()
-                .and_then(|modified| {
-                    modified.duration_since(std::time::UNIX_EPOCH).ok()
-                })
-                .map(|duration| (duration.as_secs(), duration.subsec_nanos()))
-                .unwrap_or((0, 0));
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?;
             let relative = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
-            samples.push((relative, metadata.len(), secs, nanos));
-        }
-        if samples.len() >= TREE_FINGERPRINT_BUDGET {
-            break;
+            samples.push((
+                relative,
+                metadata.is_dir(),
+                metadata.len(),
+                modified.as_secs(),
+                modified.subsec_nanos(),
+            ));
         }
     }
     samples.sort_by(|a, b| a.0.cmp(&b.0));
     let mut hasher = DefaultHasher::new();
-    for (relative, size, secs, nanos) in &samples {
+    for (relative, is_dir, size, secs, nanos) in &samples {
         relative.hash(&mut hasher);
+        is_dir.hash(&mut hasher);
         size.hash(&mut hasher);
         secs.hash(&mut hasher);
         nanos.hash(&mut hasher);
@@ -250,19 +273,15 @@ fn resolve_workspace_path(work_dir: Option<&Path>, path: &str) -> PathBuf {
 }
 
 /// Tools pure enough to serve from cache: deterministic reads whose inputs
-/// cannot change without a mutating tool running first (which bumps the
-/// version). Everything else always executes. Live or mutating tools
-/// (`browser_snapshot`, screenshots, `evaluate`, all writes/commands) stay
-/// out even though that costs re-execution: correctness first.
+/// are guarded against workspace changes.
+/// Everything else always executes. Live or mutating tools
+/// (window/permission/URL reads, skill loading, screenshots, `evaluate`, all
+/// writes/commands) stay out even though that costs re-execution: correctness first.
 const CACHEABLE_TOOLS: &[&str] = &[
     "read_file",
     "grep_search",
     "list_dir",
     "get_repo_map",
-    "computer_status",
-    "computer_windows",
-    "browser_current_url",
-    "load_skill",
 ];
 
 const REPETITION_CACHE_CAP: usize = 64;
@@ -270,8 +289,16 @@ const REPETITION_CACHE_CAP: usize = 64;
 const REPETITION_NOTE: &str = "Repeated invocation: identical arguments already ran earlier this turn and produced this same result (served from cache, not re-executed). If you need different information, change the arguments or use another tool.";
 
 impl RepetitionCacheHandle {
+    /// Pin the mutation revision before executing a cacheable read.
+    fn execution_revision(&self, name: &str) -> Option<u64> {
+        if !CACHEABLE_TOOLS.contains(&name) {
+            return None;
+        }
+        self.inner.lock().ok().map(|guard| guard.revision)
+    }
+
     /// Returns the cached content (with steering note), images, and the
-    /// original error flag for an identical call in the current version.
+    /// original error flag for an identical call that remains current.
     fn lookup(
         &self,
         name: &str,
@@ -281,31 +308,31 @@ impl RepetitionCacheHandle {
         if !CACHEABLE_TOOLS.contains(&name) {
             return None;
         }
-        let mut guard = self.inner.lock().ok()?;
         let key = (name.to_string(), args.to_string());
-        let entry = guard.entries.get(&key)?;
-        if entry.version != guard.version {
-            return None;
-        }
+        let (revision, entry) = {
+            let guard = self.inner.lock().ok()?;
+            (guard.revision, guard.entries.get(&key)?.clone())
+        };
         // External-mutation guard: a file changed outside the tool loop
         // (user edits, watchers, other agents) must not serve stale bytes.
         // Size+mtime both compared: coarse filesystems can share mtimes.
-        if let Some(path) = entry.path.as_deref() {
-            if fingerprint_file(path) != entry.fingerprint {
-                guard.entries.remove(&key);
-                return None;
-            }
-            let _ = work_dir;
+        let fresh = if let Some(path) = entry.path.as_deref() {
+            let requested = tool_paths(name, args)
+                .into_iter()
+                .next()
+                .map(|path| resolve_workspace_path(work_dir, &path));
+            // Canonical targets also change when a symlink is retargeted.
+            requested.as_deref() == Some(path) && fingerprint_file(path) == entry.fingerprint
         } else if let Some((root, sampled)) = entry.tree.as_ref() {
             // Workspace-wide reads (grep/list/map) depend on the whole tree:
-            // re-sample and evict on any drift. An unverifiable tree evicts
+            // verify the root and evict on any drift. An unverifiable tree evicts
             // too — serving blind is how stale search results happen.
-            if fingerprint_tree(root) != Some(*sampled) {
-                guard.entries.remove(&key);
-                return None;
-            }
-            let _ = work_dir;
-        }
+            work_dir.and_then(|path| path.canonicalize().ok()).as_ref() == Some(root)
+                && fingerprint_tree(root) == Some(*sampled)
+        } else {
+            false
+        };
+        self.confirm_lookup(&key, revision, &entry, fresh)?;
         Some((
             ToolOutput {
                 content: format!("{}\n\n[{REPETITION_NOTE}]", entry.content),
@@ -315,6 +342,31 @@ impl RepetitionCacheHandle {
         ))
     }
 
+    /// Recheck the candidate after unlocked validation. A stale probe must
+    /// neither return its old result nor evict a newer entry for the same call.
+    fn confirm_lookup(
+        &self,
+        key: &(String, String),
+        revision: u64,
+        entry: &Arc<CachedToolResult>,
+        fresh: bool,
+    ) -> Option<()> {
+        let mut guard = self.inner.lock().ok()?;
+        if guard.revision != revision
+            || !guard
+                .entries
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            return None;
+        }
+        if !fresh {
+            guard.entries.remove(key);
+            return None;
+        }
+        Some(())
+    }
+
     fn store(
         &self,
         name: &str,
@@ -322,60 +374,94 @@ impl RepetitionCacheHandle {
         output: &ToolOutput,
         is_error: bool,
         work_dir: Option<&Path>,
+        revision: Option<u64>,
     ) {
         if !CACHEABLE_TOOLS.contains(&name) {
             self.invalidate_for_mutation(name, args, work_dir);
             return;
         }
         // Errors cache too: identical error loops are worth short-circuiting,
-        // and any later mutation invalidates by version.
+        // and any later mutation invalidates by revision.
+        let Some(revision) = revision else {
+            return;
+        };
+        // The result may predate a concurrent write even when its post-read
+        // fingerprint matches the current file. Reject before probing again.
+        match self.inner.lock() {
+            Ok(guard) if guard.revision == revision => {}
+            _ => return,
+        }
+        let (path, fingerprint): (Option<PathBuf>, Option<FileFingerprint>) = if name == "read_file"
+        {
+            tool_paths(name, args)
+                .into_iter()
+                .next()
+                .map(|path| {
+                    let absolute = resolve_workspace_path(work_dir, &path);
+                    let fingerprint = fingerprint_file(&absolute);
+                    (Some(absolute), fingerprint)
+                })
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+        if name == "read_file" {
+            let source = threadlane_tools::read_file_snapshot_path(&output.content)
+                .map(|source| resolve_workspace_path(work_dir, &source));
+            // Missing paths and fuzzy matches cannot pin the requested
+            // file's identity. Re-execute until the resolved path is used.
+            if fingerprint.is_none()
+                || source
+                    .as_ref()
+                    .is_some_and(|source| Some(source) != path.as_ref())
+            {
+                return;
+            }
+        }
+        // Workspace-wide reads pin the complete tree so external edits
+        // (outside the tool loop, past the revision guard) bust them.
+        let tree: Option<(PathBuf, TreeFingerprint)> = match name {
+            "grep_search" | "list_dir" | "get_repo_map" => work_dir.and_then(|root| {
+                let canonical = root.canonicalize().ok()?;
+                fingerprint_tree(&canonical).map(|sampled| (canonical, sampled))
+            }),
+            _ => None,
+        };
+        if matches!(name, "grep_search" | "list_dir" | "get_repo_map") && tree.is_none() {
+            return;
+        }
+        self.store_if_current(
+            (name.to_string(), args.to_string()),
+            revision,
+            Arc::new(CachedToolResult {
+                content: output.content.clone(),
+                is_error,
+                images: output.images.clone(),
+                path,
+                fingerprint,
+                tree,
+            }),
+        );
+    }
+
+    /// A mutation during execution or filesystem probing makes this insertion obsolete.
+    fn store_if_current(&self, key: (String, String), revision: u64, entry: Arc<CachedToolResult>) {
         if let Ok(mut guard) = self.inner.lock() {
+            if guard.revision != revision {
+                return;
+            }
             if guard.entries.len() >= REPETITION_CACHE_CAP {
                 guard.entries.clear();
             }
-            let version = guard.version;
-            let (path, fingerprint): (Option<PathBuf>, Option<FileFingerprint>) =
-                if name == "read_file" {
-                    tool_paths(name, args)
-                        .into_iter()
-                        .next()
-                        .map(|path| {
-                            let absolute = resolve_workspace_path(work_dir, &path);
-                            let fingerprint = fingerprint_file(&absolute);
-                            (Some(absolute), fingerprint)
-                        })
-                        .unwrap_or((None, None))
-                } else {
-                    (None, None)
-                };
-            // Workspace-wide reads pin the sampled tree so external edits
-            // (outside the tool loop, past the version guard) bust them.
-            let tree: Option<(PathBuf, TreeFingerprint)> = match name {
-                "grep_search" | "list_dir" | "get_repo_map" => work_dir.and_then(|root| {
-                    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-                    fingerprint_tree(&canonical).map(|sampled| (canonical, sampled))
-                }),
-                _ => None,
-            };
-            guard.entries.insert(
-                (name.to_string(), args.to_string()),
-                CachedToolResult {
-                    version,
-                    content: output.content.clone(),
-                    is_error,
-                    images: output.images.clone(),
-                    path,
-                    fingerprint,
-                    tree,
-                },
-            );
+            guard.entries.insert(key, entry);
         }
     }
 
     /// A mutating tool ran: drop precisely what it could have touched.
     /// Path-scoped writes bust the same-path reads plus every workspace-wide
     /// read (grep/list/map depend on whole-tree contents); anything without
-    /// parseable paths busts the global version as before.
+    /// parseable paths busts everything. Every mutation advances the revision
+    /// so validation/insertion already in progress cannot publish stale work.
     fn invalidate_for_mutation(&self, name: &str, args: &str, work_dir: Option<&Path>) {
         let paths: Vec<PathBuf> = tool_paths(name, args)
             .into_iter()
@@ -384,8 +470,9 @@ impl RepetitionCacheHandle {
         let Ok(mut guard) = self.inner.lock() else {
             return;
         };
+        guard.revision = guard.revision.wrapping_add(1);
         if paths.is_empty() {
-            guard.version = guard.version.wrapping_add(1);
+            guard.entries.clear();
             return;
         }
         guard.entries.retain(|(entry_name, _), entry| {
@@ -402,7 +489,7 @@ impl RepetitionCacheHandle {
     fn clear(&self) {
         if let Ok(mut guard) = self.inner.lock() {
             guard.entries.clear();
-            guard.version = guard.version.wrapping_add(1);
+            guard.revision = guard.revision.wrapping_add(1);
         }
     }
 }
@@ -624,18 +711,25 @@ impl ToolDispatcher {
             let mut handles = Vec::new();
             for (index, call) in prepared {
                 let fallback_call = call.tc.clone();
+                let identity = call.identity.clone();
                 let handle = AbortOnDrop::new(tokio::spawn(async move {
                     Self::execute_prepared_tool(call).await
                 }));
-                handles.push((index, fallback_call, handle));
+                handles.push((index, fallback_call, identity, handle));
             }
 
             let mut failure = None;
-            for (index, tool_call, handle) in handles {
+            for (index, tool_call, identity, handle) in handles {
                 let result = match handle.join().await {
                     Ok(Ok(result)) => result,
                     Ok(Err(error)) => {
                         failure.get_or_insert(error);
+                        continue;
+                    }
+                    Err(error) if identity.is_some() => {
+                        failure.get_or_insert_with(|| {
+                            tool_persistence_error(&tool_call.id, "execution task", error)
+                        });
                         continue;
                     }
                     Err(error) => AgentToolResult {
@@ -654,6 +748,7 @@ impl ToolDispatcher {
                         });
                         continue;
                     }
+                    self.acknowledge_tool_reply(identity.as_ref()).await;
                 }
                 let _ = self.event_tx.send(AgentEvent::ToolExecutionEnd {
                     tool_call_id: result.tool_call_id.clone(),
@@ -682,6 +777,7 @@ impl ToolDispatcher {
         skip_before_hook: bool,
         skip_repetition_cache: bool,
     ) -> Result<AgentToolResult, AgentError> {
+        let durable_execution = intent_recorder.is_some();
         let result = AssertUnwindSafe(async {
             let call = match Self::prepare_tool_call(
                 tc.clone(),
@@ -702,37 +798,49 @@ impl ToolDispatcher {
             .await
             {
                 Ok(call) => call,
-                Err(ToolPreparationFailure::Rejected(result)) => return Ok((result, false)),
+                Err(ToolPreparationFailure::Rejected(result)) => return Ok((result, false, None)),
                 Err(ToolPreparationFailure::Persistence(error)) => return Err(error),
             };
+            let identity = call.identity.clone();
             Self::execute_prepared_tool(call)
                 .await
-                .map(|result| (result, true))
+                .map(|result| (result, true, identity))
         })
         .catch_unwind()
         .await;
 
-        let result = match result {
-            Ok(Ok((result, false))) => return Ok(result),
-            Ok(Ok((result, true))) => result,
+        let (result, identity) = match result {
+            Ok(Ok((result, false, _))) => return Ok(result),
+            Ok(Ok((result, true, identity))) => (result, identity),
             Ok(Err(error)) => return Err(error),
-            Err(_) => AgentToolResult {
-                tool_call_id: tc.id.clone(),
-                name: tc.function.name.clone(),
-                content: format!(
-                    "Tool '{}' failed: the tool panicked during execution. \
+            Err(_) if durable_execution => {
+                return Err(tool_persistence_error(
+                    &tc.id,
+                    "execution task",
+                    "tool or hook panicked after durable execution began",
+                ));
+            }
+            Err(_) => (
+                AgentToolResult {
+                    tool_call_id: tc.id.clone(),
+                    name: tc.function.name.clone(),
+                    content: format!(
+                        "Tool '{}' failed: the tool panicked during execution. \
                          Please retry the tool or use another approach.",
-                    tc.function.name
-                ),
-                is_error: true,
-                terminate: false,
-                images: Vec::new(),
-            },
+                        tc.function.name
+                    ),
+                    is_error: true,
+                    terminate: false,
+                    images: Vec::new(),
+                },
+                None,
+            ),
         };
         if let Some(recorder) = &self.tool_completion_recorder {
             recorder(&result)
                 .await
                 .map_err(|error| tool_persistence_error(&tc.id, "result", error))?;
+            self.acknowledge_tool_reply(identity.as_ref()).await;
         }
         let _ = self.event_tx.send(AgentEvent::ToolExecutionEnd {
             tool_call_id: tc.id.clone(),
@@ -742,32 +850,89 @@ impl ToolDispatcher {
         Ok(result)
     }
 
+    pub(crate) async fn acknowledge_tool_reply(&self, identity: Option<&ToolExecutionIdentity>) {
+        let Some(identity) = identity else { return };
+        for executor in &self.tool_executors {
+            if let Err(error) = executor.acknowledge_tool_reply(identity).await {
+                // The canonical result is already committed. Preserve its reply;
+                // a later reconciliation can retry this storage-only acknowledgment.
+                warn!(
+                    "saved tool reply {} acknowledgment failed: {error}",
+                    identity.tool_call_id
+                );
+            }
+        }
+    }
+
+    pub(crate) async fn recover_tool_reply(
+        &self,
+        call: &ToolCall,
+        identity: &ToolExecutionIdentity,
+    ) -> Result<Option<AgentToolResult>, AgentError> {
+        if !identity.matches_call(&call.id, &call.function.name) {
+            return Err(tool_persistence_error(
+                &call.id,
+                "reply recovery",
+                "committed call identity mismatch",
+            ));
+        }
+        let work_dir = self.work_dir.as_deref();
+        let (resolved, arguments, dyn_arguments) = resolve_tool_call(call, work_dir);
+        for executor in self.ordered_tool_executors() {
+            let Some(reply) = executor
+                .recover_tool_reply(&resolved, &arguments, work_dir, identity)
+                .await
+            else {
+                continue;
+            };
+            let (output, is_error) = match reply {
+                Ok(RecoveredToolReply::Canonical(result)) => {
+                    if !identity.matches_call(&result.tool_call_id, &result.name) {
+                        return Err(tool_persistence_error(
+                            &call.id,
+                            "reply recovery",
+                            "saved canonical reply identity mismatch",
+                        ));
+                    }
+                    return Ok(Some(result));
+                }
+                Ok(RecoveredToolReply::Extension(output)) => (output, false),
+                Err(ToolExecutionError::Failed(error)) => (
+                    ToolOutput::from(format!("Tool executor error: {error}")),
+                    true,
+                ),
+                Err(ToolExecutionError::RecoveryRequired(error)) => {
+                    return Err(tool_persistence_error(&call.id, "reply recovery", error))
+                }
+            };
+            // The VM's terminal output was committed, but host postprocessing may
+            // not have begun. Never rerun hooks while delivering that saved output.
+            let content = if dyn_arguments.is_some() && !is_error {
+                format!(
+                    "Exit Status: exit status: 0\n--- STDOUT ---\n{}\n--- STDERR ---",
+                    output.content
+                )
+            } else {
+                output.content
+            };
+            return Ok(Some(AgentToolResult {
+                tool_call_id: call.id.clone(),
+                name: call.function.name.clone(),
+                content,
+                is_error,
+                terminate: false,
+                images: output.images,
+            }));
+        }
+        Ok(None)
+    }
+
     async fn prepare_tool_call(
         tc: ToolCall,
         context: ToolRunContext,
     ) -> Result<PreparedToolCall, ToolPreparationFailure> {
-        let mut arguments = normalize_tool_arguments(
-            &tc.function.name,
-            &tc.function.arguments,
-            context.work_dir.as_deref(),
-        );
-        let mut agent_tool_call = AgentToolCall {
-            id: tc.id.clone(),
-            name: tc.function.name.clone(),
-            arguments: arguments.clone(),
-        };
-        let mut intent_arguments = None;
-        while agent_tool_call.name == "run_command" {
-            let Some((name, args)) = dyn_tool_call(&arguments) else {
-                break;
-            };
-            if intent_arguments.is_none() {
-                intent_arguments = Some(std::mem::take(&mut arguments));
-            }
-            arguments = normalize_tool_arguments(&name, &args, context.work_dir.as_deref());
-            agent_tool_call.name = name;
-            agent_tool_call.arguments = arguments.clone();
-        }
+        let (agent_tool_call, arguments, intent_arguments) =
+            resolve_tool_call(&tc, context.work_dir.as_deref());
 
         if context
             .allowed_tool_names
@@ -803,6 +968,7 @@ impl ToolDispatcher {
                 tool_arguments: Some(arguments.clone()),
                 tool_result_content: None,
                 tool_result_is_error: None,
+                tool_execution_identity: None,
             };
             if let Err(failures) = context.hooks.run_before_tool(&hook_ctx).await {
                 let reason = failures
@@ -905,6 +1071,7 @@ impl ToolDispatcher {
         });
 
         let mut execution_result = None;
+        let mut reply_executor = None;
         // Error flag for cache hits: the cached content already carries the
         // original error text, so it must not be re-prefixed below.
         let mut cached_is_error = false;
@@ -920,7 +1087,12 @@ impl ToolDispatcher {
                 served_from_cache = true;
             }
         }
-        for route in context.tool_routes {
+        let cache_revision = if !context.skip_repetition_cache && !served_from_cache {
+            context.repetition.execution_revision(&agent_tool_call.name)
+        } else {
+            None
+        };
+        for route in &context.tool_routes {
             if execution_result.is_some() {
                 break;
             }
@@ -937,41 +1109,49 @@ impl ToolDispatcher {
                 )
                 .await
             {
+                reply_executor = Some(route.executor.clone());
                 execution_result = Some(result);
                 break;
             }
         }
         let execution_result = execution_result.unwrap_or_else(|| {
-            Err(format!(
+            Err(ToolExecutionError::Failed(format!(
                 "No registered executor handles tool '{}'. If this is an auxiliary capability, run it via: dyn {} [args]",
                 agent_tool_call.name, agent_tool_call.name
-            ))
+            )))
         });
-        let (content, is_error, images) = match execution_result {
-            Ok(output) => (output.content, cached_is_error, output.images),
-            Err(error) => (format!("Tool executor error: {error}"), true, Vec::new()),
+        let (output, is_error) = match execution_result {
+            Ok(output) => (output, cached_is_error),
+            Err(ToolExecutionError::Failed(error)) => (
+                ToolOutput {
+                    content: format!("Tool executor error: {error}"),
+                    images: Vec::new(),
+                },
+                true,
+            ),
+            Err(ToolExecutionError::RecoveryRequired(error)) => {
+                return Err(tool_persistence_error(&tc.id, "extension reply", error));
+            }
         };
         if !context.skip_repetition_cache && !served_from_cache {
             // Record fresh executions for identical-call dedup, including
             // fresh errors: identical error loops are worth short-circuiting,
-            // and any later mutation invalidates by version. Cache hits never
+            // and any later mutation invalidates the cache. Cache hits never
             // re-store (that would nest steering notes).
             context.repetition.store(
                 &agent_tool_call.name,
                 &arguments,
-                &ToolOutput {
-                    content: content.clone(),
-                    images: images.clone(),
-                },
+                &output,
                 is_error,
                 context.work_dir.as_deref(),
+                cache_revision,
             );
         }
         let duration_ms = start_time.elapsed().as_millis();
         if is_error {
             warn!(
                 "Tool execution failed: '{}' (call_id: {}) after {}ms: {}",
-                tc.function.name, tc.id, duration_ms, content
+                tc.function.name, tc.id, duration_ms, output.content
             );
         } else {
             debug!(
@@ -982,10 +1162,10 @@ impl ToolDispatcher {
         let mut final_result = AgentToolResult {
             tool_call_id: tc.id.clone(),
             name: tc.function.name.clone(),
-            content,
+            content: output.content,
             is_error,
             terminate: false,
-            images,
+            images: output.images,
         };
 
         let hook_ctx = HookContext {
@@ -1003,6 +1183,7 @@ impl ToolDispatcher {
             tool_arguments: Some(arguments.clone()),
             tool_result_content: Some(final_result.content.clone()),
             tool_result_is_error: Some(final_result.is_error),
+            tool_execution_identity: identity.clone(),
         };
         let hook_run = context.hooks.run_after_tool(&hook_ctx).await;
         for failure in hook_run.failures {
@@ -1028,6 +1209,13 @@ impl ToolDispatcher {
                 "Exit Status: exit status: 0\n--- STDOUT ---\n{}\n--- STDERR ---",
                 final_result.content,
             );
+        }
+
+        if let (Some(identity), Some(executor)) = (identity.as_ref(), reply_executor) {
+            executor
+                .prepare_tool_reply(identity, &final_result)
+                .await
+                .map_err(|error| tool_persistence_error(&tc.id, "prepared reply", error))?;
         }
 
         if let Some(recorder) = &context.execution_trace_recorder {
@@ -1157,7 +1345,7 @@ mod tests {
             _args: &str,
             _work_dir: Option<&Path>,
             _identity: Option<&ToolExecutionIdentity>,
-        ) -> Option<Result<ToolOutput, String>> {
+        ) -> Option<Result<ToolOutput, ToolExecutionError>> {
             // Match by name for the stub.
             if self.tools.iter().any(|d| d.name == call.name) {
                 self.result.clone().map(|result| Ok(result.into()))
@@ -1227,7 +1415,7 @@ mod tests {
             _args: &str,
             _work_dir: Option<&Path>,
             _identity: Option<&ToolExecutionIdentity>,
-        ) -> Option<Result<ToolOutput, String>> {
+        ) -> Option<Result<ToolOutput, ToolExecutionError>> {
             panic!("tool panic")
         }
     }
@@ -1282,6 +1470,8 @@ mod tests {
         let (event_tx, _) = broadcast::channel(8);
         let mut dispatcher = ToolDispatcher::new(event_tx, HookRegistry::default());
         let mut counters = std::collections::HashMap::new();
+        // These tests exercise only the counting stubs, including read_file.
+        dispatcher.tool_executors.clear();
         for (index, (name, result)) in tools.iter().enumerate() {
             let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             counters.insert(name.to_string(), calls.clone());
@@ -1337,7 +1527,7 @@ mod tests {
             args: &str,
             work_dir: Option<&Path>,
             identity: Option<&ToolExecutionIdentity>,
-        ) -> Option<Result<ToolOutput, String>> {
+        ) -> Option<Result<ToolOutput, ToolExecutionError>> {
             assert_eq!(call.arguments, args);
             self.observed.lock().unwrap().push((
                 call.clone(),
@@ -1552,6 +1742,53 @@ mod tests {
             tool_call_id: id.into(),
             tool_name: name.into(),
             result_entry_id: "result".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_tool_panic_preserves_intent_and_settles_other_tools() {
+        for mode in [ToolExecutionMode::Sequential, ToolExecutionMode::Parallel] {
+            let (mut dispatcher, _) = counting_dispatcher(&[("sibling_probe", "sibling reply")]);
+            let mut events = dispatcher.event_tx.subscribe();
+            dispatcher.tool_execution_mode = mode;
+            dispatcher
+                .register_tool_executor(Arc::new(PanickingExecutor))
+                .unwrap();
+            dispatcher.tool_intent_recorder = Some(Arc::new(|id, name, _| {
+                let identity = execution_identity(id, name);
+                Box::pin(async move { Ok(identity) })
+            }));
+            let committed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            dispatcher.tool_completion_recorder = Some({
+                let committed = committed.clone();
+                Arc::new(move |result| {
+                    let id = result.tool_call_id.clone();
+                    let committed = committed.clone();
+                    Box::pin(async move {
+                        committed.lock().unwrap().push(id);
+                        Ok(())
+                    })
+                })
+            });
+            let error = dispatcher
+                .execute_tools(&[
+                    tool_call("panicked", "panic_tool", "{}"),
+                    tool_call("sibling", "sibling_probe", "{}"),
+                ])
+                .await
+                .unwrap_err();
+            assert!(matches!(error, AgentError::Session(_)), "{error}");
+            let expected = if matches!(mode, ToolExecutionMode::Parallel) {
+                vec!["sibling".to_string()]
+            } else {
+                vec![]
+            };
+            assert_eq!(*committed.lock().unwrap(), expected);
+            while let Ok(event) = events.try_recv() {
+                assert!(
+                    !matches!(event, AgentEvent::ToolExecutionEnd { tool_call_id, .. } if tool_call_id == "panicked")
+                );
+            }
         }
     }
 
@@ -1842,17 +2079,197 @@ mod tests {
         counters[name].load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    struct PausedBuiltinRead {
+        name: &'static str,
+        captured: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for PausedBuiltinRead {
+        fn tool_definitions(&self) -> Arc<[AgentToolDefinition]> {
+            crate::tool_executor::BuiltinToolExecutor.tool_definitions()
+        }
+
+        async fn execute_tool(&self, _: &str, _: &str) -> Option<Result<String, String>> {
+            panic!("paused read requires its workspace")
+        }
+
+        async fn execute_tool_in_workspace(
+            &self,
+            name: &str,
+            args: &str,
+            work_dir: Option<&Path>,
+        ) -> Option<Result<String, String>> {
+            let result = crate::tool_executor::BuiltinToolExecutor
+                .execute_tool_in_workspace(name, args, work_dir)
+                .await;
+            if name == self.name
+                && self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+            {
+                self.captured.notify_one();
+                self.release.notified().await;
+            }
+            result
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_finishing_after_a_tool_write_cannot_cache_old_contents() {
+        for mode in [ToolExecutionMode::Sequential, ToolExecutionMode::Parallel] {
+            for (name, args) in [
+                ("read_file", r#"{"path":"a.rs"}"#),
+                ("grep_search", r#"{"pattern":"marker"}"#),
+                ("list_dir", r#"{"path":"."}"#),
+                ("get_repo_map", "{}"),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                std::fs::write(directory.path().join("a.rs"), "fn before_marker() {}\n").unwrap();
+                let executor = Arc::new(PausedBuiltinRead {
+                    name,
+                    captured: tokio::sync::Notify::new(),
+                    release: tokio::sync::Notify::new(),
+                    reads: std::sync::atomic::AtomicUsize::new(0),
+                });
+                let (event_tx, _) = broadcast::channel(8);
+                let mut dispatcher = ToolDispatcher::new(event_tx, HookRegistry::default());
+                dispatcher.work_dir = Some(directory.path().to_owned());
+                dispatcher.tool_execution_mode = mode;
+                dispatcher.tool_executors.clear();
+                dispatcher.register_tool_executor(executor.clone()).unwrap();
+                let dispatcher = Arc::new(dispatcher);
+                let pending = tokio::spawn({
+                    let dispatcher = dispatcher.clone();
+                    async move {
+                        dispatcher
+                            .execute_tools(&[tool_call("before", name, args)])
+                            .await
+                            .unwrap()
+                    }
+                });
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    executor.captured.notified(),
+                )
+                .await
+                .expect("read must capture its result before the write");
+                // Complete a real tool write, including cache invalidation,
+                // while the original read still holds its earlier result.
+                let target = if name == "read_file" { "a.rs" } else { "b.rs" };
+                let write_args =
+                    serde_json::json!({"path":target,"content":"fn after_marker() {}\n"})
+                        .to_string();
+                let written = dispatcher
+                    .execute_tools(&[tool_call("write", "write_file", &write_args)])
+                    .await
+                    .unwrap();
+                assert!(!written[0].is_error, "{}", written[0].content);
+                executor.release.notify_one();
+                let before = pending.await.unwrap();
+                assert!(!before[0].is_error, "{}", before[0].content);
+                let expected =
+                    threadlane_tools::try_execute_tool_in_workspace(name, args, directory.path())
+                        .unwrap();
+                assert_ne!(before[0].content, expected, "{mode:?}: {name}");
+                let after = dispatcher
+                    .execute_tools(&[tool_call("after", name, args)])
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    after[0].content, expected,
+                    "{mode:?}: {name} reused a read from before the write"
+                );
+                let cached = dispatcher
+                    .execute_tools(&[tool_call("cached", name, args)])
+                    .await
+                    .unwrap();
+                assert!(cached[0].content.starts_with(&expected));
+                assert!(cached[0].content.contains("served from cache"));
+                assert_eq!(executor.reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+            }
+        }
+    }
+
+    struct LiveStateExecutor {
+        state: Arc<std::sync::Mutex<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for LiveStateExecutor {
+        fn tool_definitions(&self) -> Arc<[AgentToolDefinition]> {
+            [
+                "computer_status",
+                "computer_windows",
+                "browser_current_url",
+                "load_skill",
+            ]
+            .into_iter()
+            .map(stub_tool)
+            .collect::<Vec<_>>()
+            .into()
+        }
+
+        async fn execute_tool(&self, _: &str, _: &str) -> Option<Result<String, String>> {
+            Some(Ok(self.state.lock().unwrap().clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn live_state_reads_observe_external_changes_without_a_mutating_tool() {
+        for mode in [ToolExecutionMode::Sequential, ToolExecutionMode::Parallel] {
+            for (name, before, after) in [
+                (
+                    "computer_status",
+                    "permission missing",
+                    "permission granted",
+                ),
+                ("computer_windows", "window 1", "window 2"),
+                ("load_skill", "skill source valid", "skill source changed"),
+                (
+                    "browser_current_url",
+                    "https://example.com/old",
+                    "https://example.com/new",
+                ),
+            ] {
+                let (event_tx, _) = broadcast::channel(8);
+                let mut dispatcher = ToolDispatcher::new(event_tx, HookRegistry::default());
+                dispatcher.tool_execution_mode = mode;
+                let state = Arc::new(std::sync::Mutex::new(before.to_string()));
+                dispatcher
+                    .register_tool_executor(Arc::new(LiveStateExecutor {
+                        state: state.clone(),
+                    }))
+                    .unwrap();
+                let first = dispatcher
+                    .execute_tools(&[tool_call("first", name, "{}")])
+                    .await
+                    .unwrap();
+                assert_eq!(first[0].content, before);
+                // User actions and app navigation bypass tool-loop invalidation.
+                *state.lock().unwrap() = after.to_string();
+                let second = dispatcher
+                    .execute_tools(&[tool_call("second", name, "{}")])
+                    .await
+                    .unwrap();
+                assert_eq!(second[0].content, after, "{mode:?}: {name}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn repetition_cache_serves_identical_reads_once() {
-        // computer_windows is cacheable and unclaimed by the builtin
-        // executor, so the stub owns its schema without conflicts.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("read.txt");
+        std::fs::write(&path, "file content").unwrap();
+        let args = serde_json::json!({"path": path}).to_string();
         let (dispatcher, counters) =
-            counting_dispatcher(&[("computer_windows", "win1"), ("browser_act", "ok")]);
-        let call = tool_call("call-1", "computer_windows", "{}");
+            counting_dispatcher(&[("read_file", "file content"), ("browser_act", "ok")]);
+        let call = tool_call("call-1", "read_file", &args);
         let first = dispatcher.execute_tools(&[call.clone()]).await.unwrap();
         let second = dispatcher.execute_tools(&[call]).await.unwrap();
-        assert_eq!(call_count(&counters, "computer_windows"), 1);
-        assert_eq!(first[0].content, "win1");
+        assert_eq!(call_count(&counters, "read_file"), 1);
+        assert_eq!(first[0].content, "file content");
         assert!(
             second[0].content.contains("served from cache"),
             "cache hit must steer the model: {}",
@@ -1863,15 +2280,65 @@ mod tests {
 
     #[tokio::test]
     async fn mutation_busts_the_repetition_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("read.txt");
+        std::fs::write(&path, "file content").unwrap();
+        let args = serde_json::json!({"path": path}).to_string();
         let (dispatcher, counters) =
-            counting_dispatcher(&[("computer_windows", "win1"), ("browser_act", "ok")]);
-        let read = tool_call("call-1", "computer_windows", "{}");
+            counting_dispatcher(&[("read_file", "file content"), ("browser_act", "ok")]);
+        let read = tool_call("call-1", "read_file", &args);
         let write = tool_call("call-2", "browser_act", "{}");
         dispatcher.execute_tools(&[read.clone()]).await.unwrap();
         dispatcher.execute_tools(&[write]).await.unwrap();
         dispatcher.execute_tools(&[read]).await.unwrap();
-        assert_eq!(call_count(&counters, "computer_windows"), 2);
+        assert_eq!(call_count(&counters, "read_file"), 2);
         assert_eq!(call_count(&counters, "browser_act"), 1);
+    }
+
+    #[tokio::test]
+    async fn cached_read_errors_keep_their_flag_and_clear_after_a_write() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("read.txt"), [0xff]).unwrap();
+        let (event_tx, _) = broadcast::channel(8);
+        let mut dispatcher = ToolDispatcher::new(event_tx, HookRegistry::default());
+        dispatcher.work_dir = Some(directory.path().to_owned());
+        let args = r#"{"path":"read.txt"}"#;
+        let first = dispatcher
+            .execute_tools(&[tool_call("first", "read_file", args)])
+            .await
+            .unwrap();
+        let cached = dispatcher
+            .execute_tools(&[tool_call("cached-error", "read_file", args)])
+            .await
+            .unwrap();
+        assert!(first[0].is_error);
+        assert!(cached[0].is_error);
+        assert!(cached[0].content.starts_with(&first[0].content));
+        assert_eq!(cached[0].content.matches("Tool executor error:").count(), 1);
+        assert_eq!(cached[0].content.matches("served from cache").count(), 1);
+        let written = dispatcher
+            .execute_tools(&[tool_call(
+                "write",
+                "write_file",
+                r#"{"path":"read.txt","content":"recovered"}"#,
+            )])
+            .await
+            .unwrap();
+        assert!(!written[0].is_error);
+        let fresh = dispatcher
+            .execute_tools(&[tool_call("fresh", "read_file", args)])
+            .await
+            .unwrap();
+        assert!(!fresh[0].is_error);
+        assert!(fresh[0].content.contains("recovered"));
+        assert!(!fresh[0].content.contains("served from cache"));
+        let cached = dispatcher
+            .execute_tools(&[tool_call("cached-success", "read_file", args)])
+            .await
+            .unwrap();
+        assert!(!cached[0].is_error);
+        assert!(cached[0].content.starts_with(&fresh[0].content));
+        assert_eq!(cached[0].content.matches("served from cache").count(), 1);
     }
 
     #[tokio::test]
@@ -1885,21 +2352,29 @@ mod tests {
 
     #[tokio::test]
     async fn clearing_resets_the_repetition_cache() {
-        let (dispatcher, counters) = counting_dispatcher(&[("computer_windows", "win1")]);
-        let call = tool_call("call-1", "computer_windows", "{}");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("read.txt");
+        std::fs::write(&path, "file content").unwrap();
+        let args = serde_json::json!({"path": path}).to_string();
+        let (dispatcher, counters) = counting_dispatcher(&[("read_file", "file content")]);
+        let call = tool_call("call-1", "read_file", &args);
         dispatcher.execute_tools(&[call.clone()]).await.unwrap();
         dispatcher.clear_repetition_cache();
         dispatcher.execute_tools(&[call]).await.unwrap();
-        assert_eq!(call_count(&counters, "computer_windows"), 2);
+        assert_eq!(call_count(&counters, "read_file"), 2);
     }
 
     #[tokio::test]
     async fn replay_skips_the_repetition_cache() {
-        let (dispatcher, counters) = counting_dispatcher(&[("computer_windows", "win1")]);
-        let call = tool_call("call-1", "computer_windows", "{}");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("read.txt");
+        std::fs::write(&path, "file content").unwrap();
+        let args = serde_json::json!({"path": path}).to_string();
+        let (dispatcher, counters) = counting_dispatcher(&[("read_file", "file content")]);
+        let call = tool_call("call-1", "read_file", &args);
         dispatcher.execute_tools(&[call.clone()]).await.unwrap();
         dispatcher.execute_tools_for_replay(&[call]).await.unwrap();
-        assert_eq!(call_count(&counters, "computer_windows"), 2);
+        assert_eq!(call_count(&counters, "read_file"), 2);
     }
 
     #[test]
@@ -1921,30 +2396,49 @@ mod tests {
 
     #[test]
     fn same_path_write_busts_only_that_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "A").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "B").unwrap();
+        let work_dir = Some(dir.path());
         let cache = RepetitionCacheHandle::default();
         let output = |text: &str| ToolOutput {
             content: text.into(),
             images: Vec::new(),
         };
-        cache.store("read_file", r#"{"path":"a.rs"}"#, &output("A"), false, None);
-        cache.store("read_file", r#"{"path":"b.rs"}"#, &output("B"), false, None);
+        cache.store(
+            "read_file",
+            r#"{"path":"a.rs"}"#,
+            &output("A"),
+            false,
+            work_dir,
+            cache.execution_revision("read_file"),
+        );
+        cache.store(
+            "read_file",
+            r#"{"path":"b.rs"}"#,
+            &output("B"),
+            false,
+            work_dir,
+            cache.execution_revision("read_file"),
+        );
         cache.store(
             "grep_search",
             r#"{"pattern":"x"}"#,
             &output("G"),
             false,
-            None,
+            work_dir,
+            cache.execution_revision("grep_search"),
         );
         // Same-path write busts read_file(a) plus all workspace-wide reads.
-        cache.invalidate_for_mutation("write_file", r#"{"path":"a.rs"}"#, None);
+        cache.invalidate_for_mutation("write_file", r#"{"path":"a.rs"}"#, work_dir);
         assert!(cache
-            .lookup("read_file", r#"{"path":"a.rs"}"#, None)
+            .lookup("read_file", r#"{"path":"a.rs"}"#, work_dir)
             .is_none());
         assert!(cache
-            .lookup("read_file", r#"{"path":"b.rs"}"#, None)
+            .lookup("read_file", r#"{"path":"b.rs"}"#, work_dir)
             .is_some());
         assert!(cache
-            .lookup("grep_search", r#"{"pattern":"x"}"#, None)
+            .lookup("grep_search", r#"{"pattern":"x"}"#, work_dir)
             .is_none());
     }
 
@@ -1965,6 +2459,7 @@ mod tests {
             },
             false,
             work_dir,
+            cache.execution_revision("read_file"),
         );
         assert!(cache.lookup("read_file", args, work_dir).is_some());
         // External edit (different size forces detection even on filesystems
@@ -1974,6 +2469,101 @@ mod tests {
             cache.lookup("read_file", args, work_dir).is_none(),
             "externally modified file must re-execute"
         );
+    }
+
+    #[tokio::test]
+    async fn fuzzy_file_reads_observe_external_changes_and_new_candidates() {
+        for initially_present in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("src")).unwrap();
+            let source = dir.path().join("src/state.rs");
+            if initially_present {
+                std::fs::write(&source, "old source\n").unwrap();
+            }
+            let (event_tx, _) = broadcast::channel(8);
+            let mut dispatcher = ToolDispatcher::new(event_tx, HookRegistry::default());
+            dispatcher.work_dir = Some(dir.path().to_path_buf());
+            let args = r#"{"path":"crates/removed/state.rs"}"#;
+            let first = dispatcher
+                .execute_tools(&[tool_call("first", "read_file", args)])
+                .await
+                .unwrap();
+            assert_eq!(first[0].is_error, !initially_present);
+            if initially_present {
+                assert!(first[0].content.contains("old source"));
+                assert!(first[0].content.contains("Auto-resolved"));
+            }
+            // This edit bypasses the tool loop's mutation invalidation.
+            std::fs::write(&source, "fresh source version\n").unwrap();
+            let second = dispatcher
+                .execute_tools(&[tool_call("second", "read_file", args)])
+                .await
+                .unwrap();
+            assert!(!second[0].is_error, "{}", second[0].content);
+            assert!(
+                second[0].content.contains("fresh source version"),
+                "{}",
+                second[0].content
+            );
+            assert!(!second[0].content.contains("served from cache"));
+            std::fs::create_dir_all(dir.path().join("crates/removed")).unwrap();
+            std::fs::write(
+                dir.path().join("crates/removed/state.rs"),
+                "exact path source\n",
+            )
+            .unwrap();
+            let exact = dispatcher
+                .execute_tools(&[tool_call("exact", "read_file", args)])
+                .await
+                .unwrap();
+            assert!(
+                exact[0].content.contains("exact path source"),
+                "{}",
+                exact[0].content
+            );
+            let cached = dispatcher
+                .execute_tools(&[tool_call("cached", "read_file", args)])
+                .await
+                .unwrap();
+            assert!(cached[0].content.contains("served from cache"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retargeted_symlink_reads_observe_the_current_source() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "original source\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "different source\n").unwrap();
+        let alias = dir.path().join("alias.rs");
+        std::os::unix::fs::symlink("a.rs", &alias).unwrap();
+        let (event_tx, _) = broadcast::channel(8);
+        let mut dispatcher = ToolDispatcher::new(event_tx, HookRegistry::default());
+        dispatcher.work_dir = Some(dir.path().to_path_buf());
+        let args = r#"{"path":"alias.rs"}"#;
+        let first = dispatcher
+            .execute_tools(&[tool_call("first", "read_file", args)])
+            .await
+            .unwrap();
+        assert!(first[0].content.contains("original source"));
+        let cached = dispatcher
+            .execute_tools(&[tool_call("cached", "read_file", args)])
+            .await
+            .unwrap();
+        assert!(cached[0].content.contains("served from cache"));
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink("b.rs", &alias).unwrap();
+        let changed = dispatcher
+            .execute_tools(&[tool_call("changed", "read_file", args)])
+            .await
+            .unwrap();
+        assert!(!changed[0].is_error, "{}", changed[0].content);
+        assert!(
+            changed[0].content.contains("different source"),
+            "{}",
+            changed[0].content
+        );
+        assert!(!changed[0].content.contains("served from cache"));
     }
 
     #[test]
@@ -1993,6 +2583,7 @@ mod tests {
             },
             false,
             work_dir,
+            cache.execution_revision("read_file"),
         );
         std::fs::remove_file(&file).unwrap();
         assert!(cache.lookup("read_file", args, work_dir).is_none());
@@ -2197,18 +2788,266 @@ mod cache_freshness_tests {
     }
 
     #[test]
+    fn mutations_and_clear_fence_in_flight_cache_probes() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a.rs"), "A").unwrap();
+        std::fs::write(directory.path().join("b.rs"), "B").unwrap();
+        let root = Some(directory.path());
+        let args = r#"{"path":"a.rs"}"#;
+        let key = ("read_file".to_string(), args.to_string());
+        let other_args = r#"{"path":"b.rs"}"#;
+        let other_key = ("read_file".to_string(), other_args.to_string());
+        for mutation in ["write_file", "run_command", "clear"] {
+            let cache = RepetitionCacheHandle::default();
+            cache.store(
+                "read_file",
+                args,
+                &output("A"),
+                false,
+                root,
+                cache.execution_revision("read_file"),
+            );
+            cache.store(
+                "read_file",
+                other_args,
+                &output("B"),
+                false,
+                root,
+                cache.execution_revision("read_file"),
+            );
+            // Pause between the lookup/store filesystem probe and its commit.
+            let (revision, entry, other_entry) = {
+                let guard = cache.inner.lock().unwrap();
+                (
+                    guard.revision,
+                    guard.entries[&key].clone(),
+                    guard.entries[&other_key].clone(),
+                )
+            };
+            assert!(cache.confirm_lookup(&key, revision, &entry, true).is_some());
+            if mutation == "clear" {
+                cache.clear();
+            } else {
+                cache.invalidate_for_mutation(mutation, args, root);
+            }
+            assert!(cache.confirm_lookup(&key, revision, &entry, true).is_none());
+            cache.store_if_current(key.clone(), revision, entry);
+            assert!(cache.lookup("read_file", args, root).is_none());
+            // Even an unrelated mutation fences a probe already in progress;
+            // its failed validation must not evict a surviving unrelated read.
+            assert!(cache
+                .confirm_lookup(&other_key, revision, &other_entry, false)
+                .is_none());
+            assert_eq!(
+                cache.lookup("read_file", other_args, root).is_some(),
+                mutation == "write_file"
+            );
+            cache.store(
+                "read_file",
+                args,
+                &output("fresh"),
+                false,
+                root,
+                cache.execution_revision("read_file"),
+            );
+            assert!(cache
+                .lookup("read_file", args, root)
+                .unwrap()
+                .0
+                .content
+                .starts_with("fresh\n"));
+        }
+    }
+
+    #[test]
+    fn old_validation_cannot_return_or_evict_a_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a.rs"), "A").unwrap();
+        let root = Some(directory.path());
+        let args = r#"{"path":"a.rs"}"#;
+        let key = ("read_file".to_string(), args.to_string());
+        let cache = RepetitionCacheHandle::default();
+        cache.store(
+            "read_file",
+            args,
+            &output("old"),
+            false,
+            root,
+            cache.execution_revision("read_file"),
+        );
+        let (revision, old) = {
+            let guard = cache.inner.lock().unwrap();
+            (guard.revision, guard.entries[&key].clone())
+        };
+        cache.store(
+            "read_file",
+            args,
+            &output("replacement"),
+            false,
+            root,
+            cache.execution_revision("read_file"),
+        );
+        for fresh in [true, false] {
+            assert!(cache.confirm_lookup(&key, revision, &old, fresh).is_none());
+            let current = cache.lookup("read_file", args, root).unwrap().0;
+            assert!(current.content.starts_with("replacement\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn list_dir_observes_external_empty_directory_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let (event_tx, _) = broadcast::channel(8);
+        let mut dispatcher = ToolDispatcher::new(event_tx, HookRegistry::default());
+        dispatcher.work_dir = Some(directory.path().to_path_buf());
+        let call = ToolCall {
+            id: "listing".into(),
+            r#type: "function".into(),
+            function: threadlane_protocol::RuntimeToolCallFunction {
+                name: "list_dir".into(),
+                arguments: r#"{"path":"."}"#.into(),
+            },
+            thought_signature: None,
+        };
+        let first = dispatcher.execute_tools(&[call.clone()]).await.unwrap();
+        assert_eq!(first[0].content, "");
+        let cached = dispatcher.execute_tools(&[call.clone()]).await.unwrap();
+        assert!(cached[0].content.contains("served from cache"));
+
+        let empty = directory.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let created = dispatcher.execute_tools(&[call.clone()]).await.unwrap();
+        assert_eq!(created[0].content, "[DIR]  empty");
+        let renamed = directory.path().join("renamed");
+        std::fs::rename(empty, &renamed).unwrap();
+        let moved = dispatcher.execute_tools(&[call.clone()]).await.unwrap();
+        assert_eq!(moved[0].content, "[DIR]  renamed");
+        std::fs::remove_dir(renamed).unwrap();
+        let removed = dispatcher.execute_tools(&[call]).await.unwrap();
+        assert_eq!(removed[0].content, "");
+    }
+
+    #[test]
+    fn incomplete_tree_fingerprints_never_enable_blind_cache_hits() {
+        for directories_only in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            for index in 0..TREE_FINGERPRINT_BUDGET {
+                let path = directory.path().join(index.to_string());
+                if directories_only {
+                    std::fs::create_dir(path).unwrap();
+                } else {
+                    std::fs::write(path, "content").unwrap();
+                }
+            }
+            assert_eq!(
+                fingerprint_tree(directory.path()).map(|tree| tree.sampled),
+                Some(TREE_FINGERPRINT_BUDGET)
+            );
+            let overflow = directory.path().join("overflow");
+            if directories_only {
+                std::fs::create_dir(overflow).unwrap();
+            } else {
+                std::fs::write(overflow, "content").unwrap();
+            }
+            assert!(fingerprint_tree(directory.path()).is_none());
+            let cache = RepetitionCacheHandle::default();
+            for (name, args) in [
+                ("list_dir", r#"{"path":"."}"#),
+                ("grep_search", r#"{"pattern":"content"}"#),
+                ("get_repo_map", "{}"),
+            ] {
+                cache.store(
+                    name,
+                    args,
+                    &output("old"),
+                    false,
+                    Some(directory.path()),
+                    cache.execution_revision(name),
+                );
+                assert!(cache.lookup(name, args, Some(directory.path())).is_none());
+            }
+        }
+        let cache = RepetitionCacheHandle::default();
+        cache.store(
+            "list_dir",
+            "{}",
+            &output("old"),
+            false,
+            None,
+            cache.execution_revision("list_dir"),
+        );
+        assert!(cache.lookup("list_dir", "{}", None).is_none());
+    }
+
+    #[test]
+    fn unverifiable_workspace_roots_are_not_cached() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        std::fs::write(&file, "content").unwrap();
+        for root in [file, directory.path().join("missing")] {
+            assert!(fingerprint_tree(&root).is_none());
+            let cache = RepetitionCacheHandle::default();
+            cache.store(
+                "list_dir",
+                "{}",
+                &output("old"),
+                false,
+                Some(&root),
+                cache.execution_revision("list_dir"),
+            );
+            assert!(cache.lookup("list_dir", "{}", Some(&root)).is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retargeted_workspace_root_busts_tree_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&first, &alias).unwrap();
+        let cache = RepetitionCacheHandle::default();
+        cache.store(
+            "list_dir",
+            "{}",
+            &output("first"),
+            false,
+            Some(&alias),
+            cache.execution_revision("list_dir"),
+        );
+        assert!(cache.lookup("list_dir", "{}", Some(&alias)).is_some());
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(second, &alias).unwrap();
+        assert!(cache.lookup("list_dir", "{}", Some(&alias)).is_none());
+    }
+
+    #[test]
     fn external_tree_edit_busts_workspace_wide_reads() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "aaa").unwrap();
         let work_dir = Some(dir.path());
         let cache = RepetitionCacheHandle::default();
-        cache.store("list_dir", r#"{"path":"."}"#, &output("a.rs"), false, work_dir);
-        assert!(cache.lookup("list_dir", r#"{"path":"."}"#, work_dir).is_some());
+        cache.store(
+            "list_dir",
+            r#"{"path":"."}"#,
+            &output("a.rs"),
+            false,
+            work_dir,
+            cache.execution_revision("list_dir"),
+        );
+        assert!(cache
+            .lookup("list_dir", r#"{"path":"."}"#, work_dir)
+            .is_some());
         // External change anywhere in the tree (new file, same root mtime
         // granularity aside) must not serve the stale listing.
         std::fs::write(dir.path().join("b.rs"), "bbb").unwrap();
         assert!(
-            cache.lookup("list_dir", r#"{"path":"."}"#, work_dir).is_none(),
+            cache
+                .lookup("list_dir", r#"{"path":"."}"#, work_dir)
+                .is_none(),
             "externally changed tree must re-execute list_dir"
         );
     }
@@ -2225,6 +3064,7 @@ mod cache_freshness_tests {
             &output("a.rs:1:aaa"),
             false,
             work_dir,
+            cache.execution_revision("grep_search"),
         );
         assert!(cache
             .lookup("grep_search", r#"{"pattern":"aaa"}"#, work_dir)

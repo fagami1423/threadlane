@@ -542,6 +542,16 @@ impl AgentRuntime {
         self.synced_dispatcher().execute_tools(calls).await
     }
 
+    pub async fn recover_tool_reply(
+        &self,
+        call: &ToolCall,
+        identity: &threadlane_protocol::ToolExecutionIdentity,
+    ) -> Result<Option<AgentToolResult>, crate::error::AgentError> {
+        self.synced_dispatcher()
+            .recover_tool_reply(call, identity)
+            .await
+    }
+
     pub async fn run_steer(&mut self) {
         if !self.steering_queue.is_empty() {
             let items = self.steering_queue.clone();
