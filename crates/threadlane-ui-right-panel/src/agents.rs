@@ -1,8 +1,8 @@
 use gpui::*;
-use gpui_component::avatar::Avatar;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::scroll::{ScrollableElement, Scrollbar};
-use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable};
+use gpui_component::scroll::Scrollbar;
+use gpui_component::{ActiveTheme, Sizable, WindowExt};
+use threadlane_ui_kit as kit;
 use std::collections::HashSet;
 use threadlane_ui_state::{
     AppState, ChatMessageInfo, MessageRole, SubagentActivityInfo, SubagentActivityStatus,
@@ -43,6 +43,33 @@ async fn worktree_present(
     )
     .await
     .unwrap_or(true)
+}
+
+fn agent_worktree_target_matches(
+    expected: &SubagentActivityInfo,
+    current: &SubagentActivityInfo,
+    action: kit::AgentWorktreeAction,
+) -> bool {
+    expected.batch_run_id == current.batch_run_id
+        && expected.task_index == current.task_index
+        && expected.journal_run_id == current.journal_run_id
+        && expected.lane == current.lane
+        && expected.isolation == current.isolation
+        && kit::agent_worktree_action_enabled(action, current.status, true)
+}
+fn agent_worktree_target_current(
+    state: &AppState,
+    session: Option<&str>,
+    root: &std::path::Path,
+    expected: &SubagentActivityInfo,
+    action: kit::AgentWorktreeAction,
+) -> bool {
+    state.active_session_id.as_deref() == session
+        && state.active_git_work_dir().as_deref() == Some(root)
+        && state
+            .active_subagents()
+            .iter()
+            .any(|current| agent_worktree_target_matches(expected, current, action))
 }
 
 pub struct AgentsPanel {
@@ -91,40 +118,6 @@ impl AgentsPanel {
         }
     }
 
-    fn status(status: SubagentActivityStatus) -> &'static str {
-        match status {
-            SubagentActivityStatus::Queued => "Queued",
-            SubagentActivityStatus::Running => "Working",
-            SubagentActivityStatus::Completed => "Completed",
-            SubagentActivityStatus::Failed => "Failed",
-            SubagentActivityStatus::Cancelled => "Cancelled",
-        }
-    }
-
-    fn status_color(status: SubagentActivityStatus, cx: &App) -> gpui::Hsla {
-        let colors = cx.theme().colors;
-        match status {
-            SubagentActivityStatus::Running => colors.success,
-            SubagentActivityStatus::Queued => colors.warning,
-            SubagentActivityStatus::Failed => colors.danger,
-            SubagentActivityStatus::Cancelled => colors.muted_foreground,
-            SubagentActivityStatus::Completed => colors.muted_foreground,
-        }
-    }
-
-    fn status_pill(status: SubagentActivityStatus, cx: &App) -> Div {
-        let color = Self::status_color(status, cx);
-        div()
-            .rounded_full()
-            .px_2()
-            .py_0p5()
-            .text_xs()
-            .font_weight(FontWeight::MEDIUM)
-            .bg(color.opacity(0.14))
-            .text_color(color)
-            .child(Self::status(status))
-    }
-
     fn latest_activity(item: &SubagentActivityInfo) -> Option<String> {
         item.messages.iter().rev().find_map(|message| {
             message
@@ -153,7 +146,6 @@ impl AgentsPanel {
 
     fn render_main_agent(&self, cx: &App) -> Div {
         let state = self.model.read(cx);
-        let theme = cx.theme().colors;
         let latest = state
             .messages
             .iter()
@@ -163,209 +155,59 @@ impl AgentsPanel {
                 let text = message.content.trim();
                 (!text.is_empty()).then(|| text.chars().take(140).collect::<String>())
             });
-        let working = state.is_generating;
-        let pill_color = if working {
-            theme.primary
-        } else {
-            theme.muted_foreground
-        };
-        div()
-            .mx_3()
-            .mt_3()
-            .p_3()
-            .rounded_xl()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.title_bar)
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(Icon::new(IconName::Bot).small())
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_sm()
-                            .child("Main agent"),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .rounded_full()
-                            .px_2()
-                            .py_0p5()
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .bg(pill_color.opacity(0.14))
-                            .text_color(pill_color)
-                            .child(if working { "Working" } else { "Ready" }),
-                    ),
-            )
-            .children(latest.map(|text| {
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(text)
-            }))
+        kit::agent_main_summary(state.is_generating, latest, cx)
     }
 
     fn render_message(
         &mut self,
         message: &ChatMessageInfo,
         row_index: usize,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = cx.theme().colors;
-        let role = match message.role {
-            MessageRole::User => "Instruction",
-            MessageRole::Assistant => "Agent",
-            MessageRole::System => "System",
-            MessageRole::Error => "Error",
-            MessageRole::ContextMarker => "Context",
-        };
-        div()
-            .debug_selector(|| "agent-activity-message".into())
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_3()
-            .rounded_xl()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.muted.opacity(0.3))
-            .child(
-                div()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(if message.role == MessageRole::Error {
-                        theme.danger
-                    } else {
-                        theme.muted_foreground
-                    })
-                    .child(role),
-            )
-            .children((!message.content.trim().is_empty()).then(|| {
-                div()
-                    .text_sm()
-                    .text_color(theme.foreground)
-                    .child(message.content.clone())
-            }))
-            .children(
-                message
-                    .reasoning_content
-                    .as_ref()
-                    .filter(|text| !text.trim().is_empty())
-                    .map(|text| {
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(if message.streaming {
-                                "Thinking…"
-                            } else {
-                                "Thought process"
-                            })
-                            .child(div().whitespace_normal().child(text.clone()))
-                    }),
-            )
-            .children(message.tool_activities.iter().enumerate().map(
-                |(activity_index, activity)| {
-                    let key = format!(
-                        "{}:{}:{}:{activity_index}",
-                        self.model.read(cx).active_session_id.as_deref().unwrap_or(""),
-                        self.transcript_run_id.as_deref().unwrap_or(""),
-                        message.id,
-                    );
-                    let expanded = self.collapsed_tool_details.contains(&key);
-                    div()
-                        .flex()
-                        .items_start()
-                        .gap_2()
-                        .text_xs()
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_color(if activity.category == "Error" {
-                                    theme.danger
-                                } else {
-                                    theme.muted_foreground
-                                })
-                                .child(if activity.category == "Error" {
-                                    "!"
-                                } else {
-                                    "•"
-                                }),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(
-                                            activity
-                                                .display_summary
-                                                .trim()
-                                                .is_empty()
-                                                .then(|| activity.title.clone())
-                                                .unwrap_or_else(|| {
-                                                    activity.display_summary.clone()
-                                                }),
-                                        )
-                                        .children((!activity.detail.trim().is_empty()).then(
-                                            || {
-                                                let toggle_key = key.clone();
-                                                Button::new(SharedString::from(format!(
-                                                    "agent-tool-detail-{row_index}-{activity_index}"
-                                                )))
-                                                .label(if expanded {
-                                                    "Hide details"
-                                                } else {
-                                                    "Show details"
-                                                })
-                                                .ghost()
-                                                .xsmall()
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    if !this
-                                                        .collapsed_tool_details
-                                                        .insert(toggle_key.clone())
-                                                    {
-                                                        this.collapsed_tool_details
-                                                            .remove(&toggle_key);
-                                                    }
-                                                    cx.notify();
-                                                }))
-                                            },
-                                        )),
-                                )
-                                .children((expanded && !activity.detail.trim().is_empty()).then(
-                                    || {
-                                        div()
-                                            .mt_1()
-                                            .p_2()
-                                            .rounded_md()
-                                            .max_h(rems(12.0))
-                                            .overflow_y_scrollbar()
-                                            .whitespace_normal()
-                                            .text_color(if activity.category == "Error" {
-                                                theme.danger
-                                            } else {
-                                                theme.muted_foreground
-                                            })
-                                            .child(activity.detail.clone())
-                                    },
-                                )),
-                        )
-                },
-            ))
-            .into_any_element()
+        let session = self
+            .model
+            .read(cx)
+            .active_session_id
+            .clone()
+            .unwrap_or_default();
+        let run = self.transcript_run_id.clone().unwrap_or_default();
+        let owner = cx.entity().downgrade();
+        let tools = message
+            .tool_activities
+            .iter()
+            .enumerate()
+            .map(|(ix, activity)| {
+                // Old imported tools can lack an ID; their append-only position is the fallback.
+                let tool_id = if activity.id.is_empty() {
+                    ix.to_string()
+                } else {
+                    activity.id.clone()
+                };
+                let key = format!("{session}:{run}:{}:{tool_id}", message.id);
+                let expanded = self.collapsed_tool_details.contains(&key);
+                let toggle_key = key.clone();
+                let owner = owner.clone();
+                let (row, motion) = kit::agent_tool_activity(
+                    key,
+                    activity,
+                    expanded,
+                    move |_, cx| {
+                        let _ = owner.update(cx, |this, cx| {
+                            if !this.collapsed_tool_details.insert(toggle_key.clone()) {
+                                this.collapsed_tool_details.remove(&toggle_key);
+                            }
+                            cx.notify();
+                        });
+                    },
+                    window,
+                    cx,
+                );
+                motion.remeasure_list_row(&self.transcript_list, row_index, window);
+                row
+            })
+            .collect();
+        kit::agent_activity_message(message, tools, cx).into_any_element()
     }
 
     fn render_detail(
@@ -374,7 +216,6 @@ impl AgentsPanel {
         has_messages: bool,
         cx: &mut Context<Self>,
     ) -> Div {
-        let theme = cx.theme().colors;
         let target = item.lane.as_deref().unwrap_or(&item.agent).to_owned();
         let live = matches!(
             item.status,
@@ -388,96 +229,33 @@ impl AgentsPanel {
         let label = if live { "Message…" } else { "Continue…" };
         let model = self.model.clone();
         let branch_controls = self.render_branch_controls(item, cx);
-        div()
-            .debug_selector(|| "agent-detail".into())
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .border_t_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .debug_selector(|| "agent-detail-header".into())
-                    .px_3()
-                    .pt_3()
-                    .pb_2()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_sm()
-                                    .child(item.agent.clone()),
-                            )
-                            .child(Self::status_pill(item.status, cx))
-                            .child(div().flex_1())
-                            .child(
-                                Button::new(SharedString::from(format!(
-                                    "agents-panel-message-{}",
-                                    Self::run_id(item)
-                                )))
-                                .label(label)
-                                .outline()
-                                .xsmall()
-                                .on_click(move |_, _, cx| {
-                                    model.update(cx, |state, cx| {
-                                        state.request_composer_prompt(prompt.clone());
-                                        cx.notify();
-                                    });
-                                }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .p_2p5()
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.muted.opacity(0.3))
-                            .text_sm()
-                            .text_color(theme.foreground)
-                            .whitespace_normal()
-                            .child(item.task.clone()),
-                    ),
-            )
+        kit::agent_detail_surface(cx)
+            .child(kit::agent_detail_header(
+                item.agent.clone(),
+                item.status,
+                item.task.clone(),
+                Button::new(SharedString::from(format!(
+                    "agents-panel-message-{}",
+                    Self::run_id(item)
+                )))
+                .label(label)
+                .outline()
+                .xsmall()
+                .on_click(move |_, _, cx| {
+                    model.update(cx, |state, cx| {
+                        state.request_composer_prompt(prompt.clone());
+                        cx.notify();
+                    });
+                }),
+                cx,
+            ))
             .children(branch_controls)
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .relative()
-                    .children((!has_messages).then(|| {
-                        div()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .justify_center()
-                            .gap_2()
-                            .p_6()
-                            .text_center()
-                            .child(Icon::new(IconName::Bot).large().text_color(theme.muted_foreground.opacity(0.6)))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.muted_foreground)
-                                    .child("No activity yet"),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground.opacity(0.8))
-                                    .child("The prompt is shown above. New tool calls and replies will appear here."),
-                            )
-                    }))
+                    .children((!has_messages).then(|| kit::agent_empty_state(false, cx)))
                     .child(
                         list(
                             self.transcript_list.clone(),
@@ -494,11 +272,10 @@ impl AgentsPanel {
                     ),
             )
     }
-
     fn render_transcript_row(
         &mut self,
         index: usize,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let message = self.transcript_run_id.as_ref().and_then(|id| {
@@ -527,24 +304,13 @@ impl AgentsPanel {
                     .find(|item| Self::run_id(item) == *id)
                     .and_then(|item| item.error.clone())
             });
-            return div()
-                .p_3()
-                .children(error.map(|error| {
-                    div()
-                        .p_2()
-                        .rounded_lg()
-                        .text_color(cx.theme().colors.danger)
-                        .child(error)
-                }))
-                .into_any_element();
+            return kit::agent_error_row(error, cx).into_any_element();
         }
-        div()
-            .px_3()
-            .py_2()
+        kit::agent_activity_row(cx)
             .children(
                 message
                     .as_ref()
-                    .map(|message| self.render_message(message, index, cx)),
+                    .map(|message| self.render_message(message, index, window, cx)),
             )
             .into_any_element()
     }
@@ -563,7 +329,10 @@ impl AgentsPanel {
         // presence through project-io inside the action instead of
         // touching the client's disk.
         let worktree_available = state.daemon_remote || worktree.is_dir();
-        let theme = cx.theme().colors;
+        let guard_session = state.active_session_id.clone();
+        let guard_root = root.clone();
+        let guard_client = state.daemon_client.clone();
+        let guard_target = item.clone();
 
         let inspect_model = self.model.clone();
         let inspect_root = root.clone();
@@ -579,199 +348,168 @@ impl AgentsPanel {
         let discard_branch = branch.clone();
         let discard_worktree = worktree.clone();
 
-        Some(
-            div()
-                .mx_3()
-                .mb_2()
-                .p_2p5()
-                .rounded_xl()
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.muted.opacity(0.2))
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(Icon::default().path("icons/git/branch.svg").xsmall())
-                        .child(branch.clone()),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .flex_wrap()
-                        .child(
-                            Button::new(SharedString::from(format!("agent-inspect-{branch}")))
-                                .label("Inspect diff")
-                                .outline()
-                                .xsmall()
-                                .on_click(move |_, _, cx| {
-                                    let root = inspect_root.clone();
-                                    let branch = inspect_branch.clone();
-                                    let label = branch.clone();
-                                    let client =
-                                        inspect_model.read(cx).daemon_client.clone();
-                                    let task = cx.background_executor().spawn(async move {
-                                        threadlane_ui_state::project_io::diff_branch(
-                                            &client, &root, branch,
-                                        )
-                                        .await
-                                        .map(|diff| (root, diff))
-                                    });
-                                    let model = inspect_model.clone();
+        Some(kit::agent_worktree_controls(
+            &Self::run_id(item),
+            isolation,
+            item.status,
+            worktree_available,
+            move |action, window, cx| {
+                if !agent_worktree_target_current(
+                    inspect_model.read(cx),
+                    guard_session.as_deref(),
+                    &guard_root,
+                    &guard_target,
+                    action,
+                ) || !std::sync::Arc::ptr_eq(
+                    &inspect_model.read(cx).daemon_client,
+                    &guard_client,
+                ) {
+                    window.push_notification(
+                        "This agent worktree changed. Reopen its controls before continuing.",
+                        cx,
+                    );
+                    return;
+                }
+                match action {
+                    kit::AgentWorktreeAction::Inspect => {
+                        let root = inspect_root.clone();
+                        let branch = inspect_branch.clone();
+                        let label = branch.clone();
+                        let client = inspect_model.read(cx).daemon_client.clone();
+                        let task = cx.background_executor().spawn(async move {
+                            threadlane_ui_state::project_io::diff_branch(&client, &root, branch)
+                                .await
+                                .map(|diff| (root, diff))
+                        });
+                        let model = inspect_model.clone();
+                        cx.spawn(async move |cx| {
+                            let result = task.await;
+                            let _ = model.update(cx, |state, cx| {
+                                match result {
+                                    Ok((root, diff)) => state.request_open_diff(
+                                        root,
+                                        format!("{label}.diff"),
+                                        if diff.is_empty() {
+                                            "No committed changes on this branch.".into()
+                                        } else {
+                                            diff
+                                        },
+                                    ),
+                                    Err(error) => state.session_status = Some(error),
+                                }
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                    }
+                    kit::AgentWorktreeAction::Terminal => {
+                        terminal_model.update(cx, |state, cx| {
+                            controller::dispatch(
+                                state,
+                                AppAction::OpenTerminalAt(terminal_worktree.clone()),
+                            );
+                            cx.notify();
+                        });
+                    }
+                    kit::AgentWorktreeAction::Apply => {
+                        let root = apply_root.clone();
+                        let branch = apply_branch.clone();
+                        let worktree = apply_worktree.clone();
+                        let client = apply_model.read(cx).daemon_client.clone();
+                        let task = cx.background_executor().spawn(async move {
+                            let parent = threadlane_ui_state::project_io::inspect(
+                                &client, &root, false,
+                            )
+                            .await?;
+                            if parent.has_changes {
+                                return Err("Commit or stash parent changes before applying a subagent branch.".into());
+                            }
+                            let worktree_present =
+                                worktree_present(&client, &worktree).await;
+                            if worktree_present
+                                && threadlane_ui_state::project_io::inspect(
+                                    &client, &worktree, false,
+                                )
+                                .await?
+                                .has_changes
+                            {
+                                return Err("The subagent worktree has uncommitted changes; commit them before applying.".into());
+                            }
+                            run_git_op(
+                                &client,
+                                &root,
+                                threadlane_protocol::repo::GitOperation::Merge {
+                                    branch: branch.clone(),
+                                },
+                            )
+                            .await?;
+                            if worktree_present {
+                                // The daemon also clears the
+                                // worktree's cargo-target lane.
+                                run_git_op(
+                                    &client,
+                                    &root,
+                                    threadlane_protocol::repo::GitOperation::RemoveWorktree {
+                                        worktree: worktree.clone(),
+                                        force: false,
+                                    },
+                                )
+                                .await?;
+                            }
+                            run_git_op(
+                                &client,
+                                &root,
+                                threadlane_protocol::repo::GitOperation::DeleteBranch {
+                                    branch: branch.clone(),
+                                    force: false,
+                                },
+                            )
+                            .await?;
+                            Ok(format!("Applied {branch}"))
+                        });
+                        let model = apply_model.clone();
+                        cx.spawn(async move |cx| {
+                            let result = task.await;
+                            let _ = model.update(cx, |state, cx| {
+                                state.session_status = Some(result.unwrap_or_else(|error| error));
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                    }
+                    kit::AgentWorktreeAction::Discard => {
+                        let root = discard_root.clone();
+                        let branch = discard_branch.clone();
+                        let worktree = discard_worktree.clone();
+                        let model = discard_model.clone();
+                        let session = guard_session.clone();
+                        let target = guard_target.clone();
+                        let client = guard_client.clone();
+                        let isolation = threadlane_protocol::events::SubagentIsolation {
+                            branch: branch.clone(),
+                            workspace: worktree.clone(),
+                        };
+                        window.open_alert_dialog(cx, move |alert, _, _| {
+                            let model = model.clone();
+                            let root = root.clone();
+                            let branch = branch.clone();
+                            let worktree = worktree.clone();
+                            let session = session.clone();
+                            let target = target.clone();
+                            let client = client.clone();
+                            kit::agent_worktree_discard_dialog(alert, &isolation, &root)
+                                .on_ok(move |_,window,cx| {
+                                    if !agent_worktree_target_current(model.read(cx), session.as_deref(), &root, &target, kit::AgentWorktreeAction::Discard)
+                                        || !std::sync::Arc::ptr_eq(&model.read(cx).daemon_client, &client) {
+                                        window.push_notification("This agent worktree changed. Reopen its controls before discarding it.",cx);
+                                        return false;
+                                    }
+                                    let model = model.clone();
+                                    let root = root.clone();
+                                    let branch = branch.clone();
+                                    let worktree = worktree.clone();
+                                    let client = client.clone();
                                     cx.spawn(async move |cx| {
-                                        let result = task.await;
-                                        let _ = model.update(cx, |state, cx| {
-                                            match result {
-                                                Ok((root, diff)) => state.request_open_diff(
-                                                    root,
-                                                    format!("{label}.diff"),
-                                                    if diff.is_empty() {
-                                                        "No committed changes on this branch."
-                                                            .into()
-                                                    } else {
-                                                        diff
-                                                    },
-                                                ),
-                                                Err(error) => state.session_status = Some(error),
-                                            }
-                                            cx.notify();
-                                        });
-                                    })
-                                    .detach();
-                                }),
-                        )
-                        .child(
-                            Button::new(SharedString::from(format!("agent-terminal-{branch}")))
-                                .label("Terminal")
-                                .ghost()
-                                .xsmall()
-                                .disabled(!worktree_available)
-                                .tooltip(if worktree_available {
-                                    format!("Open terminal in {}", worktree.display())
-                                } else {
-                                    "This worktree was cleaned up; the branch is still available."
-                                        .into()
-                                })
-                                .on_click(move |_, _, cx| {
-                                    terminal_model.update(cx, |state, cx| {
-                                        controller::dispatch(
-                                            state,
-                                            AppAction::OpenTerminalAt(terminal_worktree.clone()),
-                                        );
-                                        cx.notify();
-                                    });
-                                }),
-                        )
-                        .child(
-                            Button::new(SharedString::from(format!("agent-apply-{branch}")))
-                                .label("Apply")
-                                .xsmall()
-                                .disabled(item.status != SubagentActivityStatus::Completed)
-                                .on_click(move |_, _, cx| {
-                                    let root = apply_root.clone();
-                                    let branch = apply_branch.clone();
-                                    let worktree = apply_worktree.clone();
-                                    let client = apply_model.read(cx).daemon_client.clone();
-                                    let task = cx.background_executor().spawn(async move {
-                                        let parent = threadlane_ui_state::project_io::inspect(
-                                            &client, &root, false,
-                                        )
-                                        .await?;
-                                        if parent.has_changes {
-                                            return Err("Commit or stash parent changes before applying a subagent branch.".into());
-                                        }
-                                        let worktree_present =
-                                            worktree_present(&client, &worktree).await;
-                                        if worktree_present
-                                            && threadlane_ui_state::project_io::inspect(
-                                                &client, &worktree, false,
-                                            )
-                                            .await?
-                                            .has_changes
-                                        {
-                                            return Err("The subagent worktree has uncommitted changes; commit them before applying.".into());
-                                        }
-                                        run_git_op(
-                                            &client,
-                                            &root,
-                                            threadlane_protocol::repo::GitOperation::Merge {
-                                                branch: branch.clone(),
-                                            },
-                                        )
-                                        .await?;
-                                        if worktree_present {
-                                            // The daemon also clears the
-                                            // worktree's cargo-target lane.
-                                            run_git_op(
-                                                &client,
-                                                &root,
-                                                threadlane_protocol::repo::GitOperation::RemoveWorktree {
-                                                    worktree: worktree.clone(),
-                                                    force: false,
-                                                },
-                                            )
-                                            .await?;
-                                        }
-                                        run_git_op(
-                                            &client,
-                                            &root,
-                                            threadlane_protocol::repo::GitOperation::DeleteBranch {
-                                                branch: branch.clone(),
-                                                force: false,
-                                            },
-                                        )
-                                        .await?;
-                                        Ok(format!("Applied {branch}"))
-                                    });
-                                    let model = apply_model.clone();
-                                    cx.spawn(async move |cx| {
-                                        let result = task.await;
-                                        let _ = model.update(cx, |state, cx| {
-                                            state.session_status =
-                                                Some(result.unwrap_or_else(|error| error));
-                                            cx.notify();
-                                        });
-                                    })
-                                    .detach();
-                                }),
-                        )
-                        .child(
-                            Button::new(SharedString::from(format!("agent-discard-{branch}")))
-                                .label("Discard…")
-                                .ghost()
-                                .xsmall()
-                                .disabled(matches!(
-                                    item.status,
-                                    SubagentActivityStatus::Queued | SubagentActivityStatus::Running
-                                ))
-                                .on_click(move |_, _, cx| {
-                                    let root = discard_root.clone();
-                                    let branch = discard_branch.clone();
-                                    let worktree = discard_worktree.clone();
-                                    let model = discard_model.clone();
-                                    cx.spawn(async move |cx| {
-                                        let confirmed = rfd::AsyncMessageDialog::new()
-                                            .set_title("Discard subagent branch?")
-                                            .set_description(format!(
-                                                "Delete {branch} and its worktree? This cannot be undone."
-                                            ))
-                                            .set_buttons(rfd::MessageButtons::YesNo)
-                                            .show()
-                                            .await;
-                                        if !matches!(confirmed, rfd::MessageDialogResult::Yes) {
-                                            return;
-                                        }
-                                        let client = model.update(cx, |state, _| {
-                                            state.daemon_client.clone()
-                                        });
                                         let task = cx.background_executor().spawn(async move {
                                             if worktree_present(&client, &worktree).await
                                             {
@@ -808,18 +546,20 @@ impl AgentsPanel {
                                                 Some(result.unwrap_or_else(|error| error));
                                             cx.notify();
                                         });
-                                    })
-                                    .detach();
-                                }),
-                        ),
-                ),
-        )
+                                    }).detach();
+                                    true
+                                })
+                        });
+                    }
+                }
+            },
+            cx,
+        ))
     }
 }
 
 impl Render for AgentsPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
         let state = self.model.read(cx);
         let main_count = state.messages.len();
         let main_working = state.is_generating;
@@ -883,83 +623,32 @@ impl Render for AgentsPanel {
         self.selected_run_id = selected_id.clone();
 
         let main_selected = selected_id.as_deref() == Some("main");
-        let main_dot = if main_working {
-            theme.primary
-        } else {
-            theme.muted_foreground.opacity(0.5)
-        };
         let main_description = if main_working {
             "Main agent · Working"
         } else {
             "Main agent · Ready"
         };
-        let tabs = div()
-            .flex()
-            .flex_none()
-            .items_start()
-            .gap_1()
-            .px_3()
-            .pt_2()
-            .pb_2()
-            // Scrollable defaults to full height; reserve the rest for activity.
-            .h(rems(5.5))
-            .border_b_1()
-            .border_color(theme.border)
-            .bg(theme.title_bar.opacity(0.35))
-            .overflow_x_scrollbar()
+        let tabs = kit::agent_profile_tabs(cx)
             .child(
-                Button::new("agents-profile-main")
-                    .ghost()
-                    .h(rems(3.5))
-                    .selected(main_selected)
-                    .tooltip(main_description)
-                    .accessibility_label(main_description)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap_1p5()
-                            .px_2()
-                            .py_1()
-                            .min_w(rems(4.0))
-                            .child(
-                                div().relative().child(Avatar::new().name("Main").small()).child(
-                                    div()
-                                        .absolute()
-                                        .bottom_0()
-                                        .right_0()
-                                        .size(rems(0.625))
-                                        .rounded_full()
-                                        .border_2()
-                                        .border_color(theme.title_bar)
-                                        .bg(main_dot),
-                                ),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(if main_selected {
-                                        FontWeight::SEMIBOLD
-                                    } else {
-                                        FontWeight::NORMAL
-                                    })
-                                    .text_color(if main_selected {
-                                        theme.foreground
-                                    } else {
-                                        theme.muted_foreground
-                                    })
-                                    .child("Main"),
-                            ),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.selected_run_id = Some("main".to_string());
-                        cx.notify();
-                    })),
+                kit::agent_profile_button(
+                    "agents-profile-main",
+                    "Main",
+                    main_description,
+                    if main_working {
+                        SubagentActivityStatus::Running
+                    } else {
+                        SubagentActivityStatus::Completed
+                    },
+                    main_selected,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.selected_run_id = Some("main".to_string());
+                    cx.notify();
+                })),
             )
             .children(subagents.iter().map(|(item, _)| {
                 let id = Self::run_id(item);
-                let select_id = id.clone();
                 let selected = selected_id.as_deref() == Some(id.as_str());
                 let duplicate_count = subagents
                     .iter()
@@ -970,60 +659,24 @@ impl Render for AgentsPanel {
                 } else {
                     item.agent.clone()
                 };
-                let dot = Self::status_color(item.status, cx);
-                let description =
-                    format!("{} · {}\n{}", name, Self::status(item.status), item.task);
-                Button::new(SharedString::from(format!("agents-profile-{id}")))
-                    .ghost()
-                    .h(rems(3.5))
-                    .selected(selected)
-                    .tooltip(description.clone())
-                    .accessibility_label(description)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap_1p5()
-                            .px_2()
-                            .py_1()
-                            .min_w(rems(4.0))
-                            .child(
-                                div().relative().child(Avatar::new().name(name.clone()).small()).child(
-                                    div()
-                                        .absolute()
-                                        .bottom_0()
-                                        .right_0()
-                                        .size(rems(0.625))
-                                        .rounded_full()
-                                        .border_2()
-                                        .border_color(theme.title_bar)
-                                        .bg(dot),
-                                ),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_center()
-                                    .max_w(rems(6.0))
-                                    .truncate()
-                                    .font_weight(if selected {
-                                        FontWeight::SEMIBOLD
-                                    } else {
-                                        FontWeight::NORMAL
-                                    })
-                                    .text_color(if selected {
-                                        theme.foreground
-                                    } else {
-                                        theme.muted_foreground
-                                    })
-                                    .child(name),
-                            ),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.selected_run_id = Some(select_id.clone());
-                        cx.notify();
-                    }))
+                let description = format!(
+                    "{} · {}\n{}",
+                    name,
+                    kit::agent_status_label(item.status),
+                    item.task
+                );
+                kit::agent_profile_button(
+                    SharedString::from(format!("agents-profile-{id}")),
+                    name,
+                    description,
+                    item.status,
+                    selected,
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.selected_run_id = Some(id.clone());
+                    cx.notify();
+                }))
             }));
         let profile = if let Some((item, count)) = selected {
             self.render_detail(&item, count > 0, cx).into_any_element()
@@ -1038,31 +691,7 @@ impl Render for AgentsPanel {
                         .flex_1()
                         .min_h_0()
                         .relative()
-                        .children((main_count == 0).then(|| {
-                            div()
-                                .flex_1()
-                                .flex()
-                                .flex_col()
-                                .items_center()
-                                .justify_center()
-                                .gap_2()
-                                .p_6()
-                                .text_center()
-                                .child(Icon::new(IconName::Bot).large().text_color(theme.muted_foreground.opacity(0.6)))
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(theme.muted_foreground)
-                                        .child("No main-agent activity yet"),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground.opacity(0.8))
-                                        .child("Select an agent above to inspect its work.")
-                                )
-                        }))
+                        .children((main_count == 0).then(|| kit::agent_empty_state(true, cx)))
                         .children((main_count > 0).then(|| {
                             list(
                                 self.transcript_list.clone(),
@@ -1080,10 +709,7 @@ impl Render for AgentsPanel {
                 )
                 .into_any_element()
         };
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
+        kit::agent_panel_surface(cx)
             .child(tabs)
             .child(div().flex_1().min_h_0().flex().flex_col().child(profile))
     }
@@ -1236,3 +862,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "agents_worktree_tests.rs"]
+mod worktree_tests;

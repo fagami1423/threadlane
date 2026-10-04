@@ -1,8 +1,13 @@
-use super::*;
-use gpui_component::checkbox::Checkbox;
-use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
-use threadlane_automation::{new_id, now, Schedule};
+use gpui::*;
+use gpui_component::input::{InputEvent, InputState, TextareaState};
+use gpui_component::WindowExt;
+use threadlane_automation::{new_id, now, Definition, Schedule};
 use threadlane_protocol::ReasoningEffort;
+use threadlane_ui_kit::automation_form::{
+    automation_editor_sheet, automation_form, automation_schedule_fields,
+    automation_schedule_preview, schedule_from_fields, AutomationForm, AutomationFormAction,
+};
+use threadlane_ui_state::{automation::Command, AppState};
 
 fn default_project(state: &AppState) -> Option<&std::path::PathBuf> {
     state
@@ -23,32 +28,12 @@ fn project_model(models: &[threadlane_daemon::catalog::ModelOption], preferred: 
         .unwrap_or_default()
 }
 
-fn calendar_cadence(days: &[u32]) -> &'static str {
-    match days {
-        [0, 1, 2, 3, 4, 5, 6] => "daily",
-        [0, 1, 2, 3, 4] => "weekdays",
-        [_] => "weekly",
-        _ => "custom",
-    }
-}
-
-fn calendar_days(cadence: &str, weekday: u32, original: &Schedule) -> Vec<u32> {
-    match cadence {
-        "daily" => (0..7).collect(),
-        "weekdays" => (0..5).collect(),
-        "custom" => match original {
-            Schedule::Calendar { days, .. } => days.clone(),
-            _ => Vec::new(),
-        },
-        _ => vec![weekday],
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{calendar_cadence, calendar_days, default_project, project_model};
+    use super::{default_project, project_model};
     use threadlane_automation::Schedule;
     use threadlane_daemon::catalog::{ModelOption, ModelProvider};
+    use threadlane_ui_kit::automation_form::{calendar_cadence, calendar_days};
     use threadlane_ui_state::{activate_test_session, AppState};
 
     #[test]
@@ -168,33 +153,9 @@ pub(super) fn open(
             paused_reason: None,
         }
     });
-    let title = if definition.revision == 0 {
-        "New automation"
-    } else {
-        "Edit automation"
-    };
-    let (cadence, interval, time, timezone, weekday) = match &definition.schedule {
-        Schedule::Manual => ("manual", "60".into(), "09:00".into(), "UTC".into(), 0),
-        Schedule::Interval { minutes } => (
-            "interval",
-            minutes.to_string(),
-            "09:00".into(),
-            "UTC".into(),
-            0,
-        ),
-        Schedule::Calendar {
-            hour,
-            minute,
-            days,
-            timezone,
-        } => (
-            calendar_cadence(days),
-            "60".into(),
-            format!("{hour:02}:{minute:02}"),
-            timezone.clone(),
-            days.first().copied().unwrap_or(0),
-        ),
-    };
+    let editing = definition.revision != 0;
+    let (cadence, interval, time, timezone, weekday) =
+        automation_schedule_fields(&definition.schedule);
     let editor = cx.new(|cx| {
         let name = cx.new(|cx| InputState::new(window, cx).default_value(&definition.name));
         let prompt = cx.new(|cx| {
@@ -219,7 +180,8 @@ pub(super) fn open(
                 }
             },
         ));
-        let models = threadlane_daemon::catalog::available_models_for_project(Some(&definition.project));
+        let models =
+            threadlane_daemon::catalog::available_models_for_project(Some(&definition.project));
         // Keep the safe worktree default until background discovery completes.
         let is_git = true;
         Editor {
@@ -243,13 +205,9 @@ pub(super) fn open(
     editor.update(cx, |this, cx| this.refresh_project(cx));
     window.open_sheet(cx, move |sheet, _, _| {
         let owner = editor.downgrade();
-        sheet
-            .title(title)
-            .size(rems(34.0))
-            .child(editor.clone())
-            .on_close(move |_, _, cx| {
-                let _ = owner.update(cx, |this, _| this.closed = true);
-            })
+        automation_editor_sheet(sheet, editing, editor.clone()).on_close(move |_, _, cx| {
+            let _ = owner.update(cx, |this, _| this.closed = true);
+        })
     });
 }
 impl Editor {
@@ -279,32 +237,16 @@ impl Editor {
     }
 
     fn schedule(&self, cx: &App) -> Result<Schedule, String> {
-        match self.cadence.as_str() {
-            "manual" => Ok(Schedule::Manual),
-            "interval" => Ok(Schedule::Interval {
-                minutes: self
-                    .interval
-                    .read(cx)
-                    .value()
-                    .trim()
-                    .parse()
-                    .map_err(|_| "Enter an interval in whole minutes")?,
-            }),
-            _ => {
-                let value = self.time.read(cx).value();
-                let (hour, minute) = value
-                    .trim()
-                    .split_once(':')
-                    .ok_or("Enter a time as HH:MM")?;
-                Ok(Schedule::Calendar {
-                    hour: hour.parse().map_err(|_| "Invalid hour")?,
-                    minute: minute.parse().map_err(|_| "Invalid minute")?,
-                    days: calendar_days(&self.cadence, self.weekday, &self.definition.schedule),
-                    timezone: self.timezone.read(cx).value().trim().into(),
-                })
-            }
-        }
+        schedule_from_fields(
+            &self.cadence,
+            &self.interval.read(cx).value(),
+            &self.time.read(cx).value(),
+            &self.timezone.read(cx).value(),
+            self.weekday,
+            &self.definition.schedule,
+        )
     }
+
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
             return;
@@ -345,291 +287,103 @@ impl Editor {
         cx.notify();
     }
 }
-fn field(label: &'static str, control: impl IntoElement) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(div().text_sm().child(label))
-        .child(control)
-}
 impl Render for Editor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let projects: Vec<_> = self
-            .model
-            .read(cx)
-            .projects
-            .iter()
-            .map(|p| (p.work_dir.to_string_lossy().into_owned(), p.name.clone()))
-            .collect();
-        let project_id = self.definition.project.to_string_lossy().into_owned();
-        let project_label = projects
-            .iter()
-            .find(|(id, _)| *id == project_id)
-            .map(|(_, name)| name.clone())
-            .unwrap_or_else(|| "Project unavailable".into());
-        let owner = cx.entity().downgrade();
-        let project = picker(
-            "automation-project",
-            project_label,
-            projects,
-            project_id,
-            self.busy,
-            move |id, cx| {
-                let _ = owner.update(cx, |this, cx| {
-                    this.definition.project = id.into();
-                    this.is_git = true;
-                    this.refresh_project(cx);
-                    this.models = threadlane_daemon::catalog::available_models_for_project(Some(
-                        &this.definition.project,
-                    ));
-                    this.definition.model = project_model(&this.models, &this.definition.model);
-                    this.definition.effort = threadlane_provider::model_registry::effective_effort(
-                        &this.definition.model,
-                        ReasoningEffort::from_label(&this.definition.effort).unwrap_or_default(),
-                        Some(&this.definition.project),
-                    )
-                    .label()
-                    .into();
-                    cx.notify();
-                });
-            },
-        );
-        let models = self.models.clone();
-        let model_label = threadlane_daemon::catalog::selection_label(&self.definition.model, &models);
-        let choices = models
-            .into_iter()
-            .filter(|m| !m.id.starts_with("acp/"))
-            .map(|m| (m.id, m.label))
-            .collect();
-        let owner = cx.entity().downgrade();
-        let model = picker(
-            "automation-model",
-            model_label,
-            choices,
-            self.definition.model.clone(),
-            self.busy,
-            move |id, cx| {
-                let _ = owner.update(cx, |this, cx| {
-                    this.definition.effort = threadlane_provider::model_registry::effective_effort(
-                        &id,
-                        ReasoningEffort::from_label(&this.definition.effort).unwrap_or_default(),
-                        Some(&this.definition.project),
-                    )
-                    .label()
-                    .into();
-                    this.definition.model = id;
-                    cx.notify();
-                });
-            },
-        );
-        let owner = cx.entity().downgrade();
-        let efforts = threadlane_daemon::catalog::efforts_for_model(
-            &self.definition.model,
-            Some(&self.definition.project),
-        )
-        .iter()
-        .map(|e| (e.label().into(), e.label().into()))
-        .collect();
-        let effort = picker(
-            "automation-effort",
-            self.definition.effort.clone(),
-            efforts,
-            self.definition.effort.clone(),
-            self.busy,
-            move |id, cx| {
-                let _ = owner.update(cx, |this, cx| {
-                    this.definition.effort = id;
-                    cx.notify();
-                });
-            },
-        );
-        let mut cadences = vec![
-            ("manual", "Manual"),
-            ("interval", "Every N minutes"),
-            ("daily", "Daily"),
-            ("weekdays", "Weekdays"),
-            ("weekly", "Weekly"),
-        ];
-        if matches!(&self.definition.schedule, Schedule::Calendar { days, .. } if calendar_cadence(days) == "custom")
-        {
-            cadences.push(("custom", "Custom days"));
-        }
-        let label = cadences
-            .iter()
-            .find(|(id, _)| *id == self.cadence)
-            .unwrap()
-            .1
-            .to_string();
-        let owner = cx.entity().downgrade();
-        let cadence = picker(
-            "automation-cadence",
-            label,
-            cadences
-                .into_iter()
-                .map(|(id, label)| (id.into(), label.into()))
+        let form = AutomationForm {
+            definition: &self.definition,
+            name: &self.name,
+            prompt: &self.prompt,
+            interval: &self.interval,
+            time: &self.time,
+            timezone: &self.timezone,
+            cadence: &self.cadence,
+            weekday: self.weekday,
+            projects: self
+                .model
+                .read(cx)
+                .projects
+                .iter()
+                .map(|p| (p.work_dir.to_string_lossy().into_owned(), p.name.clone()))
                 .collect(),
-            self.cadence.clone(),
-            self.busy,
-            move |id, cx| {
+            model_label: threadlane_daemon::catalog::selection_label(
+                &self.definition.model,
+                &self.models,
+            ),
+            models: self
+                .models
+                .iter()
+                .filter(|m| !m.id.starts_with("acp/"))
+                .map(|m| (m.id.clone(), m.label.clone()))
+                .collect(),
+            efforts: threadlane_daemon::catalog::efforts_for_model(
+                &self.definition.model,
+                Some(&self.definition.project),
+            )
+            .iter()
+            .map(|e| (e.label().into(), e.label().into()))
+            .collect(),
+            show_effort: threadlane_daemon::catalog::supports_reasoning(
+                &self.definition.model,
+                Some(&self.definition.project),
+            ),
+            is_git: self.is_git,
+            busy: self.busy,
+            error: self.error.clone(),
+            schedule_preview: automation_schedule_preview(self.schedule(cx), now()),
+        };
+        let owner = cx.entity().downgrade();
+        automation_form(
+            form,
+            move |action, window, cx| {
                 let _ = owner.update(cx, |this, cx| {
-                    this.cadence = id;
+                    match action {
+                        AutomationFormAction::Project(id) => {
+                            this.definition.project = id.into();
+                            this.is_git = true;
+                            this.refresh_project(cx);
+                            this.models = threadlane_daemon::catalog::available_models_for_project(
+                                Some(&this.definition.project),
+                            );
+                            this.definition.model =
+                                project_model(&this.models, &this.definition.model);
+                            this.definition.effort =
+                                threadlane_provider::model_registry::effective_effort(
+                                    &this.definition.model,
+                                    ReasoningEffort::from_label(&this.definition.effort)
+                                        .unwrap_or_default(),
+                                    Some(&this.definition.project),
+                                )
+                                .label()
+                                .into();
+                        }
+                        AutomationFormAction::Model(id) => {
+                            this.definition.effort =
+                                threadlane_provider::model_registry::effective_effort(
+                                    &id,
+                                    ReasoningEffort::from_label(&this.definition.effort)
+                                        .unwrap_or_default(),
+                                    Some(&this.definition.project),
+                                )
+                                .label()
+                                .into();
+                            this.definition.model = id;
+                        }
+                        AutomationFormAction::Effort(id) => this.definition.effort = id,
+                        AutomationFormAction::Cadence(id) => this.cadence = id,
+                        AutomationFormAction::Weekday(day) => this.weekday = day,
+                        AutomationFormAction::Worktree(worktree) => {
+                            this.definition.worktree = worktree
+                        }
+                        AutomationFormAction::NotifyAll(notify) => {
+                            this.definition.notify_all = notify
+                        }
+                        AutomationFormAction::Save => this.save(window, cx),
+                        AutomationFormAction::Cancel => window.close_sheet(cx),
+                    }
                     cx.notify();
                 });
             },
-        );
-        let mut body = div()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(field(
-                "Name",
-                Input::new(&self.name)
-                    .aria_label("Automation name")
-                    .disabled(self.busy),
-            ))
-            .child(field(
-                "Prompt",
-                Textarea::new(&self.prompt)
-                    .aria_label("Automation prompt")
-                    .disabled(self.busy),
-            ))
-            .child(field("Project", project))
-            .child(field("Model", model))
-            .when(
-                threadlane_daemon::catalog::supports_reasoning(
-                    &self.definition.model,
-                    Some(&self.definition.project),
-                ),
-                |body| body.child(field("Reasoning effort", effort)),
-            )
-            .child(field("Schedule", cadence));
-        if self.cadence == "interval" {
-            body = body.child(field(
-                "Minutes between runs",
-                Input::new(&self.interval)
-                    .aria_label("Minutes between runs")
-                    .disabled(self.busy),
-            ));
-        }
-        if self.cadence == "custom" {
-            if let Schedule::Calendar { days, .. } = &self.definition.schedule {
-                let labels = [
-                    "Monday",
-                    "Tuesday",
-                    "Wednesday",
-                    "Thursday",
-                    "Friday",
-                    "Saturday",
-                    "Sunday",
-                ];
-                let days = days
-                    .iter()
-                    .filter_map(|d| labels.get(*d as usize).copied())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                body = body.child(div().text_sm().child(format!("Days: {days}")));
-            }
-        }
-        if ["daily", "weekdays", "weekly", "custom"].contains(&self.cadence.as_str()) {
-            body = body
-                .child(field(
-                    "Time (HH:MM)",
-                    Input::new(&self.time)
-                        .aria_label("Time in HH:MM")
-                        .disabled(self.busy),
-                ))
-                .child(field(
-                    "Timezone (IANA name)",
-                    Input::new(&self.timezone)
-                        .aria_label("IANA timezone")
-                        .disabled(self.busy),
-                ));
-        }
-        if self.cadence == "weekly" {
-            let days = [
-                "Monday",
-                "Tuesday",
-                "Wednesday",
-                "Thursday",
-                "Friday",
-                "Saturday",
-                "Sunday",
-            ];
-            let owner = cx.entity().downgrade();
-            body = body.child(field(
-                "Day",
-                picker(
-                    "automation-day",
-                    days[self.weekday as usize].into(),
-                    days.iter()
-                        .enumerate()
-                        .map(|(i, day)| (i.to_string(), day.to_string()))
-                        .collect(),
-                    self.weekday.to_string(),
-                    self.busy,
-                    move |id, cx| {
-                        let _ = owner.update(cx, |this, cx| {
-                            this.weekday = id.parse().unwrap_or(0);
-                            cx.notify();
-                        });
-                    },
-                ),
-            ));
-        }
-        let preview = self.schedule(cx).and_then(|s| {
-            let mut after = now();
-            let mut times = Vec::new();
-            for _ in 0..3 {
-                if let Some(next) = s.next(after, now())? {
-                    times.push(display_time(next, s.timezone()));
-                    after = next;
-                }
-            }
-            Ok(if times.is_empty() {
-                "Runs only when you choose Run now".into()
-            } else {
-                format!("Next runs: {}", times.join(" · "))
-            })
-        });
-        let owner = cx.entity().downgrade();
-        let mut environments = vec![("local".into(), "Local".into())];
-        if self.is_git {
-            environments.push(("worktree".into(), "Worktree".into()));
-        }
-        body = body
-            .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                .child(preview.unwrap_or_else(|error| error)))
-            .child(field("Run in", picker(
-                "automation-environment",
-                if self.definition.worktree { "Worktree" } else { "Local" }.into(),
-                environments,
-                if self.definition.worktree { "worktree" } else { "local" }.into(),
-                self.busy,
-                move |id, cx| {
-                    let _ = owner.update(cx, |this, cx| {
-                        this.definition.worktree = id == "worktree";
-                        cx.notify();
-                    });
-                },
-            )))
-            .child(div().text_sm().text_color(cx.theme().muted_foreground).child(
-                if self.definition.worktree {
-                    "For code changes. Each run gets a fresh Git worktree, separate from your project checkout."
-                } else {
-                    "For research and issue creation. Uses your project checkout without creating a worktree. This is not read-only; the prompt should say when files must not change."
-                }))
-            .when(!self.is_git, |body| body.child(div().text_sm().text_color(cx.theme().muted_foreground)
-                .child("Worktrees require a Git repository.")))
-            .child(Checkbox::new("automation-notify").label("Notify on every completion").checked(self.definition.notify_all).disabled(self.busy)
-                .on_click(cx.listener(|this, checked, _, cx| { this.definition.notify_all = *checked; cx.notify(); })))
-            .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Runs while Threadlane is open and your computer is awake. Permission and question requests wait for you in the run’s chat. Saving does not run the prompt immediately."))
-            .children(self.error.clone().map(|error| div().text_color(cx.theme().danger).child(error)))
-            .child(div().flex().justify_end().gap_2()
-                .child(Button::new("automation-editor-cancel").label("Cancel").disabled(self.busy).on_click(|_, window, cx| window.close_sheet(cx)))
-                .child(Button::new("automation-editor-save").debug_selector(|| "automation-editor-save".into()).primary().label(if self.busy { "Saving…" } else { "Save" }).disabled(self.busy)
-                    .on_click(cx.listener(|this, _, window, cx| this.save(window, cx)))));
-        body.key_context("AutomationEditor")
-            .on_action(cx.listener(|this, _: &SaveAutomation, window, cx| this.save(window, cx)))
+            cx,
+        )
     }
 }

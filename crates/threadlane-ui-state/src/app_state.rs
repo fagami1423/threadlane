@@ -753,23 +753,7 @@ impl AppState {
     }
 
     pub fn issue_branch_name(number: u64, title: &str, suffix: &str) -> String {
-        let slug = title
-            .chars()
-            .flat_map(char::to_lowercase)
-            .fold(String::new(), |mut slug, character| {
-                if character.is_ascii_alphanumeric() {
-                    slug.push(character);
-                } else if !slug.is_empty() && !slug.ends_with('-') {
-                    slug.push('-');
-                }
-                slug
-            })
-            .trim_matches('-')
-            .to_string();
-        format!(
-            "issue/{number}-{}-{suffix}",
-            if slug.is_empty() { "task" } else { &slug }
-        )
+        threadlane_protocol::repo::issue_branch_name(number, title, suffix)
     }
 
     pub fn load() -> Self {
@@ -830,12 +814,19 @@ impl AppState {
     }
 
     pub(crate) fn load_from_registry(registry_projects: Vec<AttachedProject>) -> Self {
+        Self::load_from_registry_inner(registry_projects, true)
+    }
+
+    fn load_from_registry_inner(
+        registry_projects: Vec<AttachedProject>,
+        load_host_state: bool,
+    ) -> Self {
         #[cfg(not(test))]
         let mut registry_projects = registry_projects;
         #[cfg(not(test))]
         registry_projects.retain(|project| is_attachable_project_root(&project.path));
         #[cfg(not(test))]
-        if registry_projects.is_empty() {
+        if load_host_state && registry_projects.is_empty() {
             if let Ok(curr) = std::env::current_dir().and_then(std::fs::canonicalize) {
                 if is_attachable_project_root(&curr) {
                     let project = AttachedProject::from_path(curr);
@@ -947,15 +938,15 @@ impl AppState {
         let (daemon_client, daemon_remote): (
             Arc<dyn threadlane_client::DaemonClient>,
             bool,
-        ) = match std::env::var("THREADLANE_DAEMON_URL") {
-            Ok(url) => (
+        ) = match load_host_state.then(|| std::env::var("THREADLANE_DAEMON_URL").ok()).flatten() {
+            Some(url) => (
                 threadlane_client::RemoteDaemon::connect(
                     url,
                     std::env::var("THREADLANE_DAEMON_TOKEN").ok(),
                 ),
                 true,
             ),
-            Err(_) => (
+            None => (
                 threadlane_client::LocalDaemon::new(daemon_core.clone()),
                 false,
             ),
@@ -966,7 +957,10 @@ impl AppState {
         // Daemon events flow into the UI stream: in local mode this is one
         // extra hop through the core's journal/broadcast, in remote mode it
         // is the whole event path. The view drains stream_rx unchanged.
-        if let Ok(executor) = crate::chat::executor() {
+        // Isolated UI fixtures feed state on the deterministic GPUI test
+        // scheduler. A live Tokio event forwarder would wake that scheduler
+        // from another thread, even when no fixture session is running.
+        if let Some(executor) = load_host_state.then(crate::chat::executor).and_then(Result::ok) {
             let mut daemon_events = daemon_client.subscribe();
             {
                 let stream_tx = stream_tx.clone();
@@ -1193,6 +1187,15 @@ impl AppState {
 
     pub fn available_models(&self) -> &[threadlane_daemon::catalog::ModelOption] {
         &self.available_models
+    }
+
+    /// Test support: construct local state without loading the user's project
+    /// registry, restoring their active session, connecting a remote daemon,
+    /// or forwarding live daemon events into the deterministic UI scheduler.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn for_tests() -> Self {
+        Self::load_from_registry_inner(Vec::new(), false)
     }
 
     /// Test support: seed the model picker's catalog directly.
@@ -4328,37 +4331,7 @@ impl AppState {
         else {
             return Vec::new();
         };
-        projection
-            .model_context
-            .iter()
-            .map(|entry| {
-                let json_text = serde_json::to_string_pretty(&entry.message)
-                    .unwrap_or_else(|_| format!("{:?}", entry.message));
-                TrajectoryEntry {
-                    seq: Some(entry.seq),
-                    run_id: None,
-                    turn: None,
-                    request: None,
-                    category: "Model Context".into(),
-                    summary: format!("{} · {}", entry.id, entry.message.role_str()),
-                    detail: format!(
-                        "**Entry ID**: `{}`\n**Role**: `{}`\n**Lane**: `{}`\n\n```json\n{}\n```",
-                        entry.id,
-                        entry.message.role_str(),
-                        entry.lane,
-                        json_text
-                    ),
-                    lane: Some(entry.lane.clone()),
-                    correlation_id: Some(entry.id.clone()),
-                    diagnostics: TrajectoryDiagnostics {
-                        model_visible: true,
-                        source: Some("Model context projection".into()),
-                        raw: Some(json_text),
-                        ..Default::default()
-                    },
-                }
-            })
-            .collect()
+        threadlane_daemon::projection::project_model_context_diagnostics(projection)
     }
 
     pub fn active_durable_event_diagnostics(&self) -> Vec<TrajectoryEntry> {
@@ -4368,45 +4341,7 @@ impl AppState {
         else {
             return Vec::new();
         };
-        projection
-            .durable_events
-            .iter()
-            .map(|event| {
-                let (category, summary, detail) = match &event.kind {
-                    threadlane_runtime::harness::DurableEventKind::Entry { role, parent_id } => (
-                        "Entry",
-                        format!("{} · {role}", event.id),
-                        format!("parent={parent_id:?}"),
-                    ),
-                    threadlane_runtime::harness::DurableEventKind::Record => (
-                        "Record",
-                        format!("{} · durable record", event.id),
-                        format!(
-                            "seq={} lane={} run={}",
-                            event.seq,
-                            event.lane,
-                            event.run_id.as_deref().unwrap_or("—")
-                        ),
-                    ),
-                };
-                TrajectoryEntry {
-                    seq: Some(event.seq),
-                    run_id: event.run_id.clone(),
-                    turn: event.turn,
-                    request: None,
-                    category: category.into(),
-                    summary,
-                    detail: detail.clone(),
-                    lane: Some(event.lane.clone()),
-                    correlation_id: Some(event.id.clone()),
-                    diagnostics: TrajectoryDiagnostics {
-                        source: Some("Canonical durable event".into()),
-                        raw: Some(detail.clone()),
-                        ..Default::default()
-                    },
-                }
-            })
-            .collect()
+        threadlane_daemon::projection::project_durable_event_diagnostics(projection)
     }
 
     pub fn active_recovery_diagnostics(&self) -> Vec<TrajectoryEntry> {
@@ -4416,7 +4351,7 @@ impl AppState {
         else {
             return Vec::new();
         };
-        project_recovery_diagnostics(&projection.recovery)
+        threadlane_daemon::projection::project_recovery_diagnostics(&projection.recovery)
     }
 
     pub fn active_trajectory(&self) -> &[TrajectoryEntry] {
@@ -5856,81 +5791,6 @@ impl AppState {
     }
 }
 
-fn project_recovery_diagnostics(
-    lanes: &[threadlane_runtime::harness::LaneRecoveryDiagnostic],
-) -> Vec<TrajectoryEntry> {
-    let mut rows = Vec::new();
-    for lane in lanes {
-        let decision = match lane.decision {
-            threadlane_runtime::harness::RecoveryDecision::None => "No recovery required",
-            threadlane_runtime::harness::RecoveryDecision::ResumeFromLeaf => {
-                "Resume interrupted operation from durable leaf"
-            }
-            threadlane_runtime::harness::RecoveryDecision::ReplaySafeToolsThenResume => {
-                "Replay safe interrupted tools, then resume"
-            }
-            threadlane_runtime::harness::RecoveryDecision::AbortUnsafeTool => {
-                "Abort interrupted run; unsafe tool cannot be replayed"
-            }
-            threadlane_runtime::harness::RecoveryDecision::WaitForDeferredResult => {
-                "Wait for deferred provider result"
-            }
-            threadlane_runtime::harness::RecoveryDecision::ExplicitRetryRequired => {
-                "Keep failed; require explicit retry"
-            }
-        };
-        rows.push(TrajectoryEntry {
-            seq: None,
-            run_id: lane.open_operation.clone(),
-            turn: None,
-            request: None,
-            category: "Decision".into(),
-            summary: format!("{} · {decision}", lane.lane),
-            detail: format!(
-                "status={:?} attempts={} abort_requested={} leaf={}",
-                lane.status,
-                lane.attempts,
-                lane.abort_requested,
-                lane.leaf_id.as_deref().unwrap_or("—")
-            ),
-            lane: Some(lane.lane.clone()),
-            correlation_id: lane.open_operation.clone(),
-            diagnostics: TrajectoryDiagnostics::default(),
-        });
-        for tool in &lane.interrupted_tools {
-            rows.push(TrajectoryEntry {
-                seq: None,
-                run_id: Some(tool.run_id.clone()),
-                turn: None,
-                request: None,
-                category: "Interrupted Tool".into(),
-                summary: format!("{} · replay {:?}", tool.name, tool.replay),
-                detail: format!(
-                    "call={} result_entry={}",
-                    tool.call_id, tool.result_entry_id
-                ),
-                lane: Some(lane.lane.clone()),
-                correlation_id: Some(tool.call_id.clone()),
-                diagnostics: TrajectoryDiagnostics::default(),
-            });
-        }
-        for queued in &lane.queued_work {
-            rows.push(TrajectoryEntry {
-                seq: None,
-                run_id: lane.open_operation.clone(),
-                turn: None,
-                request: None,
-                category: "Queued Work".into(),
-                summary: format!("{:?} · {}", queued.queue, queued.entry_id),
-                detail: String::new(),
-                lane: Some(lane.lane.clone()),
-                correlation_id: Some(queued.entry_id.clone()),
-                diagnostics: TrajectoryDiagnostics::default(),
-            });
-        }
-    }
-    rows
-}
 
 #[path = "tests.rs"]
 #[cfg(test)]

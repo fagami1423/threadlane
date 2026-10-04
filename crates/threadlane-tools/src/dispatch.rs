@@ -30,14 +30,7 @@ pub fn read_file_snapshot_digest(output: &str) -> Option<&str> {
     })
 }
 
-pub fn read_file_snapshot_path(output: &str) -> Option<String> {
-    output.lines().take(3).find_map(|line| {
-        let path = line
-            .strip_prefix(READ_FILE_SNAPSHOT_PATH_PREFIX)?
-            .strip_suffix(']')?;
-        serde_json::from_str(path).ok()
-    })
-}
+pub use threadlane_protocol::tool::read_file_snapshot_path;
 
 const MAX_TOOL_OUTPUT_CHARS: usize = 3_000;
 const TRUNCATE_HEAD_CHARS: usize = 1_200;

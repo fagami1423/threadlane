@@ -1,18 +1,22 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use threadlane_git::{can_create_pull_request, GitStatus};
+use threadlane_git::{GitStatus, can_create_pull_request};
+use threadlane_ui_kit::{
+    ReviewDraftPrFields, review_draft_pr_prefill,
+    review_file_discard_targets as discard_options,
+    review_selection_discard_targets as selection_bar_discard_options,
+};
 
 use super::draft_pr::{
-    draft_pr_prefill, DraftPrAttemptState, DraftPrCompletion, DraftPrContextKey, DraftPrFields,
-    DraftPrRemoteResult,
+    DraftPrAttemptState, DraftPrCompletion, DraftPrContextKey, DraftPrRemoteResult,
 };
-use super::pr_generation::{generation_prompt, PrField};
+use super::pr_generation::{PrField, generation_prompt};
 use super::types::{
-    can_publish_branch, discard_options, message_generated_matches_active_project,
-    selection_bar_discard_options, DiscardOption, GitAction, ReviewDiffRequest, ReviewDiffTarget,
+    DiscardOption, GitAction, ReviewDiffRequest, ReviewDiffTarget, can_publish_branch,
+    discard_git_action, message_generated_matches_active_project,
 };
-use super::view::{retain_review_selection, RightPanelView};
+use super::view::{RightPanelView, retain_review_selection};
 use threadlane_project::files::scan_project_tree;
 
 fn paths(values: &[&str]) -> HashSet<String> {
@@ -200,13 +204,15 @@ fn draft_pr_fields_validate_every_value_required_by_the_existing_backend() {
         ("main", "\n", "Body"),
         ("main", "Title", ""),
     ] {
-        assert!(DraftPrFields {
-            base: base.into(),
-            title: title.into(),
-            body: body.into(),
-        }
-        .validate()
-        .is_err());
+        assert!(
+            ReviewDraftPrFields {
+                base: base.into(),
+                title: title.into(),
+                body: body.into(),
+            }
+            .validate()
+            .is_err()
+        );
     }
 }
 
@@ -223,21 +229,21 @@ fn draft_prefill_reuses_default_branch_and_latest_commit_metadata() {
         ..Default::default()
     };
     assert_eq!(
-        draft_pr_prefill(&status),
-        DraftPrFields {
+        review_draft_pr_prefill(&status),
+        ReviewDraftPrFields {
             base: "develop".into(),
             title: "Add draft PR workflow".into(),
             body: "Keep publishing explicit and recoverable.".into(),
         }
     );
 
-    let fallback = draft_pr_prefill(&GitStatus {
+    let fallback = review_draft_pr_prefill(&GitStatus {
         branch: Some("feature/draft-pr".into()),
         ..Default::default()
     });
     assert_eq!(
         fallback,
-        DraftPrFields {
+        ReviewDraftPrFields {
             base: "main".into(),
             title: "feature/draft-pr".into(),
             body: "feature/draft-pr".into(),
@@ -253,8 +259,8 @@ fn draft_key(branch: &str, revision: u64) -> DraftPrContextKey {
     }
 }
 
-fn draft_fields(title: &str) -> DraftPrFields {
-    DraftPrFields {
+fn draft_fields(title: &str) -> ReviewDraftPrFields {
+    ReviewDraftPrFields {
         base: "main".into(),
         title: title.into(),
         body: "Body".into(),
@@ -398,14 +404,18 @@ fn project_scan_is_bounded_and_skips_generated_roots() {
             .collect::<Vec<_>>(),
         vec!["src"]
     );
-    assert!(items[0]
-        .children
-        .iter()
-        .any(|item| item.relative_path == "src/main.rs"));
-    assert!(items[0]
-        .children
-        .iter()
-        .any(|item| item.relative_path == "src/nested"));
+    assert!(
+        items[0]
+            .children
+            .iter()
+            .any(|item| item.relative_path == "src/main.rs")
+    );
+    assert!(
+        items[0]
+            .children
+            .iter()
+            .any(|item| item.relative_path == "src/nested")
+    );
 
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -426,7 +436,10 @@ fn project_scan_keeps_root_siblings_when_early_directory_is_large() {
 
     let items = scan_project_tree(&root, 4);
     assert_eq!(
-        items.iter().map(|item| item.name.as_str()).collect::<Vec<_>>(),
+        items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
         vec![".agents", "crates", "docs"]
     );
     std::fs::remove_dir_all(root).unwrap();
@@ -536,7 +549,7 @@ fn discard_option_confirmation_and_action() {
     assert!(!single.requires_confirmation());
     assert_eq!(single.confirmation_prompt(), None);
     assert_eq!(
-        single.git_action(),
+        discard_git_action(&single),
         GitAction::DiscardFile("src/foo.rs".to_string())
     );
 
@@ -546,7 +559,7 @@ fn discard_option_confirmation_and_action() {
     assert_eq!(prompt.0, "Discard selected changes?");
     assert!(prompt.1.contains("2 selected files"));
     assert_eq!(
-        selected.git_action(),
+        discard_git_action(&selected),
         GitAction::DiscardFiles(vec!["src/a.rs".into(), "src/b.rs".into()])
     );
 
@@ -555,11 +568,15 @@ fn discard_option_confirmation_and_action() {
     let prompt_all = all.confirmation_prompt().unwrap();
     assert_eq!(prompt_all.0, "Discard all changes?");
     assert!(prompt_all.1.contains("4 files"));
-    assert_eq!(all.git_action(), GitAction::DiscardAll);
+    assert_eq!(discard_git_action(&all), GitAction::DiscardAll);
 }
 
 #[test]
 fn diff_ratio_preserves_single_sided_changes() {
+    assert_eq!(
+        RightPanelView::diff_addition_percent(u32::MAX, u32::MAX),
+        50.0
+    );
     assert_eq!(RightPanelView::diff_addition_percent(10, 0), 100.0);
     assert_eq!(RightPanelView::diff_addition_percent(0, 10), 0.0);
     assert_eq!(RightPanelView::diff_addition_percent(1, 99), 5.0);

@@ -8448,13 +8448,16 @@ dependencies = [
 name = "threadlane-gpui"
 version = "0.1.40"
 dependencies = [
+ "futures",
  "gpui-component",
  "gpui-pre",
  "gpui-pre-platform",
  "hotpath",
+ "reqwest",
  "tempfile",
  "threadlane-coding-agent",
  "threadlane-project",
+ "threadlane-provider",
  "threadlane-ui-chat",
  "threadlane-ui-theme",
  "threadlane-ui-workspace",
@@ -8625,6 +8628,7 @@ dependencies = [
  "tempfile",
  "threadlane-hashline",
  "threadlane-project",
+ "threadlane-protocol",
  "tracing",
 ]
 
@@ -8640,6 +8644,7 @@ dependencies = [
  "threadlane-git",
  "threadlane-protocol",
  "threadlane-provider",
+ "threadlane-ui-kit",
  "threadlane-ui-state",
  "threadlane-ui-theme",
 ]
@@ -8668,8 +8673,8 @@ dependencies = [
  "threadlane-skills",
  "threadlane-tools",
  "threadlane-ui-editor",
+ "threadlane-ui-kit",
  "threadlane-ui-mirror",
- "threadlane-ui-session",
  "threadlane-ui-state",
  "threadlane-ui-theme",
  "tokio",
@@ -8684,6 +8689,7 @@ dependencies = [
  "gpui-pre",
  "rfd",
  "tempfile",
+ "threadlane-ui-kit",
  "threadlane-ui-state",
  "tracing",
 ]
@@ -8703,9 +8709,49 @@ dependencies = [
  "threadlane-project",
  "threadlane-protocol",
  "threadlane-provider",
+ "threadlane-ui-kit",
  "threadlane-ui-state",
  "threadlane-ui-theme",
  "tokio",
+]
+
+[[package]]
+name = "threadlane-ui-kit"
+version = "0.1.0"
+dependencies = [
+ "gpui-component",
+ "gpui-kit",
+ "gpui-kit-assets",
+ "gpui-pre",
+ "serde_json",
+ "threadlane-automation",
+ "threadlane-protocol",
+ "threadlane-ui-theme",
+ "vt100",
+]
+
+[[package]]
+name = "threadlane-ui-kit-preview"
+version = "0.1.0"
+dependencies = [
+ "gpui-component",
+ "gpui-pre",
+ "gpui-pre-platform",
+ "image",
+ "serde",
+ "serde_json",
+ "threadlane-acp-engine",
+ "threadlane-automation",
+ "threadlane-daemon",
+ "threadlane-git",
+ "threadlane-project",
+ "threadlane-protocol",
+ "threadlane-runtime",
+ "threadlane-skills",
+ "threadlane-ui-kit",
+ "threadlane-ui-state",
+ "threadlane-ui-theme",
+ "vt100",
 ]
 
 [[package]]
@@ -8760,6 +8806,7 @@ dependencies = [
  "threadlane-protocol",
  "threadlane-provider",
  "threadlane-tools",
+ "threadlane-ui-kit",
  "threadlane-ui-state",
  "threadlane-ui-theme",
  "tokio",
@@ -8767,17 +8814,6 @@ dependencies = [
  "webkit2gtk",
  "webview2-com",
  "windows-core 0.61.2",
-]
-
-[[package]]
-name = "threadlane-ui-session"
-version = "0.1.0"
-dependencies = [
- "gpui-component",
- "gpui-kit-assets",
- "gpui-pre",
- "threadlane-protocol",
- "threadlane-ui-theme",
 ]
 
 [[package]]
@@ -8796,6 +8832,7 @@ dependencies = [
  "threadlane-provider",
  "threadlane-runtime",
  "threadlane-skills",
+ "threadlane-ui-kit",
  "threadlane-ui-state",
  "threadlane-ui-theme",
  "threadlane-updater",
@@ -8815,8 +8852,8 @@ dependencies = [
  "threadlane-coding-agent",
  "threadlane-daemon",
  "threadlane-git",
+ "threadlane-ui-kit",
  "threadlane-ui-pairing",
- "threadlane-ui-session",
  "threadlane-ui-state",
  "threadlane-ui-theme",
  "threadlane-updater",
@@ -8861,6 +8898,7 @@ dependencies = [
  "gpui-component",
  "gpui-pre",
  "portable-pty",
+ "threadlane-ui-kit",
  "tokio",
  "tracing",
  "url",
@@ -8895,6 +8933,7 @@ dependencies = [
  "threadlane-ui-chat",
  "threadlane-ui-editor",
  "threadlane-ui-github",
+ "threadlane-ui-kit",
  "threadlane-ui-right-panel",
  "threadlane-ui-settings",
  "threadlane-ui-sidebar",
@@ -9862,8 +9901,6 @@ dependencies = [
 [[package]]
 name = "vt100"
 version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
 dependencies = [
  "itoa",
  "unicode-width",

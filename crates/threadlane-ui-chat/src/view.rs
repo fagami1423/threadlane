@@ -8,22 +8,21 @@ use base64::Engine as _;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{
-    Button, ButtonCustomVariant, ButtonVariants, Toggle, ToggleVariants,
+    Button, ButtonVariants,
 };
-use gpui_component::combobox::{Combobox, ComboboxEvent, ComboboxState};
+use gpui_component::combobox::{ComboboxEvent, ComboboxState};
 use gpui_component::input::{
     Input, InputEvent, InputState, MoveDown, MoveUp, TextareaState,
 };
 use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_component::notification::Notification;
 use gpui_component::popover::Popover;
-use gpui_component::progress::ProgressCircle;
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::spinner::Spinner;
 use gpui_component::tag::{Tag, TagVariant};
 use gpui_component::text::{TextView, TextViewState};
 use gpui_component::theme::ActiveTheme;
-use gpui_component::{Disableable, Icon, IconName, Selectable, Sizable, WindowExt, v_flex};
+use gpui_component::{Disableable, Icon, IconName, Sizable, WindowExt};
 use crate::image_preview::decode_staged_image;
 
 use threadlane_ui_editor::EditorView;
@@ -39,41 +38,19 @@ use super::context_meter::*;
 use super::tool_detail;
 use super::markdown::*;
 use super::model_picker::{self, ModelPickerDelegate, ModelPickerValue, PickerOwner};
-use super::trajectory::*;
 use super::transcript::*;
 
-fn environment_changes_label(status: Option<&threadlane_git::GitStatus>) -> String {
-    let Some(status) = status else {
-        return "Git status unavailable".into();
-    };
-    let summary = match status.files.len() {
-        0 => "No uncommitted changes".to_string(),
-        1 => "1 changed file".to_string(),
-        count => format!("{count} changed files"),
-    };
-    let (added, removed) = status
-        .files
-        .iter()
-        .fold((0_u64, 0_u64), |(added, removed), file| {
-            (
-                added + u64::from(file.additions),
-                removed + u64::from(file.deletions),
-            )
-        });
-    if added > 0 || removed > 0 {
-        format!("{summary} · +{added} −{removed}")
-    } else {
-        summary
-    }
-}
+#[cfg(test)]
+use threadlane_ui_kit::environment_changes_label;
 fn editor_target_matches_active_work_dir(target: &Path, active: Option<&Path>) -> bool {
     active == Some(target)
 }
 
 fn chat_error_summary(error: &str) -> (String, bool) {
+    let normalized = error.to_lowercase();
     let expired = ["token_expired", "token has expired", "sign-in expired"]
         .iter()
-        .any(|marker| contains_case_insensitive(error, marker));
+        .any(|marker| normalized.contains(marker));
     if expired {
         return (
             "Your provider sign-in has expired. Sign in again in Settings → Providers, then resend your message.".into(),
@@ -82,12 +59,15 @@ fn chat_error_summary(error: &str) -> (String, bool) {
     }
     let rejected = ["invalid_api_key", "http 401", "401 unauthorized"]
         .iter()
-        .any(|marker| contains_case_insensitive(error, marker));
+        .any(|marker| normalized.contains(marker));
     if rejected {
         return (
             "The provider rejected your credentials. Check your sign-in or API key in Settings → Providers, then resend your message.".into(),
             true,
         );
+    }
+    if normalized.contains("generation ended without a durable agentend event") {
+        return ("The response ended unexpectedly.".into(), false);
     }
     let first_line = error
         .lines()
@@ -125,19 +105,7 @@ fn last_retryable_prompt(messages: &[ChatMessageInfo]) -> Option<String> {
         .map(|message| message.content.clone())
 }
 
-fn format_run_elapsed(seconds: u64) -> String {
-    if seconds < 60 {
-        return format!("{seconds}s");
-    }
-    let minutes = seconds / 60;
-    let remaining = seconds % 60;
-    if minutes < 60 {
-        return format!("{minutes}m {remaining:02}s");
-    }
-    let hours = minutes / 60;
-    let minutes = minutes % 60;
-    format!("{hours}h {minutes:02}m")
-}
+use threadlane_ui_kit::format_run_elapsed;
 
 fn has_sendable_prompt(text: &str, image_count: usize) -> bool {
     !text.trim().is_empty() || image_count > 0
@@ -153,63 +121,16 @@ fn queued_entry_id(message_id: &str, session_id: Option<&str>) -> Option<String>
         .map(str::to_owned)
 }
 
-fn truncate_preview_text(text: &str, max_chars: usize) -> String {
-    let text = text.trim();
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let clamped = max_chars.max(2) - 1;
-    let truncated: String = text.chars().take(clamped).collect();
-    format!("{}…", truncated.trim_end())
-}
+#[cfg(test)]
+use threadlane_ui_kit::truncate_preview_text as truncate_plan_step;
 
-fn truncate_plan_step(step: &str, max_chars: usize) -> String {
-    truncate_preview_text(step, max_chars)
-}
-
-fn completed_activities_text(hidden_count: usize) -> String {
-    format!(
-        "{hidden_count} completed {}",
-        if hidden_count == 1 {
-            "activity"
-        } else {
-            "activities"
-        }
-    )
-}
-
-fn expand_activities_a11y(hidden_count: usize) -> String {
-    format!(
-        "Expand {hidden_count} completed tool {}",
-        if hidden_count == 1 {
-            "activity"
-        } else {
-            "activities"
-        }
-    )
-}
-
-fn plan_tracker_texts(
-    completed: usize,
-    total: usize,
-    current_step: Option<&str>,
-) -> (String, String, String) {
-    match current_step {
-        Some(step) => (
-            step.to_string(),
-            format!("Task plan, {completed} of {total} complete, current step: {step}"),
-            format!("Show task plan · {step}"),
-        ),
-        None => (
-            "Complete".to_string(),
-            format!("Task plan, {completed} of {total} complete"),
-            "Show task plan · all steps complete".to_string(),
-        ),
-    }
-}
+use threadlane_ui_kit::tool_group_summary;
 
 #[cfg(test)]
-use threadlane_ui_session::{reasoning_token_badge, tool_activity_glyph};
+use threadlane_ui_kit::plan_tracker_texts;
+
+#[cfg(test)]
+use threadlane_ui_kit::{reasoning_token_badge, tool_activity_glyph};
 
 fn progress_header_prefix(is_error: bool) -> &'static str {
     if is_error {
@@ -219,50 +140,20 @@ fn progress_header_prefix(is_error: bool) -> &'static str {
     }
 }
 
-fn skills_chip_label(active_count: usize) -> String {
-    if active_count == 0 {
-        "Skills".to_string()
-    } else {
-        format!(
-            "{active_count} {}",
-            if active_count == 1 { "Skill" } else { "Skills" }
-        )
-    }
-}
+#[cfg(test)]
+use threadlane_ui_kit::skills_chip_label;
 
 fn is_current_project(active: Option<&PathBuf>, candidate: &Path) -> bool {
     active.is_some_and(|dir| dir.as_path() == candidate)
 }
 
 fn render_chat_error(id: &str, error: &str, model: &Entity<AppState>, cx: &App) -> Div {
-    let theme = cx.theme().colors;
     let (summary, needs_provider_settings) = chat_error_summary(error);
     let details = error.to_owned();
     let retry_text = last_retryable_prompt(&model.read(cx).messages);
     let can_retry = retry_text.is_some() && !model.read(cx).is_generating;
     div().w_full().my_2().px_4().child(
-        div()
-            .w_full()
-            .p_3p5()
-            .rounded_xl()
-            .bg(theme.danger.opacity(0.08))
-            .border_1()
-            .border_color(theme.danger.opacity(0.4))
-            .shadow_sm()
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.danger)
-                    .child("Turn stopped"),
-            )
-            .child(
-                div()
-                    .mt_1()
-                    .text_sm()
-                    .text_color(theme.foreground)
-                    .child(summary),
-            )
+        threadlane_ui_kit::chat_error_card(summary, cx)
             .child(
                 div()
                     .mt_2()
@@ -273,7 +164,7 @@ fn render_chat_error(id: &str, error: &str, model: &Entity<AppState>, cx: &App) 
                         let text = retry_text.clone().expect("retry gated on a user prompt");
                         let model = model.clone();
                         Button::new(SharedString::from(format!("chat-error-retry-{id}")))
-                            .label("Retry")
+                            .label("Resend")
                             .small()
                             .rounded_md()
                             .tooltip("Resend the last message")
@@ -326,7 +217,7 @@ fn render_chat_error(id: &str, error: &str, model: &Entity<AppState>, cx: &App) 
     )
 }
 use threadlane_coding_agent::commands::{available_slash_commands, SlashCommandInfo};
-use threadlane_protocol::{ImageAttachment, PlanItemStatus, SessionPlan};
+use threadlane_protocol::{ImageAttachment, SessionPlan};
 
 actions!(
     threadlane_composer,
@@ -336,8 +227,6 @@ actions!(
         SelectPreviousSlashCommand,
         SelectNextSlashCommand,
         DismissSlashCommand,
-        RecallOlderPrompt,
-        RecallNewerPrompt,
     ]
 );
 
@@ -349,6 +238,7 @@ mod file_completion;
 mod prompt_navigation;
 pub use conversation_find::ConversationFindHandoff;
 use conversation_find::*;
+pub use threadlane_ui_kit::{RecallOlderPrompt, RecallNewerPrompt};
 use file_completion::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -385,17 +275,8 @@ pub fn init(cx: &mut App) {
             DismissSlashCommand,
             Some(SLASH_COMMAND_BINDING_CONTEXT),
         ),
-        KeyBinding::new(
-            "up",
-            RecallOlderPrompt,
-            Some(PROMPT_RECALL_BINDING_CONTEXT),
-        ),
-        KeyBinding::new(
-            "down",
-            RecallNewerPrompt,
-            Some(PROMPT_RECALL_BINDING_CONTEXT),
-        ),
     ]);
+    threadlane_ui_kit::init_prompt_recall(cx);
     init_conversation_find(cx);
     init_file_completion(cx);
 }
@@ -443,7 +324,7 @@ pub struct ChatListView {
     pub input_state: Entity<TextareaState>,
     pub header_left_padding: Pixels,
     environment_available: bool,
-    transcript: threadlane_ui_session::transcript::TranscriptState,
+    transcript: threadlane_ui_kit::transcript::TranscriptState,
     find_open: bool,
     find_input: Entity<InputState>,
     find_query: String,
@@ -516,8 +397,8 @@ pub struct ChatListView {
     /// Entities are created lazily when the card renders and dropped on
     /// submit/dismiss/session-switch.
     question_inputs: std::collections::HashMap<String, Entity<InputState>>,
-    copied_code_block: Option<(String, std::time::Instant)>,
     copied_message: Option<(String, std::time::Instant)>,
+    copy_feedback_task: Option<Task<()>>,
     expanded_tool_aggregates: HashSet<String>,
     segment_cache: HashMap<String, (String, Vec<MarkdownSegment>)>,
     _subscriptions: Vec<Subscription>,
@@ -527,7 +408,7 @@ pub struct ChatListView {
 const CHAT_STREAM_BATCH_LIMIT: usize = 128;
 /// How long copy confirmations stay visible on code blocks and message
 /// footers; shared so both affordances clear together.
-const COPIED_FEEDBACK_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+const COPIED_FEEDBACK_WINDOW: std::time::Duration = threadlane_ui_kit::MESSAGE_COPY_FEEDBACK_WINDOW;
 
 async fn next_chat_stream_batch(
     receiver: &mut tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
@@ -537,7 +418,7 @@ async fn next_chat_stream_batch(
 
 impl ChatListView {
     pub fn new(model: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let transcript = threadlane_ui_session::transcript::TranscriptState::new(window);
+        let transcript = threadlane_ui_kit::transcript::TranscriptState::new(window);
         let transcript_list_state = transcript.list.clone();
         let chat = cx.entity().downgrade();
         transcript_list_state.set_scroll_handler(move |_, _, cx| {
@@ -904,8 +785,8 @@ impl ChatListView {
             context_meter_open: false,
             question_selections: std::collections::HashMap::new(),
             question_inputs: std::collections::HashMap::new(),
-            copied_code_block: None,
             copied_message: None,
+            copy_feedback_task: None,
             expanded_tool_aggregates: HashSet::new(),
             segment_cache: HashMap::new(),
             _subscriptions: vec![sub1, sub2, sub_editor, find_subscription],
@@ -1016,13 +897,7 @@ impl ChatListView {
         window.open_dialog(cx, move |dialog, window, _cx| {
             let content_chat = content_chat.clone();
             let close_chat = close_chat.clone();
-            dialog
-                .title("Image preview")
-                .w(window.rem_size() * 40.0)
-                .max_w(window.viewport_size().width - window.rem_size() * 2.0)
-                .button_props(
-                    gpui_component::dialog::DialogButtonProps::default().ok_text("Close"),
-                )
+            threadlane_ui_kit::image_preview_dialog(dialog, window)
                 .content(move |content, window, cx| {
                     let preview = content_chat
                         .update(cx, |this, cx| {
@@ -1077,156 +952,72 @@ impl ChatListView {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let preview = self
-            .image_preview
-            .as_ref()
-            .filter(|preview| {
-                preview.generation == generation && self.preview_attachment_is_current(preview)
-            })?;
+        let preview = self.image_preview.as_ref().filter(|preview| {
+            preview.generation == generation && self.preview_attachment_is_current(preview)
+        })?;
         let display_name = preview.display_name.clone();
         let decoded = preview.decoded.as_ref().map(|result| match result {
             Ok(image) => Ok(image.clone()),
             Err(error) => Err(error.clone()),
         });
         let mode = preview.mode;
-        let theme = cx.theme().colors;
-        let (image, dimensions, error) = match decoded {
-            Some(Ok(image)) => {
+        let dimensions = decoded
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .map(|image| {
                 let size = image.size(0);
-                (Some(image), Some((size.width.0 as u32, size.height.0 as u32)), None)
-            }
-            Some(Err(error)) => (None, None, Some(error)),
-            None => (None, None, None),
-        };
-
+                (size.width.0 as u32, size.height.0 as u32)
+            });
         let mode_controls = dimensions.map(|(width, height)| {
             div()
                 .flex()
                 .items_center()
                 .gap_1()
                 .child(
-                    Button::new(("image-preview-fit", generation))
-                        .label("Fit")
-                        .xsmall()
-                        .ghost()
-                        .selected(mode == ImagePreviewMode::Fit)
-                        .accessibility_label("Fit image to preview")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(preview) = this
-                                .image_preview
-                                .as_mut()
-                                .filter(|preview| preview.generation == generation)
-                            {
-                                preview.mode = ImagePreviewMode::Fit;
-                                cx.notify();
-                            }
-                        })),
+                    threadlane_ui_kit::image_preview_fit_button(
+                        ("image-preview-fit", generation),
+                        mode == ImagePreviewMode::Fit,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(preview) = this
+                            .image_preview
+                            .as_mut()
+                            .filter(|preview| preview.generation == generation)
+                        {
+                            preview.mode = ImagePreviewMode::Fit;
+                            cx.notify();
+                        }
+                    })),
                 )
                 .child(
-                    Button::new(("image-preview-actual-size", generation))
-                        .label("Actual size")
-                        .xsmall()
-                        .ghost()
-                        .selected(mode == ImagePreviewMode::ActualSize)
-                        .accessibility_label(format!(
-                            "Show image at actual size, {width} by {height} pixels"
-                        ))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(preview) = this
-                                .image_preview
-                                .as_mut()
-                                .filter(|preview| preview.generation == generation)
-                            {
-                                preview.mode = ImagePreviewMode::ActualSize;
-                                cx.notify();
-                            }
-                        })),
+                    threadlane_ui_kit::image_preview_actual_size_button(
+                        ("image-preview-actual-size", generation),
+                        mode == ImagePreviewMode::ActualSize,
+                        width,
+                        height,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(preview) = this
+                            .image_preview
+                            .as_mut()
+                            .filter(|preview| preview.generation == generation)
+                        {
+                            preview.mode = ImagePreviewMode::ActualSize;
+                            cx.notify();
+                        }
+                    })),
                 )
         });
-        let image_area_height = (window.viewport_size().height - window.rem_size() * 12.0)
-            .max(window.rem_size() * 8.0);
-        let image_area: AnyElement = if let Some(image) = image {
-            match mode {
-                ImagePreviewMode::Fit => div()
-                    .w_full()
-                    .h(image_area_height)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .overflow_hidden()
-                    .child(img(image).size_full().object_fit(ObjectFit::Contain))
-                    .into_any_element(),
-                ImagePreviewMode::ActualSize => {
-                    let size = image.size(0);
-                    let scale = window.scale_factor();
-                    div()
-                        .w_full()
-                        .max_h(image_area_height)
-                        .min_h_0()
-                        .overflow_scrollbar()
-                        .child(
-                            div()
-                                .w(px(size.width.0 as f32 / scale))
-                                .h(px(size.height.0 as f32 / scale))
-                                .child(img(image).size_full().object_fit(ObjectFit::None)),
-                        )
-                        .into_any_element()
-                }
-            }
-        } else if let Some(error) = error {
-            div()
-                .w_full()
-                .h(image_area_height)
-                .flex()
-                .items_center()
-                .justify_center()
-                .p_4()
-                .text_color(theme.danger)
-                .child(error)
-                .into_any_element()
-        } else {
-            div()
-                .w_full()
-                .h(image_area_height)
-                .flex()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .child(Spinner::new().small())
-                .child("Preparing image preview…")
-                .into_any_element()
-        };
-
-        let metadata = dimensions.map(|(width, height)| format!("{width} × {height} px"));
         Some(
-            div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .truncate()
-                                .text_color(theme.muted_foreground)
-                                .child(display_name),
-                        )
-                        .children(mode_controls)
-                        .children(metadata.map(|metadata| {
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(metadata)
-                        })),
-                )
-                .child(image_area)
-                .into_any_element(),
+            threadlane_ui_kit::image_preview_content(
+                display_name,
+                decoded,
+                mode == ImagePreviewMode::ActualSize,
+                mode_controls.map(|controls| controls.into_any_element()),
+                window,
+                cx,
+            )
+            .into_any_element(),
         )
     }
 
@@ -1443,10 +1234,7 @@ impl ChatListView {
         } else {
             "Editor".to_string()
         };
-        let segment_style = ButtonCustomVariant::new(cx)
-            .color(theme.muted.opacity(0.45))
-            .hover(theme.secondary)
-            .active(theme.secondary_active);
+
 
         let status_badge = match active_attention {
             SessionAttention::NeedsYou => Some(
@@ -1492,71 +1280,15 @@ impl ChatListView {
             SessionAttention::Idle => None,
         };
 
-        div()
-            .min_h(rems(3.0))
-            .flex_none()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_2()
-            .px_4()
-            .pl(self.header_left_padding)
-            // The workspace owns the rightmost 128px for command palette,
-            // environment, and panel buttons rendered as absolute overlays.
-            .pr_32()
-            .border_b_1()
-            .border_color(theme.border.opacity(0.5))
-            .bg(theme.title_bar)
+        threadlane_ui_kit::chat_header_surface(self.header_left_padding, cx)
             .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .justify_start()
-                    .min_w_0()
-                    .child(
-                        Icon::default()
-                            .path("icons/tabs/chat.svg")
-                            .size_4()
-                            .text_color(theme.primary),
-                    )
-                    .child(
-                        div()
-                            .id("chat-header-title")
-                            .truncate()
-                            .text_sm()
-                            .line_height(rems(1.125))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.foreground)
-                            .tooltip({
-                                let title = active_title.clone();
-                                move |window, cx| {
-                                    gpui_component::tooltip::Tooltip::new(title.clone())
-                                        .build(window, cx)
-                                }
-                            })
-                            .child(display_title),
-                    )
-                    .children(status_badge),
+                threadlane_ui_kit::chat_header_identity(
+                    display_title, active_title, status_badge.map(IntoElement::into_any_element), cx,
+                ),
             )
             .when(self.current_tab == CentralTab::Chat, |el| {
                 el.child(
-                    Button::new("conversation-find-open")
-                        .debug_selector(|| "conversation-find-open".into())
-                        .icon(IconName::Search)
-                        .ghost()
-                        .small()
-                        .accessibility_label(if cfg!(target_os = "macos") {
-                            "Find in conversation (⌘F)"
-                        } else {
-                            "Find in conversation (Ctrl+F)"
-                        })
-                        .tooltip(if cfg!(target_os = "macos") {
-                            "Find in conversation (⌘F)"
-                        } else {
-                            "Find in conversation (Ctrl+F)"
-                        })
+                    threadlane_ui_kit::conversation_find_button()
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.open_conversation_find(&FindInConversation, window, cx)
                         })),
@@ -1566,21 +1298,13 @@ impl ChatListView {
             // with the active surface raised; kept as direct children so the
             // header's flex_wrap can still stack them on narrow widths.
             .child(
-                Button::new("central-tab-chat")
-                    .debug_selector(|| "central-tab-chat".into())
-                    .label("Chat")
+                threadlane_ui_kit::chat_tab_button("central-tab-chat", "Chat", self.current_tab == CentralTab::Chat, cx)
                     .tooltip("Chat (⌘1)")
                     .accessibility_label("Chat (⌘1)")
-                    .custom(segment_style)
-                    .small()
-                    .rounded_full()
-                    .selected(self.current_tab == CentralTab::Chat)
                     .on_click(cx.listener(|this, _, _, cx| this.set_tab(CentralTab::Chat, cx))),
             )
             .child(
-                Button::new("central-tab-editor")
-                    .debug_selector(|| "central-tab-editor".into())
-                    .label(editor_label.clone())
+                threadlane_ui_kit::chat_tab_button("central-tab-editor", editor_label.clone(), self.current_tab == CentralTab::Editor, cx)
                     .tooltip("Editor (⌘3)")
                     .accessibility_label(format!(
                         "Editor (⌘3){}",
@@ -1590,74 +1314,13 @@ impl ChatListView {
                             String::new()
                         }
                     ))
-                    .custom(segment_style)
-                    .small()
-                    .rounded_full()
-                    .selected(self.current_tab == CentralTab::Editor)
                     .on_click(cx.listener(|this, _, _, cx| this.set_tab(CentralTab::Editor, cx))),
             )
     }
 
-    /// Renders the 16px status circle used for a plan step: a bordered ✓ for
-    /// completed, a spinner for in-progress (active generation), a static dot for in-progress (idle), and an empty ring for pending.
-    fn plan_step_marker(
-        status: PlanItemStatus,
-        is_generating: bool,
-        colors: gpui_component::ThemeColor,
-    ) -> AnyElement {
-        match status {
-            PlanItemStatus::Completed => div()
-                .size_4()
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_full()
-                .border_1()
-                .border_color(colors.success)
-                .text_xs()
-                .font_weight(FontWeight::BOLD)
-                .text_color(colors.success)
-                .child("✓")
-                .into_any_element(),
-            PlanItemStatus::InProgress => {
-                if is_generating {
-                    div()
-                        .size_4()
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(colors.primary)
-                        .child(gpui_component::spinner::Spinner::new().xsmall())
-                        .into_any_element()
-                } else {
-                    div()
-                        .size_4()
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_full()
-                        .border_1()
-                        .border_color(colors.primary)
-                        .child(div().size(rems(0.375)).rounded_full().bg(colors.primary))
-                        .into_any_element()
-                }
-            }
-            PlanItemStatus::Pending => div()
-                .size_4()
-                .flex_none()
-                .rounded_full()
-                .border_1()
-                .border_color(colors.muted_foreground)
-                .into_any_element(),
-        }
-    }
-
     /// The workspace owns the available width and hides this summary when a tool panel opens.
     pub fn set_environment_width(&mut self, width: Pixels, rem: Pixels, cx: &mut Context<Self>) {
-        let available = width >= rem * (CHAT_CONTENT_MAX_WIDTH + 24.0);
+        let available = threadlane_ui_kit::environment_fits(width, rem);
         if self.environment_available != available {
             self.environment_available = available;
             cx.notify();
@@ -1685,452 +1348,88 @@ impl ChatListView {
             Some(dir) if Some(dir) != project => "Worktree",
             Some(_) => "Local",
         };
-        let branch = status
-            .and_then(|status| status.branch.clone())
-            .unwrap_or_else(|| {
-                if status.is_some_and(|s| s.detached) {
-                    "Detached HEAD"
-                } else {
-                    "Branch unavailable"
-                }
-                .into()
-            });
-        let changes = environment_changes_label(status);
-        let theme = cx.theme();
-        let changes_content = status.map(|status| {
-            let (added, removed) = status
-                .files
-                .iter()
-                .fold((0_u64, 0_u64), |(added, removed), file| {
-                    (
-                        added + u64::from(file.additions),
-                        removed + u64::from(file.deletions),
-                    )
-                });
-            let summary = changes.split(" · ").next().unwrap_or(&changes).to_owned();
-            let mut content = div().flex().items_center().min_w_0().child(summary);
-            if added > 0 || removed > 0 {
-                content = content.child(" · ");
-                content = content.child(
-                    div()
-                        .debug_selector(|| "environment-changes-additions".into())
-                        .text_color(theme.success)
-                        .child(format!("+{added}")),
-                );
-                content = content.child(" ");
-                content = content.child(
-                    div()
-                        .debug_selector(|| "environment-changes-deletions".into())
-                        .text_color(theme.danger)
-                        .child(format!("−{removed}")),
-                );
-            }
-            content.into_any_element()
-        });
-        let changes_content = changes_content.unwrap_or_else(|| changes.clone().into_any_element());
+        let menu_model = self.model.clone();
         let model = self.model.clone();
-        // Button's built-in icon/label wrapper centers its contents independently.
-        let action_content = |icon: Icon, label: AnyElement| {
-            div()
-                .w_full()
-                .min_w_0()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(icon.small().flex_none())
-                .child(div().min_w_0().truncate().child(label))
-        };
-        div()
-            .id("chat-environment")
-            .debug_selector(|| "chat-environment".into())
-            .w(rems(18.0))
-            .flex_none()
-            .min_h_0()
-            .overflow_y_scrollbar()
-            .pt_5()
-            .pl_3()
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .text_sm()
-                    .p_1()
-                    .pb_2()
-                    .rounded_xl()
-                    .border_1()
-                    .border_color(theme.border.opacity(0.4))
-                    .bg(theme.muted.opacity(0.14))
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child("Environment"),
-                    )
-            .child(
-                div()
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(Icon::new(IconName::Folder).small())
-                    .child(div().min_w_0().truncate().child(name)),
-            )
-            .child(
-                div()
-                    .px_2()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(location),
-            )
-            .child(
-                Button::new("environment-branch")
-                    .ghost()
-                    .small()
-                    .w_full()
-                    .justify_start()
-                    .accessibility_label(format!("Manage branches: {branch}"))
-                    .child(action_content(
-                        Icon::default().path("icons/git/branch.svg"),
-                        div().child(branch.clone()).into_any_element(),
-                    ))
-                    .tooltip(format!("Manage branches: {branch}"))
-                    .disabled(status.is_none())
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(crate::OpenWorkspaceBranches), cx)
-                    }),
-            )
-            .child(
-                Button::new("environment-changes")
-                    .debug_selector(|| "environment-changes".into())
-                    .ghost()
-                    .small()
-                    .w_full()
-                    .justify_start()
-                    .accessibility_label(changes.clone())
-                    .child(action_content(Icon::new(IconName::File), changes_content))
-                    .disabled(checkout.is_none())
-                    .tooltip("Review workspace changes")
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(crate::OpenWorkspaceReview), cx)
-                    }),
-            )
-            .children(status.map(|status| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .children((status.ahead > 0 || status.behind > 0).then(|| {
-                        div()
-                            .debug_selector(|| "environment-sync".into())
-                            .px_2()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(format!("{} ahead · {} behind", status.ahead, status.behind))
-                    }))
-                    .child(
-                        Button::new("environment-git-actions")
-                            .debug_selector(|| "environment-git-actions".into())
-                            .ghost()
-                            .small()
-                            .w_full()
-                            .justify_start()
-                            .accessibility_label("Git actions")
-                            .tooltip("Commit, pull, push, create a pull request or branch")
-                            .child(action_content(
-                                Icon::default().path("icons/git/actions.svg"),
-                                div().child("Git actions").into_any_element(),
-                            ))
-                            .dropdown_menu({
-                                let model = self.model.clone();
-                                move |menu, _, cx| {
-                                    let state = model.read(cx);
-                                    let status = state
-                                        .active_git_work_dir()
-                                        .and_then(|dir| state.git_statuses.get(&dir));
-                                    let has_changes = status.is_some_and(|s| !s.files.is_empty());
-                                    let can_sync = status.is_some_and(|s| {
-                                        s.remote.is_some() && s.branch.is_some() && !s.detached
-                                    });
-                                    menu.item(
-                                        PopupMenuItem::new("Commit…")
-                                            .disabled(!has_changes)
-                                            .action(Box::new(crate::OpenWorkspaceCommit)),
-                                    )
-                                    .item(
-                                        PopupMenuItem::new("Pull")
-                                            .disabled(
-                                                !can_sync
-                                                    || !status.is_some_and(|s| s.has_upstream),
-                                            )
-                                            .action(Box::new(crate::PullWorkspaceBranch)),
-                                    )
-                                    .item(
-                                        PopupMenuItem::new("Push")
-                                            .disabled(!can_sync)
-                                            .action(Box::new(crate::PushWorkspaceBranch)),
-                                    )
-                                    .separator()
-                                    .item(
-                                        PopupMenuItem::new("Create draft PR…")
-                                            .disabled(!threadlane_git::can_create_pull_request(
-                                                state.active_git_work_dir().is_some(),
-                                                status,
-                                            ))
-                                            .action(Box::new(crate::CreateWorkspacePullRequest)),
-                                    )
-                                    .item(
-                                        PopupMenuItem::new("Create branch…")
-                                            .disabled(status.is_none())
-                                            .action(Box::new(crate::CreateWorkspaceBranch)),
-                                    )
-                                }
-                            }),
-                    )
-                    .children(status.remote.as_ref().map(|remote| {
-                        let model = self.model.clone();
-                        let repository = remote
-                            .trim()
-                            .trim_end_matches('/')
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or_default()
-                            .trim_end_matches(".git");
-                        let repository = if repository.is_empty() {
-                            "GitHub repository"
-                        } else {
-                            repository
-                        };
-                        Button::new("environment-repository")
-                            .debug_selector(|| "environment-repository".into())
-                            .ghost()
-                            .small()
-                            .w_full()
-                            .justify_start()
-                            .accessibility_label(format!("{repository}: open GitHub workspace"))
-                            .tooltip(format!("Open GitHub workspace for {repository}"))
-                            .child(action_content(
-                                Icon::new(IconName::Github),
-                                div().child(repository.to_owned()).into_any_element(),
-                            ))
-                            .on_click(move |_, _, cx| {
-                                model.update(cx, |state, cx| {
-                                    controller::dispatch(state, AppAction::OpenGitHub);
-                                    cx.notify();
-                                });
-                            })
-                    }))
-                    .children(
-                        status
-                            .pr
-                            .as_ref()
-                            .filter(|pr| {
-                                pr.url.starts_with("https://") || pr.url.starts_with("http://")
-                            })
-                            .map(|pr| {
-                                div()
-                                    .debug_selector(|| "environment-pr".into())
-                                    .px_2()
-                                    .min_w_0()
-                                    .child(
-                                        gpui_kit::base::Link::new("environment-pr-link")
-                                            .href(pr.url.clone())
-                                            .open_with(|url, _, _, cx| cx.open_url(url))
-                                            .accessibility_label(format!(
-                                                "Open PR #{}: {}",
-                                                pr.number, pr.title
-                                            ))
-                                            .text_color(theme.link)
-                                            .underline()
-                                            .cursor_pointer()
-                                            .border_1()
-                                            .border_color(theme.transparent)
-                                            .rounded(theme.radius)
-                                            .hover(|style| style.bg(theme.list_hover))
-                                            .focus_visible(|style| {
-                                                style.border_color(theme.primary)
-                                            })
-                                            .child(div().min_w_0().truncate().child(format!(
-                                                "PR #{} · {}",
-                                                pr.number, pr.title
-                                            ))),
-                                    )
-                            }),
-                    )
-            }))
-            .child(
-                div()
-                    .mt_1()
-                    .pt_2()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .child(
-                        Button::new("environment-files")
-                            .debug_selector(|| "environment-files".into())
-                            .ghost()
-                            .small()
-                            .w_full()
-                            .justify_start()
-                            .accessibility_label("Files")
-                            .child(action_content(
-                                Icon::new(IconName::Folder),
-                                div().child("Files").into_any_element(),
-                            ))
-                            .disabled(checkout.is_none())
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(crate::OpenWorkspaceFiles), cx)
-                            }),
+        threadlane_ui_kit::environment_panel(
+            name,
+            location,
+            status,
+            checkout.is_some(),
+            move |menu, _, cx| {
+                let state = menu_model.read(cx);
+                let status = state
+                    .active_git_work_dir()
+                    .and_then(|dir| state.git_statuses.get(&dir));
+                threadlane_ui_kit::environment_git_menu(
+                    menu,
+                    status,
+                    threadlane_git::can_create_pull_request(
+                        state.active_git_work_dir().is_some(),
+                        status,
                     ),
-            )
-            .child(
-                Button::new("environment-terminal")
-                    .debug_selector(|| "environment-terminal".into())
-                    .ghost()
-                    .small()
-                    .w_full()
-                    .justify_start()
-                    .accessibility_label("Terminal")
-                    .child(action_content(
-                        Icon::new(IconName::SquareTerminal),
-                        div().child("Terminal").into_any_element(),
-                    ))
-                    .disabled(checkout.is_none())
-                    .on_click(move |_, _, cx| {
-                        if let Some(dir) = checkout.as_ref() {
-                            model.update(cx, |state, cx| {
-                                controller::dispatch(state, AppAction::OpenTerminalAt(dir.clone()));
-                                cx.notify();
-                            });
+                    |label, action| {
+                        PopupMenuItem::new(label)
+                            .when_some(Self::environment_command(action), |item, action| {
+                                item.action(action)
+                            })
+                    },
+                )
+            },
+            self.render_token_efficiency(cx),
+            move |action, window, cx| {
+                use threadlane_ui_kit::EnvironmentAction;
+                match action {
+                    EnvironmentAction::Repository => model.update(cx, |state, cx| {
+                        controller::dispatch(state, AppAction::OpenGitHub);
+                        cx.notify();
+                    }),
+                    EnvironmentAction::Terminal => model.update(cx, |state, cx| {
+                        if let Some(dir) = state.active_git_work_dir() {
+                            controller::dispatch(state, AppAction::OpenTerminalAt(dir));
+                            cx.notify();
                         }
                     }),
-            )
-            .child(self.render_token_efficiency(cx)),
+                    action => Self::dispatch_environment_action(action, window, cx),
+                }
+            },
+            cx,
         )
-        .into_any_element()
+    }
+    fn environment_command(
+        action: threadlane_ui_kit::EnvironmentAction,
+    ) -> Option<Box<dyn Action>> {
+        use threadlane_ui_kit::EnvironmentAction;
+        let action: Box<dyn Action> = match action {
+            EnvironmentAction::Branches => Box::new(crate::OpenWorkspaceBranches),
+            EnvironmentAction::Review => Box::new(crate::OpenWorkspaceReview),
+            EnvironmentAction::Commit => Box::new(crate::OpenWorkspaceCommit),
+            EnvironmentAction::Pull => Box::new(crate::PullWorkspaceBranch),
+            EnvironmentAction::Push => Box::new(crate::PushWorkspaceBranch),
+            EnvironmentAction::CreatePullRequest => Box::new(crate::CreateWorkspacePullRequest),
+            EnvironmentAction::CreateBranch => Box::new(crate::CreateWorkspaceBranch),
+            EnvironmentAction::Files => Box::new(crate::OpenWorkspaceFiles),
+            EnvironmentAction::Repository | EnvironmentAction::Terminal => return None,
+        };
+        Some(action)
     }
 
-    fn render_token_efficiency(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn dispatch_environment_action(
+        action: threadlane_ui_kit::EnvironmentAction,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(action) = Self::environment_command(action) {
+            window.dispatch_action(action, cx);
+        }
+    }
+
+    fn render_token_efficiency(&self, cx: &App) -> AnyElement {
         let state = self.model.read(cx);
-        let theme = cx.theme();
-        let mut section = div()
-            .debug_selector(|| "environment-token-efficiency".into())
-            .mt_1()
-            .pt_2()
-            .px_2()
-            .border_t_1()
-            .border_color(theme.border)
-            .flex()
-            .flex_col()
-            .gap_1()
-            .text_xs()
-            .child(
-                div()
-                    .text_color(theme.muted_foreground)
-                    .child("Token efficiency"),
-            );
-        let Some(report) = state.active_token_efficiency() else {
-            return section
-                .child(
-                    div()
-                        .text_color(theme.muted_foreground)
-                        .child("Available after a provider run"),
-                )
-                .into_any_element();
-        };
-        let requests: u64 = report
-            .lanes
-            .values()
-            .map(|lane| lane.provider_requests)
-            .sum();
-        let failures: u64 = report
-            .lanes
-            .values()
-            .map(|lane| lane.failed_provider_requests)
-            .sum();
-        let reductions: u64 = report
-            .lanes
-            .values()
-            .map(|lane| lane.reduced_context_items)
-            .sum();
-        let child_tokens: u64 = report
-            .lanes
-            .iter()
-            .filter(|(id, _)| id.as_str() != "main")
-            .map(|(_, lane)| lane.usage.processed_tokens())
-            .sum();
-        if requests == 0 && report.usage.processed_tokens() == 0 {
-            return section
-                .child(
-                    div()
-                        .text_color(theme.muted_foreground)
-                        .child("No provider usage reported"),
-                )
-                .into_any_element();
-        }
-        for (label, value) in [
-            (
-                "Processed tokens",
-                format_meter_tokens(report.usage.processed_tokens()),
-            ),
-            (
-                "Uncached input",
-                format_meter_tokens(report.usage.uncached_input_tokens),
-            ),
-            (
-                "Cache reads / writes",
-                format!(
-                    "{} / {}",
-                    format_meter_tokens(report.usage.cache_read_tokens),
-                    format_meter_tokens(report.usage.cache_write_tokens)
-                ),
-            ),
-            (
-                "Output tokens",
-                format_meter_tokens(report.usage.output_tokens),
-            ),
-            ("Child tokens", format_meter_tokens(child_tokens)),
-            (
-                "Tokens / completed run",
-                report
-                    .session_tokens_per_completed_foreground_run
-                    .map(|tokens| format_meter_tokens(tokens.round() as u64))
-                    .unwrap_or_else(|| "—".into()),
-            ),
-            ("Requests / failed", format!("{requests} / {failures}")),
-            ("Reduced context items", reductions.to_string()),
-            (
-                "Compactions / rereads",
-                format!(
-                    "{} / {}",
-                    report.compactions, report.repeated_snapshot_reads
-                ),
-            ),
-        ] {
-            section = section.child(
-                div()
-                    .debug_selector(move || format!("efficiency-{label}").into())
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(div().text_color(theme.muted_foreground).child(label))
-                    .child(div().flex_none().child(value)),
-            );
-        }
-        section
-            .child(
-                div()
-                    .text_color(theme.muted_foreground)
-                    .child(if state.is_generating {
-                        "All lanes · last journal snapshot. Updates after this run."
-                    } else {
-                        "Reported usage · all lanes, cached tokens and failed attempts."
-                    }),
-            )
-            .into_any_element()
+        threadlane_ui_kit::token_efficiency(
+            state.active_token_efficiency(),
+            state.is_generating,
+            cx,
+        )
     }
 
     fn render_workspace_changes(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -2184,151 +1483,35 @@ impl ChatListView {
         )
     }
 
-    fn render_plan_tracker(
-        &self,
-        plan: &SessionPlan,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if plan.items.is_empty() {
-            return None;
-        }
-
-        let is_generating = self.model.read(cx).is_generating;
-        let theme = cx.theme().colors;
-        let completed = plan
-            .items
-            .iter()
-            .filter(|item| item.status == PlanItemStatus::Completed)
-            .count();
-        let total = plan.items.len();
-        let current_step_opt = plan
-            .items
-            .iter()
-            .position(|item| item.status == PlanItemStatus::InProgress)
-            .or_else(|| {
-                plan.items
-                    .iter()
-                    .position(|item| item.status == PlanItemStatus::Pending)
-            })
-            .map(|index| plan.items[index].step.as_str());
-        let (display_step, tracker_a11y, tracker_tooltip) =
-            plan_tracker_texts(completed, total, current_step_opt);
-        let content_plan = plan.clone();
-
-        Some(
-            div()
-                .w_full()
-                .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
-                .mx_auto()
-                .px_4()
-                .min_w_0()
-                .flex()
-                .justify_center()
-                .py_1()
-                .child(
-                    Popover::new(SharedString::from(format!(
-                        "session-plan-{}",
-                        self.model
-                            .read(cx)
-                            .active_session_id
-                            .as_deref()
-                            .unwrap_or("draft")
-                    )))
-                    .anchor(Anchor::BottomCenter)
-                    .trigger(
-                        Button::new("session-plan-tracker")
-                            .debug_selector(|| "session-plan-tracker".into())
-                            .secondary()
-                            .small()
-                            .rounded_full()
-                            .label(format!(
-                                "Plan · {completed}/{total} · {}",
-                                truncate_plan_step(&display_step, 42)
-                            ))
-                            .accessibility_label(tracker_a11y.clone())
-                            .tooltip(tracker_tooltip.clone())
-                            .max_w(rems(26.0))
-                            .min_w_0()
-                            .flex_shrink_1()
-                            .overflow_hidden(),
-                    )
-                    .content(move |_state, _window, _cx| {
-                        let colors = theme;
-                        let rows = content_plan.items.iter().enumerate().map(|(index, item)| {
-                            let marker = Self::plan_step_marker(item.status, is_generating, colors);
-                            div().flex().items_start().gap_2().child(marker).child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .text_sm()
-                                    .text_color(colors.foreground)
-                                    .child(format!("{}. {}", index + 1, item.step)),
-                            )
-                        });
-                        div()
-                            .debug_selector(|| "session-plan-details".into())
-                            .w(rems(32.0))
-                            .max_w(rems(CHAT_CONTENT_MAX_WIDTH - 2.0))
-                            .p_3()
-                            .rounded_xl()
-                            .border_1()
-                            .border_color(colors.border.opacity(0.8))
-                            .bg(colors.popover)
-                            .shadow_lg()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .children(content_plan.explanation.clone().map(|explanation| {
-                                div()
-                                    .flex_none()
-                                    .pb_2()
-                                    .border_b_1()
-                                    .border_color(colors.border.opacity(0.4))
-                                    .text_sm()
-                                    .text_color(colors.muted_foreground)
-                                    .child(explanation)
-                            }))
-                            .child(
-                                div()
-                                    .w_full()
-                                    .max_h(rems(18.0))
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .overflow_y_scrollbar()
-                                    .children(rows),
-                            )
-                    }),
-                )
-                .into_any_element(),
-        )
+    fn render_plan_tracker(&self, plan: &SessionPlan, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let state = self.model.read(cx);
+        threadlane_ui_kit::plan_tracker(state.active_session_id.as_deref().unwrap_or("draft"), plan, state.is_generating, cx)
     }
 
-    fn render_tool_activity(&self, activity: &ToolActivityInfo, cx: &mut Context<Self>) -> AnyElement {
-        if let Some(preview) = super::tool_preview::render(activity, &self.model, cx) {
-            return div()
-                .w_full()
-                .min_w_0()
-                .py_1()
-                .child(preview)
-                .into_any_element();
-        }
-
-        if tool_detail::is_command_tool(&activity.title) {
-            return div()
-                .w_full()
-                .min_w_0()
-                .py_1()
-                .child(tool_detail::render_command_card(activity, cx))
-                .into_any_element();
-        }
-
+    fn render_tool_activity(
+        &self,
+        activity: &ToolActivityInfo,
+        window: &mut Window,
+        row_index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let model = self.model.clone();
         let transcript = self.transcript.list.clone();
         let tool_call_id = activity.id.clone();
         let has_detail = !activity.detail.trim().is_empty() || tool_detail::expandable(activity);
-        let detail = activity.is_expanded.then(|| tool_detail::render_activity_detail_card(activity, &self.model, cx).unwrap_or_else(|| threadlane_ui_session::tool_detail(cx).child(activity.detail.clone()).into_any_element()));
-        threadlane_ui_session::tool_activity(activity, has_detail, detail, false, move |_, cx| {
+        let motion = threadlane_ui_kit::DisclosureMotion::new(
+            SharedString::from(format!("tool-body-{}", activity.id)),
+            activity.is_expanded,
+            window,
+            cx,
+        );
+        motion.remeasure_list_row(&self.transcript.list, row_index, window);
+        let detail = motion.is_visible().then(|| {
+            tool_detail::render_activity_detail_card(activity, &self.model, cx)
+                .unwrap_or_else(|| threadlane_ui_kit::tool_detail(cx)
+                    .child(activity.detail.clone()).into_any_element())
+        }).map(|body| motion.content(body));
+        threadlane_ui_kit::tool_activity(activity, has_detail, detail, false, move |_, cx| {
             transcript.pause_following_tail();
             transcript.remeasure();
             model.update(cx, |state, cx| {
@@ -2341,6 +1524,8 @@ impl ChatListView {
     fn render_activity_group(
         &mut self,
         messages: &[ChatMessageInfo],
+        window: &mut Window,
+        row_index: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme().colors;
@@ -2350,67 +1535,35 @@ impl ChatListView {
             .next()
             .map(|activity| activity.id.clone())
             .unwrap_or_else(|| "empty".into());
-        let is_expanded = self.expanded_activity_groups.contains(&group_id);
-        let hidden_count = activities
-            .clone()
-            .filter(|activity| {
-                !matches!(activity.category.as_str(), "Working" | "Thinking" | "Error")
-            })
-            .count();
-        let activity_rows = activities
-            .filter(|activity| {
-                is_expanded
-                    || matches!(activity.category.as_str(), "Working" | "Thinking" | "Error")
-            })
-            .map(|activity| self.render_tool_activity(activity, cx))
-            .collect::<Vec<_>>();
-        let button_group_id = group_id.clone();
-
-        div()
-            .w_full()
-            .min_w_0()
-            .flex_none()
-            .my_1()
-            .px_4()
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .children((hidden_count > 0).then(|| {
-                        let disclosure_text = if is_expanded {
-                            "Collapse activities".to_string()
-                        } else {
-                            completed_activities_text(hidden_count)
-                        };
-                        let disclosure_a11y = if is_expanded {
-                            "Collapse completed tool activity".to_string()
-                        } else {
-                            expand_activities_a11y(hidden_count)
-                        };
-                        Button::new(SharedString::from(format!("activity-group-{group_id}")))
-                            .debug_selector(|| "activity-group-disclosure".into())
-                            .xsmall()
-                            .ghost()
-                            .justify_start()
-                            .text_color(theme.muted_foreground)
-                            .label(disclosure_text.clone())
-                            .accessibility_label(disclosure_a11y.clone())
-                            .tooltip(disclosure_a11y)
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                if !this.expanded_activity_groups.remove(&button_group_id) {
-                                    this.expanded_activity_groups
-                                        .insert(button_group_id.clone());
-                                }
-                                this.transcript.list.pause_following_tail();
-                                this.transcript.list.remeasure();
-                                cx.notify();
-                            }))
-                    }))
-                    .children(activity_rows),
-            )
-            .into_any_element()
+        let expanded = self.expanded_activity_groups.contains(&group_id);
+        let motion = threadlane_ui_kit::DisclosureMotion::new(
+            SharedString::from(format!("activity-group-body-{group_id}")),
+            expanded,
+            window,
+            cx,
+        );
+        motion.remeasure_list_row(&self.transcript.list, row_index, window);
+        let owner = cx.entity().downgrade();
+        let toggle_id = group_id.clone();
+        let group = threadlane_ui_kit::completed_activity_group(
+            &group_id,
+            expanded,
+            activities,
+            &motion,
+            |activity| self.render_tool_activity(activity, window, row_index, cx),
+            move |_, cx| {
+                let _ = owner.update(cx, |this, cx| {
+                    if !this.expanded_activity_groups.remove(&toggle_id) {
+                        this.expanded_activity_groups.insert(toggle_id.clone());
+                    }
+                    this.transcript.list.pause_following_tail();
+                    this.transcript.list.remeasure();
+                    cx.notify();
+                });
+            },
+            &theme,
+        );
+        group
     }
 
     fn render_working_indicator(&self, _cx: &mut Context<Self>) -> AnyElement {
@@ -2426,7 +1579,7 @@ impl ChatListView {
     fn render_transcript_row(
         &mut self,
         index: usize,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let messages = Arc::clone(&self.transcript.messages);
@@ -2446,20 +1599,15 @@ impl ChatListView {
         let content = match self.transcript.rows.get(index).cloned() {
             Some(TranscriptRow::Message(message_index)) => messages
                 .get(message_index)
-                .map(|message| self.render_message(message, cx)),
+                .map(|message| self.render_message(message, window, index, cx)),
             Some(TranscriptRow::Activities(range)) => messages
                 .get(range)
-                .map(|messages| self.render_activity_group(messages, cx)),
+                .map(|messages| self.render_activity_group(messages, window, index, cx)),
             Some(TranscriptRow::Working) => Some(self.render_working_indicator(cx)),
             None => None,
         };
 
-        div()
-            .w_full()
-            .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
-            .mx_auto()
-            .when(selected, |el| el.border_1().border_color(cx.theme().primary)
-                .child(div().text_sm().child(selected_label)))
+        threadlane_ui_kit::conversation_transcript_row(selected.then_some(selected_label), cx)
             .children(content)
             .into_any_element()
     }
@@ -2470,27 +1618,16 @@ impl ChatListView {
         source: &str,
         cx: &mut Context<Self>,
     ) -> Entity<TextViewState> {
-        threadlane_ui_session::markdown::markdown_state(&mut self.markdown_states, self.markdown_cache_namespace.clone(), key, source, cx)
+        threadlane_ui_kit::markdown::markdown_state(&mut self.markdown_states, self.markdown_cache_namespace.clone(), key, source, cx)
     }
 
     fn cached_segments(&mut self, message_id: &str, content: &str) -> Vec<MarkdownSegment> {
-        if let Some((cached_content, segments)) = self.segment_cache.get(message_id) {
-            if cached_content == content {
-                return segments.clone();
-            }
-        }
-
-        let segments = extract_markdown_segments(content);
-        self.segment_cache.insert(
-            message_id.to_owned(),
-            (content.to_owned(), segments.clone()),
-        );
-        segments
+        threadlane_ui_kit::markdown::markdown_segments(&mut self.segment_cache, message_id, content)
     }
 
     fn chat_markdown_view(&self, state: &Entity<TextViewState>) -> TextView {
         let model = self.model.clone();
-        threadlane_ui_session::markdown::markdown_view(state, move |path, cx| {
+        threadlane_ui_kit::markdown::markdown_view(state, move |path, cx| {
             model.update(cx, |state, cx| { state.request_open_file(path); cx.notify(); });
         })
     }
@@ -2505,7 +1642,6 @@ impl ChatListView {
         streaming: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = cx.theme().colors;
         let model = self.model.clone();
         let code_str = code.to_string();
         let copy_code = code.to_string();
@@ -2518,197 +1654,70 @@ impl ChatListView {
         });
         let path_for_open = (!streaming).then(|| path_opt.clone()).flatten();
 
-        let display_lang = if language.trim().is_empty() {
-            "code"
-        } else {
-            language.trim()
-        };
-
-        div()
-            .w_full()
-            .my_2p5()
-            .rounded_xl()
-            .border_1()
-            .border_color(theme.border.opacity(0.35))
-            .bg(theme.muted.opacity(0.18))
-            .overflow_hidden()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px_3p5()
-                    .py_1p5()
-                    .bg(theme.background.opacity(0.35))
-                    .border_b_1()
-                    .border_color(theme.border.opacity(0.3))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .min_w_0()
-                            .child(
-                                Tag::new()
-                                    .child(display_lang.to_string())
-                                    .with_variant(TagVariant::Secondary)
-                                    .small(),
-                            )
-                            .children(path_opt.map(|path| {
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "code-path-{msg_id}-{block_index}"
-                                    )))
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .truncate()
-                                    .tooltip({
-                                        let tip = path.clone();
-                                        move |window, cx| {
-                                            gpui_component::tooltip::Tooltip::new(tip.clone())
-                                                .build(window, cx)
-                                        }
-                                    })
-                                    .child(
-                                        Icon::new(IconName::File)
-                                            .xsmall()
-                                            .text_color(theme.muted_foreground),
-                                    )
-                                    .child(path)
-                            })),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .children(is_runnable.then(|| {
-                                let cmd = code_str.clone();
-                                let model = model.clone();
-                                Button::new(SharedString::from(format!(
-                                    "run-term-{msg_id}-{block_index}"
-                                )))
-                                .icon(IconName::SquareTerminal)
-                                .label("Run in Terminal")
-                                .accessibility_label("Run in active project terminal")
-                                .xsmall()
-                                .secondary()
-                                .tooltip("Run in active project terminal")
-                                .on_click(move |_event, _window, cx| {
-                                    let cmd = normalize_terminal_command(&cmd);
-                                    if cmd.lines().filter(|line| !line.trim().is_empty()).count() > 1 {
-                                        let model = model.clone();
-                                        cx.spawn(async move |cx| {
-                                            let result = rfd::AsyncMessageDialog::new()
-                                                .set_title("Run multiple terminal commands?")
-                                                .set_description("This code block contains multiple commands. Run them in the active terminal?")
-                                                .set_buttons(rfd::MessageButtons::YesNo)
-                                                .show()
-                                                .await;
-                                            if matches!(result, rfd::MessageDialogResult::Yes) {
-                                                let _ = model.update(cx, |state, cx| {
-                                                    controller::dispatch(state, AppAction::RunTerminalCommand(cmd));
-                                                    cx.notify();
-                                                });
-                                            }
-                                        }).detach();
-                                    } else {
-                                        model.update(cx, |state, cx| {
-                                            controller::dispatch(state, AppAction::RunTerminalCommand(cmd));
-                                            cx.notify();
-                                        });
-                                    }
-                                })
-                            }))
-                            .children(path_for_open.map(|path| {
-                                let model = model.clone();
-                                Button::new(SharedString::from(format!(
-                                    "open-edit-{msg_id}-{block_index}"
-                                )))
-                                .icon(IconName::File)
-                                .label("Open in Editor")
-                                .accessibility_label("Open file in central editor")
-                                .xsmall()
-                                .ghost()
-                                .tooltip("Open file in central editor")
-                                .on_click(move |_event, _window, cx| {
-                                    let path = path.clone();
-                                    model.update(cx, |state, cx| {
-                                        controller::dispatch(
-                                            state,
-                                            AppAction::OpenFileInEditor(path),
-                                        );
+        let key = format!("{msg_id}-{block_index}");
+        let actions = threadlane_ui_kit::code_block_actions()
+            .children(is_runnable.then(|| {
+                let cmd = code_str.clone();
+                let model = model.clone();
+                threadlane_ui_kit::code_block_run_button(&key)
+                    .on_click(move |_, _, cx| {
+                        let cmd = normalize_terminal_command(&cmd);
+                        if cmd.lines().filter(|line| !line.trim().is_empty()).count() > 1 {
+                            let model = model.clone();
+                            cx.spawn(async move |cx| {
+                                let result = rfd::AsyncMessageDialog::new()
+                                    .set_title("Run multiple terminal commands?")
+                                    .set_description("This code block contains multiple commands. Run them in the active terminal?")
+                                    .set_buttons(rfd::MessageButtons::YesNo)
+                                    .show().await;
+                                if matches!(result, rfd::MessageDialogResult::Yes) {
+                                    let _ = model.update(cx, |state, cx| {
+                                        controller::dispatch(state, AppAction::RunTerminalCommand(cmd));
                                         cx.notify();
                                     });
-                                })
-                            }))
-                            .when(!streaming, |actions| {
-                                let block_key = format!("copy-code-{msg_id}-{block_index}");
-                                let is_copied = self.copied_code_block.as_ref().is_some_and(|(id, time)| {
-                                    id == &block_key && time.elapsed() < COPIED_FEEDBACK_WINDOW
-                                });
-                                let copy_code_key = block_key.clone();
-                                actions.child(
-                                    Button::new(SharedString::from(block_key))
-                                        .icon(if is_copied {
-                                            IconName::Check
-                                        } else {
-                                            IconName::Copy
-                                        })
-                                        .accessibility_label(if is_copied {
-                                            "Code copied"
-                                        } else {
-                                            "Copy code"
-                                        })
-                                        .xsmall()
-                                        .ghost()
-                                        .tooltip(if is_copied {
-                                            "Copied!"
-                                        } else {
-                                            "Copy code to clipboard"
-                                        })
-                                        .when(is_copied, |btn| btn.text_color(theme.success))
-                                        .on_click(cx.listener(move |this, _event, window, cx| {
-                                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                                copy_code.clone(),
-                                            ));
-                                            this.copied_code_block = Some((copy_code_key.clone(), std::time::Instant::now()));
-                                            window.push_notification(
-                                                Notification::info("Code copied to clipboard"),
-                                                cx,
-                                            );
-                                            cx.notify();
-                                        })),
-                                )
-                            }),
-                    ),
-            )
-            .child(
-                div()
-                    .overflow_x_scrollbar()
-                    .p_3()
-                    .font_family("monospace")
-                    .text_xs()
-                    .text_color(theme.foreground)
-                    .child({
-                        let formatted_code =
-                            format!("```{language}\n{}\n```", code.trim_end());
-                        let code_state = self.markdown_state(
-                            format!("code-{msg_id}-{block_index}"),
-                            &formatted_code,
-                            cx,
-                        );
-                        self.chat_markdown_view(&code_state)
-                    }),
-            )
+                                }
+                            }).detach();
+                        } else {
+                            model.update(cx, |state, cx| {
+                                controller::dispatch(state, AppAction::RunTerminalCommand(cmd));
+                                cx.notify();
+                            });
+                        }
+                    })
+            }))
+            .children(path_for_open.map(|path| {
+                let model = model.clone();
+                threadlane_ui_kit::code_block_open_button(&key)
+                    .on_click(move |_, _, cx| {
+                        model.update(cx, |state, cx| {
+                            controller::dispatch(state, AppAction::OpenFileInEditor(path.clone()));
+                            cx.notify();
+                        });
+                    })
+            }))
+            .children((!streaming).then(|| {
+                let copy_key = format!("copy-code-{key}");
+                let copied = self.copied_message.as_ref().is_some_and(|(id, time)| {
+                    id == &copy_key && time.elapsed() < COPIED_FEEDBACK_WINDOW
+                });
+                threadlane_ui_kit::code_block_copy_button(&key, copied, cx)
+                    .on_click(cx.listener(move |host, _, window, cx| {
+                        host.copy_text(copy_key.clone(), copy_code.clone(), cx);
+                        window.push_notification(Notification::info("Code copied to clipboard"), cx);
+                    }))
+            }));
+        let formatted_code = format!("```{language}\n{}\n```", code.trim_end());
+        let code_state = self.markdown_state(format!("code-{key}"), &formatted_code, cx);
+        threadlane_ui_kit::code_block_surface(&key, cx)
+            .child(threadlane_ui_kit::code_block_header(&key, language, path_opt.as_deref(), actions, cx))
+            .child(threadlane_ui_kit::code_block_body().child(self.chat_markdown_view(&code_state)))
     }
 
     fn render_reasoning_block(
         &mut self,
         msg: &ChatMessageInfo,
+        window: &mut Window,
+        row_index: usize,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let reasoning = msg.reasoning_content.as_deref()?;
@@ -2720,8 +1729,15 @@ impl ChatListView {
         let model = self.model.clone();
         let msg_id = msg.id.clone();
 
-        let detail = is_expanded.then(|| {
-            let container = threadlane_ui_session::reasoning_detail(cx);
+        let motion = threadlane_ui_kit::DisclosureMotion::new(
+            SharedString::from(format!("reasoning-body-{}", msg.id)),
+            is_expanded,
+            window,
+            cx,
+        );
+        motion.remeasure_list_row(&self.transcript.list, row_index, window);
+        let detail = motion.is_visible().then(|| {
+            let container = threadlane_ui_kit::reasoning_detail(cx);
             if is_streaming {
                 container.child(reasoning.to_owned()).into_any_element()
             } else {
@@ -2731,10 +1747,10 @@ impl ChatListView {
                     .child(self.chat_markdown_view(&markdown_state))
                     .into_any_element()
             }
-        });
+        }).map(|body| motion.content(body));
 
         let transcript = self.transcript.list.clone();
-        Some(threadlane_ui_session::reasoning_card(msg, detail, false, move |_, cx| {
+        Some(threadlane_ui_kit::reasoning_card(msg, detail, false, move |_, cx| {
             transcript.pause_following_tail();
             transcript.remeasure();
             model.update(cx, |state, cx| {
@@ -2748,70 +1764,30 @@ impl ChatListView {
         &mut self,
         msg_id: &str,
         tools: &[ToolActivityInfo],
+        window: &mut Window,
+        row_index: usize,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if tools.is_empty() {
             return None;
         }
         if tools.len() == 1 {
-            return Some(self.render_tool_activity(&tools[0], cx).into_any_element());
+            return Some(
+                self.render_tool_activity(&tools[0], window, row_index, cx)
+                    .into_any_element(),
+            );
         }
 
-        let mut reads = 0;
-        let mut edits = 0;
-        let mut runs = 0;
-        let mut others = 0;
-        let mut has_error = false;
-        let mut has_running = false;
-        for t in tools {
-            if t.category == "Error" {
-                has_error = true;
-            } else if t.category == "Working" || t.category == "Thinking" {
-                has_running = true;
-            }
-            match t.title.as_str() {
-                "read_file" | "view_file" | "grep_search" | "find_by_name" | "list_dir" => {
-                    reads += 1
-                }
-                "write_to_file" | "replace_file_content" | "apply_diff" | "edit_file" => edits += 1,
-                "run_command" | "execute" => runs += 1,
-                _ => others += 1,
-            }
-        }
-
-        let mut parts = Vec::new();
-        if reads > 0 {
-            parts.push(format!(
-                "inspected {reads} file{}",
-                if reads == 1 { "" } else { "s" }
-            ));
-        }
-        if edits > 0 {
-            parts.push(format!(
-                "edited {edits} file{}",
-                if edits == 1 { "" } else { "s" }
-            ));
-        }
-        if runs > 0 {
-            parts.push(format!(
-                "ran {runs} command{}",
-                if runs == 1 { "" } else { "s" }
-            ));
-        }
-        if others > 0 {
-            parts.push(format!(
-                "{others} other tool{}",
-                if others == 1 { "" } else { "s" }
-            ));
-        }
-        let summary = if parts.is_empty() {
-            format!("Ran {} tools", tools.len())
-        } else {
-            let mut s = parts.join(", ");
-            if let Some(c) = s.get_mut(0..1) {
-                c.make_ascii_uppercase();
-            }
-            s
+        let summary = tool_group_summary(tools);
+        let has_error = tools.iter().any(|tool| tool.category == "Error");
+        let has_running = tools
+            .iter()
+            .any(|tool| matches!(tool.category.as_str(), "Working" | "Thinking"));
+        let status = match (has_running, has_error) {
+            (true, true) => "Running · failed",
+            (true, false) => "Running",
+            (false, true) => "Failed",
+            (false, false) => "Completed",
         };
 
         let group_key = format!("tool-group-{msg_id}");
@@ -2825,13 +1801,13 @@ impl ChatListView {
         };
 
         let theme = cx.theme().colors;
-        let status_icon = if has_running {
-            Spinner::new().xsmall().color(theme.info).into_any_element()
-        } else if has_error {
+        let status_icon = if has_error {
             Icon::new(IconName::CircleX)
                 .xsmall()
                 .text_color(theme.danger)
                 .into_any_element()
+        } else if has_running {
+            Spinner::new().xsmall().color(theme.info).into_any_element()
         } else {
             Icon::new(IconName::CircleCheck)
                 .xsmall()
@@ -2841,104 +1817,112 @@ impl ChatListView {
 
         let toggle_key = group_key.clone();
         let toggle_has_running = has_running;
-        let header = Button::new(SharedString::from(format!("tool-toggle-{msg_id}")))
-            .accessibility_label(format!(
-                "{}: {summary}",
-                if is_expanded {
-                    "Collapse tools"
-                } else {
-                    "Expand tools"
+        let description = format!(
+            "{}: {summary}, {} tools, {status}",
+            if is_expanded {
+                "Collapse tools"
+            } else {
+                "Expand tools"
+            },
+            tools.len()
+        );
+        let header = threadlane_ui_kit::disclosure_button(
+            SharedString::from(format!("tool-toggle-{msg_id}")),
+            is_expanded,
+            description,
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .min_w_0()
+                .flex_1()
+                .child(status_icon)
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .truncate()
+                        .child(summary),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(status),
+                ),
+        )
+        .debug_selector(|| "tool-group-disclosure".into())
+        .px_3()
+        .rounded_none()
+        .bg(theme.muted.opacity(0.1))
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            this.transcript.list.pause_following_tail();
+            this.transcript.list.remeasure();
+            if toggle_has_running {
+                let key = format!("collapsed-{toggle_key}");
+                if !this.expanded_tool_aggregates.remove(&key) {
+                    this.expanded_tool_aggregates.insert(key);
                 }
-            ))
-            .ghost()
-            .small()
-            .w_full()
-            .px_3()
-            .rounded_none()
-            .bg(theme.muted.opacity(0.1))
-            .flex()
-            .items_center()
-            .justify_between()
-            .child(
+            } else {
+                let key = format!("expanded-{toggle_key}");
+                if !this.expanded_tool_aggregates.remove(&key) {
+                    this.expanded_tool_aggregates.insert(key);
+                }
+            }
+            cx.notify();
+        }));
+
+        let motion = threadlane_ui_kit::DisclosureMotion::new(
+            SharedString::from(format!("tool-group-body-{msg_id}")),
+            is_expanded,
+            window,
+            cx,
+        );
+        motion.remeasure_list_row(&self.transcript.list, row_index, window);
+        let detail_rows = motion
+            .is_visible()
+            .then(|| {
                 div()
                     .flex()
-                    .items_center()
-                    .gap_2()
-                    .min_w_0()
-                    .flex_1()
-                    .child(status_icon)
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.muted_foreground)
-                            .truncate()
-                            .child(summary),
+                    .flex_col()
+                    .px_2p5()
+                    .py_1()
+                    .border_t_1()
+                    .border_color(theme.border.opacity(0.3))
+                    .bg(theme.background.opacity(0.3))
+                    .children(
+                        tools
+                            .iter()
+                            .map(|tool| self.render_tool_activity(tool, window, row_index, cx)),
                     )
-                    .child(
-                        Tag::new()
-                            .child(format!("{} tools", tools.len()))
-                            .small()
-                            .with_variant(TagVariant::Secondary),
-                    ),
-            )
-            .child(
-                Icon::new(if is_expanded {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                })
-                .xsmall()
-                .text_color(theme.muted_foreground),
-            )
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.transcript.list.pause_following_tail();
-                this.transcript.list.remeasure();
-                if toggle_has_running {
-                    let key = format!("collapsed-{toggle_key}");
-                    if !this.expanded_tool_aggregates.remove(&key) {
-                        this.expanded_tool_aggregates.insert(key);
-                    }
-                } else {
-                    let key = format!("expanded-{toggle_key}");
-                    if !this.expanded_tool_aggregates.remove(&key) {
-                        this.expanded_tool_aggregates.insert(key);
-                    }
-                }
-                cx.notify();
-            }));
-
-        let tool_rows = tools
-            .iter()
-            .map(|t| self.render_tool_activity(t, cx))
-            .collect::<Vec<_>>();
-        let detail_rows = is_expanded.then(|| {
-            div()
-                .flex()
-                .flex_col()
-                .px_2p5()
-                .py_1()
-                .border_t_1()
-                .border_color(theme.border.opacity(0.3))
-                .bg(theme.background.opacity(0.3))
-                .children(tool_rows)
-        });
+            })
+            .map(|body| motion.content(body));
 
         Some(
-            div()
-                .w_full()
-                .min_w_0()
+            threadlane_ui_kit::result_surface(&theme)
                 .flex()
                 .flex_col()
-                .rounded_xl()
-                .border_1()
-                .border_color(theme.border.opacity(0.3))
-                .bg(theme.muted.opacity(0.12))
-                .overflow_hidden()
                 .child(header)
                 .children(detail_rows)
                 .into_any_element(),
         )
+    }
+
+    fn copy_text(&mut self, key: String, content: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(content));
+        self.copied_message = Some((key, std::time::Instant::now()));
+        // One retained timer, matching the preview: the latest copy owns feedback.
+        self.copy_feedback_task = Some(cx.spawn(async move |owner, cx| {
+            cx.background_executor().timer(COPIED_FEEDBACK_WINDOW).await;
+            let _ = owner.update(cx, |host, cx| {
+                host.copied_message = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
 
     fn render_message_copy_button(
@@ -2947,7 +1931,6 @@ impl ChatListView {
         align_end: bool,
         cx: &mut Context<Self>,
     ) -> Div {
-        let theme = cx.theme().colors;
         let copy_key = format!("message-copy-{}", msg.id);
         let is_copied = self
             .copied_message
@@ -2955,38 +1938,21 @@ impl ChatListView {
             .is_some_and(|(id, time)| id == &copy_key && time.elapsed() < COPIED_FEEDBACK_WINDOW);
         let content = msg.content.clone();
         let copy_key_click = copy_key.clone();
-        let row = div().flex().items_center().gap_1();
-        let row = if align_end { row.justify_end() } else { row };
-        row.child(
-            Button::new(SharedString::from(copy_key))
-                .icon(if is_copied {
-                    IconName::Check
-                } else {
-                    IconName::Copy
-                })
-                .xsmall()
-                .ghost()
-                .tooltip(if is_copied {
-                    "Copied!"
-                } else {
-                    "Copy message to clipboard"
-                })
-                .accessibility_label(if is_copied {
-                    "Message copied"
-                } else {
-                    "Copy message"
-                })
-                .debug_selector(|| "message-copy".into())
-                .when(is_copied, |btn| btn.text_color(theme.success))
+        threadlane_ui_kit::message_actions(align_end).child(
+            threadlane_ui_kit::message_copy_button(&msg.id, is_copied, cx)
                 .on_click(cx.listener(move |this, _event, _window, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(content.clone()));
-                    this.copied_message = Some((copy_key_click.clone(), std::time::Instant::now()));
-                    cx.notify();
+                    this.copy_text(copy_key_click.clone(), content.clone(), cx);
                 })),
         )
     }
 
-    fn render_message(&mut self, msg: &ChatMessageInfo, cx: &mut Context<Self>) -> AnyElement {
+    fn render_message(
+        &mut self,
+        msg: &ChatMessageInfo,
+        window: &mut Window,
+        row_index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme().colors;
         match msg.role {
             MessageRole::User => {
@@ -2994,7 +1960,7 @@ impl ChatListView {
                     msg.id.starts_with("queued-user-") && self.model.read(cx).is_generating;
                 let is_steered =
                     msg.id.starts_with("steered-user-") && self.model.read(cx).is_generating;
-                threadlane_ui_session::message_row(MessageRole::User)
+                threadlane_ui_kit::message_row(MessageRole::User)
                     .when(is_queued, |el| {
                         el.child(
                             div().flex().items_center().gap_1().mb_1().child(
@@ -3016,7 +1982,7 @@ impl ChatListView {
                         )
                     })
                     .child(
-                        threadlane_ui_session::user_message_bubble(cx)
+                        threadlane_ui_kit::user_message_bubble(cx)
                             .child({
                                 let markdown_state =
                                     self.markdown_state(msg.id.clone(), &msg.content, cx);
@@ -3026,7 +1992,7 @@ impl ChatListView {
                                 let content = msg.content.clone();
                                 move |menu, window, _cx| {
                                     let text = content.clone();
-                                    menu.item(PopupMenuItem::new("Copy Message").on_click(
+                                    threadlane_ui_kit::message_context_menu(menu,
                                         move |_event, window, cx| {
                                             cx.write_to_clipboard(ClipboardItem::new_string(
                                                 text.clone(),
@@ -3036,7 +2002,7 @@ impl ChatListView {
                                                 cx,
                                             );
                                         },
-                                    ))
+                                    )
                                 }
                             }),
                     )
@@ -3045,18 +2011,7 @@ impl ChatListView {
                         if !self.model.read(cx).is_generating {
                             let content = msg.content.clone();
                             footer = footer.child(
-                                Button::new(SharedString::from(format!(
-                                    "message-edit-{}",
-                                    msg.id
-                                )))
-                                .icon(Icon::default().path("icons/square-pen.svg"))
-                                .xsmall()
-                                .ghost()
-                                .tooltip("Load this message into the composer to edit and resend")
-                                .accessibility_label(
-                                    "Load this message into the composer to edit and resend",
-                                )
-                                .debug_selector(|| "message-edit".into())
+                                threadlane_ui_kit::message_edit_button(&msg.id)
                                 .on_click(cx.listener(
                                     move |this, _event, window, cx| {
                                         if !this.input_state.read(cx).value().is_empty()
@@ -3084,23 +2039,18 @@ impl ChatListView {
                     }))
             }
             MessageRole::Assistant => {
-                let reasoning_element = self.render_reasoning_block(msg, cx);
+                let reasoning_element = self.render_reasoning_block(msg, window, row_index, cx);
                 let filtered_tools: Vec<ToolActivityInfo> = msg
                     .tool_activities
                     .iter()
                     .filter(|tool| tool.title != "update_plan")
                     .cloned()
                     .collect();
-                let tools_element = self.render_tool_activities_block(&msg.id, &filtered_tools, cx);
+                let tools_element = self.render_tool_activities_block(&msg.id, &filtered_tools, window, row_index, cx);
 
-                threadlane_ui_session::message_row(MessageRole::Assistant)
+                threadlane_ui_kit::message_row(MessageRole::Assistant)
                     .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_2p5()
+                        threadlane_ui_kit::assistant_message_content()
                             .children(reasoning_element)
                             .children(if !msg.content.is_empty() {
                                 let segments = self.cached_segments(&msg.id, &msg.content);
@@ -3136,11 +2086,7 @@ impl ChatListView {
                                     .collect();
 
                                 Some(
-                                    div()
-                                        .w_full()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
+                                    threadlane_ui_kit::message_content_column()
                                         .children(rendered_segments),
                                 )
                             } else {
@@ -3154,7 +2100,7 @@ impl ChatListView {
                                 let content = msg.content.clone();
                                 move |menu, window, _cx| {
                                     let text = content.clone();
-                                    menu.item(PopupMenuItem::new("Copy Message").on_click(
+                                    threadlane_ui_kit::message_context_menu(menu,
                                         move |_event, window, cx| {
                                             cx.write_to_clipboard(ClipboardItem::new_string(
                                                 text.clone(),
@@ -3164,7 +2110,7 @@ impl ChatListView {
                                                 cx,
                                             );
                                         },
-                                    ))
+                                    )
                                 }
                             }),
                     )
@@ -3186,7 +2132,7 @@ impl ChatListView {
                         let content = msg.content.clone();
                         move |menu, window, _cx| {
                             let text = content.clone();
-                            menu.item(PopupMenuItem::new("Copy Message").on_click(
+                            threadlane_ui_kit::message_context_menu(menu,
                                 move |_event, window, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                                     window.push_notification(
@@ -3194,7 +2140,7 @@ impl ChatListView {
                                         cx,
                                     );
                                 },
-                            ))
+                            )
                         }
                     }),
             ),
@@ -3228,40 +2174,27 @@ impl ChatListView {
         let model = self.model.clone();
         let hero_active_dir = active_work_dir.clone();
 
-        let project_picker = Button::new("new-task-project-picker")
-            .debug_selector(|| "new-task-project-picker".into())
-            .icon(IconName::Folder)
-            .label(selected_project.clone())
-            .accessibility_label(format!("Project for the new task: {selected_project}"))
-            .tooltip(
-                selected_project_path
-                    .map(|path| format!("Project for the new task: {path}"))
-                    .unwrap_or_else(|| "Choose a project for the new task".to_string()),
-            )
-            .dropdown_caret(true)
-            .ghost()
-            .small()
-            .dropdown_menu(move |menu, window, _cx| {
-                let mut menu = menu;
-                for (name, work_dir) in projects.clone() {
-                    let model = model.clone();
-                    let is_current = is_current_project(hero_active_dir.as_ref(), &work_dir);
-                    menu = menu.item(PopupMenuItem::new(name).checked(is_current).on_click(
-                        move |_event, _window, cx| {
-                            model.update(cx, |state, cx| {
-                                controller::dispatch(
-                                    state,
-                                    AppAction::SelectDraftProject(work_dir.clone()),
-                                );
-                                cx.notify();
-                            });
-                        },
-                    ));
-                }
+        let project_picker =
+            threadlane_ui_kit::new_task_project_button(selected_project.clone(), selected_project_path)
+                .dropdown_menu(move |menu, window, _cx| {
+                    let items = projects.clone().into_iter().map(|(name, work_dir)| {
+                        let model = model.clone();
+                        let is_current = is_current_project(hero_active_dir.as_ref(), &work_dir);
+                        threadlane_ui_kit::project_picker_item(name, is_current).on_click(
+                            move |_event, _window, cx| {
+                                model.update(cx, |state, cx| {
+                                    controller::dispatch(
+                                        state,
+                                        AppAction::SelectDraftProject(work_dir.clone()),
+                                    );
+                                    cx.notify();
+                                });
+                            },
+                        )
+                    });
 
-                let model = model.clone();
-                menu.separator()
-                    .item(PopupMenuItem::new("New project…").on_click(
+                    let model = model.clone();
+                    let attach = threadlane_ui_kit::new_project_picker_item().on_click(
                         move |_event, _window, cx| {
                             let model = model.clone();
                             cx.spawn(async move |cx| {
@@ -3277,8 +2210,9 @@ impl ChatListView {
                             })
                             .detach();
                         },
-                    ))
-            });
+                    );
+                    threadlane_ui_kit::project_picker_menu(menu, items, attach)
+                });
 
         let suggestions: [(SharedString, &str, Icon); 4] = [
             (
@@ -3841,7 +2775,7 @@ impl ChatListView {
             .accessibility_label("View full command & arguments").ghost().xsmall().rounded_md().tooltip("View full command & arguments")
             .on_click(cx.listener(move |this, _, window, cx| this.open_permission_details(&request_id, window, cx)));
         Some(div().w_full().max_w(rems(CHAT_CONTENT_MAX_WIDTH)).mx_auto().flex_none().px_4().pt_1().bg(cx.theme().background)
-            .child(threadlane_ui_session::permission_card(&request, false, true, Some(details.into_any_element()),
+            .child(threadlane_ui_kit::permission_card(&request, false, true, Some(details.into_any_element()),
                 move |request_id, decision, _, cx| { let _ = owner.update(cx, |this, cx| this.resolve_pending_permission(request_id, decision, cx)); }, cx))
             .into_any_element())
     }
@@ -3885,7 +2819,7 @@ impl ChatListView {
                     .unwrap_or_default();
                 let owner = cx.entity().downgrade();
                 let request_id = request.id.clone(); let question_id = item.id.clone();
-                threadlane_ui_session::question_item(&request.id, item, &selected,
+                threadlane_ui_kit::question_item(&request.id, item, &selected,
                     self.question_inputs.get(&key), false,
                     move |value, _, cx| { let _ = owner.update(cx, |this, cx| {
                         this.toggle_question_option(&request_id, &question_id, value, cx);
@@ -3923,7 +2857,7 @@ impl ChatListView {
                 .pt_1()
                 .bg(theme.background)
                 .child(
-                    threadlane_ui_session::question_surface(cx)
+                    threadlane_ui_kit::question_surface(cx)
                         .child(
                             div()
                                 .flex()
@@ -4093,15 +3027,7 @@ impl ChatListView {
             let state = self.model.read(cx);
             let context_window = state
                 .active_context_window()
-                .map(|context| ContextMeterContext {
-                    current_tokens: context.current_tokens,
-                    context_limit: context.context_limit,
-                    context_limit_is_estimate: context.context_limit_is_estimate,
-                    effective_model: context.effective_model.clone(),
-                    last_compaction_seq: context.last_compaction_seq,
-                    provisional: context.provisional,
-                    estimating: context.estimating,
-                });
+                .map(ContextMeterContext::from);
             (state.active_session_metrics(), context_window)
         };
         let supports_live_steering = !threadlane_acp_engine::is_acp_model(&selected_model);
@@ -4130,10 +3056,22 @@ impl ChatListView {
         };
         let has_models = !model_options.is_empty();
         let needs_provider = !has_models;
+        let preparing_worktree = self.model.read(cx).active_worktree_setup().is_some();
+        let composer_shortcut_hint = if is_generating {
+            "Enter to queue · Shift+Enter for a new line"
+        } else {
+            "Enter to send · Shift+Enter for a new line"
+        };
         let model_label = selected_option
             .as_ref()
             .map(|option| option.label.clone())
-            .unwrap_or_else(|| "Connect a provider".to_string());
+            .unwrap_or_else(|| {
+                if needs_provider {
+                    "Connect a provider".to_string()
+                } else {
+                    threadlane_daemon::catalog::selection_label(&selected_model, &model_options)
+                }
+            });
         // Selecting an ACP agent picks the *agent*; the agent then picks its own
         // model. Naming it here rather than only in the settings menu is what
         // makes choosing a model visibly take effect, since this is the control
@@ -4181,67 +3119,34 @@ impl ChatListView {
             .iter()
             .enumerate()
             .map(|(index, image)| {
-                let name = image.display_name.clone();
-                let preview_label = format!("Preview {name}, image {} of {image_count}", index + 1);
-                let remove_label = format!("Remove {name}");
+                // The existing upload model has no attachment ID. Retain its index-keyed
+                // controls and generation guard; the kit receives host-owned identity.
                 let preview_button_id = ("preview-pasted-image", index);
                 let preview_focus = window
                     .use_keyed_state(preview_button_id.clone(), cx, |_, cx| cx.focus_handle())
                     .read(cx)
                     .clone();
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .px_2p5()
-                    .py_1()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.secondary)
-                    .text_xs()
-                    .text_color(theme.foreground)
-                    .child(Icon::new(IconName::File).xsmall().text_color(theme.primary))
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("pasted-image-{index}")))
-                            .max_w(rems(10.0))
-                            .truncate()
-                            .tooltip({
-                                let tip = name.clone();
-                                move |window, cx| {
-                                    gpui_component::tooltip::Tooltip::new(tip.clone())
-                                        .build(window, cx)
-                                }
-                            })
-                            .child(name.clone()),
-                    )
-                    .child(
-                        Button::new(preview_button_id)
-                            .label("Preview…")
-                            .xsmall()
-                            .ghost()
-                            .accessibility_label(preview_label.clone())
-                            .tooltip(preview_label)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_image_preview(index, preview_focus.clone(), window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new(("remove-pasted-image", index))
-                            .icon(IconName::Close)
-                            .accessibility_label(remove_label.clone())
-                            .xsmall()
-                            .ghost()
-                            .tooltip(remove_label)
-                            .on_click(cx.listener(move |this, _event, window, cx| {
-                                if index < this.pasted_images.len() {
-                                    this.pasted_images.remove(index);
-                                    this.invalidate_image_preview(window, cx);
-                                    cx.notify();
-                                }
-                            })),
-                    )
+                let preview = threadlane_ui_kit::staged_image_preview_button(
+                    preview_button_id,
+                    &image.display_name,
+                    index + 1,
+                    image_count,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_image_preview(index, preview_focus.clone(), window, cx);
+                }));
+                let remove = threadlane_ui_kit::staged_image_remove_button(
+                    ("remove-pasted-image", index),
+                    &image.display_name,
+                )
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    if index < this.pasted_images.len() {
+                        this.pasted_images.remove(index);
+                        this.invalidate_image_preview(window, cx);
+                        cx.notify();
+                    }
+                }));
+                threadlane_ui_kit::staged_image_chip(image.display_name.clone(), preview, remove, cx)
             })
             .collect::<Vec<_>>();
 
@@ -4368,56 +3273,45 @@ impl ChatListView {
             .as_ref()
             .map(|dir| dir.display().to_string())
             .unwrap_or_else(|| selected_project_name.clone());
-        let project_chip = Button::new("composer-project-chip")
-            .icon(IconName::Folder)
-            .label(selected_project_name.clone())
-            .accessibility_label(format!("Project: {selected_project_name}"))
-            .dropdown_caret(true)
-            .ghost()
-            .xsmall()
-            .rounded_full()
-            // Duplicate folder names are indistinguishable by label alone:
-            // cap the width, keep the full path in the tooltip.
-            .max_w(rems(10.0))
-            .tooltip(format!("Project: {project_chip_tooltip}"))
-            .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, window, _cx| {
-                let mut menu = menu;
-                for (name, work_dir) in projects_list.clone() {
-                    let model = project_chip_model.clone();
-                    let is_current = is_current_project(project_chip_active.as_ref(), &work_dir);
-                    menu = menu.item(PopupMenuItem::new(name).checked(is_current).on_click(
-                        move |_event, _window, cx| {
-                            model.update(cx, |state, cx| {
-                                controller::dispatch(
-                                    state,
-                                    AppAction::SelectDraftProject(work_dir.clone()),
-                                );
-                                cx.notify();
-                            });
-                        },
-                    ));
-                }
-
+        let project_chip = threadlane_ui_kit::composer_project_button(
+            selected_project_name.clone(),
+            project_chip_tooltip,
+        )
+        .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, window, _cx| {
+            let items = projects_list.clone().into_iter().map(|(name, work_dir)| {
                 let model = project_chip_model.clone();
-                menu.separator()
-                    .item(PopupMenuItem::new("New project…").on_click(
-                        move |_event, _window, cx| {
-                            let model = model.clone();
-                            cx.spawn(async move |cx| {
-                                let Some(folder) = rfd::AsyncFileDialog::new().pick_folder().await
-                                else {
-                                    return;
-                                };
-                                let path = folder.path().to_path_buf();
-                                let _ = model.update(cx, |state, cx| {
-                                    controller::dispatch(state, AppAction::AttachProject(path));
-                                    cx.notify();
-                                });
-                            })
-                            .detach();
-                        },
-                    ))
+                let is_current = is_current_project(project_chip_active.as_ref(), &work_dir);
+                threadlane_ui_kit::project_picker_item(name, is_current).on_click(
+                    move |_event, _window, cx| {
+                        model.update(cx, |state, cx| {
+                            controller::dispatch(
+                                state,
+                                AppAction::SelectDraftProject(work_dir.clone()),
+                            );
+                            cx.notify();
+                        });
+                    },
+                )
             });
+
+            let model = project_chip_model.clone();
+            let attach =
+                threadlane_ui_kit::new_project_picker_item().on_click(move |_event, _window, cx| {
+                    let model = model.clone();
+                    cx.spawn(async move |cx| {
+                        let Some(folder) = rfd::AsyncFileDialog::new().pick_folder().await else {
+                            return;
+                        };
+                        let path = folder.path().to_path_buf();
+                        let _ = model.update(cx, |state, cx| {
+                            controller::dispatch(state, AppAction::AttachProject(path));
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                });
+            threadlane_ui_kit::project_picker_menu(menu, items, attach)
+        });
 
         let work_mode_model = self.model.clone();
         let work_mode_label = match effective_work_mode {
@@ -4433,25 +3327,7 @@ impl ChatListView {
             }
         };
 
-        let work_mode_chip = Button::new("composer-workmode-chip")
-            .icon(if effective_work_mode == WorkMode::Worktree {
-                Icon::default().path("icons/git/branch.svg")
-            } else {
-                Icon::new(IconName::SquareTerminal)
-            })
-            .label(work_mode_label)
-            .accessibility_label(format!(
-                "Execution location: {}",
-                match effective_work_mode {
-                    WorkMode::Local => "Local",
-                    WorkMode::Worktree => "Worktree",
-                }
-            ))
-            .tooltip("Where new tasks run: local checkout or an isolated worktree")
-            .dropdown_caret(true)
-            .ghost()
-            .xsmall()
-            .rounded_full()
+        let work_mode_chip = threadlane_ui_kit::composer_work_mode_button(work_mode_label, effective_work_mode == WorkMode::Worktree)
             .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, window, _cx| {
                 let menu = menu.check_side(gpui_component::Side::Right);
                 let local_model = work_mode_model.clone();
@@ -4495,17 +3371,7 @@ impl ChatListView {
             let label = selected
                 .clone()
                 .unwrap_or_else(|| "Loading branches…".into());
-            Button::new("composer-worktree-base")
-                .debug_selector(|| "composer-worktree-base".into())
-                .max_w(rems(14.0))
-                .label(format!("Base: {label}"))
-                .accessibility_label(format!("Worktree base branch: {label}"))
-                .tooltip("Create the worktree from this branch’s committed changes")
-                .dropdown_caret(true)
-                .ghost()
-                .xsmall()
-                .rounded_full()
-                .disabled(branches.is_empty())
+            threadlane_ui_kit::composer_worktree_base_button(label, !branches.is_empty())
                 .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, _, _| {
                     let mut menu = menu;
                     for branch in &branches {
@@ -4544,14 +3410,7 @@ impl ChatListView {
                 })
                 .unwrap_or(0);
 
-            Button::new("composer-skills-chip")
-                .icon(IconName::BookOpen)
-                .label(skills_chip_label(active_skills_count))
-                .accessibility_label("Manage workspace skills")
-                .tooltip("Manage workspace skills")
-                .xsmall()
-                .ghost()
-                .rounded_full()
+            threadlane_ui_kit::composer_skills_button(active_skills_count)
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.model.update(cx, |state, cx| {
                         controller::dispatch(state, AppAction::OpenSettings);
@@ -4560,45 +3419,9 @@ impl ChatListView {
                 }))
         };
 
-        let composer_context_bar = div()
-            .w_full()
-            .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
-            .mx_auto()
-            .mb_2p5()
-            .px_1()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_1p5()
-            .child(project_chip)
-            .child(work_mode_chip)
-            .children(base_chip)
-            .child(skills_chip)
-            .children(branch.map(|branch| {
-                div()
-                    .id("composer-branch")
-                    .min_w_0()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .truncate()
-                    .tooltip({
-                        let branch = branch.clone();
-                        move |window, cx| {
-                            gpui_component::tooltip::Tooltip::new(branch.clone()).build(window, cx)
-                        }
-                    })
-                    .child(
-                        Icon::default()
-                            .path("icons/git/branch.svg")
-                            .xsmall()
-                            .text_color(theme.muted_foreground),
-                    )
-                    .child(branch)
-            }));
+        let composer_context_bar = threadlane_ui_kit::composer_context_bar()
+            .child(project_chip).child(work_mode_chip).children(base_chip).child(skills_chip)
+            .children(branch.map(|branch| threadlane_ui_kit::composer_branch_label(branch, cx)));
 
         let queued_messages: Vec<(String, String)> = self
             .model
@@ -4629,263 +3452,127 @@ impl ChatListView {
             None => std::collections::HashSet::new(),
         };
         let queued_preview = (!queued_messages.is_empty()).then(|| {
-            div()
-                .debug_selector(|| "queued-messages-panel".into())
-                .w_full()
-                .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
-                .mx_auto()
-                .mb_2()
-                .rounded_lg()
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.title_bar)
-                .child(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_2()
-                        .text_xs()
-                        .child(div().text_color(theme.foreground).child("Queued Messages"))
-                        .child(
-                            Tag::new()
-                                .child(queued_messages.len().to_string())
-                                .with_variant(TagVariant::Secondary)
-                                .small(),
-                        )
-                        .child(
-                            div()
-                                .text_color(theme.muted_foreground)
-                                .child("Sends after agent finishes working"),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("queued-messages-list")
-                        .max_h(rems(10.0))
-                        .overflow_y_scrollbar()
-                        .children(queued_messages.into_iter().map(|(message_id, text)| {
-                            let entry_id = queued_entry_id(&message_id, queued_session_id.as_deref());
-                            let mut row = div()
-                                .debug_selector(|| "queued-message-row".into())
-                                .w_full()
-                                .min_w_0()
-                                .px_3()
-                                .py_2()
-                                .border_t_1()
-                                .border_color(theme.border)
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .text_sm()
-                                        .text_color(theme.foreground)
-                                        .child(text),
-                                );
-                            if let Some(entry_id) = entry_id {
-                                if queued_pending_removals.contains(&entry_id) {
-                                    row = row.child(
-                                        div()
-                                            .flex_none()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child("Removing…"),
+            let count = queued_messages.len();
+            let rows = queued_messages
+                .into_iter()
+                .map(|(message_id, text)| {
+                    let entry_id = queued_entry_id(&message_id, queued_session_id.as_deref());
+                    let removing = entry_id
+                        .as_ref()
+                        .is_some_and(|entry_id| queued_pending_removals.contains(entry_id));
+                    let mut actions = Vec::new();
+                    if let Some(entry_id) = entry_id.filter(|_| !removing) {
+                        let queued_steer_model = self.model.clone();
+                        let queued_edit_model = self.model.clone();
+                        let queued_remove_model = self.model.clone();
+                        let queued_edit_input = self.input_state.clone();
+                        let steer_entry_id = entry_id.clone();
+                        let remove_entry_id = entry_id.clone();
+                        actions.push(
+                            threadlane_ui_kit::queued_steer_button(
+                                &message_id,
+                                supports_live_steering,
+                                steer_tooltip,
+                            )
+                            .on_click(move |_event, _window, cx| {
+                                queued_steer_model.update(cx, |state, cx| {
+                                    controller::dispatch(
+                                        state,
+                                        AppAction::SteerQueuedMessage {
+                                            entry_id: steer_entry_id.clone(),
+                                        },
                                     );
-                                    return row;
-                                }
-                                let queued_steer_model = self.model.clone();
-                                let queued_edit_model = self.model.clone();
-                                let queued_remove_model = self.model.clone();
-                                let queued_edit_input = self.input_state.clone();
-                                let steer_entry_id = entry_id.clone();
-                                let remove_entry_id = entry_id.clone();
-                                row = row.child(
-                                    div()
-                                        .flex_none()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .child(
-                                            Button::new(format!("queued-steer-{message_id}"))
-                                                .debug_selector(|| "queued-steer".into())
-                                                .icon(IconName::ArrowRight)
-                                                .accessibility_label(
-                                                    "Steer current turn with this message",
-                                                )
-                                                .xsmall()
-                                                .ghost()
-                                                .disabled(!supports_live_steering)
-                                                .tooltip(steer_tooltip)
-                                                .on_click(move |_event, _window, cx| {
-                                                    queued_steer_model.update(cx, |state, cx| {
-                                                        controller::dispatch(
-                                                            state,
-                                                            AppAction::SteerQueuedMessage {
-                                                                entry_id: steer_entry_id.clone(),
-                                                            },
-                                                        );
-                                                        cx.notify();
-                                                    });
-                                                }),
-                                        )
-                                        .child(
-                                            Button::new(format!("queued-edit-{message_id}"))
-                                                .debug_selector(|| "queued-edit".into())
-                                                .icon(Icon::default().path("icons/square-pen.svg"))
-                                                .accessibility_label("Edit queued message")
-                                                .xsmall()
-                                                .ghost()
-                                                .tooltip("Edit message in the composer")
-                                                .on_click(cx.listener(
-                                                    move |this, _event, window, cx| {
-                                                        if !this
-                                                            .input_state
-                                                            .read(cx)
-                                                            .value()
-                                                            .is_empty()
-                                                            || !this.pasted_images.is_empty()
-                                                        {
-                                                            window.push_notification(
-                                                                Notification::info(
-                                                                    "Send or clear your draft before editing a message",
-                                                                ),
-                                                                cx,
-                                                            );
-                                                            this.focus_composer(window, cx);
-                                                            return;
-                                                        }
-                                                        let restored = queued_edit_model.update(
-                                                            cx,
-                                                            |state, cx| {
-                                                                let restored = state
-                                                                    .edit_queued_message(
-                                                                        &entry_id,
-                                                                    )
-                                                                    .map_err(|error| {
-                                                                        state.session_status =
-                                                                            Some(error);
-                                                                    })
-                                                                    .ok();
-                                                                cx.notify();
-                                                                restored
-                                                            },
-                                                        );
-                                                        if let Some((text, images)) = restored {
-                                                            this.prompt_recall = None;
-                                                            this.pasted_images.extend(images);
-                                                            queued_edit_input.update(
-                                                                cx,
-                                                                |input, cx| {
-                                                                    input.set_value(
-                                                                        text, window, cx,
-                                                                    );
-                                                                },
-                                                            );
-                                                        }
-                                                    },
-                                                )),
-                                        )
-                                        .child(
-                                            Button::new(format!("queued-remove-{message_id}"))
-                                                .debug_selector(|| "queued-remove".into())
-                                                .icon(IconName::Close)
-                                                .accessibility_label("Remove queued message")
-                                                .xsmall()
-                                                .ghost()
-                                                .tooltip("Remove from queue")
-                                                .on_click(move |_event, _window, cx| {
-                                                    queued_remove_model.update(cx, |state, cx| {
-                                                        controller::dispatch(
-                                                            state,
-                                                            AppAction::RemoveQueuedMessage {
-                                                                entry_id: remove_entry_id.clone(),
-                                                            },
-                                                        );
-                                                        cx.notify();
-                                                    });
-                                                }),
-                                        ),
-                                );
-                            }
-                            row
-                        })),
-                )
+                                    cx.notify();
+                                });
+                            })
+                            .into_any_element(),
+                        );
+                        actions.push(
+                            threadlane_ui_kit::queued_edit_button(&message_id)
+                                .on_click(cx.listener(move |this, _event, window, cx| {
+                                    if !this.input_state.read(cx).value().is_empty()
+                                        || !this.pasted_images.is_empty()
+                                    {
+                                        window.push_notification(
+                                            Notification::info(
+                                                "Send or clear your draft before editing a message",
+                                            ),
+                                            cx,
+                                        );
+                                        this.focus_composer(window, cx);
+                                        return;
+                                    }
+                                    let restored = queued_edit_model.update(cx, |state, cx| {
+                                        let restored = state
+                                            .edit_queued_message(&entry_id)
+                                            .map_err(|error| {
+                                                state.session_status = Some(error);
+                                            })
+                                            .ok();
+                                        cx.notify();
+                                        restored
+                                    });
+                                    if let Some((text, images)) = restored {
+                                        this.prompt_recall = None;
+                                        this.pasted_images.extend(images);
+                                        queued_edit_input.update(cx, |input, cx| {
+                                            input.set_value(text, window, cx);
+                                        });
+                                    }
+                                }))
+                                .into_any_element(),
+                        );
+                        actions.push(
+                            threadlane_ui_kit::queued_remove_button(&message_id)
+                                .on_click(move |_event, _window, cx| {
+                                    queued_remove_model.update(cx, |state, cx| {
+                                        controller::dispatch(
+                                            state,
+                                            AppAction::RemoveQueuedMessage {
+                                                entry_id: remove_entry_id.clone(),
+                                            },
+                                        );
+                                        cx.notify();
+                                    });
+                                })
+                                .into_any_element(),
+                        );
+                    }
+                    threadlane_ui_kit::queued_message_row(&message_id, text, removing, actions, cx)
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>();
+            threadlane_ui_kit::queued_message_panel(
+                format!(
+                    "queued-messages-list-{}",
+                    queued_session_id.as_deref().unwrap_or("new-task")
+                ),
+                count,
+                rows,
+                cx,
+            )
         });
         let pending_preview = pending_message.map(|text| {
-            div()
-                .debug_selector(|| "pending-preview-row".into())
-                .w_full()
-                .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
-                .mx_auto()
-                .mb_2()
-                .h(rems(3.25))
-                .px_3()
-                .rounded_lg()
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.title_bar)
-                .flex()
-                .items_center()
-                .gap_3()
-                .child(
-                    Tag::new()
-                        .child("Pending")
-                        .with_variant(TagVariant::Secondary)
-                        .small(),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_sm()
-                        .text_color(theme.foreground)
-                        .child(text),
-                )
-                .child(
-                    Button::new("queue-pending-message")
-                        .debug_selector(|| "pending-queue".into())
-                        .icon(IconName::Plus)
-                        .accessibility_label("Queue pending message")
-                        .xsmall()
-                        .secondary()
-                        .tooltip("Queue after the current response")
+            threadlane_ui_kit::pending_message_row(
+                text,
+                [
+                    threadlane_ui_kit::pending_queue_button()
                         .on_click(move |_event, _window, cx| {
                             queue_model.update(cx, |state, cx| {
                                 controller::dispatch(state, AppAction::QueuePendingMessage);
                                 cx.notify();
                             });
-                        }),
-                )
-                .child(
-                    Button::new("steer-pending-message")
-                        .debug_selector(|| "pending-steer".into())
-                        .icon(IconName::ArrowRight)
-                        .accessibility_label("Steer with pending message")
-                        .xsmall()
-                        .primary()
-                        .disabled(!supports_live_steering)
-                        .tooltip(steer_tooltip)
+                        })
+                        .into_any_element(),
+                    threadlane_ui_kit::pending_steer_button(supports_live_steering, steer_tooltip)
                         .on_click(move |_event, _window, cx| {
                             steer_model.update(cx, |state, cx| {
                                 controller::dispatch(state, AppAction::SteerPendingMessage);
                                 cx.notify();
                             });
-                        }),
-                )
-                .child(
-                    Button::new("dismiss-pending-message")
-                        .debug_selector(|| "pending-dismiss".into())
-                        .icon(IconName::Undo2)
-                        .accessibility_label("Edit pending message")
-                        .xsmall()
-                        .ghost()
-                        .tooltip("Edit message in the composer")
+                        })
+                        .into_any_element(),
+                    threadlane_ui_kit::pending_edit_button()
                         .on_click(cx.listener(move |this, _event, window, cx| {
                             let restored = dismiss_model.update(cx, |state, cx| {
                                 let restored =
@@ -4900,8 +3587,11 @@ impl ChatListView {
                                     input.set_value(restored, window, cx);
                                 });
                             }
-                        })),
-                )
+                        }))
+                        .into_any_element(),
+                ],
+                cx,
+            )
         });
 
         // The picker owns a per-open snapshot (model_picker.rs): one state
@@ -4910,11 +3600,11 @@ impl ChatListView {
         // keyboard cursor mid-open.
         let picker_owner = PickerOwner::capture(self.model.read(cx));
         if self.model_picker.is_none() || self.model_picker_owner.as_ref() != Some(&picker_owner) {
-            let delegate = ModelPickerDelegate::new(
+            let delegate = ModelPickerDelegate::new(model_picker::picker_sections(
                 &model_options,
                 &acp_model_sections,
                 &selected_model,
-            );
+            ));
             let picker_state =
                 cx.new(|cx| ComboboxState::new(delegate, Vec::new(), window, cx).searchable(true));
             self.model_picker_subscription = Some(cx.subscribe_in(
@@ -4943,11 +3633,11 @@ impl ChatListView {
             // Closed: track the live catalog. Swapping the delegate wholesale
             // keeps the snapshot consistent, and clearing the query makes
             // the next open land on the full list with the cursor on row one.
-            let delegate = ModelPickerDelegate::new(
+            let delegate = ModelPickerDelegate::new(model_picker::picker_sections(
                 &model_options,
                 &acp_model_sections,
                 &selected_model,
-            );
+            ));
             if let Some(picker_state) = self.model_picker.as_ref() {
                 picker_state.update(cx, |picker, cx| {
                     picker.set_items(delegate, window, cx);
@@ -4965,73 +3655,14 @@ impl ChatListView {
         let model_label_for_trigger = model_label.clone();
         let provider_icon = selected_option
             .as_ref()
-            .map(|option| option.provider.icon_path());
-        let picker_state_for_empty = picker_state.clone();
-        let model_picker = div().min_w_0().child(
-            Combobox::new(&picker_state)
-                .small()
-                .menu_width(rems(20.))
-                .menu_max_h(rems(20.))
-                .search_placeholder("Search models or agents…")
-                .disabled(!has_models)
-                .empty(move |_window, cx| {
-                    v_flex()
-                        .items_center()
-                        .gap_2()
-                        .py_6()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("No matching models")
-                        .child(
-                            Button::new("model-picker-clear-search")
-                                .small()
-                                .label("Clear search")
-                                .on_click({
-                                    let picker = picker_state_for_empty.clone();
-                                    move |_event, window, cx| {
-                                        picker.update(cx, |picker, cx| {
-                                            picker.set_query("", window, cx);
-                                        });
-                                    }
-                                }),
-                        )
-                })
-                .render_trigger(move |trigger, _window, _cx| {
-                    picker_open_flag.set(trigger.is_open());
-                    let button = Button::new("composer-model-picker")
-                        .debug_selector(|| "composer-model-picker".into())
-                        // Visual only — the combobox's own trigger owns
-                        // focus and activation.
-                        .tab_stop(false)
-                        .small()
-                        .label(model_label_for_trigger.clone())
-                        .accessibility_label(format!("Model: {model_label_for_trigger}"))
-                        .dropdown_caret(true)
-                        .ghost()
-                        .rounded_full()
-                        // The open popup reads as a held press on its trigger.
-                        .selected(trigger.is_open())
-                        .disabled(trigger.is_disabled())
-                        // Long agent model names ("Claude Code · Opus 4.8 with
-                        // 1M context") must not squeeze Send off the composer
-                        // row: cap the width, the full label stays in the
-                        // tooltip.
-                        .max_w(rems(12.5))
-                        .tooltip(if has_models {
-                            format!("Model: {model_label_for_trigger}")
-                        } else {
-                            "No models available — connect a provider in Settings".to_string()
-                        });
-                    button.when_some(provider_icon, |button, icon| {
-                        button.icon(Icon::default().path(icon))
-                    })
-                })
-                // The inner Button carries the pill look; the frame only
-                // needs the focus ring, so clear its own chrome.
-                .h_7()
-                .border_0()
-                .rounded_full()
-                .bg(cx.theme().transparent)
-                .max_w(rems(12.5)),
+            .map(|option| SharedString::from(option.provider.icon_path()));
+        let model_picker = threadlane_ui_kit::composer_model_picker(
+            &picker_state,
+            model_label_for_trigger,
+            has_models,
+            provider_icon,
+            move |open| picker_open_flag.set(open),
+            cx,
         );
 
         let effort_model = self.model.clone();
@@ -5041,15 +3672,7 @@ impl ChatListView {
         // offer no effort control instead of dead options.
         let show_effort_picker =
             threadlane_daemon::catalog::supports_reasoning(&selected_model, project_root.as_deref());
-        let effort_picker = Button::new("composer-reasoning-effort-picker")
-            .debug_selector(|| "composer-reasoning-effort-picker".into())
-            .icon(Icon::default().path("icons/effort.svg"))
-            .label(reasoning_effort.label())
-            .accessibility_label(format!("Reasoning effort: {}", reasoning_effort.label()))
-            .tooltip(format!("Reasoning effort: {}", reasoning_effort.label()))
-            .dropdown_caret(true)
-            .ghost()
-            .rounded_full()
+        let effort_picker = threadlane_ui_kit::composer_effort_button(reasoning_effort.label())
             .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, window, _cx| {
                 let menu = menu.check_side(gpui_component::Side::Right);
                 effort_options
@@ -5084,20 +3707,7 @@ impl ChatListView {
         // frontier-main + sidekick lanes.
         let mode_model = self.model.clone();
         let has_mode_project = self.model.read(cx).active_work_dir.is_some();
-        let mode_picker = Button::new("composer-mode-picker")
-            .debug_selector(|| "composer-mode-picker".into())
-            .small()
-            .label(orchestrator_mode.label())
-            .accessibility_label(format!("Mode: {}", orchestrator_mode.label()))
-            .tooltip(if has_mode_project {
-                "Session mode: Agent or Fusion".to_string()
-            } else {
-                "Attach a project to switch session modes".to_string()
-            })
-            .dropdown_caret(true)
-            .ghost()
-            .rounded_full()
-            .disabled(!has_mode_project)
+        let mode_picker = threadlane_ui_kit::composer_mode_button(orchestrator_mode.label(), has_mode_project)
             .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, _window, _cx| {
                 let menu = menu.check_side(gpui_component::Side::Right);
                 [
@@ -5317,169 +3927,17 @@ impl ChatListView {
             },
             !threadlane_acp_engine::is_acp_model(&selected_model),
         );
-        let displayed_percent = meter.percent.unwrap_or_default();
         let context_percent_label = meter.percent.map(|percent| format!("{percent:.0}%"));
-        let meter_color = if meter.percent.is_none() || displayed_percent == 0.0 {
-            theme.muted_foreground
-        } else if displayed_percent >= CONTEXT_METER_DANGER_PCT {
-            theme.danger
-        } else if displayed_percent >= CONTEXT_METER_WARN_PCT {
-            theme.warning
-        } else {
-            theme.accent
-        };
         let subagent_popover = self.render_subagent_popover(cx);
-        let context_meter_open = self.context_meter_open;
-        let toggle_context_meter = cx.entity();
-        let sync_context_meter = cx.entity();
-        let context_meter = Popover::new("context-window-popover")
-            .anchor(Anchor::BottomRight)
-            .appearance(false)
-            .open(context_meter_open)
-            .on_open_change(move |open, _window, cx| {
-                sync_context_meter.update(cx, |this, cx| {
-                    if this.context_meter_open != *open {
-                        this.context_meter_open = *open;
-                        cx.notify();
-                    }
+        let sync_context_meter = cx.entity().downgrade();
+        let context_meter = threadlane_ui_kit::context_meter::context_meter_popover(
+            meter, self.context_meter_open,
+            move |open, _, cx| {
+                let _ = sync_context_meter.update(cx, |this, cx| {
+                    if this.context_meter_open != *open { this.context_meter_open = *open; cx.notify(); }
                 });
-            })
-            .trigger(ContextMeterTrigger {
-                selected: context_meter_open,
-                toggle: Toggle::new("context-meter-badge")
-                    .ghost()
-                    .rounded_full()
-                    .size_8()
-                    .text_color(theme.muted_foreground)
-                    .tooltip(meter.detail_label.clone())
-                    .when_some(meter.percent, |toggle, percent| toggle.child(
-                        ProgressCircle::new("context-meter-circle").relative()
-                            .value(percent.clamp(0.0, 100.0) as f32)
-                            .color(meter_color)
-                            .size_6(),
-                    ))
-                    .when(meter.percent.is_none(), |toggle| toggle.child("—"))
-                    .on_click(move |open, _window, cx| {
-                        toggle_context_meter.update(cx, |this, cx| {
-                            this.context_meter_open = *open;
-                            cx.notify();
-                        });
-                    }),
-            })
-            .content(move |_state, _window, _cx| {
-                let bar_width = meter.bar_percent / 100.0 * 308.0;
-                let current_summary = match meter.percent {
-                    Some(percent) => format!(
-                        "{percent:.0}% · {}{}",
-                        meter.current_label,
-                        if meter.provisional {
-                            " · provisional"
-                        } else {
-                            ""
-                        }
-                    ),
-                    None => meter.current_label.clone(),
-                };
-                div()
-                    .w(rems(21.25))
-                    .p_4()
-                    .rounded_xl()
-                    .border_1()
-                    .border_color(theme.border.opacity(0.8))
-                    .bg(theme.popover)
-                    .shadow_lg()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex()
-                            .justify_between()
-                            .items_center()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.foreground)
-                                    .child("Current context"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(theme.muted_foreground)
-                                    .child(current_summary),
-                            ),
-                    )
-                    .when(meter.percent.is_some(), |card| card.child(
-                        div()
-                            .w_full()
-                            .h(rems(0.3125))
-                            .rounded_full()
-                            .bg(theme.muted.opacity(0.8))
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(px(bar_width as f32))
-                                    .rounded_full()
-                                    .bg(meter_color),
-                            ),
-                    ))
-                    .when_some(meter.effective_model.clone(), |card, effective_model| {
-                        card.child(
-                            div()
-                                .flex()
-                                .justify_between()
-                                .items_center()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child("Model")
-                                .child(effective_model),
-                        )
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .justify_between()
-                            .items_center()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child("Total processed")
-                            .child(meter.total_processed_label.clone()),
-                    )
-                    .when_some(meter.cache_hit_label.clone(), |card, cache_hit| {
-                        card.child(
-                            div()
-                                .flex()
-                                .justify_between()
-                                .items_center()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child("Cache hit")
-                                .child(cache_hit),
-                        )
-                    })
-                    .when_some(meter.last_compaction_seq, |card, sequence| {
-                        card.child(
-                            div()
-                                .flex()
-                                .justify_between()
-                                .items_center()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child("Last compacted")
-                                .child(format!("Record #{sequence}")),
-                        )
-                    })
-                    .child(
-                        div()
-                            .pt_2()
-                            .border_t_1()
-                            .border_color(theme.border.opacity(0.4))
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child("Context is compacted automatically when needed. Percent reflects the current model request."),
-                    )
-            });
+            }, cx,
+        );
 
         let stashed_draft = active_session_id
             .as_ref()
@@ -5493,132 +3951,67 @@ impl ChatListView {
             let restore_session_id = stash_session_id.clone();
             let dismiss_model = stash_model.clone();
             let dismiss_session_id = stash_session_id.clone();
-            let preview_text = truncate_preview_text(&draft, 60);
-            div()
-                .w_full()
-                .mb_2()
-                .px_3()
-                .py_2()
-                .rounded_lg()
-                .border_1()
-                .border_color(theme.accent.opacity(0.3))
-                .bg(theme.accent.opacity(0.1))
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .flex_1()
-                        .min_w_0()
-                        .child(IconName::File)
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.foreground)
-                                .truncate()
-                                // Full draft in the tooltip: restoring blind
-                                // just to read it, then re-stashing, is gone.
-                                .id("stashed-draft-preview")
-                                .tooltip({
-                                    let tip = format!("Stashed draft:\n{draft}");
-                                    move |window, cx| {
-                                        gpui_component::tooltip::Tooltip::new(tip.clone())
-                                            .build(window, cx)
+            threadlane_ui_kit::saved_draft_banner(
+                &draft,
+                threadlane_ui_kit::restore_saved_draft_button().on_click(cx.listener(
+                    move |this, _event, window, cx| {
+                        if !restore_input.read(cx).value().is_empty() || !this.pasted_images.is_empty()
+                        {
+                            window.push_notification(
+                                Notification::info(
+                                    "Send or clear your draft before restoring the saved draft",
+                                ),
+                                cx,
+                            );
+                            this.focus_composer(window, cx);
+                            return;
+                        }
+                        if let Some(session_id) = &restore_session_id {
+                            if let Some(text) = restore_model.update(cx, |state, cx| {
+                                let popped = state.pop_stashed_prompt(session_id);
+                                cx.notify();
+                                popped
+                            }) {
+                                this.prompt_recall = None;
+                                restore_input.update(cx, |input, cx| {
+                                    input.set_value(text, window, cx);
+                                });
+                            }
+                            this.focus_composer(window, cx);
+                        }
+                    },
+                )),
+                threadlane_ui_kit::discard_saved_draft_button().on_click(move |_event, window, cx| {
+                    let Some(session_id) = dismiss_session_id.clone() else {
+                        return;
+                    };
+                    let Some(draft) = dismiss_model
+                        .read(cx)
+                        .get_stashed_prompt(&session_id)
+                        .cloned()
+                    else {
+                        return;
+                    };
+                    let model = dismiss_model.clone();
+                    window.open_alert_dialog(cx, move |alert, _, _| {
+                        let model = model.clone();
+                        let session_id = session_id.clone();
+                        let draft = draft.clone();
+                        threadlane_ui_kit::discard_saved_draft_dialog(alert, draft.clone()).on_ok(
+                            move |_, _, cx| {
+                                model.update(cx, |state, cx| {
+                                    if state.get_stashed_prompt(&session_id) == Some(&draft) {
+                                        state.clear_stashed_prompt(&session_id);
+                                        cx.notify();
                                     }
-                                })
-                                .child(format!("Stashed draft: \"{preview_text}\"")),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            Button::new("restore-stashed-draft")
-                                .label("Restore draft")
-                                .small()
-                                .primary()
-                                .debug_selector(|| "restore-stashed-draft".into())
-                                .on_click(cx.listener(move |this, _event, window, cx| {
-                                    if !restore_input.read(cx).value().is_empty()
-                                        || !this.pasted_images.is_empty()
-                                    {
-                                        window.push_notification(
-                                            Notification::info(
-                                                "Send or clear your draft before restoring the saved draft",
-                                            ),
-                                            cx,
-                                        );
-                                        this.focus_composer(window, cx);
-                                        return;
-                                    }
-                                    if let Some(session_id) = &restore_session_id {
-                                        if let Some(text) = restore_model.update(cx, |state, cx| {
-                                            let popped = state.pop_stashed_prompt(session_id);
-                                            cx.notify();
-                                            popped
-                                        }) {
-                                            this.prompt_recall = None;
-                                            restore_input.update(cx, |input, cx| {
-                                                input.set_value(text, window, cx);
-                                            });
-                                        }
-                                        this.focus_composer(window, cx);
-                                    }
-                                })),
+                                });
+                                true
+                            },
                         )
-                        .child(
-                            Button::new("dismiss-stashed-draft")
-                                .icon(IconName::Close)
-                                .accessibility_label("Discard stashed draft")
-                                .ghost()
-                                .xsmall()
-                                .tooltip("Discard saved draft…")
-                                .debug_selector(|| "discard-stashed-draft".into())
-                                .on_click(move |_event, window, cx| {
-                                    let Some(session_id) = dismiss_session_id.clone() else {
-                                        return;
-                                    };
-                                    let Some(draft) = dismiss_model.read(cx)
-                                        .get_stashed_prompt(&session_id).cloned() else {
-                                        return;
-                                    };
-                                    let model = dismiss_model.clone();
-                                    window.open_alert_dialog(cx, move |alert, _, _| {
-                                        let model = model.clone();
-                                        let session_id = session_id.clone();
-                                        let draft = draft.clone();
-                                        alert
-                                            .title("Discard saved draft?")
-                                            .description("This removes the saved draft. Your current composer text and attachments will not change.")
-                                            .child(
-                                                div().max_h(rems(8.0)).overflow_y_scrollbar()
-                                                    .text_sm().child(draft.clone()),
-                                            )
-                                            .button_props(
-                                                gpui_component::dialog::DialogButtonProps::default()
-                                                    .ok_text("Discard")
-                                                    .ok_variant(gpui_component::button::ButtonVariant::Danger)
-                                                    .show_cancel(true),
-                                            )
-                                            .on_ok(move |_, _, cx| {
-                                                model.update(cx, |state, cx| {
-                                                    if state.get_stashed_prompt(&session_id) == Some(&draft) {
-                                                        state.clear_stashed_prompt(&session_id);
-                                                        cx.notify();
-                                                    }
-                                                });
-                                                true
-                                            })
-                                    });
-                                }),
-                        ),
-                )
+                    });
+                }),
+                cx,
+            )
         });
 
         let stash_button = {
@@ -5626,30 +4019,22 @@ impl ChatListView {
             let do_stash_model = self.model.clone();
             let do_stash_session_id = active_session_id.clone();
             let stash_unavailable_reason = if is_generating {
-                Some("Wait for the current turn to finish before stashing a draft")
+                Some("Wait for the current turn to finish before saving a draft")
             } else if active_session_id.is_none() {
-                Some("Start a task before stashing a draft")
+                Some("Start a task before saving a draft")
             } else if active_session_id
                 .as_ref()
                 .is_some_and(|id| self.model.read(cx).get_stashed_prompt(id).is_some())
             {
-                Some("Restore or discard the saved draft before stashing another")
+                Some("Restore or discard the saved draft before saving another")
             } else if !self.pasted_images.is_empty() {
-                Some("Draft stashes support text only; remove attached images first")
+                Some("Saved drafts support text only; remove attached images first")
             } else if !has_composer_text {
-                Some("Type a message to stash")
+                Some("Type a message to save")
             } else {
                 None
             };
-            Button::new("stash-prompt-btn")
-                .debug_selector(|| "stash-prompt-btn".into())
-                .icon(IconName::Folder)
-                .accessibility_label("Stash draft")
-                .tooltip(stash_unavailable_reason.unwrap_or("Stash draft"))
-                .ghost()
-                .small()
-                .rounded_lg()
-                .disabled(stash_unavailable_reason.is_some())
+            threadlane_ui_kit::save_draft_button(stash_unavailable_reason)
                 .on_click(move |_event, window, cx| {
                     if let Some(session_id) = &do_stash_session_id {
                         let text = do_stash_input.read(cx).value().to_string();
@@ -5681,15 +4066,7 @@ impl ChatListView {
             } else {
                 self.prompt_recall_block_reason(has_composer_text, cx)
             };
-            Button::new("prompt-recall-btn")
-                .debug_selector(|| "prompt-recall-btn".into())
-                .icon(IconName::Undo2)
-                .accessibility_label("Recall previous prompt")
-                .tooltip(recall_unavailable_reason.unwrap_or("Recall previous prompt (Up)"))
-                .ghost()
-                .small()
-                .rounded_lg()
-                .disabled(recall_unavailable_reason.is_some())
+            threadlane_ui_kit::recall_prompt_button(recall_unavailable_reason)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.step_prompt_recall(true, window, cx);
                     this.focus_composer(window, cx);
@@ -5819,17 +4196,7 @@ impl ChatListView {
                     )
             });
 
-        div()
-            .w_full()
-            .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
-            .mx_auto()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .px_5()
-            .pt_2()
-            .pb_4()
-            .bg(theme.background)
+        threadlane_ui_kit::composer_container(cx)
             .children(provider_setup_banner)
             .children(setup_card)
             .children(session_status.map(|status| {
@@ -5866,7 +4233,9 @@ impl ChatListView {
             .children(queued_preview)
             .child(composer_context_bar)
             .child(
-                threadlane_ui_session::composer_surface(cx)
+                threadlane_ui_kit::composer_surface(
+                    self.input_state.read(cx).focus_handle(cx).is_focused(window), cx,
+                )
                     .on_action(cx.listener(Self::paste_composer_clipboard))
                     .map(|composer| {
                         let mut contexts = String::new();
@@ -5908,7 +4277,7 @@ impl ChatListView {
                     }))
                     .children(
                         (!image_chips.is_empty())
-                            .then(|| div().flex().flex_wrap().gap_2().children(image_chips)),
+                            .then(|| threadlane_ui_kit::composer_attachment_group().children(image_chips)),
                     )
                     .child(command_menu)
                     .child(file_menu)
@@ -5918,37 +4287,20 @@ impl ChatListView {
                             .flex_1()
                             .min_h_6()
                             .child(
-                                threadlane_ui_session::composer_input(&self.input_state),
+                                threadlane_ui_kit::composer_input(&self.input_state),
                             ),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .flex_wrap()
-                            .mt_2()
-                            .pt_2p5()
-                            .border_t_1()
-                            .border_color(theme.border.opacity(0.22))
+                        threadlane_ui_kit::composer_toolbar(cx)
                             .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .min_w_0()
-                                    .flex_wrap()
+                                threadlane_ui_kit::composer_picker_group()
                                     .child(model_picker)
                                     .child(mode_picker)
                                     .children(show_effort_picker.then_some(effort_picker)),
                             )
                             .child(div().flex_1().min_w_2())
                             .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .flex_wrap()
+                                threadlane_ui_kit::composer_actions_group()
                                     .child(stash_button)
                                     .child(prompt_recall_button)
                                     .children(subagent_popover)
@@ -5960,7 +4312,9 @@ impl ChatListView {
                                     }))
                                     .child(context_meter)
                                     .child({
-                                        let send_hint = if needs_provider {
+                                        let send_hint = if preparing_worktree {
+                                            "Wait for worktree setup to finish before sending"
+                                        } else if needs_provider {
                                             "Connect a model provider in Settings before sending"
                                         } else if !has_prompt {
                                             "Type a message to send"
@@ -5969,15 +4323,7 @@ impl ChatListView {
                                         } else {
                                             "Send message (Enter)"
                                         };
-                                        Button::new("send-btn")
-                                            .debug_selector(|| "send-btn".into())
-                                            .size_8()
-                                            .rounded_full()
-                                            .icon(IconName::ArrowUp)
-                                            .accessibility_label(send_hint)
-                                            .tooltip(send_hint)
-                                            .when(has_prompt && !needs_provider, |b| b.primary())
-                                            .when(!has_prompt || needs_provider || self.model.read(cx).active_worktree_setup().is_some(), |b| b.ghost().disabled(true))
+                                        threadlane_ui_kit::composer_send_button(is_generating, has_prompt && !needs_provider && !preparing_worktree, send_hint)
                                             .on_click(cx.listener(move |this, _event, window, cx| {
                                                 let text = send_input.read(cx).value().to_string();
                                                 if !text.trim().is_empty()
@@ -6026,6 +4372,9 @@ impl ChatListView {
                                     })),
                             ),
                     ),
+            )
+            .child(
+                threadlane_ui_kit::composer_shortcuts(composer_shortcut_hint, cx),
             )
     }
 }
@@ -6412,16 +4761,7 @@ impl Render for ChatListView {
             && !is_new_task
             && self.model.read(cx).active_work_dir.is_some();
 
-        div()
-            .relative()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .h_full()
-            .min_w_0()
-            .min_h_0()
-            .bg(theme.background)
-            .id("conversation-surface")
+        threadlane_ui_kit::conversation_surface(cx)
             .when(self.current_tab == CentralTab::Chat, |el| el
                 .role(Role::Group).track_focus(&self.chat_focus)
                 .key_context(if self.find_open { "Conversation ConversationFindActive" } else { "Conversation" })
@@ -6440,34 +4780,12 @@ impl Render for ChatListView {
                     .min_w_0()
                     .justify_center()
                     .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .w_full()
-                            // Scrollable gutters keep cards clear of the rail and Environment.
-                            .max_w(rems(
-                                CHAT_CONTENT_MAX_WIDTH
-                                    + if show_environment { 4.0 } else { 0.0 },
-                            ))
-                            .min_h_0()
-                            .min_w_0()
+                        threadlane_ui_kit::conversation_column(show_environment)
                             .children(
                                 (self.current_tab == CentralTab::Chat && !is_generating)
                                     .then(|| self.model.read(cx).active_run_elapsed_seconds())
                                     .flatten()
-                                    .map(|seconds| {
-                                        let label =
-                                            format!("Last run · {}", format_run_elapsed(seconds));
-                                        div()
-                                            .id("last-run-duration")
-                                            .role(Role::Status)
-                                            .aria_label(label.clone())
-                                            .px_4()
-                                            .py_1()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(label)
-                                    }),
+                                    .map(|seconds| threadlane_ui_kit::last_run_duration(seconds, cx)),
                             )
                             .child(match self.current_tab {
                                 CentralTab::Editor => self.editor.clone().into_any_element(),
@@ -6493,69 +4811,16 @@ impl Render for ChatListView {
                                         // same new-task hero wherever it appears.
                                         self.render_new_task(cx)
                                     } else {
-                                        div()
-                                            .id("chat-transcript-container")
-                                            .relative()
-                                            .flex()
-                                            .gap_2()
-                                            .w_full()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .min_h_0()
-                                            .child(self.render_prompt_rail(cx))
-                                            .child(
-                                                div()
-                                                    .debug_selector(|| "chat-transcript-viewport".into())
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .h_full()
-                                                    .child(
-                                                        threadlane_ui_session::transcript_list(&self.transcript, cx.processor(Self::render_transcript_row))
-                                                            .when(show_environment, |el| el.px_8()),
-                                                    ),
-                                            )
-                                            .child(div().absolute().inset_0().child(
-                                                gpui_component::scroll::Scrollbar::vertical(
-                                                    &self.transcript.list,
-                                                ),
-                                            ))
-                                            .when(
-                                                !self.transcript.list.is_following_tail(),
-                                                |el| {
-                                                    el.child(
-                                                        div()
-                                                            .absolute()
-                                                            .bottom_3()
-                                                            .right_4()
-                                                            .child(
-                                                            Button::new("jump-to-latest")
-                                                                .debug_selector(|| {
-                                                                    "jump-to-latest".into()
-                                                                })
-                                                                .icon(IconName::ArrowDown)
-                                                                .size_8()
-                                                                .secondary()
-                                                                .rounded_full()
-                                                                .shadow_md()
-                                                                .accessibility_label(
-                                                                    "Jump to latest message",
-                                                                )
-                                                                .tooltip(
-                                                                    "Scroll to the latest message",
-                                                                )
-                                                                .on_click(cx.listener(
-                                                                    |this, _, _, cx| {
-                                                                        this.outline_selected_id = None;
-                                                                        this.transcript.list
-                                                                            .scroll_to_end();
-                                                                        cx.notify();
-                                                                    },
-                                                                )),
-                                                        ),
-                                                    )
-                                                },
-                                            )
-                                            .into_any_element()
+                                        let rail = self.render_prompt_rail(cx);
+                                        let transcript = threadlane_ui_kit::transcript_list(&self.transcript, cx.processor(Self::render_transcript_row));
+                                        threadlane_ui_kit::conversation_transcript_viewport(
+                                            rail, transcript, &self.transcript.list, show_environment,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.outline_selected_id = None;
+                                                this.transcript.list.scroll_to_end();
+                                                cx.notify();
+                                            }),
+                                        ).into_any_element()
                                     }
                                 }
                             })

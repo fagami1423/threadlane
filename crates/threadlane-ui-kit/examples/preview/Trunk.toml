@@ -1,0 +1,10 @@
+[build]
+target = "index.html"
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8080
+headers = { "Cross-Origin-Embedder-Policy" = "require-corp", "Cross-Origin-Opener-Policy" = "same-origin" }
+
+[watch]
+watch = [".", "../../src", "../../../threadlane-ui-theme/src", "../../../threadlane-ui-theme/themes", "../../../threadlane-ui-theme/assets/fonts"]

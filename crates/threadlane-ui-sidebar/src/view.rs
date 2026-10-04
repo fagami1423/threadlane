@@ -1,3 +1,4 @@
+use threadlane_ui_kit::DateGroup;
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -7,15 +8,10 @@ use gpui::InteractiveElement;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 
-use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
-use gpui_component::checkbox::Checkbox;
-use gpui_component::dialog::DialogButtonProps;
-use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::progress::Progress;
-use gpui_component::spinner::Spinner;
 use gpui_component::theme::ActiveTheme;
-use gpui_component::tooltip::Tooltip;
-use gpui_component::{Disableable, Icon, IconName, Selectable, Sizable, StyledExt, WindowExt};
+use gpui_component::{Disableable, Icon, Sizable, WindowExt};
 
 use threadlane_ui_state::{
     snooze_return_label, AppState, GitHubTab, SessionAttention, SessionInfo, SessionSnooze,
@@ -24,76 +20,7 @@ use threadlane_ui_state::{
 use threadlane_ui_state::{actions::AppAction, controller};
 use threadlane_updater::UpdateStatus;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SessionRemovalKind {
-    Archive,
-    Remove,
-}
-
-impl SessionRemovalKind {
-    fn title(self) -> &'static str {
-        match self {
-            Self::Archive => "Archive session?",
-            Self::Remove => "Remove session?",
-        }
-    }
-
-    fn description(self, title: &str, project: &str, worktree_note: Option<&str>) -> String {
-        let base = match self {
-            // Archive hides the session from the list but keeps its
-            // transcript in the archive; Remove destroys it permanently.
-            Self::Archive => format!(
-                "“{title}” ({project}) will leave the active list. Its transcript stays in the archive."
-            ),
-            Self::Remove => {
-                format!("“{title}” ({project}) will be permanently deleted, transcript included.")
-            }
-        };
-        match worktree_note {
-            Some(note) => format!("{base}\n{note}"),
-            None => base,
-        }
-    }
-
-    fn action_prefix(self) -> &'static str {
-        match self {
-            Self::Archive => "archive",
-            Self::Remove => "remove",
-        }
-    }
-
-    fn button_props(self) -> DialogButtonProps {
-        match self {
-            Self::Archive => DialogButtonProps::default()
-                .ok_text("Archive")
-                .show_cancel(true),
-            Self::Remove => DialogButtonProps::default()
-                .ok_text("Remove")
-                .ok_variant(ButtonVariant::Danger)
-                .show_cancel(true),
-        }
-    }
-
-    fn dispatch_action(
-        self,
-        work_dir: PathBuf,
-        session_id: String,
-        delete_worktree: bool,
-    ) -> AppAction {
-        match self {
-            Self::Archive => AppAction::SettleSession {
-                work_dir,
-                session_id,
-                delete_worktree,
-            },
-            Self::Remove => AppAction::RemoveSession {
-                work_dir,
-                session_id,
-                delete_worktree,
-            },
-        }
-    }
-}
+use threadlane_ui_kit::SidebarSessionRemoval as SessionRemovalKind;
 
 fn open_session_removal_dialog(
     window: &mut Window,
@@ -131,48 +58,28 @@ fn open_session_removal_dialog(
                         .map(|session| (session.title.clone(), project.name.clone()))
                 })
                 .unwrap_or_else(|| ("Untitled session".into(), "project".into()));
-            let worktree_note = is_worktree.then(|| {
-                let branch = git_branch
-                    .as_deref()
-                    .map(|branch| format!(" on branch '{branch}'"))
-                    .unwrap_or_default();
-                if delete_worktree.get() {
-                    format!("Its worktree{branch} will be deleted too. Uncheck below to keep it.")
-                } else {
-                    format!("Its worktree{branch} will be kept.")
-                }
-            });
-            let mut alert = alert
-                .title(kind.title())
-                .description(kind.description(&title, &project_name, worktree_note.as_deref()))
-                .button_props(kind.button_props());
-
-            if is_worktree {
-                let delete_worktree_click = delete_worktree.clone();
-                let model_click = model.clone();
-                let label = if let Some(branch) = &git_branch {
-                    format!("Delete associated worktree ({branch})")
-                } else {
-                    "Delete associated worktree".to_string()
-                };
-                alert = alert.child(
-                    div().pt_2().child(
-                        Checkbox::new(SharedString::from(format!(
-                            "{}-delete-worktree-{}",
-                            kind.action_prefix(),
-                            session_id
-                        )))
-                        .checked(delete_worktree.get())
-                        .label(label)
-                        .on_click(move |checked, _window, cx| {
-                            delete_worktree_click.set(*checked);
-                            model_click.update(cx, |_state, cx| {
-                                cx.notify();
-                            });
-                        }),
-                    ),
-                );
-            }
+            let target = threadlane_ui_kit::SidebarSessionRemovalTarget::new(
+                &session_id,
+                title,
+                project_name,
+            );
+            let target = if is_worktree {
+                target.worktree(git_branch.clone())
+            } else {
+                target
+            };
+            let toggle = delete_worktree.clone();
+            let toggle_model = model.clone();
+            let alert = threadlane_ui_kit::sidebar_session_removal_dialog(
+                alert,
+                kind,
+                &target,
+                delete_worktree.get(),
+                move |checked, _, cx| {
+                    toggle.set(checked);
+                    toggle_model.update(cx, |_, cx| cx.notify());
+                },
+            );
 
             alert.on_ok(move |_event, _window, cx| {
                 let delete_worktree_val = if is_worktree {
@@ -183,11 +90,18 @@ fn open_session_removal_dialog(
                 model.update(cx, |state, cx| {
                     controller::dispatch(
                         state,
-                        kind.dispatch_action(
-                            work_dir.clone(),
-                            session_id.clone(),
-                            delete_worktree_val,
-                        ),
+                        match kind {
+                            SessionRemovalKind::Archive => AppAction::SettleSession {
+                                work_dir: work_dir.clone(),
+                                session_id: session_id.clone(),
+                                delete_worktree: delete_worktree_val,
+                            },
+                            SessionRemovalKind::Remove => AppAction::RemoveSession {
+                                work_dir: work_dir.clone(),
+                                session_id: session_id.clone(),
+                                delete_worktree: delete_worktree_val,
+                            },
+                        },
                     );
                     cx.notify();
                 });
@@ -321,19 +235,6 @@ fn build_diagnostic_export(
     }))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DateGroup {
-    Pinned,
-    NeedsYou,
-    Working,
-    Today,
-    Yesterday,
-    ThisWeek,
-    Older,
-    /// Confirmed snoozes live below every date group, ordered by return
-    /// time. Pending (unconfirmed) snoozes stay in their normal group.
-    Snoozed,
-}
 
 #[derive(Clone)]
 enum HistoryRow {
@@ -475,35 +376,6 @@ fn flatten_history_sessions_with_pins(
     rows
 }
 
-impl DateGroup {
-    const COUNT: usize = 8;
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Pinned => "Pinned",
-            Self::NeedsYou => "Needs you",
-            Self::Working => "Working",
-            Self::Today => "Today",
-            Self::Yesterday => "Yesterday",
-            Self::ThisWeek => "This Week",
-            Self::Older => "Older",
-            Self::Snoozed => "Snoozed",
-        }
-    }
-
-    fn rank(self) -> u8 {
-        match self {
-            Self::Pinned => 0,
-            Self::NeedsYou => 1,
-            Self::Working => 2,
-            Self::Today => 3,
-            Self::Yesterday => 4,
-            Self::ThisWeek => 5,
-            Self::Older => 6,
-            Self::Snoozed => 7,
-        }
-    }
-}
 
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
@@ -512,51 +384,8 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
-/// Callers pass a shared `now` so a render pass performs one clock read
-/// instead of one per row.
-fn get_date_group(timestamp: u64, now: u64) -> DateGroup {
-    let seconds = now.saturating_sub(timestamp);
-    if seconds < 86400 {
-        DateGroup::Today
-    } else if seconds < 172800 {
-        DateGroup::Yesterday
-    } else if seconds < 604800 {
-        DateGroup::ThisWeek
-    } else {
-        DateGroup::Older
-    }
-}
 
-fn history_group(attention: SessionAttention, timestamp: u64, now: u64) -> DateGroup {
-    match attention {
-        SessionAttention::NeedsYou => DateGroup::NeedsYou,
-        SessionAttention::Working => DateGroup::Working,
-        SessionAttention::Ready | SessionAttention::Idle => get_date_group(timestamp, now),
-    }
-}
-
-fn history_group_with_pin(
-    is_pinned: bool,
-    attention: SessionAttention,
-    timestamp: u64,
-    now: u64,
-) -> DateGroup {
-    if is_pinned {
-        DateGroup::Pinned
-    } else {
-        history_group(attention, timestamp, now)
-    }
-}
-
-fn format_time_ago(timestamp: u64, now: u64) -> String {
-    let seconds = now.saturating_sub(timestamp);
-    match seconds {
-        0..=59 => "Just now".to_string(),
-        60..=3599 => format!("{}m ago", seconds / 60),
-        3600..=86399 => format!("{}h ago", seconds / 3600),
-        _ => format!("{}d ago", seconds / 86400),
-    }
-}
+use threadlane_ui_kit::session_history_group as history_group_with_pin;
 
 fn update_control_label(status: &UpdateStatus) -> Option<String> {
     Some(match status {
@@ -634,7 +463,10 @@ fn sidebar_session_fingerprint(
     hasher.finish()
 }
 
-use threadlane_ui_session::session_identity as sidebar_session_identity;
+#[cfg(test)]
+use threadlane_ui_kit::session_identity as sidebar_session_identity;
+#[cfg(test)]
+use threadlane_ui_kit::{sidebar_pr_status_label as pr_status_label, sidebar_pr_status_tooltip as pr_status_tooltip, session_time_ago as format_time_ago};
 
 /// Hash of every piece of `AppState` the sidebar renders. Streaming deltas
 /// mutate messages, plans, and usage without touching any of these fields, so
@@ -738,151 +570,262 @@ fn session_pr_info<'a>(
         .and_then(Option::as_ref)
 }
 
-fn pr_status_label(pr: &threadlane_git::GitHubPrInfo) -> &'static str {
-    if pr.state.eq_ignore_ascii_case("merged") {
-        "Merged"
-    } else if pr.is_draft || pr.state.eq_ignore_ascii_case("draft") {
-        "Draft"
-    } else if pr.state.eq_ignore_ascii_case("closed") {
-        "Closed"
-    } else {
-        "Open"
-    }
+fn export_sidebar_session(
+    model: Entity<AppState>,
+    session: &SessionInfo,
+    include_log: bool,
+    cx: &mut App,
+) {
+    let source = session.session_file.clone();
+    let session_id = session.id.clone();
+    let title = session.title.clone();
+    let work_dir = session.work_dir.clone();
+    let (trajectory, runtime) = model.update(cx, |state, _cx| {
+        (
+            state.session_trajectory(&session_id).to_vec(),
+            Some(state.ensure_session_runtime(work_dir.clone(), source.clone())),
+        )
+    });
+    cx.spawn(async move |cx| {
+        let default_name = format!(
+            "{}-{}.json",
+            safe_file_stem(&title),
+            if include_log {
+                "session-diagnostics"
+            } else {
+                "trajectory"
+            }
+        );
+        let Some(destination) = rfd::AsyncFileDialog::new()
+            .set_file_name(&default_name)
+            .save_file()
+            .await
+        else {
+            return;
+        };
+        // Blocking file + JSON work hops to the background
+        // executor: session logs can be tens of MB, and
+        // this continuation already left the UI thread.
+        let destination_path = destination.path().to_path_buf();
+        let result = cx
+            .background_executor()
+            .spawn(async move {
+                build_diagnostic_export(
+                    &source,
+                    &session_id,
+                    &title,
+                    &work_dir,
+                    runtime.as_deref(),
+                    trajectory,
+                    include_log,
+                )
+                .and_then(|value| {
+                    serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())
+                })
+                .and_then(|bytes| {
+                    std::fs::write(&destination_path, bytes).map_err(|error| error.to_string())
+                })
+            })
+            .await;
+        let _ = model.update(cx, |state, cx| {
+            state.session_status = Some(match result {
+                Ok(()) => if include_log {
+                    "Session diagnostics exported"
+                } else {
+                    "Trajectory exported"
+                }
+                .into(),
+                Err(error) => {
+                    format!(
+                        "Could not export {}: {error}",
+                        if include_log {
+                            "session diagnostics"
+                        } else {
+                            "trajectory"
+                        }
+                    )
+                }
+            });
+            cx.notify();
+        });
+    })
+    .detach();
 }
 
-/// The snooze block shared by the row context menu and the visible
-/// session-actions menu. Confirmed snoozes report their resolved local
-/// deadline plus Unsnooze; a pending write shows "Saving snooze…" (or the
-/// failure and a retry); otherwise a native submenu offers the fixed
-/// durations — or, for ineligible sessions, a disabled item carrying the
-/// reason.
-fn session_snooze_menu_items(
-    menu: gpui_component::menu::PopupMenu,
-    window: &mut Window,
-    cx: &mut Context<gpui_component::menu::PopupMenu>,
+fn execute_sidebar_session_action(
+    action: threadlane_ui_kit::SidebarSessionAction,
     model: &Entity<AppState>,
+    view: &WeakEntity<SidebarView>,
     session: &SessionInfo,
-) -> gpui_component::menu::PopupMenu {
-    let state = model.read(cx);
-    let snooze = state.session_snooze(&session.work_dir, &session.id);
-    let eligibility = state.session_snooze_eligibility(session);
-    let work_dir = session.work_dir.clone();
-    let session_id = session.id.clone();
-    let unsnooze = |menu: gpui_component::menu::PopupMenu| {
-        let unsnooze_model = model.clone();
-        let unsnooze_work_dir = work_dir.clone();
-        let unsnooze_session_id = session_id.clone();
-        menu.item(PopupMenuItem::new("Unsnooze session").on_click(
-            move |_event, _window, cx| {
-                unsnooze_model.update(cx, |state, cx| {
-                    controller::dispatch(
-                        state,
-                        AppAction::UnsnoozeSession {
-                            work_dir: unsnooze_work_dir.clone(),
-                            session_id: unsnooze_session_id.clone(),
-                        },
-                    );
+    window: &mut Window,
+    cx: &mut App,
+) {
+    use threadlane_ui_kit::SidebarSessionAction as Action;
+    let intent = match action {
+        Action::Open => AppAction::SelectSession {
+            work_dir: session.work_dir.clone(),
+            session_id: session.id.clone(),
+        },
+        Action::TogglePin => AppAction::TogglePinSession {
+            work_dir: session.work_dir.clone(),
+            session_id: session.id.clone(),
+        },
+        Action::Snooze(duration_secs) => AppAction::SnoozeSession {
+            work_dir: session.work_dir.clone(),
+            session_id: session.id.clone(),
+            duration_secs,
+        },
+        Action::Unsnooze => AppAction::UnsnoozeSession {
+            work_dir: session.work_dir.clone(),
+            session_id: session.id.clone(),
+        },
+        Action::RetrySnooze => AppAction::RetrySnoozeSave {
+            work_dir: session.work_dir.clone(),
+            session_id: session.id.clone(),
+        },
+        Action::OpenTerminal => AppAction::OpenTerminalAt(session.runtime_work_dir.clone()),
+        Action::RegenerateTitle => {
+            let _ = view.update(cx, |view, cx| {
+                view.regenerate_title(session.clone(), window, cx)
+            });
+            return;
+        }
+        Action::Fork => {
+            let work = model
+                .read(cx)
+                .prepare_session_fork(session.work_dir.clone(), session.id.clone());
+            let work = match work {
+                Ok(work) => work,
+                Err(error) => {
+                    window.push_notification(error, cx);
+                    return;
+                }
+            };
+            window.push_notification("Forking session… The fork will use the same checkout.", cx);
+            let model = model.clone();
+            let project = session.work_dir.clone();
+            cx.spawn(async move |cx| {
+                let result = cx.background_executor().spawn(async move { work() }).await;
+                let _ = model.update(cx, |state, cx| {
+                    match result {
+                        Ok((id, sessions)) => {
+                            state.finish_session_fork(project, id, sessions);
+                        }
+                        Err(error) => {
+                            state.session_status = Some(format!("Could not fork session: {error}"));
+                        }
+                    }
                     cx.notify();
                 });
-            },
-        ))
-    };
-    match snooze {
-        Some(snooze) if snooze.pending => {
-            let mut menu = menu.item(
-                PopupMenuItem::new(if snooze.save_failed {
-                    "Couldn't save snooze"
-                } else {
-                    "Saving snooze…"
-                })
-                .disabled(true),
-            );
-            if snooze.save_failed {
-                let retry_model = model.clone();
-                let retry_work_dir = work_dir.clone();
-                let retry_session_id = session_id.clone();
-                menu = menu.item(PopupMenuItem::new("Retry saving snooze").on_click(
-                    move |_event, _window, cx| {
-                        retry_model.update(cx, |state, cx| {
-                            controller::dispatch(
-                                state,
-                                AppAction::RetrySnoozeSave {
-                                    work_dir: retry_work_dir.clone(),
-                                    session_id: retry_session_id.clone(),
-                                },
-                            );
-                            cx.notify();
-                        });
-                    },
-                ));
-            }
-            // Even while saving, abandoning the snooze stays one click.
-            unsnooze(menu)
+            })
+            .detach();
+
+            return;
         }
-        Some(snooze) => unsnooze(menu.item(
-            PopupMenuItem::new(format!(
-                "Snoozed until {}",
-                snooze_return_label(snooze.wake_at)
-            ))
-            .disabled(true),
-        )),
-        None => match eligibility {
-            Ok(()) => {
-                let submenu_model = model.clone();
-                menu.submenu("Snooze session…", window, cx, move |submenu, _window, _cx| {
-                    let mut submenu = submenu;
-                    for (label, duration_secs) in SNOOZE_OPTIONS {
-                        let item_model = submenu_model.clone();
-                        let item_work_dir = work_dir.clone();
-                        let item_session_id = session_id.clone();
-                        let duration_secs = *duration_secs;
-                        // The label resolves the return time at menu-open;
-                        // the deadline itself is computed in `snooze_session`
-                        // at activation, never when the row mounted.
-                        let back_at =
-                            snooze_return_label(now_unix_secs() + duration_secs);
-                        submenu = submenu.item(
-                            PopupMenuItem::new(format!("{label} — back at {back_at}")).on_click(
-                                move |_event, _window, cx| {
-                                    item_model.update(cx, |state, cx| {
-                                        controller::dispatch(
-                                            state,
-                                            AppAction::SnoozeSession {
-                                                work_dir: item_work_dir.clone(),
-                                                session_id: item_session_id.clone(),
-                                                duration_secs,
-                                            },
-                                        );
-                                        cx.notify();
-                                    });
-                                },
-                            ),
-                        );
-                    }
-                    submenu
-                })
-            }
-            Err(reason) => menu.item(
-                PopupMenuItem::new(format!("Snooze session… — {reason}")).disabled(true),
-            ),
-        },
+        Action::CopyId | Action::CopyProjectPath | Action::CopySessionFile => {
+            let text = match action {
+                Action::CopyId => session.id.clone(),
+                Action::CopyProjectPath => session.work_dir.display().to_string(),
+                _ => session.session_file.display().to_string(),
+            };
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            return;
+        }
+        Action::ExportLog | Action::ExportTrajectory => {
+            export_sidebar_session(model.clone(), session, action == Action::ExportLog, cx);
+            return;
+        }
+        Action::Archive => {
+            open_archive_session_dialog(
+                window,
+                cx,
+                model.clone(),
+                session.work_dir.clone(),
+                session.id.clone(),
+                session.is_worktree,
+                session.git_branch.clone(),
+            );
+            return;
+        }
+        Action::Remove => {
+            open_remove_session_dialog(
+                window,
+                cx,
+                model.clone(),
+                session.work_dir.clone(),
+                session.id.clone(),
+                session.is_worktree,
+                session.git_branch.clone(),
+            );
+            return;
+        }
+    };
+    model.update(cx, |state, cx| {
+        controller::dispatch(state, intent);
+        cx.notify();
+    });
+}
+
+fn sidebar_snooze_status(snooze: SessionSnooze) -> threadlane_ui_kit::SidebarSnoozeStatus {
+    if snooze.pending {
+        if snooze.save_failed {
+            threadlane_ui_kit::SidebarSnoozeStatus::SaveFailed
+        } else {
+            threadlane_ui_kit::SidebarSnoozeStatus::Saving
+        }
+    } else {
+        threadlane_ui_kit::SidebarSnoozeStatus::Snoozed(snooze_return_label(snooze.wake_at))
     }
 }
 
-fn pr_status_tooltip(pr: &threadlane_git::GitHubPrInfo) -> String {
-    format!(
-        "PR #{} · {}\n{}\n{} → {}\nChecks: {} passed · {} pending · {} failed\nDiscussion: {} comments · {} review comments\n{}",
-        pr.number,
-        pr_status_label(pr),
-        pr.title,
-        pr.head_ref,
-        pr.base_ref,
-        pr.passing_checks,
-        pr.pending_checks,
-        pr.failing_checks,
-        pr.comments_count,
-        pr.review_comments.len(),
-        pr.url,
+fn render_sidebar_session_menu(
+    menu: gpui_component::menu::PopupMenu,
+    model: Entity<AppState>,
+    view: WeakEntity<SidebarView>,
+    session: SessionInfo,
+    scope: threadlane_ui_kit::SidebarSessionMenuScope,
+    window: &mut Window,
+    cx: &mut Context<gpui_component::menu::PopupMenu>,
+) -> gpui_component::menu::PopupMenu {
+    use threadlane_ui_kit::{SidebarSessionMenuState, SidebarSnoozeChoice, SidebarSnoozeMenu};
+    let state = model.read(cx);
+    let snooze = match state.session_snooze(&session.work_dir, &session.id) {
+        Some(snooze) => SidebarSnoozeMenu::Status(sidebar_snooze_status(snooze)),
+        None => match state.session_snooze_eligibility(&session) {
+            Ok(()) => SidebarSnoozeMenu::Available(
+                SNOOZE_OPTIONS
+                    .iter()
+                    .map(|(label, secs)| {
+                        SidebarSnoozeChoice::new(*label, *secs)
+                            .with_return_label(snooze_return_label(now_unix_secs() + secs))
+                    })
+                    .collect(),
+            ),
+            Err(reason) => SidebarSnoozeMenu::Unavailable(reason),
+        },
+    };
+    let title_generating = view.upgrade().is_some_and(|view| {
+        view.read(cx)
+            .title_generating
+            .contains(&session.session_file)
+    });
+    let menu_state = SidebarSessionMenuState::new(snooze)
+        .pinned(state.is_session_pinned(&session.work_dir, &session.id))
+        .title_generating(title_generating)
+        .title_loading(
+            state.active_session_matches(&session.id, &session.session_file)
+                && state.active_session_is_loading(),
+        )
+        .terminal_available(!session.is_worktree || session.worktree_available);
+    threadlane_ui_kit::sidebar_session_menu(
+        menu,
+        menu_state,
+        scope,
+        move |action, window, cx| {
+            execute_sidebar_session_action(action, &model, &view, &session, window, cx)
+        },
+        window,
+        cx,
     )
 }
 
@@ -1000,189 +943,18 @@ impl SidebarView {
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
         let state = self.model.read(cx);
-
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .px_2p5()
-            .pt(threadlane_ui_theme::WINDOW_CONTROLS_CLEARANCE)
-            .pb_1p5()
-            .bg(theme.title_bar)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px_1p5()
-                    .pt_1()
-                    .pb_2()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .size(rems(1.5))
-                                    .rounded_lg()
-                                    .bg(theme.foreground.opacity(0.12))
-                                    .border_1()
-                                    .border_color(theme.foreground.opacity(0.2))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        Icon::default()
-                                            .path("icons/threadlane.svg")
-                                            .size_4()
-                                            .text_color(theme.foreground),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .text_color(theme.foreground)
-                                    .child("Threadlane"),
-                            ),
-                    )
-                    .child({
-                        let is_loading = state.active_session_is_loading();
-                        let active_attention = state.active_session_attention();
-                        let is_generating = state.is_generating
-                            || active_attention == Some(SessionAttention::Working);
-
-                        // The header stays clean when idle: Ready is already
-                        // visible on the session card and chat header, so only
-                        // Loading / Working / Needs-you surface here.
-                        if is_loading {
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(rems(0.25))
-                                .px_2()
-                                .py(rems(0.0625))
-                                .rounded_full()
-                                .bg(theme.muted.opacity(0.35))
-                                .border_1()
-                                .border_color(theme.border.opacity(0.2))
-                                .child(Spinner::new().xsmall().color(theme.muted_foreground))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_medium()
-                                        .text_color(theme.muted_foreground)
-                                        .child("Loading"),
-                                )
-                                .into_any_element()
-                        } else if is_generating {
-                            div()
-                                .id("sidebar-working-indicator")
-                                .flex()
-                                .items_center()
-                                .gap(rems(0.25))
-                                .px_2()
-                                .py(rems(0.0625))
-                                .rounded_full()
-                                .bg(theme.info.opacity(0.12))
-                                .border_1()
-                                .border_color(theme.info.opacity(0.25))
-                                .child(Spinner::new().xsmall().color(theme.info))
-                                .into_any_element()
-                        } else if active_attention == Some(SessionAttention::NeedsYou) {
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1p5()
-                                .px_2()
-                                .py(rems(0.0625))
-                                .rounded_full()
-                                .bg(theme.warning.opacity(0.15))
-                                .border_1()
-                                .border_color(theme.warning.opacity(0.28))
-                                .child(
-                                    div()
-                                        .size(rems(0.375))
-                                        .rounded_full()
-                                        .bg(theme.warning),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_medium()
-                                        .text_color(theme.warning)
-                                        .child("Needs you"),
-                                )
-                                .into_any_element()
-                        } else {
-                            Empty.into_any_element()
-                        }
-                    }),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .p_1()
-                    .rounded_xl()
-                    .bg(theme.muted.opacity(0.28))
-                    .flex()
-                    .items_center()
-                    .child(
-                        Button::new("new-task-btn")
-                            .accessibility_label("Start a new task (⌘N)")
-                            .ghost()
-                            .xsmall()
-                            .compact()
-                            .w_full()
-                            .justify_start()
-                            .tooltip("Start a new task (⌘N)")
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_start()
-                                    .gap_2()
-                                    .w_full()
-                                    .px_1()
-                                    .child(
-                                        Icon::new(IconName::Plus)
-                                            .size_3p5()
-                                            .text_color(theme.primary),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(theme.foreground)
-                                            .child("New task"),
-                                    )
-                                    .child(div().flex_1())
-                                    .child(
-                                        div()
-                                            .px_1p5()
-                                            .py(rems(0.125))
-                                            .rounded_md()
-                                            .bg(theme.muted.opacity(0.5))
-                                            .text_xs()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(theme.muted_foreground.opacity(0.85))
-                                            .child("⌘N"),
-                                    ),
-                            )
-                            .on_click(move |_event, window, cx| {
-                                window.dispatch_action(Box::new(crate::BeginNewTask), cx);
-                            }),
-                    ),
-            )
-            .child(self.render_github_nav(cx))
+        threadlane_ui_kit::sidebar_header(
+            state.active_session_is_loading(),
+            state.is_generating,
+            state.active_session_attention().unwrap_or(SessionAttention::Idle),
+            self.render_github_nav(cx).into_any_element(),
+            |window, cx| window.dispatch_action(Box::new(crate::BeginNewTask), cx),
+            cx,
+        )
     }
 
-
     fn render_project_filter(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
         let (projects, selected_filter) = {
             let state = self.model.read(cx);
             (
@@ -1212,114 +984,33 @@ impl SidebarView {
         let filter_model = self.model.clone();
         let attach_model = self.model.clone();
 
-        div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .px_3()
-            .pt_1()
-            .pb_1()
-            .child(
-                div().min_w_0().flex_1().child(
-                    Button::new("sidebar-project-filter")
-                        .accessibility_label(format!(
-                            "Filter sessions by project: {selected_label}"
-                        ))
-                        .tooltip("Filter sessions by project")
-                        .dropdown_caret(true)
-                        .selected(selected_filter.is_some())
-                        .ghost()
-                        .small()
-                        .w_full()
-                        .justify_start()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .w_full()
-                                .min_w_0()
-                                .child(
-                                    Icon::new(IconName::Folder)
-                                        .size_3p5()
-                                        .text_color(theme.foreground),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .truncate()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(theme.foreground)
-                                        .child(selected_label.clone()),
-                                ),
-                        )
-                        .dropdown_menu(move |menu, _window, _cx| {
-                            let all_model = filter_model.clone();
-                            let total_sessions: usize =
-                                projects.iter().map(|(_, _, count)| count).sum();
-                            let mut menu = menu.item(
-                                PopupMenuItem::new(format!("All projects · {total_sessions}"))
-                                    .checked(selected_filter.is_none())
-                                    .on_click(move |_event, _window, cx| {
-                                        all_model.update(cx, |state, cx| {
-                                            controller::dispatch(
-                                                state,
-                                                AppAction::SetSidebarProjectFilter(None),
-                                            );
-                                            cx.notify();
-                                        });
-                                    }),
-                            );
-                            for (name, work_dir, session_count) in projects.clone() {
-                                let model = filter_model.clone();
-                                let checked = selected_filter.as_ref() == Some(&work_dir);
-                                let item_label = format!("{name} · {session_count}");
-                                menu = menu.item(
-                                    PopupMenuItem::new(item_label).checked(checked).on_click(
-                                        move |_event, _window, cx| {
-                                            model.update(cx, |state, cx| {
-                                                controller::dispatch(
-                                                    state,
-                                                    AppAction::SetSidebarProjectFilter(Some(
-                                                        work_dir.clone(),
-                                                    )),
-                                                );
-                                                cx.notify();
-                                            });
-                                        },
-                                    ),
-                                );
-                            }
-                            menu
-                        }),
-                ),
-            )
-            .child(
-                Button::new("attach-project-btn")
-                    .icon(IconName::Plus)
-                    .accessibility_label("Attach project")
-                    .tooltip("Attach project…")
-                    .ghost()
-                    .small()
-                    .on_click(move |_event, _window, cx| {
-                        let model = attach_model.clone();
-                        cx.spawn(async move |cx| {
-                            let Some(folder) = rfd::AsyncFileDialog::new().pick_folder().await
-                            else {
-                                return;
-                            };
-                            let path = folder.path().to_path_buf();
-                            let _ = model.update(cx, |state, cx| {
-                                controller::dispatch(state, AppAction::AttachProject(path));
-                                cx.notify();
-                            });
-                        })
-                        .detach();
-                    }),
-            )
-            .bg(theme.title_bar)
+        threadlane_ui_kit::sidebar_project_filter(
+            &selected_label,
+            selected_filter.is_some(),
+            move |menu, window, cx| {
+                let model = filter_model.clone();
+                threadlane_ui_kit::sidebar_project_menu(menu, &projects, selected_filter.as_deref(), move |selected, _, cx| {
+                    model.update(cx, |state, cx| { controller::dispatch(state, AppAction::SetSidebarProjectFilter(selected)); cx.notify(); });
+                }, window, cx)
+            },
+            threadlane_ui_kit::sidebar_attach_project_button().on_click(
+                move |_event, _window, cx| {
+                    let model = attach_model.clone();
+                    cx.spawn(async move |cx| {
+                        let Some(folder) = rfd::AsyncFileDialog::new().pick_folder().await else {
+                            return;
+                        };
+                        let path = folder.path().to_path_buf();
+                        let _ = model.update(cx, |state, cx| {
+                            controller::dispatch(state, AppAction::AttachProject(path));
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                },
+            ),
+            cx,
+        )
     }
 
     fn has_history_filters(&self, state: &AppState) -> bool {
@@ -1341,21 +1032,8 @@ impl SidebarView {
         is_active: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        let status_indicator = threadlane_ui_session::session_attention(&session.id, attention, cx);
-
-
-        let title_color = if is_active {
-            theme.foreground
-        } else {
-            theme.sidebar_foreground
-        };
-        let session_identity = sidebar_session_identity(session);
-        let session_title = session_identity.title;
-        let time_ago = format_time_ago(session.updated_at, now_unix_secs());
-        let project = self
-            .model
-            .read(cx)
+        let state = self.model.read(cx);
+        let project = state
             .projects
             .iter()
             .find(|project| {
@@ -1365,1124 +1043,80 @@ impl SidebarView {
                     .any(|candidate| candidate.session_file == session.session_file)
             })
             .map(|project| project.name.clone())
-            .unwrap_or_else(|| "Project".to_string());
-        // Rich hover card (Synara ThreadHoverCardContent pattern): keep the
-        // row to title + status, move project path, branch/worktree, recency,
-        // and attention detail into the tooltip.
-        let work_dir_display = session.work_dir.to_string_lossy().into_owned();
-        let branch_display = session.git_branch.as_deref().unwrap_or("no branch");
-        let worktree_display = if session.is_worktree {
-            if session.worktree_available {
-                "worktree"
-            } else {
-                "worktree unavailable"
-            }
-        } else {
-            "local checkout"
-        };
-        let has_unseen_result = self.model.read(cx).session_has_unseen_result(session);
-        let session_tooltip = format!(
-            "{}\n{} · {}\nBranch: {branch_display} ({worktree_display})\n{} · {}",
-            session_identity.tooltip,
+            .unwrap_or_else(|| "Project".into());
+        let card_state = threadlane_ui_kit::SidebarSessionCardState {
             project,
-            work_dir_display,
-            time_ago,
-            attention.label(),
-        );
-        let session_tooltip = if has_unseen_result {
-            format!("{session_tooltip}\nNew result: a finished run has output you have not seen yet")
-        } else {
-            session_tooltip
-        };
-
-        let work_dir = session.work_dir.clone();
-        let session_id = session.id.clone();
-        let model = self.model.clone();
-        let title_work_dir = session.work_dir.clone();
-        let title_session_id = session.id.clone();
-        let title_model = self.model.clone();
-        let is_pinned = self
-            .model
-            .read(cx)
-            .is_session_pinned(&session.work_dir, &session.id);
-        let session_snooze = self
-            .model
-            .read(cx)
-            .session_snooze(&session.work_dir, &session.id);
-        let snooze_label = session_snooze.map(|snooze| {
-            if snooze.pending {
-                if snooze.save_failed {
-                    "Couldn't save snooze".to_string()
-                } else {
-                    "Saving snooze…".to_string()
-                }
-            } else {
-                format!("Snoozed until {}", snooze_return_label(snooze.wake_at))
-            }
-        });
-        let session_git_status = {
-            let state = self.model.read(cx);
-            state
+            attention,
+            selected: is_active,
+            pinned: state.is_session_pinned(&session.work_dir, &session.id),
+            unseen_result: state.session_has_unseen_result(session),
+            snooze: state
+                .session_snooze(&session.work_dir, &session.id)
+                .map(sidebar_snooze_status),
+            git_status: state
                 .git_statuses
                 .get(&session.runtime_work_dir)
                 .or_else(|| state.git_statuses.get(&session.work_dir))
-                .cloned()
+                .cloned(),
+            pr: session_pr_info(session, &state.git_prs).cloned(),
+            now: now_unix_secs(),
         };
-        let quick_pin_model = self.model.clone();
-        let quick_pin_work_dir = session.work_dir.clone();
-        let quick_pin_session_id = session.id.clone();
-        let context_work_dir = session.work_dir.clone();
-        let context_session_id = session.id.clone();
-        let context_model = self.model.clone();
-        let title_view = cx.entity().downgrade();
-        let title_session = session.clone();
-        let terminal_model = self.model.clone();
-        let terminal_work_dir = session.runtime_work_dir.clone();
-        let terminal_unavailable = session.is_worktree && !session.worktree_available;
-        let context_is_worktree = session.is_worktree;
-        let context_git_branch = session.git_branch.clone();
-        let copy_session_file = session.session_file.display().to_string();
-        let export_log_source = session.session_file.clone();
-        let export_trajectory_title = session.title.clone();
-        let quick_settle_model = self.model.clone();
-        let quick_settle_work_dir = session.work_dir.clone();
-        let quick_settle_session_id = session.id.clone();
-        let quick_settle_is_worktree = session.is_worktree;
-        let quick_settle_git_branch = session.git_branch.clone();
-        let actions_model = self.model.clone();
-        let actions_work_dir = session.work_dir.clone();
-        let actions_session_id = session.id.clone();
-        let actions_session = session.clone();
-        let actions_is_pinned = is_pinned;
-        let actions_is_worktree = session.is_worktree;
-        let actions_git_branch = session.git_branch.clone();
-
-        // Full-row screen-reader label: the inner title button only carries
-        // the title, so status, project, branch, and recency live here.
-        // Keyboard users operate the row through its focusable title button
-        // (Tab, Enter to select); this label makes the row itself announce.
-        let branch_suffix = session
-            .git_branch
-            .as_deref()
-            .map(|branch| format!(", branch {branch}"))
-            .unwrap_or_default();
-        let pinned_prefix = if is_pinned { "Pinned, " } else { "" };
-        let unseen_suffix = if has_unseen_result {
-            ", new result"
-        } else {
-            ""
-        };
-        // Snooze and deadline state are mirrored into the row and title
-        // labels — never a color-only cue.
-        let snooze_suffix = session_snooze
-            .map(|snooze| {
-                if snooze.pending && snooze.save_failed {
-                    ", couldn't save snooze".to_string()
-                } else if snooze.pending {
-                    ", saving snooze".to_string()
-                } else {
-                    format!(", snoozed until {}", snooze_return_label(snooze.wake_at))
-                }
-            })
-            .unwrap_or_default();
-        let session_row_label = format!(
-            "{pinned_prefix}{}, project {}, {}, {}{}{}{}",
-            session_title,
-            project,
-            attention.label(),
-            time_ago,
-            branch_suffix,
-            unseen_suffix,
-            snooze_suffix,
-        );
-
-        let pr_info = session_pr_info(session, &self.model.read(cx).git_prs).cloned();
-
-        let pr_meta = pr_info.map(|pr| {
-            let state_upper = pr.state.to_uppercase();
-            let is_merged = state_upper == "MERGED";
-            let is_draft = pr.is_draft || state_upper == "DRAFT";
-            let is_closed = state_upper == "CLOSED";
-            let tooltip = pr_status_tooltip(&pr);
-
-            let (pr_bg, pr_fg, pr_border, pr_label, pr_icon) = if is_merged {
-                (
-                    theme.success.opacity(0.15),
-                    theme.success,
-                    theme.success.opacity(0.28),
-                    format!("#{}", pr.number),
-                    Icon::default().path("icons/git/branch.svg"),
-                )
-            } else if is_draft {
-                (
-                    theme.secondary,
-                    theme.muted_foreground,
-                    theme.border.opacity(0.3),
-                    format!("#{}", pr.number),
-                    Icon::default().path("icons/git/compare.svg"),
-                )
-            } else if is_closed {
-                (
-                    theme.danger.opacity(0.12),
-                    theme.danger,
-                    theme.danger.opacity(0.25),
-                    format!("#{}", pr.number),
-                    Icon::default().path("icons/git/compare.svg"),
-                )
-            } else {
-                (
-                    theme.primary.opacity(0.12),
-                    theme.primary,
-                    theme.primary.opacity(0.25),
-                    format!("#{}", pr.number),
-                    Icon::default().path("icons/git/compare.svg"),
-                )
-            };
-
-            div().flex().flex_none().items_center().gap_1().child(
-                Button::new(SharedString::from(format!(
-                    "session-pr-{}-{}",
-                    session.id, pr.number
-                )))
-                .icon(pr_icon)
-                .label(pr_label)
-                .accessibility_label(format!(
-                    "Pull request #{}, {}",
-                    pr.number,
-                    pr_status_label(&pr)
-                ))
-                .tooltip(tooltip)
-                .ghost()
-                .xsmall()
-                .bg(pr_bg)
-                .border_1()
-                .border_color(pr_border)
-                .rounded_full()
-                .text_color(pr_fg),
-            )
-        });
-
-        // Three-row card: title / context (where) / signals (what needs
-        // attention). The old single wrapping meta row crammed project,
-        // branch, git, PR, pinned, and status into one line with bullet
-        // separators. Splitting keeps each row single-purpose and lets
-        // quiet sessions collapse back to two rows.
-        let mut context_items = Vec::new();
-        let mut signal_items = Vec::new();
-        if has_unseen_result {
-            signal_items.push(
-                div()
-                    .id(SharedString::from(format!(
-                        "session-new-result-{}",
-                        session.id
-                    )))
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .px_1p5()
-                    .py(rems(0.125))
-                    .rounded_full()
-                    .bg(theme.muted.opacity(0.2))
-                    .text_xs()
-                    .font_medium()
-                    .text_color(theme.muted_foreground)
-                    .child("New result")
-                    .into_any_element(),
-            );
-        }
-        if let (Some(snooze), Some(label)) = (session_snooze, snooze_label.as_ref()) {
-            let snooze_tooltip = if snooze.pending {
-                format!("{label} — the session stays in its normal group until the save is confirmed")
-            } else {
-                format!("{label}\nReturns to its normal group when the deadline passes")
-            };
-            signal_items.push(
-                div()
-                    .id(SharedString::from(format!("session-snoozed-{}", session.id)))
-                    .debug_selector({
-                        let id = session.id.clone();
-                        move || format!("session-snoozed-{id}")
-                    })
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_1()
-                    .px_1p5()
-                    .py(rems(0.125))
-                    .rounded_full()
-                    .bg(theme.muted.opacity(0.35))
-                    .tooltip(move |window, cx| {
-                        Tooltip::new(snooze_tooltip.clone()).build(window, cx)
-                    })
-                    .child(
-                        Icon::new(IconName::Moon)
-                            .xsmall()
-                            .text_color(theme.muted_foreground.opacity(0.9)),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_medium()
-                            .text_color(theme.muted_foreground.opacity(0.9))
-                            .child(label.clone()),
-                    )
-                    .into_any_element(),
-            );
-        }
-        context_items.push(
-            div()
-                .flex()
-                .flex_1()
-                .min_w_0()
-                .items_center()
-                .gap_1()
-                .text_color(theme.muted_foreground.opacity(0.85))
-                .child(
-                    Icon::new(IconName::Folder)
-                        .xsmall()
-                        .text_color(theme.muted_foreground.opacity(0.55)),
-                )
-                .child(div().min_w_0().truncate().child(project))
-                .into_any_element(),
-        );
-
-        if let Some(pr_chips) = pr_meta {
-            signal_items.push(pr_chips.into_any_element());
-        }
-
-        if session.is_worktree && !session.worktree_available {
-            let branch_display = session.git_branch.as_deref().unwrap_or("worktree");
-            let tooltip = format!(
-                "Worktree unavailable\nBranch: '{branch_display}'\nNot checked out locally\nRecorded path: {}\nSession history remains available",
-                session.runtime_work_dir.display()
-            );
-            context_items.push(
-                Button::new(SharedString::from(format!(
-                    "session-worktree-{}",
-                    session.id
-                )))
-                .icon(Icon::default().path("icons/git/branch.svg"))
-                .label("Not checked out")
-                .accessibility_label(format!(
-                    "Worktree unavailable for branch '{branch_display}', not checked out locally"
-                ))
-                .tooltip(tooltip)
-                .ghost()
-                .xsmall()
-                .bg(theme.warning.opacity(0.12))
-                .rounded_full()
-                .text_color(theme.warning)
-                .into_any_element(),
-            );
-        } else if let Some(branch) = session.git_branch.as_deref() {
-            let branch_tooltip = format!("Branch: {branch}");
-            context_items.push(
-                div()
-                    .id(SharedString::from(format!("session-branch-badge-{}", session.id)))
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_1()
-                    .px_1p5()
-                    .py(rems(0.125))
-                    .rounded_full()
-                    .bg(theme.muted.opacity(0.3))
-                    .tooltip(move |window, cx| Tooltip::new(branch_tooltip.clone()).build(window, cx))
-                    .child(
-                        Icon::default()
-                            .path("icons/git/branch.svg")
-                            .size(rems(0.6875))
-                            .text_color(theme.muted_foreground.opacity(0.85)),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_medium()
-                            .text_color(theme.muted_foreground)
-                            .max_w(rems(5.5))
-                            .truncate()
-                            .child(branch.to_string()),
-                    )
-                    .into_any_element(),
-            );
-        }
-
-        if let Some(git) = session_git_status {
-            if !git.files.is_empty() {
-                let changed_count = git.files.len();
-                let additions: u32 = git.files.iter().map(|f| f.additions).sum();
-                let deletions: u32 = git.files.iter().map(|f| f.deletions).sum();
-                let git_tooltip = format!("{changed_count} changed files (+{additions} -{deletions})");
-                signal_items.push(
-                    div()
-                        .id(SharedString::from(format!("session-git-badge-{}", session.id)))
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .gap_1()
-                        .px_1p5()
-                        .py(rems(0.125))
-                        .rounded_full()
-                        .bg(theme.muted.opacity(0.3))
-                        .tooltip(move |window, cx| Tooltip::new(git_tooltip.clone()).build(window, cx))
-                        .child(
-                            div()
-                                .size(rems(0.3125))
-                                .rounded_full()
-                                .bg(if additions > 0 { theme.success } else { theme.warning }),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_medium()
-                                .text_color(theme.muted_foreground)
-                                .child(format!("{changed_count}")),
-                        )
-                        .when(additions > 0 || deletions > 0, |this| {
-                            this.child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(rems(0.125))
-                                    .text_xs()
-                                    .when(additions > 0, |this| {
-                                        this.child(
-                                            div()
-                                                .text_color(theme.success)
-                                                .font_medium()
-                                                .child(format!("+{additions}")),
-                                        )
-                                    })
-                                    .when(deletions > 0, |this| {
-                                        this.child(
-                                            div()
-                                                .text_color(theme.danger)
-                                                .font_medium()
-                                                .child(format!("-{deletions}")),
-                                        )
-                                    }),
-                            )
-                        })
-                        .into_any_element(),
-                );
-            }
-        }
-
-        if is_pinned {
-            signal_items.push(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_1()
-                    .px_1p5()
-                    .py(rems(0.125))
-                    .rounded_full()
-                    .bg(theme.primary.opacity(0.1))
-                    .text_xs()
-                    .font_medium()
-                    .text_color(theme.primary)
-                    .child(Icon::default().path("icons/pin.svg").size(rems(0.625)).text_color(theme.primary))
-                    .child("Pinned")
-                    .into_any_element(),
-            );
-        }
-
-        threadlane_ui_session::session_card(&session.id, is_active, cx)
-            .tooltip(move |window, cx| Tooltip::new(session_tooltip.clone()).build(window, cx))
-            .aria_label(session_row_label.clone())
-            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
-                let work_dir = work_dir.clone();
-                let session_id = session_id.clone();
-                model.update(cx, |state, cx| {
-                    controller::dispatch(
-                        state,
-                        AppAction::SelectSession {
-                            work_dir,
-                            session_id,
-                        },
-                    );
-                    cx.notify();
-                });
-            })
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap_1p5()
-                    .pl_3p5()
-                    .pr_3()
-                    .py_2p5()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                Button::new(SharedString::from(format!(
-                                    "session-title-{}",
-                                    session.id
-                                )))
-                                .debug_selector({
-                                    let id = session.id.clone();
-                                    move || format!("session-title-{id}")
-                                })
-                                .accessibility_label(format!(
-                                    "{session_title}{}{}",
-                                    if has_unseen_result {
-                                        " — New result"
-                                    } else {
-                                        ""
-                                    },
-                                    snooze_suffix
-                                ))
-                                .ghost()
-                                .xsmall()
-                                .compact()
-                                .flex_1()
-                                .min_w_0()
-                                .px_0()
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                    cx.stop_propagation();
-                                })
-                                .on_click(move |_, _, cx| {
-                                    title_model.update(cx, |state, cx| {
-                                        controller::dispatch(
-                                            state,
-                                            AppAction::SelectSession {
-                                                work_dir: title_work_dir.clone(),
-                                                session_id: title_session_id.clone(),
-                                            },
-                                        );
-                                        cx.notify();
-                                    });
-                                })
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .min_w_0()
-                                        .text_sm()
-                                        .font_weight(if is_active {
-                                            FontWeight::SEMIBOLD
-                                        } else {
-                                            FontWeight::MEDIUM
-                                        })
-                                        .text_color(title_color)
-                                        .truncate()
-                                        .child(session_title),
-                                ),
-                            )
-                            .child(
-                                div()
-                                    .relative()
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .justify_end()
-                                    .gap_1()
-                                    .child(
-                                        div().flex().items_center().gap_1().child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(theme.muted_foreground)
-                                                // Trailing-slot swap (Synara SidebarRowHoverActions
-                                                // pattern): timestamp fades out when the hover
-                                                // actions appear, so the 223px row never shows
-                                                // both at once. Layout width is preserved for
-                                                // stability; only visual crowding is removed.
-                                                .opacity(1.0)
-                                                .group_hover("session-card", |style| {
-                                                    style.opacity(0.0)
-                                                })
-                                                .when(is_active, |this| this.opacity(0.0))
-                                                .child(time_ago),
-                                        ),
-                                    )
-                                    .child(
-                                        Button::new(SharedString::from(format!(
-                                            "pin-session-{}",
-                                            session.id
-                                        )))
-                                        .debug_selector({
-                                            let id = session.id.clone();
-                                            move || format!("pin-session-{id}")
-                                        })
-                                        .icon(Icon::default().path("icons/pin.svg"))
-                                        .ghost()
-                                        .xsmall()
-                                        .compact()
-                                        .tab_stop(false)
-                                        .accessibility_label(if is_pinned {
-                                            "Unpin session"
-                                        } else {
-                                            "Pin session"
-                                        })
-                                        .tooltip(if is_pinned {
-                                            "Unpin session"
-                                        } else {
-                                            "Pin session to top"
-                                        })
-                                        .text_color(if is_pinned {
-                                            theme.primary
-                                        } else {
-                                            theme.muted_foreground
-                                        })
-                                        .opacity(if is_pinned { 1.0 } else { 0.0 })
-                                        .group_hover("session-card", |style| style.opacity(1.0))
-                                        .focus_visible(|style| style.opacity(1.0))
-                                        .when(is_active, |button| button.opacity(1.0))
-                                        .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                                            cx.stop_propagation();
-                                        })
-                                        .on_click(move |_event, _window, cx| {
-                                            quick_pin_model.update(cx, |state, cx| {
-                                                controller::dispatch(
-                                                    state,
-                                                    AppAction::TogglePinSession {
-                                                        work_dir: quick_pin_work_dir.clone(),
-                                                        session_id: quick_pin_session_id.clone(),
-                                                    },
-                                                );
-                                                cx.notify();
-                                            });
-                                        }),
-                                    )
-                                    .child(
-                                        Button::new(SharedString::from(format!(
-                                            "settle-session-{}",
-                                            session.id
-                                        )))
-                                        .icon(Icon::default().path("icons/archive.svg"))
-                                        .ghost()
-                                        .xsmall()
-                                        .accessibility_label("Archive session")
-                                        .opacity(0.0)
-                                        .group_hover("session-card", |style| style.opacity(1.0))
-                                        .focus_visible(|style| style.opacity(1.0))
-                                        // Touch and no-hover users never get
-                                        // group_hover: the selected row always
-                                        // shows its archive action.
-                                        .when(is_active, |button| button.opacity(1.0))
-                                        .tooltip("Archive session")
-                                        // The card selects a session on mouse-down. Keep action buttons from
-                                        // bubbling that event, otherwise archiving first selects the row and
-                                        // queues hydration for the file that is about to be archived.
-                                        .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                                            cx.stop_propagation();
-                                        })
-                                        .on_click(
-                                            move |_event, window, cx| {
-                                                if quick_settle_is_worktree {
-                                                    open_archive_session_dialog(
-                                                        window,
-                                                        cx,
-                                                        quick_settle_model.clone(),
-                                                        quick_settle_work_dir.clone(),
-                                                        quick_settle_session_id.clone(),
-                                                        true,
-                                                        quick_settle_git_branch.clone(),
-                                                    );
-                                                } else {
-                                                    quick_settle_model.update(cx, |state, cx| {
-                                                        controller::dispatch(
-                                                            state,
-                                                            AppAction::SettleSession {
-                                                                work_dir: quick_settle_work_dir
-                                                                    .clone(),
-                                                                session_id: quick_settle_session_id
-                                                                    .clone(),
-                                                                delete_worktree: false,
-                                                            },
-                                                        );
-                                                        cx.notify();
-                                                    });
-                                                }
-                                            },
-                                        ),
-                                    )
-                                    .child(
-                                        // Visible session-actions menu: the
-                                        // same row actions as the context
-                                        // menu for keyboard and no-hover
-                                        // users — tabbable, and always
-                                        // shown on the selected row.
-                                        Button::new(SharedString::from(format!(
-                                            "session-actions-{}",
-                                            session.id
-                                        )))
-                                        .debug_selector({
-                                            let id = session.id.clone();
-                                            move || format!("session-actions-{id}")
-                                        })
-                                        .icon(IconName::Ellipsis)
-                                        .ghost()
-                                        .xsmall()
-                                        .compact()
-                                        .accessibility_label("Session actions")
-                                        .tooltip("Session actions")
-                                        .opacity(0.0)
-                                        .group_hover("session-card", |style| style.opacity(1.0))
-                                        .focus_visible(|style| style.opacity(1.0))
-                                        .when(is_active, |button| button.opacity(1.0))
-                                        // No stop_propagation: the popover
-                                        // toggle lives on an ancestor, and
-                                        // selecting the row on open is the
-                                        // desired behavior for this menu.
-                                        .dropdown_menu(move |menu, window, cx| {
-                                            let open_model = actions_model.clone();
-                                            let open_work_dir = actions_work_dir.clone();
-                                            let open_session_id = actions_session_id.clone();
-                                            let pin_model = actions_model.clone();
-                                            let pin_work_dir = actions_work_dir.clone();
-                                            let pin_session_id = actions_session_id.clone();
-                                            let settle_model = actions_model.clone();
-                                            let settle_work_dir = actions_work_dir.clone();
-                                            let settle_session_id = actions_session_id.clone();
-                                            let remove_model = actions_model.clone();
-                                            let remove_work_dir = actions_work_dir.clone();
-                                            let remove_session_id = actions_session_id.clone();
-                                            let settle_git_branch = actions_git_branch.clone();
-                                            let remove_git_branch = actions_git_branch.clone();
-                                            let menu = menu
-                                                .item(
-                                                    PopupMenuItem::new("Open Session")
-                                                        .on_click(move |_event, _window, cx| {
-                                                            open_model.update(cx, |state, cx| {
-                                                                controller::dispatch(
-                                                                    state,
-                                                                    AppAction::SelectSession {
-                                                                        work_dir: open_work_dir
-                                                                            .clone(),
-                                                                        session_id:
-                                                                            open_session_id
-                                                                                .clone(),
-                                                                    },
-                                                                );
-                                                                cx.notify();
-                                                            });
-                                                        }),
-                                                )
-                                                .item(
-                                                    PopupMenuItem::new(if actions_is_pinned {
-                                                        "Unpin Session"
-                                                    } else {
-                                                        "Pin Session"
-                                                    })
-                                                    .on_click(move |_event, _window, cx| {
-                                                        pin_model.update(cx, |state, cx| {
-                                                            controller::dispatch(
-                                                                state,
-                                                                AppAction::TogglePinSession {
-                                                                    work_dir: pin_work_dir
-                                                                        .clone(),
-                                                                    session_id: pin_session_id
-                                                                        .clone(),
-                                                                },
-                                                            );
-                                                            cx.notify();
-                                                        });
-                                                    }),
-                                                );
-                                            session_snooze_menu_items(
-                                                menu,
-                                                window,
-                                                cx,
-                                                &actions_model,
-                                                &actions_session,
-                                            )
-                                            .separator()
-                                            .item(
-                                                PopupMenuItem::new("Archive Session").on_click(
-                                                    move |_event, window, cx| {
-                                                        open_archive_session_dialog(
-                                                            window,
-                                                            cx,
-                                                            settle_model.clone(),
-                                                            settle_work_dir.clone(),
-                                                            settle_session_id.clone(),
-                                                            actions_is_worktree,
-                                                            settle_git_branch.clone(),
-                                                        );
-                                                    },
-                                                ),
-                                            )
-                                            .separator()
-                                            .item(
-                                                PopupMenuItem::new("Remove Session").on_click(
-                                                    move |_event, window, cx| {
-                                                        open_remove_session_dialog(
-                                                            window,
-                                                            cx,
-                                                            remove_model.clone(),
-                                                            remove_work_dir.clone(),
-                                                            remove_session_id.clone(),
-                                                            actions_is_worktree,
-                                                            remove_git_branch.clone(),
-                                                        );
-                                                    },
-                                                ),
-                                            )
-                                        }),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .text_xs()
-                            .min_w_0()
-                            .children(context_items),
-                    )
-                    .when(!signal_items.is_empty() || status_indicator.is_some(), |el| {
-                        el.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1p5()
-                                .text_xs()
-                                .min_w_0()
-                                .flex_wrap()
-                                .children(signal_items)
-                                .children(status_indicator),
-                        )
-                    }),
-            )
-            .context_menu(move |menu, _window, _cx| {
-                let open_model = context_model.clone();
-                let open_work_dir = context_work_dir.clone();
-                let open_session_id = context_session_id.clone();
-                let copy_session_id = context_session_id.clone();
-                let fork_model = context_model.clone();
-                let fork_work_dir = context_work_dir.clone();
-                let fork_session_id = context_session_id.clone();
-                let copy_project_path = context_work_dir.to_string_lossy().into_owned();
-                let copy_session_file = copy_session_file.clone();
-                let export_log_model = context_model.clone();
-                let export_log_source = export_log_source.clone();
-                let export_log_session_id = context_session_id.clone();
-                let export_log_title = export_trajectory_title.clone();
-                let export_log_work_dir = context_work_dir.clone();
-                let export_trajectory_model = context_model.clone();
-                let export_trajectory_source = export_log_source.clone();
-                let export_trajectory_session_id = context_session_id.clone();
-                let export_trajectory_title = export_trajectory_title.clone();
-                let export_trajectory_work_dir = context_work_dir.clone();
-                let settle_model = context_model.clone();
-                let settle_work_dir = context_work_dir.clone();
-                let settle_session_id = context_session_id.clone();
-                let settle_is_worktree = context_is_worktree;
-                let settle_git_branch = context_git_branch.clone();
-                let remove_model = context_model.clone();
-                let remove_work_dir = context_work_dir.clone();
-                let remove_session_id = context_session_id.clone();
-                let remove_is_worktree = context_is_worktree;
-                let remove_git_branch = context_git_branch.clone();
-                let pin_model = context_model.clone();
-                let pin_work_dir = context_work_dir.clone();
-                let pin_session_id = context_session_id.clone();
-
-                let title_generating = title_view.upgrade().is_some_and(|view| {
-                    view.read(_cx)
-                        .title_generating
-                        .contains(&title_session.session_file)
-                });
-                let snooze_session = title_session.clone();
-                let title_loading = context_model
-                    .read(_cx)
-                    .active_session_matches(&title_session.id, &title_session.session_file)
-                    && context_model.read(_cx).active_session_is_loading();
-                let title_view = title_view.clone();
-                let title_session = title_session.clone();
-
-                menu.item(
-                    PopupMenuItem::new(if title_generating {
-                        "Generating title…"
-                    } else {
-                        "Regenerate title"
-                    })
-                    .disabled(title_generating || title_loading)
-                    .on_click(move |_, window, cx| {
-                        let _ = title_view.update(cx, |this, cx| {
-                            this.regenerate_title(title_session.clone(), window, cx);
-                        });
-                    }),
-                )
-                .item(
-                    PopupMenuItem::new("Open Session").on_click(move |_event, _window, cx| {
-                        open_model.update(cx, |state, cx| {
-                            controller::dispatch(
-                                state,
-                                AppAction::SelectSession {
-                                    work_dir: open_work_dir.clone(),
-                                    session_id: open_session_id.clone(),
-                                },
-                            );
-                            cx.notify();
-                        });
-                    }),
-                )
-                .item(
-                    PopupMenuItem::new("Fork Session").on_click(move |_event, window, cx| {
-                        let work = fork_model.read(cx).prepare_session_fork(
-                            fork_work_dir.clone(),
-                            fork_session_id.clone(),
+        let model = self.model.clone();
+        let view = cx.entity().downgrade();
+        let target = session.clone();
+        let quick_model = self.model.clone();
+        let quick_view = view.clone();
+        let quick_target = session.clone();
+        let full_model = self.model.clone();
+        let full_view = view.clone();
+        let full_target = session.clone();
+        threadlane_ui_kit::sidebar_session_card(
+            session,
+            card_state,
+            move |action, window, cx| {
+                // Preserve the quick-archive contract: ordinary checkouts archive
+                // immediately; associated worktrees require the existing confirmation.
+                if action == threadlane_ui_kit::SidebarSessionAction::Archive && !target.is_worktree
+                {
+                    model.update(cx, |state, cx| {
+                        controller::dispatch(
+                            state,
+                            AppAction::SettleSession {
+                                work_dir: target.work_dir.clone(),
+                                session_id: target.id.clone(),
+                                delete_worktree: false,
+                            },
                         );
-                        let work = match work {
-                            Ok(work) => work,
-                            Err(error) => {
-                                window.push_notification(error, cx);
-                                return;
-                            }
-                        };
-                        window.push_notification("Forking session… The fork will use the same checkout.", cx);
-                        let model = fork_model.clone();
-                        let project = fork_work_dir.clone();
-                        cx.spawn(async move |cx| {
-                            let result = cx
-                                .background_executor()
-                                .spawn(async move { work() })
-                                .await;
-                            let _ = model.update(cx, |state, cx| {
-                                match result {
-                                    Ok((id, sessions)) => {
-                                        state.finish_session_fork(project, id, sessions);
-                                    }
-                                    Err(error) => {
-                                        state.session_status = Some(format!("Could not fork session: {error}"));
-                                    }
-                                }
-                                cx.notify();
-                            });
-                        })
-                        .detach();
-                    }),
-                )
-                .item(
-                    PopupMenuItem::new(if is_pinned {
-                        "Unpin Session"
-                    } else {
-                        "Pin Session"
-                    })
-                    .on_click(move |_event, _window, cx| {
-                        pin_model.update(cx, |state, cx| {
-                            controller::dispatch(
-                                state,
-                                AppAction::TogglePinSession {
-                                    work_dir: pin_work_dir.clone(),
-                                    session_id: pin_session_id.clone(),
-                                },
-                            );
-                            cx.notify();
-                        });
-                    }),
-                )
-                .map(|menu| {
-                    session_snooze_menu_items(
-                        menu,
-                        _window,
-                        _cx,
-                        &context_model,
-                        &snooze_session,
-                    )
-                })
-                .separator()
-                .item({
-                    let item = PopupMenuItem::new(if terminal_unavailable {
-                        "Open Terminal Here — worktree unavailable"
-                    } else {
-                        "Open Terminal Here"
+                        cx.notify();
                     });
-                    if terminal_unavailable {
-                        item.disabled(true)
-                    } else {
-                        item.on_click({
-                            let terminal_model = terminal_model.clone();
-                            let terminal_work_dir = terminal_work_dir.clone();
-                            move |_event, _window, cx| {
-                                terminal_model.update(cx, |state, cx| {
-                                    controller::dispatch(
-                                        state,
-                                        AppAction::OpenTerminalAt(terminal_work_dir.clone()),
-                                    );
-                                    cx.notify();
-                                });
-                            }
-                        })
-                    }
-                })
-                .item(
-                    PopupMenuItem::new("Copy Session ID").on_click(move |_event, _window, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(copy_session_id.clone()));
-                    }),
+                } else {
+                    execute_sidebar_session_action(action, &model, &view, &target, window, cx);
+                }
+            },
+            move |menu, window, cx| {
+                render_sidebar_session_menu(
+                    menu,
+                    quick_model.clone(),
+                    quick_view.clone(),
+                    quick_target.clone(),
+                    threadlane_ui_kit::SidebarSessionMenuScope::Quick,
+                    window,
+                    cx,
                 )
-                .item(PopupMenuItem::new("Copy Project Root Path").on_click(
-                    move |_event, _window, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(copy_project_path.clone()));
-                    },
-                ))
-                .item(PopupMenuItem::new("Copy Session File Path").on_click(
-                    move |_event, _window, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(copy_session_file.clone()));
-                    },
-                ))
-                .separator()
-                .item(PopupMenuItem::new("Export Session Log…").on_click(
-                    move |_event, _window, cx| {
-                        let model = export_log_model.clone();
-                        let source = export_log_source.clone();
-                        let session_id = export_log_session_id.clone();
-                        let title = export_log_title.clone();
-                        let work_dir = export_log_work_dir.clone();
-                        let (trajectory, runtime) = model.update(cx, |state, _cx| {
-                            (
-                                state.session_trajectory(&session_id).to_vec(),
-                                Some(
-                                    state.ensure_session_runtime(work_dir.clone(), source.clone()),
-                                ),
-                            )
-                        });
-                        cx.spawn(async move |cx| {
-                            let default_name =
-                                format!("{}-session-diagnostics.json", safe_file_stem(&title));
-                            let Some(destination) = rfd::AsyncFileDialog::new()
-                                .set_file_name(&default_name)
-                                .save_file()
-                                .await
-                            else {
-                                return;
-                            };
-                            // Blocking file + JSON work hops to the background
-                            // executor: session logs can be tens of MB, and
-                            // this continuation already left the UI thread.
-                            let destination_path = destination.path().to_path_buf();
-                            let result = cx
-                                .background_executor()
-                                .spawn(async move {
-                                    build_diagnostic_export(
-                                        &source,
-                                        &session_id,
-                                        &title,
-                                        &work_dir,
-                                        runtime.as_deref(),
-                                        trajectory,
-                                        true,
-                                    )
-                                    .and_then(|value| {
-                                        serde_json::to_vec_pretty(&value)
-                                            .map_err(|error| error.to_string())
-                                    })
-                                    .and_then(|bytes| {
-                                        std::fs::write(&destination_path, bytes)
-                                            .map_err(|error| error.to_string())
-                                    })
-                                })
-                                .await;
-                            let _ = model.update(cx, |state, cx| {
-                                state.session_status = Some(match result {
-                                    Ok(()) => "Session diagnostics exported".into(),
-                                    Err(error) => {
-                                        format!("Could not export session diagnostics: {error}")
-                                    }
-                                });
-                                cx.notify();
-                            });
-                        })
-                        .detach();
-                    },
-                ))
-                .item(PopupMenuItem::new("Export Trajectory…").on_click(
-                    move |_event, _window, cx| {
-                        let model = export_trajectory_model.clone();
-                        let session_id = export_trajectory_session_id.clone();
-                        let title = export_trajectory_title.clone();
-                        let source = export_trajectory_source.clone();
-                        let work_dir = export_trajectory_work_dir.clone();
-                        let (trajectory, runtime) = model.update(cx, |state, _cx| {
-                            (
-                                state.session_trajectory(&session_id).to_vec(),
-                                Some(
-                                    state.ensure_session_runtime(work_dir.clone(), source.clone()),
-                                ),
-                            )
-                        });
-                        cx.spawn(async move |cx| {
-                            let default_name =
-                                format!("{}-trajectory.json", safe_file_stem(&title));
-                            let Some(destination) = rfd::AsyncFileDialog::new()
-                                .set_file_name(&default_name)
-                                .save_file()
-                                .await
-                            else {
-                                return;
-                            };
-                            let destination_path = destination.path().to_path_buf();
-                            let result = cx
-                                .background_executor()
-                                .spawn(async move {
-                                    build_diagnostic_export(
-                                        &source,
-                                        &session_id,
-                                        &title,
-                                        &work_dir,
-                                        runtime.as_deref(),
-                                        trajectory,
-                                        false,
-                                    )
-                                    .and_then(|value| {
-                                        serde_json::to_vec_pretty(&value)
-                                            .map_err(|error| error.to_string())
-                                    })
-                                    .and_then(|bytes| {
-                                        std::fs::write(&destination_path, bytes)
-                                            .map_err(|error| error.to_string())
-                                    })
-                                })
-                                .await;
-                            let _ = model.update(cx, |state, cx| {
-                                state.session_status = Some(match result {
-                                    Ok(()) => "Trajectory exported".into(),
-                                    Err(error) => format!("Could not export trajectory: {error}"),
-                                });
-                                cx.notify();
-                            });
-                        })
-                        .detach();
-                    },
-                ))
-                .separator()
-                .item(
-                    PopupMenuItem::new("Archive Session").on_click(move |_event, window, cx| {
-                        open_archive_session_dialog(
-                            window,
-                            cx,
-                            settle_model.clone(),
-                            settle_work_dir.clone(),
-                            settle_session_id.clone(),
-                            settle_is_worktree,
-                            settle_git_branch.clone(),
-                        );
-                    }),
+            },
+            move |menu, window, cx| {
+                render_sidebar_session_menu(
+                    menu,
+                    full_model.clone(),
+                    full_view.clone(),
+                    full_target.clone(),
+                    threadlane_ui_kit::SidebarSessionMenuScope::Full,
+                    window,
+                    cx,
                 )
-                .separator()
-                .item(
-                    PopupMenuItem::new("Remove Session").on_click(move |_event, window, cx| {
-                        open_remove_session_dialog(
-                            window,
-                            cx,
-                            remove_model.clone(),
-                            remove_work_dir.clone(),
-                            remove_session_id.clone(),
-                            remove_is_worktree,
-                            remove_git_branch.clone(),
-                        );
-                    }),
-                )
-            })
+            },
+            cx,
+        )
     }
 
     fn render_update_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -2546,45 +1180,12 @@ impl SidebarView {
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let settings_model = self.model.clone();
         let pairing_model = self.model.clone();
-        let theme = cx.theme().colors;
         let settings_selected =
             self.model.read(cx).workspace_page == threadlane_ui_state::WorkspacePage::Settings;
 
-        div()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_2()
-            .border_t_1()
-            .border_color(theme.border.opacity(0.25))
-            .bg(theme.title_bar)
+        threadlane_ui_kit::sidebar_footer_surface(cx)
             .child(
-                Button::new("sidebar-settings")
-                    .debug_selector(|| "sidebar-settings".into())
-                    .accessibility_label("Open settings")
-                    .tooltip("Open settings")
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .justify_start()
-                            .gap_2()
-                            .child(Icon::new(IconName::Settings).size_4())
-                            .child("Settings"),
-                    )
-                    .ghost()
-                    .selected(settings_selected)
-                    .flex_1()
-                    .min_w_0()
-                    .justify_start()
-                    .text_color(if settings_selected {
-                        theme.foreground
-                    } else {
-                        theme.muted_foreground
-                    })
+                threadlane_ui_kit::sidebar_settings_button(settings_selected, cx)
                     .on_click(move |_event, _window, cx| {
                         settings_model.update(cx, |state, cx| {
                             controller::dispatch(state, AppAction::OpenSettings);
@@ -2593,16 +1194,7 @@ impl SidebarView {
                     }),
             )
             .child(
-                Button::new("sidebar-pair-device")
-                    .accessibility_label("Share with mobile")
-                    .tooltip("Share with mobile")
-                    .ghost()
-                    .child(
-                        Icon::default()
-                            .path("icons/smartphone.svg")
-                            .size_4()
-                            .text_color(theme.muted_foreground),
-                    )
+                threadlane_ui_kit::sidebar_pairing_button(cx)
                     .on_click(move |_event, window, cx| {
                         threadlane_ui_pairing::open_pairing_dialog(
                             pairing_model.clone(),
@@ -2615,220 +1207,30 @@ impl SidebarView {
     }
 
     fn render_github_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use threadlane_ui_kit::SidebarDestination;
         let state = self.model.read(cx);
-        let theme = cx.theme().colors;
-        let automation_model = self.model.clone();
-        let attention = state
-            .automations
-            .snapshot
-            .runs
-            .iter()
-            .filter(|run| run.needs_attention())
-            .count();
-        let open_prs = state
-            .git_prs
-            .values()
-            .filter_map(|p| p.as_ref())
-            .filter(|pr| pr.state.eq_ignore_ascii_case("OPEN"))
-            .count();
-
-        let automations_selected = state.workspace_page == WorkspacePage::Automations;
-        let issues_selected =
-            state.workspace_page == WorkspacePage::GitHub && state.github_tab == GitHubTab::Issues;
-        let prs_selected = state.workspace_page == WorkspacePage::GitHub
-            && state.github_tab == GitHubTab::PullRequests;
-
-        // Two-row nav: Automations gets its own full row, Issues and PRs
-        // share the second row. All three crammed in one row truncated
-        // labels at the default sidebar width.
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_1p5()
-            .child(
-                div()
-                    .w_full()
-                    .p_1()
-                    .rounded_xl()
-                    .bg(theme.muted.opacity(0.28))
-                    .flex()
-                    .items_center()
-                    .child(
-                        Button::new("sidebar-automations")
-                            .debug_selector(|| "sidebar-automations".into())
-                            .accessibility_label(format!(
-                                "Automations, {attention} runs need attention"
-                            ))
-                            .tooltip("Automations")
-                            .ghost()
-                            .xsmall()
-                            .compact()
-                            .w_full()
-                            .selected(automations_selected)
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_start()
-                                    .gap_2()
-                                    .w_full()
-                                    .px_1()
-                                    .child(
-                                        Icon::from(IconName::Calendar)
-                                            .size_3p5()
-                                            .text_color(theme.foreground),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(theme.foreground)
-                                            .child("Automations"),
-                                    )
-                                    .children((attention > 0).then(|| {
-                                        div()
-                                            .px_1()
-                                            .py(rems(0.03125))
-                                            .rounded_full()
-                                            .bg(theme.warning.opacity(0.2))
-                                            .text_xs()
-                                            .font_bold()
-                                            .text_color(theme.warning)
-                                            .child(attention.to_string())
-                                    })),
-                            )
-                            .on_click(move |_, _, cx| {
-                                automation_model.update(cx, |state, cx| {
-                                    controller::dispatch(state, AppAction::OpenAutomations);
-                                    cx.notify();
-                                });
-                            }),
-                    ),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .p_1()
-                    .rounded_xl()
-                    .bg(theme.muted.opacity(0.28))
-                    .flex()
-                    .items_center()
-                    .child({
-                        let model = self.model.clone();
-                        Button::new("sidebar-issues")
-                            .debug_selector(|| "sidebar-issues".into())
-                            .accessibility_label(if issues_selected {
-                                "Open GitHub issues, current view"
-                            } else {
-                                "Open GitHub issues"
-                            })
-                            .tooltip("Issues")
-                            .ghost()
-                            .xsmall()
-                            .compact()
-                            .w_full()
-                            .selected(issues_selected)
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_start()
-                                    .gap_2()
-                                    .w_full()
-                                    .px_1()
-                                    .child(
-                                        Icon::default()
-                                            .path("icons/git/issue.svg")
-                                            .size_3p5()
-                                            .text_color(theme.foreground),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(theme.foreground)
-                                            .child("Issues"),
-                                    ),
-                            )
-                            .on_click(move |_event, _window, cx| {
-                                model.update(cx, |state, cx| {
-                                    controller::dispatch(
-                                        state,
-                                        AppAction::OpenGitHubTab(GitHubTab::Issues),
-                                    );
-                                    cx.notify();
-                                });
-                            })
-                    }),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .p_1()
-                    .rounded_xl()
-                    .bg(theme.muted.opacity(0.28))
-                    .flex()
-                    .items_center()
-                    .child({
-                let model = self.model.clone();
-                Button::new("sidebar-pull-requests")
-                    .debug_selector(|| "sidebar-pull-requests".into())
-                    .accessibility_label(if prs_selected {
-                        "Open GitHub pull requests, current view"
-                    } else {
-                        "Open GitHub pull requests"
-                    })
-                    .tooltip("Pull Requests")
-                    .ghost()
-                    .xsmall()
-                    .compact()
-                    .w_full()
-                    .selected(prs_selected)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_start()
-                            .gap_2()
-                            .w_full()
-                            .px_1()
-                            .child(
-                                Icon::default()
-                                    .path("icons/git/pull-request.svg")
-                                    .size_3p5()
-                                    .text_color(theme.foreground),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme.foreground)
-                                    .child("PRs"),
-                            )
-                            .children((open_prs > 0).then(|| {
-                                div()
-                                    .px_1()
-                                    .py(rems(0.03125))
-                                    .rounded_full()
-                                    .bg(theme.primary.opacity(0.2))
-                                    .text_xs()
-                                    .font_bold()
-                                    .text_color(theme.primary)
-                                    .child(open_prs.to_string())
-                            })),
-                    )
-                    .on_click(move |_event, _window, cx| {
-                        model.update(cx, |state, cx| {
-                            controller::dispatch(
-                                state,
-                                AppAction::OpenGitHubTab(GitHubTab::PullRequests),
-                            );
-                            cx.notify();
-                        });
-                    })
-                    })
-            )
+        let selected = match state.workspace_page {
+            WorkspacePage::Automations => Some(SidebarDestination::Automations),
+            WorkspacePage::GitHub => Some(match state.github_tab {
+                GitHubTab::Issues => SidebarDestination::Issues,
+                GitHubTab::PullRequests => SidebarDestination::PullRequests,
+            }),
+            _ => None,
+        };
+        let attention = state.automations.snapshot.runs.iter().filter(|run| run.needs_attention()).count();
+        let open_prs = state.git_prs.values().filter_map(|pr| pr.as_ref())
+            .filter(|pr| pr.state.eq_ignore_ascii_case("OPEN")).count();
+        let model = self.model.clone();
+        threadlane_ui_kit::sidebar_navigation(selected, attention, open_prs, move |destination, _, cx| {
+            model.update(cx, |state, cx| {
+                controller::dispatch(state, match destination {
+                    SidebarDestination::Automations => AppAction::OpenAutomations,
+                    SidebarDestination::Issues => AppAction::OpenGitHubTab(GitHubTab::Issues),
+                    SidebarDestination::PullRequests => AppAction::OpenGitHubTab(GitHubTab::PullRequests),
+                });
+                cx.notify();
+            });
+        }, cx)
     }
 
     /// Filter, group, and sort sessions for the history list. Only runs when
@@ -2897,7 +1299,6 @@ impl SidebarView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = cx.theme().colors;
         match self
             .history_cache
             .as_ref()
@@ -2905,132 +1306,20 @@ impl SidebarView {
             .cloned()
         {
             Some(HistoryRow::Group(group)) => {
-                let status_dot = match group {
-                    DateGroup::Pinned => Some(
-                        div()
-                            .flex()
-                            .items_center()
-                            .child(
-                                Icon::default()
-                                    .path("icons/pin.svg")
-                                    .size(rems(0.6875))
-                                    .text_color(theme.primary),
-                            ),
-                    ),
-                    DateGroup::NeedsYou => Some(
-                        div()
-                            .size(rems(0.4375))
-                            .rounded_full()
-                            .bg(theme.warning),
-                    ),
-                    DateGroup::Working => Some(
-                        div()
-                            .size(rems(0.4375))
-                            .rounded_full()
-                            .bg(theme.primary),
-                    ),
-                    _ => None,
-                };
-
-                let is_pinned_group = group == DateGroup::Pinned;
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .pt(if index == 0 {
-                        window.rem_size() * 0.25
-                    } else {
-                        window.rem_size() * 0.75
-                    })
-                    .pb_1()
-                    .children(status_dot)
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_semibold()
-                            .text_color(if is_pinned_group {
-                                theme.primary
-                            } else {
-                                theme.muted_foreground.opacity(0.85)
-                            })
-                            .child(group.label()),
-                    )
-                    .child(
-                        div()
-                            .h(rems(0.0625))
-                            .flex_1()
-                            .bg(if is_pinned_group {
-                                theme.primary.opacity(0.25)
-                            } else {
-                                theme.border.opacity(0.25)
-                            }),
-                    )
-                    .into_any_element()
+                threadlane_ui_kit::session_group_header(group, index == 0, window, cx).into_any_element()
             }
             Some(HistoryRow::SnoozedHeader(count)) => {
-                let collapsed = self.snoozed_collapsed;
-                let chevron = if collapsed {
-                    IconName::ChevronRight
-                } else {
-                    IconName::ChevronDown
-                };
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .pt(if index == 0 {
-                        window.rem_size() * 0.25
-                    } else {
-                        window.rem_size() * 0.75
-                    })
-                    .pb_1()
-                    .child(
-                        Icon::new(IconName::Moon)
-                            .xsmall()
-                            .text_color(theme.muted_foreground.opacity(0.85)),
-                    )
-                    .child(
-                        Button::new("snoozed-section-toggle")
-                            .debug_selector(|| "snoozed-section-toggle".into())
-                            .icon(Icon::new(chevron))
-                            .label(format!("Snoozed ({count})"))
-                            .accessibility_label(if collapsed {
-                                format!("Snoozed, {count} sessions, collapsed")
-                            } else {
-                                format!("Snoozed, {count} sessions, expanded")
-                            })
-                            .tooltip(if collapsed {
-                                "Expand snoozed sessions"
-                            } else {
-                                "Collapse snoozed sessions"
-                            })
-                            .ghost()
-                            .xsmall()
-                            .compact()
-                            .text_color(theme.muted_foreground.opacity(0.85))
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.snoozed_collapsed = !this.snoozed_collapsed;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        div()
-                            .h(rems(0.0625))
-                            .flex_1()
-                            .bg(theme.border.opacity(0.25)),
-                    )
-                    .into_any_element()
+                let owner = cx.entity().downgrade();
+                threadlane_ui_kit::sidebar_snoozed_header(count, self.snoozed_collapsed, index == 0, move |_, cx| {
+                    let _ = owner.update(cx, |this, cx| { this.snoozed_collapsed = !this.snoozed_collapsed; cx.notify(); });
+                }, window, cx).into_any_element()
             }
             Some(HistoryRow::Session(session, attention, _has_unseen_result, _snooze)) => {
                 let state = self.model.read(cx);
                 let is_active = state.workspace_page == WorkspacePage::Chat
                     && state.active_work_dir.as_ref() == Some(&session.work_dir)
                     && state.active_session_id.as_deref() == Some(session.id.as_str());
-                div()
-                    .px_2()
-                    .child(self.render_session_card(&session, attention, is_active, cx))
+                threadlane_ui_kit::session_history_card_row(self.render_session_card(&session, attention, is_active, cx))
                     .into_any_element()
             }
             None => div().into_any_element(),
@@ -3083,7 +1372,6 @@ impl SidebarView {
     }
 
     fn render_history(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
         let state = self.model.read(cx);
         let query = state.search_query.trim().to_lowercase();
         let has_filters = self.has_history_filters(state);
@@ -3135,92 +1423,14 @@ impl SidebarView {
             .as_ref()
             .map_or(0, |(_, rows)| rows.len());
         if row_count == 0 {
-            return div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap_3()
-                .px_4()
-                .py_8()
-                .child(
-                    div()
-                        .size(rems(2.5))
-                        .rounded_full()
-                        .bg(theme.muted.opacity(0.4))
-                        .border_1()
-                        .border_color(theme.border.opacity(0.25))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            Icon::new(if has_filters {
-                                IconName::Search
-                            } else {
-                                IconName::SquareTerminal
-                            })
-                            .small()
-                            .text_color(theme.muted_foreground.opacity(0.7)),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_semibold()
-                                .text_color(theme.foreground)
-                                .child(if has_filters {
-                                    "No matching tasks"
-                                } else {
-                                    "No tasks yet"
-                                }),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .text_center()
-                                .child(if has_filters {
-                                    "Try a different project"
-                                } else {
-                                    "Start a new session to begin coding"
-                                }),
-                        ),
-                )
-                .when(has_filters, |this| {
-                    this.child(
-                        Button::new("empty-history-clear-filters")
-                            .debug_selector(|| "empty-history-clear-filters".into())
-                            .label("Clear filter")
-                            .tooltip("Clear project filter")
-                            .outline()
-                            .small()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.clear_history_filters(cx);
-                            })),
-                    )
-                })
-                .children((!has_filters).then(|| {
-                    Button::new("empty-history-new-task")
-                        .icon(IconName::Plus)
-                        .label("New task")
-                        .outline()
-                        .small()
-                        .accessibility_label("Start a new task")
-                        .tooltip("Start a new task (⌘N)")
-                        .on_click(move |_event, window, cx| {
-                            window.dispatch_action(Box::new(crate::BeginNewTask), cx);
-                        })
-                }))
-                .into_any_element();
+            let owner = cx.entity().downgrade();
+            return threadlane_ui_kit::sidebar_history_empty(has_filters, move |action, window, cx| match action {
+                threadlane_ui_kit::SidebarEmptyAction::ClearFilters => { let _ = owner.update(cx, |this, cx| this.clear_history_filters(cx)); }
+                threadlane_ui_kit::SidebarEmptyAction::NewTask => window.dispatch_action(Box::new(crate::BeginNewTask), cx),
+            }, cx).into_any_element();
         }
 
-        threadlane_ui_session::session_list(self.history_list_state.clone(), cx.processor(Self::render_history_row))
+        threadlane_ui_kit::session_list(self.history_list_state.clone(), cx.processor(Self::render_history_row))
             .into_any_element()
     }
 }
@@ -3312,6 +1522,7 @@ mod tests {
         cx.update(|window, cx| {
             window.blur(cx);
             window.focus_next(cx); // Settings
+            window.focus_next(cx); // Share with mobile
             window.focus_next(cx); // Retry update
             window.draw(cx).clear(cx);
         });
@@ -3998,6 +2209,78 @@ mod tests {
     }
 
     #[gpui::test]
+    fn project_filter_menu_selects_and_clears_without_switching_chat(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::*;
+        use threadlane_ui_state::{AppState, ProjectInfo};
+
+        struct Filter(Entity<super::SidebarView>);
+        impl Render for Filter {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div().w(rems(16.5)).child(self.0.update(cx, |sidebar, cx| {
+                    sidebar.render_project_filter(cx).into_any_element()
+                }))
+            }
+        }
+        cx.update(gpui_component::init);
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        let model = cx.new(|_| {
+            let mut state = AppState::default();
+            state.pending_hydrations.clear();
+            state.projects = vec![
+                ProjectInfo {
+                    name: "First".into(),
+                    work_dir: first.clone(),
+                    sessions: Vec::new(),
+                    is_expanded: true,
+                },
+                ProjectInfo {
+                    name: "Second".into(),
+                    work_dir: second.clone(),
+                    sessions: Vec::new(),
+                    is_expanded: true,
+                },
+            ];
+            state.active_work_dir = Some(first.clone());
+            state.active_session_id = Some("active-chat".into());
+            state.sidebar_project_filter = None;
+            state
+        });
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let sidebar = cx.new(|cx| super::SidebarView::new(model.clone(), window, cx));
+            gpui_component::Root::new(cx.new(|_| Filter(sidebar)), window, cx)
+        });
+        for (steps, expected) in [(3, Some(second)), (1, None)] {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let trigger = cx.debug_bounds("sidebar-project-filter").unwrap();
+            cx.simulate_click(trigger.center(), Modifiers::default());
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            for _ in 0..steps {
+                cx.simulate_keystrokes("down");
+            }
+            cx.simulate_keystrokes("enter");
+            model.read_with(cx, |state, _| {
+                assert_eq!(state.sidebar_project_filter, expected);
+                assert_eq!(state.active_work_dir.as_ref(), Some(&first));
+                assert_eq!(state.active_session_id.as_deref(), Some("active-chat"));
+            });
+        }
+        // Escape dismisses without changing the last confirmed filter.
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let trigger = cx.debug_bounds("sidebar-project-filter").unwrap();
+        cx.simulate_click(trigger.center(), Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_keystrokes("down down down escape");
+        model.read_with(cx, |state, _| {
+            assert!(state.sidebar_project_filter.is_none())
+        });
+    }
+    #[gpui::test]
     fn session_actions_menu_opens_and_escape_dismisses(cx: &mut gpui::TestAppContext) {
         use gpui::*;
         use threadlane_ui_state::{AppState, RunCompletionToken};
@@ -4124,15 +2407,7 @@ mod tests {
 
 impl Render for SidebarView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
-
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .min_w_0()
-            .min_h_0()
-            .bg(theme.title_bar)
+        threadlane_ui_kit::sidebar_surface(cx)
             .child(self.render_header(cx))
             .child(self.render_project_filter(cx))
             .child(div().flex_1().min_h_0().child(self.render_history(cx)))

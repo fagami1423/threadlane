@@ -2410,6 +2410,7 @@ source = "git+https://github.com/longbridge/gpui-kit?rev=201b55a431fb1b82a6047e9
 dependencies = [
  "gpui-base",
  "gpui-component",
+ "gpui-kit-assets",
  "gpui-pre",
  "gpui-pre-platform",
  "gpui-pre-web",
@@ -6956,7 +6957,7 @@ dependencies = [
  "objc2 0.6.4",
  "threadlane-client",
  "threadlane-protocol",
- "threadlane-ui-session",
+ "threadlane-ui-kit",
  "threadlane-ui-theme",
  "tokio",
  "url",
@@ -6986,12 +6987,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "threadlane-ui-session"
+name = "threadlane-ui-kit"
 version = "0.1.0"
 dependencies = [
  "gpui-component",
+ "gpui-kit",
  "gpui-kit-assets",
  "gpui-pre",
+ "serde_json",
+ "threadlane-automation",
  "threadlane-protocol",
  "threadlane-ui-theme",
 ]

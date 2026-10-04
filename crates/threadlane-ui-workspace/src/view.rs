@@ -5,12 +5,10 @@ use std::sync::Arc;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::command::{Command, CommandGroup, CommandItem, CommandState};
-use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
-use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable, ResizableState};
-use gpui_component::scroll::ScrollableElement;
+use gpui_component::command::{CommandGroup, CommandState};
+use gpui_component::resizable::ResizableState;
 use gpui_component::status_bar::StatusBar;
-use gpui_component::{v_flex, ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable};
+use gpui_component::{ActiveTheme, IconName, Selectable, Sizable};
 
 actions!(
     threadlane_workspace,
@@ -24,6 +22,12 @@ actions!(
         SelectTrajectoryTab,
         SelectEditorTab,
         FocusComposer,
+        QuitThreadlane,
+        HideThreadlane,
+        HideOtherApplications,
+        ShowAllApplications,
+        MinimizeWindow,
+        ZoomWindow,
     ]
 );
 // `BeginNewTask` and `ToggleSidebar` are shared with the sidebar, so the
@@ -108,11 +112,41 @@ fn open_github_from_palette(state: &mut AppState, notify: impl FnOnce()) {
     notify();
 }
 
+fn install_window_close_handler(
+    window: &mut Window,
+    cx: &mut App,
+    request_close: impl Fn(&mut Window, &mut App) -> bool + Clone + 'static,
+) {
+    window.on_window_should_close(cx, request_close.clone());
+    let window_handle = window.window_handle();
+    cx.on_action(move |_: &QuitThreadlane, cx| {
+        // Also stop the startup fallback when there is no focused window.
+        cx.stop_propagation();
+        let request_close = request_close.clone();
+        // An action can arrive while this window is already being updated.
+        cx.defer(move |cx| {
+            let _ = window_handle.update(cx, |_, window, cx| {
+                if request_close(window, cx) {
+                    window.remove_window();
+                }
+            });
+        });
+    });
+}
+
 pub fn init(cx: &mut App) {
     threadlane_ui_automation::init(cx);
     threadlane_ui_github::view::init(cx);
     threadlane_ui_terminal::init(cx);
     cx.bind_keys([
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-q", QuitThreadlane, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-h", HideThreadlane, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-alt-h", HideOtherApplications, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-m", MinimizeWindow, None),
         KeyBinding::new("cmd-k", ToggleCommandPalette, None),
         KeyBinding::new("ctrl-k", ToggleCommandPalette, None),
         KeyBinding::new("cmd-b", ToggleSidebar, None),
@@ -137,6 +171,72 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-s", threadlane_ui_editor::SaveFile, None),
         KeyBinding::new("ctrl-s", threadlane_ui_editor::SaveFile, None),
     ]);
+    // Startup owns no active work. Once loaded, the workspace installs the
+    // guarded Quit handler below, including when its window is unfocused.
+    cx.on_action(|_: &QuitThreadlane, cx| cx.quit());
+    #[cfg(target_os = "macos")]
+    {
+        cx.on_action(|_: &HideThreadlane, cx| cx.hide());
+        cx.on_action(|_: &HideOtherApplications, cx| cx.hide_other_apps());
+        cx.on_action(|_: &ShowAllApplications, cx| cx.unhide_other_apps());
+        cx.on_action(|_: &MinimizeWindow, cx| {
+            if let Some(window) = cx.active_window() {
+                cx.defer(move |cx| {
+                    let _ = window.update(cx, |_, window, _| window.minimize_window());
+                });
+            }
+        });
+        cx.on_action(|_: &ZoomWindow, cx| {
+            if let Some(window) = cx.active_window() {
+                cx.defer(move |cx| {
+                    let _ = window.update(cx, |_, window, _| window.zoom_window());
+                });
+            }
+        });
+        use gpui_component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
+        cx.set_menus([
+            Menu::new("Threadlane").items([
+                MenuItem::action("Settings…", OpenSettings),
+                MenuItem::separator(),
+                MenuItem::os_submenu("Services", SystemMenuType::Services),
+                MenuItem::separator(),
+                MenuItem::action("Hide Threadlane", HideThreadlane),
+                MenuItem::action("Hide Others", HideOtherApplications),
+                MenuItem::action("Show All", ShowAllApplications),
+                MenuItem::separator(),
+                MenuItem::action("Quit Threadlane", QuitThreadlane),
+            ]),
+            Menu::new("File").items([
+                MenuItem::action("New Chat", BeginNewTask),
+                MenuItem::action("Save File", threadlane_ui_editor::SaveFile),
+            ]),
+            Menu::new("Edit").items([
+                MenuItem::os_action("Undo", Undo, OsAction::Undo),
+                MenuItem::os_action("Redo", Redo, OsAction::Redo),
+                MenuItem::separator(),
+                MenuItem::os_action("Cut", Cut, OsAction::Cut),
+                MenuItem::os_action("Copy", Copy, OsAction::Copy),
+                MenuItem::os_action("Paste", Paste, OsAction::Paste),
+                MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
+            ]),
+            Menu::new("View").items([
+                MenuItem::action("Command Palette", ToggleCommandPalette),
+                MenuItem::separator(),
+                MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                MenuItem::action("Toggle Right Panel", ToggleRightPanel),
+                MenuItem::action("Toggle Terminal", ToggleTerminal),
+                MenuItem::separator(),
+                MenuItem::action("Chat", SelectChatTab),
+                MenuItem::action("Trajectory", SelectTrajectoryTab),
+                MenuItem::action("Editor", SelectEditorTab),
+                MenuItem::action("Focus Composer", FocusComposer),
+            ]),
+            Menu::new("Window").items([
+                MenuItem::action("Minimize", MinimizeWindow),
+                MenuItem::action("Zoom", ZoomWindow),
+            ]),
+        ]);
+    }
 }
 
 enum GitEvent {
@@ -292,7 +392,7 @@ pub struct WorkspaceView {
     /// Two-step close confirm for shells holding output: (project, tab).
     /// A misclick arms instead of destroying build/test scrollback; the
     /// second click confirms.
-    pending_terminal_close: Option<(PathBuf, usize)>,
+    pending_terminal_close: Option<(PathBuf, EntityId)>,
     terminal_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -645,7 +745,7 @@ impl WorkspaceView {
         });
         view.update(cx, |view, cx| {
             let weak_view = cx.weak_entity();
-            window.on_window_should_close(cx, move |window, cx| {
+            let request_close = move |window: &mut Window, cx: &mut App| {
                 if cx.windows().len() != 1 {
                     return true;
                 }
@@ -667,7 +767,8 @@ impl WorkspaceView {
                 };
                 open_active_close_confirmation(window, cx, model, work);
                 false
-            });
+            };
+            install_window_close_handler(window, cx, request_close);
             let hydration_requests = view
                 .model
                 .update(cx, |state, _cx| state.take_pending_hydrations());
@@ -1100,6 +1201,100 @@ impl WorkspaceView {
             .expect("fallback terminal exists")
     }
 
+    fn request_terminal_tab(
+        &mut self,
+        action: threadlane_ui_kit::TerminalTabAction,
+        project: Option<&PathBuf>,
+        cwd: Option<&PathBuf>,
+        terminal: &Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use threadlane_ui_kit::TerminalTabAction;
+        let tab = project
+            .and_then(|project| self.terminal_groups.get(project))
+            .and_then(|group| {
+                group
+                    .tabs
+                    .iter()
+                    .position(|candidate| candidate.entity_id() == terminal.entity_id())
+            });
+        match action {
+            TerminalTabAction::Select => {
+                if let (Some(project), Some(tab)) = (project, tab) {
+                    self.select_terminal_tab(project, tab, window, cx);
+                }
+            }
+            TerminalTabAction::Close => {
+                if let (Some(project), Some(tab)) = (project, tab) {
+                    self.close_terminal_tab(project, tab, cx);
+                }
+            }
+            TerminalTabAction::CloseOthers => {
+                if let (Some(project), Some(tab)) = (project, tab) {
+                    self.close_other_terminal_tabs(project, tab, cx);
+                }
+            }
+            TerminalTabAction::Restart => {
+                if tab.is_some()
+                    || self
+                        .fallback_terminal
+                        .as_ref()
+                        .is_some_and(|fallback| fallback.entity_id() == terminal.entity_id())
+                {
+                    terminal.update(cx, |terminal, cx| terminal.restart(cx));
+                }
+            }
+            TerminalTabAction::NewTab => {
+                if let (Some(project), Some(cwd)) = (project, cwd) {
+                    self.add_terminal_tab(project.clone(), cwd.clone(), window, cx);
+                }
+            }
+        }
+    }
+
+    fn request_terminal_action(
+        &mut self,
+        action: threadlane_ui_kit::TerminalAction,
+        project: Option<PathBuf>,
+        cwd: Option<PathBuf>,
+        terminal: Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use threadlane_ui_kit::TerminalAction;
+        if action == TerminalAction::Hide {
+            self.bottom_panel_visible = false;
+            cx.notify();
+            return;
+        }
+        if !self
+            .displayed_terminal(cx)
+            .is_some_and(|(_, active)| active.entity_id() == terminal.entity_id())
+        {
+            return;
+        }
+        match action {
+            TerminalAction::NewTab => {
+                if let Some(project) = project {
+                    self.add_terminal_tab(project.clone(), cwd.unwrap_or(project), window, cx);
+                }
+            }
+            TerminalAction::Clear => terminal.update(cx, |terminal, cx| terminal.clear(cx)),
+            TerminalAction::Restart => terminal.update(cx, |terminal, cx| terminal.restart(cx)),
+            TerminalAction::Find => terminal.update(cx, |terminal, cx| {
+                terminal.open_find(&FindInTerminalOutput, window, cx)
+            }),
+            TerminalAction::OpenLinks => {
+                terminal.update(cx, |terminal, cx| terminal.open_links(window, cx))
+            }
+            TerminalAction::AddSelectionToChat => {
+                self.add_terminal_selection_to_chat(terminal, project, window, cx)
+            }
+            _ => {}
+        }
+    }
+
     fn select_terminal_tab(
         &mut self,
         project: &PathBuf,
@@ -1119,13 +1314,15 @@ impl WorkspaceView {
     fn close_terminal_tab(&mut self, project: &PathBuf, tab: usize, cx: &mut Context<Self>) {
         // Two-step confirm when the shell holds output: the first click arms,
         // the second destroys. A clean shell closes immediately.
+        let Some(terminal_id) = self.terminal_groups.get(project)
+            .and_then(|group| group.tabs.get(tab)).map(|terminal| terminal.entity_id()) else { return; };
         let dirty = self
             .terminal_groups
             .get(project)
             .and_then(|group| group.tabs.get(tab))
             .is_some_and(|terminal| terminal.read(cx).has_output());
-        if dirty && self.pending_terminal_close != Some((project.clone(), tab)) {
-            self.pending_terminal_close = Some((project.clone(), tab));
+        if dirty && self.pending_terminal_close != Some((project.clone(), terminal_id)) {
+            self.pending_terminal_close = Some((project.clone(), terminal_id));
             cx.notify();
             return;
         }
@@ -1573,228 +1770,16 @@ impl WorkspaceView {
     }
 
     fn render_command_palette(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
         let model = self.model.clone();
         let state = model.read(cx);
 
-        let commands: [(&str, &str, &str, Icon, &[&str], &str); 26] = [
-            (
-                "New Task",
-                "Start a fresh session",
-                "new",
-                Icon::from(IconName::Plus),
-                &["task", "fresh", "session", "new"],
-                "⌘N",
-            ),
-            (
-                "Go to Task…",
-                "Jump to a recent task or session",
-                "go_task",
-                Icon::from(IconName::Search),
-                &["go", "task", "jump", "find", "session", "recent"],
-                "",
-            ),
-            (
-                "Open File…",
-                "Browse project files in the right panel",
-                "open_file",
-                Icon::from(IconName::File),
-                &["open", "file", "browse", "tree", "explorer"],
-                "",
-            ),
-            (
-                "Run Terminal Command…",
-                "Open or focus the integrated terminal",
-                "run_terminal",
-                Icon::from(IconName::SquareTerminal),
-                &["run", "terminal", "command", "shell", "exec"],
-                "⌘J",
-            ),
-            (
-                "Terminal: Open link…",
-                "Links in visible output",
-                "open_terminal_link",
-                Icon::from(IconName::ExternalLink),
-                &["terminal", "link", "url", "browser", "open"],
-                "",
-            ),
-            (
-                "Add Selection to Chat",
-                "Append the selected terminal text to the chat draft",
-                "add_terminal_selection",
-                Icon::default().path("icons/square-pen.svg"),
-                &["terminal", "selection", "chat", "draft", "add", "output"],
-                "",
-            ),
-            (
-                "Find in files…",
-                "Search saved files in the active checkout",
-                "find_files",
-                Icon::from(IconName::Search),
-                &["find", "files", "search", "text", "contents"],
-                "",
-            ),
-            (
-                "Search project conversations…",
-                "Find saved messages across this project's sessions",
-                "search_conversations",
-                Icon::from(IconName::Search),
-                &["search", "conversations", "messages", "find", "transcript"],
-                "",
-            ),
-            (
-                "Open Issue/PR…",
-                "Browse GitHub issues and pull requests",
-                "open_issue",
-                Icon::from(IconName::Github),
-                &["issue", "pr", "pull", "request", "github", "browse"],
-                "",
-            ),
-            (
-                "Toggle Worktree Mode",
-                "Toggle new-task execution between local and worktree mode",
-                "switch_worktree",
-                Icon::from(IconName::FolderOpen),
-                &["switch", "worktree", "mode", "local", "branch"],
-                "",
-            ),
-            (
-                "Ask Agent to…",
-                "Focus the composer to prompt the agent",
-                "ask_agent",
-                Icon::from(IconName::Bot),
-                &["ask", "agent", "prompt", "chat", "ai", "help"],
-                "⌘L",
-            ),
-            (
-                "Add Project",
-                "Attach a project folder to your workspace",
-                "attach",
-                Icon::from(IconName::FolderOpen),
-                &["folder", "workspace", "attach", "open", "project"],
-                "",
-            ),
-            (
-                "Goal Planning (/goal)",
-                "Autonomous goal loop extension",
-                "goal",
-                Icon::from(IconName::Bot),
-                &["goal", "planning", "loop", "agent", "autonomous"],
-                "",
-            ),
-            (
-                "Model Selection (/model)",
-                "Switch model or provider",
-                "model",
-                Icon::from(IconName::Cpu),
-                &["model", "llm", "switch", "provider", "select"],
-                "",
-            ),
-            (
-                "Compact History (/compact)",
-                "Compact context conversation",
-                "compact",
-                Icon::from(IconName::Minimize),
-                &["compact", "history", "context", "clean"],
-                "",
-            ),
-            (
-                "Git Review & Commit",
-                "Review changed files and commit",
-                "git",
-                Icon::default().path("icons/git/commit.svg"),
-                &["git", "diff", "review", "commit", "stage"],
-                "",
-            ),
-            (
-                "Automations",
-                "Schedule recurring prompts and review runs",
-                "automations",
-                Icon::from(IconName::Calendar),
-                &["automation", "schedule", "recurring", "runs"],
-                "",
-            ),
-            (
-                "GitHub",
-                "Browse project issues and pull requests",
-                "github",
-                Icon::default().path("icons/git/comments.svg"),
-                &["github", "issues", "pull requests", "repository"],
-                "",
-            ),
-            (
-                "Git: Switch Branch",
-                "Switch or checkout a Git branch",
-                "git_branch",
-                Icon::default().path("icons/git/branch.svg"),
-                &["git", "branch", "switch", "checkout"],
-                "",
-            ),
-            (
-                "Git: New Branch",
-                "Create a new branch from current HEAD",
-                "git_new_branch",
-                Icon::from(IconName::Plus),
-                &["git", "branch", "new", "create"],
-                "",
-            ),
-            (
-                "Git: Merge Branch",
-                "Merge another branch into current branch",
-                "git_merge",
-                Icon::from(IconName::Redo),
-                &["git", "merge", "branch", "integrate"],
-                "",
-            ),
-            (
-                "Git: Restore Stashed Changes",
-                "Restore changes previously stashed on this branch",
-                "git_stash_pop",
-                Icon::from(IconName::Undo2),
-                &["git", "stash", "pop", "restore", "unstash"],
-                "",
-            ),
-            (
-                "Git: Pull Origin",
-                "Pull latest commits from remote origin",
-                "git_pull",
-                Icon::from(IconName::Redo),
-                &["git", "pull", "origin", "fetch", "sync"],
-                "",
-            ),
-            (
-                "Toggle Sidebar",
-                "Show or hide your projects and tasks",
-                "sidebar",
-                Icon::from(IconName::PanelLeft),
-                &["sidebar", "toggle", "hide", "show", "projects"],
-                "⌘B",
-            ),
-            (
-                "Toggle Right Panel",
-                "Show review / files / terminal",
-                "panel",
-                Icon::from(IconName::PanelRight),
-                &["panel", "right", "terminal", "review", "toggle"],
-                "⌘R",
-            ),
-            (
-                "Settings",
-                "Configure API keys and providers",
-                "settings",
-                Icon::from(IconName::Settings),
-                &["settings", "keys", "provider", "preferences", "config"],
-                "⌘,",
-            ),
-        ];
+        let commands = threadlane_ui_kit::workspace_commands();
 
         let handoff_terminal = self
             .displayed_terminal(cx)
             .map(|(_group, terminal)| terminal);
         let excerpt_block = match &handoff_terminal {
-            Some(terminal) => {
-                terminal_excerpt_block_reason(terminal.read(cx).selection_status())
-            }
+            Some(terminal) => terminal_excerpt_block_reason(terminal.read(cx).selection_status()),
             None => Some("No terminal is visible"),
         };
 
@@ -1802,83 +1787,18 @@ impl WorkspaceView {
         // stays listed but disabled, carrying its reason in the subtitle.
         let no_project = conversation_search_scope(state).is_none();
         let mut commands_group = CommandGroup::new().label("Commands & Actions");
-        for (name, desc, action_key, icon, keywords, shortcut) in &commands {
-            let name_str = name.to_string();
-            let desc_str = if *action_key == "search_conversations" && no_project {
-                "Select a project first".to_string()
-            } else {
-                desc.to_string()
-            };
-            let shortcut_str = shortcut.to_string();
-            let mut item = CommandItem::new()
-                .label(*name)
-                .icon(icon.clone())
-                .keywords(keywords.iter().copied());
-            if *action_key == "add_terminal_selection" {
-                item = item.disabled(excerpt_block.is_some());
-            }
-            if *action_key == "search_conversations" {
-                item = item.disabled(no_project);
-            }
-            let item = item.child(move |_window, cx| {
-                    let colors = cx.theme().colors;
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .gap_0p5()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .child(name_str.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(colors.muted_foreground)
-                                        .child(desc_str.clone()),
-                                ),
-                        )
-                        .when(!shortcut_str.is_empty(), |el| {
-                            el.child(
-                                div()
-                                    .flex_none()
-                                    .ml_2()
-                                    .px_1p5()
-                                    .py_0p5()
-                                    .rounded_sm()
-                                    .bg(colors.muted.opacity(0.5))
-                                    .text_xs()
-                                    .text_color(colors.muted_foreground)
-                                    .child(shortcut_str.clone()),
-                            )
-                        })
-                });
-            commands_group = commands_group.item(item);
+        let disabled_reason = |key: &str| match key {
+            "add_terminal_selection" => excerpt_block,
+            "search_conversations" if no_project => Some("Select a project first"),
+            _ => None,
+        };
+        for command in &commands {
+            commands_group = commands_group.item(command.item(disabled_reason(command.key())));
         }
-
         let mut recent_group = CommandGroup::new().label("Recently used");
         for action_key in &self.recent_palette_actions {
-            if let Some((name, _, _, icon, keywords, _)) = commands
-                .iter()
-                .find(|(_, _, key, _, _, _)| key == action_key)
-            {
-                let mut item = CommandItem::new()
-                    .label(*name)
-                    .icon(icon.clone())
-                    .keywords(keywords.iter().copied());
-                if *action_key == "add_terminal_selection" {
-                    item = item.disabled(excerpt_block.is_some());
-                }
-                if *action_key == "search_conversations" {
-                    item = item.disabled(no_project);
-                }
-                recent_group = recent_group.item(item);
+            if let Some(command) = commands.iter().find(|command| command.key() == *action_key) {
+                recent_group = recent_group.item(command.item(disabled_reason(command.key())));
             }
         }
 
@@ -1898,22 +1818,8 @@ impl WorkspaceView {
             let subtitle = format!("Settings · {}", item.page);
             let keywords = item.keywords;
             settings_group = settings_group.item(
-                CommandItem::new()
-                    .label(title)
-                    .icon(IconName::Settings)
-                    .keywords(keywords.iter().copied())
-                    .child(move |_window, cx| {
-                        let colors = cx.theme().colors;
-                        v_flex()
-                            .gap_0p5()
-                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(colors.muted_foreground)
-                                    .child(subtitle.clone()),
-                            )
-                    }),
+                threadlane_ui_kit::palette_item(title, subtitle, IconName::Settings)
+                    .keywords(keywords.iter().copied()),
             );
         }
         let mut sessions_group = CommandGroup::new().label("Sessions");
@@ -1924,32 +1830,13 @@ impl WorkspaceView {
                 let project_name = project.name.clone();
                 // Mirror the sidebar search scope so palette lookup also
                 // matches the session branch when one is recorded.
-                let mut session_keywords =
-                    vec![project.name.clone(), session.id.clone()];
+                let mut session_keywords = vec![project.name.clone(), session.id.clone()];
                 if let Some(branch) = session.git_branch.as_deref() {
                     session_keywords.push(branch.to_string());
                 }
-                let item = CommandItem::new()
-                    .label(title.clone())
-                    .icon(IconName::SquareTerminal)
-                    .keywords(session_keywords)
-                    .child(move |_window, cx| {
-                        let colors = cx.theme().colors;
-                        v_flex()
-                            .gap_0p5()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(title.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(colors.muted_foreground)
-                                    .child(project_name.clone()),
-                            )
-                    });
+                let item =
+                    threadlane_ui_kit::palette_item(title, project_name, IconName::SquareTerminal)
+                        .keywords(session_keywords);
                 sessions_group = sessions_group.item(item);
             }
         }
@@ -1957,101 +1844,73 @@ impl WorkspaceView {
         let view = cx.weak_entity();
         let view_cancel = cx.weak_entity();
 
-        div()
-            .id("command-palette-backdrop")
-            .absolute()
-            .inset_0()
-            .bg(threadlane_ui_theme::overlay_scrim())
-            .flex()
-            .items_start()
-            .justify_center()
-            .pt_20()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _event, window, cx| {
+        let view_backdrop = cx.weak_entity();
+        let command = threadlane_ui_kit::workspace_palette_command(&self.command_state)
+            .group(recent_group)
+            .group(commands_group)
+            .when(settings_query, |command| command.group(settings_group))
+            .group(sessions_group)
+            .on_cancel(move |window, cx| {
+                let _ = view_cancel.update(cx, |this, cx| {
                     this.close_command_palette(window, cx);
                     cx.notify();
-                }),
-            )
-            .child(
-                div()
-                    .id("command-palette-modal")
-                    .w(rems(35.0))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.title_bar)
-                    .shadow_lg()
-                    .overflow_hidden()
-                    .on_mouse_down(MouseButton::Left, |_event, _window, cx| cx.stop_propagation())
-                    .child(
-                        Command::new(&self.command_state)
-                            .bordered(false)
-                            .placeholder("Search commands, settings, or sessions…")
-                            .max_h(rems(26.25))
-                            .group(recent_group)
-                            .group(commands_group)
-                            .when(settings_query, |command| command.group(settings_group))
-                            .group(sessions_group)
-                            .on_cancel(move |window, cx| {
-                                let _ = view_cancel.update(cx, |this, cx| {
-                                    this.close_command_palette(window, cx);
-                                    cx.notify();
-                                });
-                            })
-                            .on_confirm(move |index, window, cx| {
-                                let _ = view.update(cx, |this, cx| {
-                                    this.close_command_palette(window, cx);
-                                    let sessions_section = if settings_query { 3 } else { 2 };
-                                    if index.section == 2 && settings_query {
-                                        if let Some(id) = settings_entries.get(index.row) {
-                                            this.model.update(cx, |state, cx| {
-                                                controller::dispatch(state, AppAction::OpenSettings);
-                                                cx.notify();
-                                            });
-                                            this.settings.update(cx, |settings, cx| {
-                                                settings.open_search_destination(id, cx)
-                                            });
-                                            cx.notify();
-                                            return;
-                                        }
-                                    }
-                                    if index.section == 0 {
-                                        if let Some(action_key) =
-                                            this.recent_palette_actions.get(index.row)
-                                        {
-                                            this.execute_palette_action(action_key, window, cx);
-                                        }
-                                    } else if index.section == 1 {
-                                        if let Some((_, _, action_key, _, _, _)) =
-                                            commands.get(index.row)
-                                        {
-                                            this.execute_palette_action(action_key, window, cx);
-                                        }
-                                    } else if index.section == sessions_section {
-                                        if let Some((work_dir, session_id)) =
-                                            session_entries.get(index.row)
-                                        {
-                                            let work_dir = work_dir.clone();
-                                            let session_id = session_id.clone();
-                                            this.model.update(cx, |state, cx| {
-                                                controller::dispatch(
-                                                    state,
-                                                    AppAction::SelectSession {
-                                                        work_dir,
-                                                        session_id,
-                                                    },
-                                                );
-                                                cx.notify();
-                                            });
-                                        }
-                                    }
-                                    cx.notify();
-                                });
-                            }),
-                    ),
-            )
-            .into_any_element()
+                });
+            })
+            .on_confirm(move |index, window, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    this.close_command_palette(window, cx);
+                    let sessions_section = if settings_query { 3 } else { 2 };
+                    if index.section == 2 && settings_query {
+                        if let Some(id) = settings_entries.get(index.row) {
+                            this.model.update(cx, |state, cx| {
+                                controller::dispatch(state, AppAction::OpenSettings);
+                                cx.notify();
+                            });
+                            this.settings.update(cx, |settings, cx| {
+                                settings.open_search_destination(id, cx)
+                            });
+                            cx.notify();
+                            return;
+                        }
+                    }
+                    if index.section == 0 {
+                        if let Some(action_key) = this.recent_palette_actions.get(index.row) {
+                            this.execute_palette_action(action_key, window, cx);
+                        }
+                    } else if index.section == 1 {
+                        if let Some(command) = commands.get(index.row) {
+                            this.execute_palette_action(command.key(), window, cx);
+                        }
+                    } else if index.section == sessions_section {
+                        if let Some((work_dir, session_id)) = session_entries.get(index.row) {
+                            let work_dir = work_dir.clone();
+                            let session_id = session_id.clone();
+                            this.model.update(cx, |state, cx| {
+                                controller::dispatch(
+                                    state,
+                                    AppAction::SelectSession {
+                                        work_dir,
+                                        session_id,
+                                    },
+                                );
+                                cx.notify();
+                            });
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        threadlane_ui_kit::workspace_palette_frame(
+            command,
+            move |window, cx| {
+                let _ = view_backdrop.update(cx, |this, cx| {
+                    this.close_command_palette(window, cx);
+                    cx.notify();
+                });
+            },
+            cx,
+        )
+        .into_any_element()
     }
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2437,19 +2296,25 @@ impl Render for WorkspaceView {
         let terminal_project = terminal_key;
         let new_tab_cwd =
             terminal_cwd.or_else(|| terminal_project.clone());
-        let sidebar_tooltip = if self.sidebar_collapsed {
-            "Expand sidebar"
-        } else {
-            "Collapse sidebar"
-        };
         let theme = cx.theme().colors;
         let rem = window.rem_size();
         let viewport = window.viewport_size();
-        let sidebar_width = self.sidebar_resizable_state.read(cx).sizes().first()
-            .copied().unwrap_or(rem * 16.5).clamp(rem * 12.0, rem * 18.0);
-        let required_content = if self.right_panel_visible { rem * 48.0 } else { rem * 28.0 };
-        let show_sidebar = !self.sidebar_collapsed && viewport.width >= sidebar_width + required_content;
-        let review_focus = self.right_panel_visible && viewport.width < rem * 48.0;
+        let sidebar_width = self
+            .sidebar_resizable_state
+            .read(cx)
+            .sizes()
+            .first()
+            .copied()
+            .unwrap_or(rem * self.preferred_panel_sizes[0]);
+        let layout = threadlane_ui_kit::WorkspaceLayout::new(
+            viewport.width,
+            rem,
+            sidebar_width,
+            self.sidebar_collapsed,
+            self.right_panel_visible,
+        );
+        let show_sidebar = layout.sidebar_visible;
+        let review_focus = layout.right_panel_focus;
         let visible_panels = [
             workspace_page != WorkspacePage::Settings && show_sidebar,
             workspace_page == WorkspacePage::Chat && self.right_panel_visible && !review_focus,
@@ -2463,19 +2328,35 @@ impl Render for WorkspaceView {
                 if this.panel_layout != Some(panel_layout) {
                     return;
                 }
-                for (visible, state, index, preferred) in [
-                    (visible_panels[0], this.sidebar_resizable_state.clone(), 0, this.preferred_panel_sizes[0]),
-                    (visible_panels[1], this.right_panel_resizable_state.clone(), 1, this.preferred_panel_sizes[1]),
-                    (visible_panels[2], this.bottom_panel_resizable_state.clone(), 1, this.preferred_panel_sizes[2]),
-                ] {
-                    if visible {
-                        state.update(cx, |state, cx| state.resize_panel(index, rem * preferred, window, cx));
-                    }
-                }
+                threadlane_ui_kit::restore_workspace_panel_sizes(
+                    [
+                        (
+                            visible_panels[0],
+                            this.sidebar_resizable_state.clone(),
+                            0,
+                            this.preferred_panel_sizes[0],
+                        ),
+                        (
+                            visible_panels[1],
+                            this.right_panel_resizable_state.clone(),
+                            1,
+                            this.preferred_panel_sizes[1],
+                        ),
+                        (
+                            visible_panels[2],
+                            this.bottom_panel_resizable_state.clone(),
+                            1,
+                            this.preferred_panel_sizes[2],
+                        ),
+                    ],
+                    rem,
+                    window,
+                    cx,
+                );
                 cx.notify();
             });
         }
-        let header_inset = if show_sidebar { window.rem_size() * 0.875 } else { window.rem_size() * 6.875 };
+        let header_inset = layout.header_inset;
         if self.chat_list.read(cx).header_left_padding != header_inset {
             self.chat_list.update(cx, |chat, cx| {
                 chat.header_left_padding = header_inset;
@@ -2483,9 +2364,7 @@ impl Render for WorkspaceView {
             });
         }
 
-        let environment_width = if self.right_panel_visible { Pixels::ZERO } else {
-            viewport.width - if show_sidebar { sidebar_width } else { Pixels::ZERO }
-        };
+        let environment_width = layout.environment_width;
         self.chat_list.update(cx, |chat, cx| {
             chat.set_environment_width(environment_width, rem, cx);
         });
@@ -2495,28 +2374,22 @@ impl Render for WorkspaceView {
             panel.set_visible(self.right_panel_visible, cx);
         });
             let upper_content = if review_focus {
-                div().flex().flex_col().size_full()
-                    .child(Button::new("review-back-to-chat").label("Back to conversation").ghost().small()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.toggle_right_panel_action(&ToggleRightPanel, window, cx);
-                        })))
-                    .child(div().flex_1().min_h_0().child(self.right_panel.clone()))
-                    .into_any_element()
+                threadlane_ui_kit::workspace_right_panel_focus(
+                    self.right_panel.clone(),
+                    cx.listener(|this, _, window, cx| {
+                        this.toggle_right_panel_action(&ToggleRightPanel, window, cx);
+                    }),
+                    cx,
+                ).into_any_element()
             } else if self.right_panel_visible {
-                h_resizable("workspace-chat-right-split")
-                    .with_state(&self.right_panel_resizable_state)
+                threadlane_ui_kit::workspace_right_panel_split(
+                    &self.right_panel_resizable_state, self.chat_list.clone(), self.right_panel.clone(), rem, viewport.width,
+                )
                     .on_resize(cx.listener(|this, state: &Entity<ResizableState>, window, cx| {
                         if let Some(size) = state.read(cx).sizes().get(1) {
                             this.preferred_panel_sizes[1] = *size / window.rem_size();
                         }
                     }))
-                    .child(resizable_panel().size_range(rem * 24.0..Pixels::MAX).child(self.chat_list.clone()))
-                    .child(
-                        resizable_panel()
-                            .size(rem * 22.0)
-                            .size_range(rem * 18.0..viewport.width * 0.42)
-                            .child(self.right_panel.clone()),
-                    )
                     .into_any_element()
             } else {
                 self.chat_list.clone().into_any_element()
@@ -2524,444 +2397,163 @@ impl Render for WorkspaceView {
 
             let main_content = if self.bottom_panel_visible {
                 if terminal_unavailable {
-                    let recreate_model = self.model.clone();
-                    let local_model = self.model.clone();
-                    let close_view = cx.entity().clone();
-                    let terminal_panel = div()
-                        .size_full()
-                        .min_h_0()
-                        .flex()
-                        .flex_col()
-                        .bg(theme.background)
-                        .border_t_1()
-                        .border_color(theme.border)
-                        .child(
-                            div()
-                                .h(rems(2.125))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .px_2()
-                                .bg(theme.title_bar)
-                                .border_b_1()
-                                .border_color(theme.title_bar_border)
-                                .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Terminal"))
-                                .child(div().flex_1())
-                                .child(
-                                    Button::new("terminal-unavailable-close")
-                                        .icon(IconName::Close)
-                                        .accessibility_label("Hide terminal")
-                                        .tooltip("Hide terminal (Cmd+J)")
-                                        .ghost()
-                                        .small()
-                                        .on_click(move |_event, _window, cx| {
-                                            close_view.update(cx, |this, cx| {
-                                                this.bottom_panel_visible = false;
-                                                cx.notify();
-                                            });
-                                        }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .flex()
-                                .flex_col()
-                                .items_center()
-                                .justify_center()
-                                .gap_3()
-                                .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Worktree unavailable"))
-                                .child(div().text_xs().text_color(theme.muted_foreground).child("This session's worktree is not checked out"))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(
-                                            Button::new("terminal-recreate-worktree")
-                                                .label("Recreate worktree")
-                                                .small()
-                                                .on_click(move |_event, _window, cx| {
-                                                    recreate_model.update(cx, |state, cx| {
-                                                        controller::dispatch(state, AppAction::RecreateActiveWorktree);
-                                                        cx.notify();
-                                                    });
-                                                }),
-                                        )
-                                        .child(
-                                            Button::new("terminal-use-project-folder")
-                                                .label("Use project folder")
-                                                .small()
-                                                .ghost()
-                                                .on_click(move |_event, _window, cx| {
-                                                    local_model.update(cx, |state, cx| {
-                                                        if let Some(work_dir) = state.active_work_dir.clone() {
-                                                            controller::dispatch(
-                                                                state,
-                                                                AppAction::SelectDraftProject(work_dir),
-                                                            );
-                                                        }
-                                                        cx.notify();
-                                                    });
-                                                }),
-                                        ),
-                                ),
-                        );
-                    v_resizable("workspace-main-bottom-split")
-                        .with_state(&self.bottom_panel_resizable_state)
-                        .on_resize(cx.listener(|this, state: &Entity<ResizableState>, window, cx| {
+                    let owner = cx.entity().clone();
+                    let terminal_panel = threadlane_ui_kit::terminal_unavailable(
+                        move |action, _, cx| {
+                            owner.update(cx, |this, cx| {
+                                match action {
+                                    threadlane_ui_kit::TerminalAction::Hide => {
+                                        this.bottom_panel_visible = false
+                                    }
+                                    threadlane_ui_kit::TerminalAction::RecreateWorktree => {
+                                        this.model.update(cx, |state, cx| {
+                                            controller::dispatch(state, AppAction::RecreateActiveWorktree);
+                                            cx.notify();
+                                        });
+                                    }
+                                    threadlane_ui_kit::TerminalAction::UseProjectFolder => {
+                                        this.model.update(cx, |state, cx| {
+                                            if let Some(work_dir) = state.active_work_dir.clone() {
+                                                controller::dispatch(
+                                                    state,
+                                                    AppAction::SelectDraftProject(work_dir),
+                                                );
+                                            }
+                                            cx.notify();
+                                        });
+                                    }
+                                    _ => return,
+                                }
+                                cx.notify();
+                            })
+                        },
+                        cx,
+                    );
+                    threadlane_ui_kit::workspace_terminal_split(
+                        &self.bottom_panel_resizable_state,
+                        upper_content,
+                        terminal_panel,
+                        rem,
+                        viewport.height,
+                    )
+                    .on_resize(
+                        cx.listener(|this, state: &Entity<ResizableState>, window, cx| {
                             if let Some(size) = state.read(cx).sizes().get(1) {
                                 this.preferred_panel_sizes[2] = *size / window.rem_size();
                             }
-                        }))
-                        .child(resizable_panel().child(upper_content))
-                        .child(
-                            resizable_panel()
-                                .size(rem * 14.0)
-                                .size_range(rem * 8.0..(viewport.height - rem * 24.0).max(rem * 8.0))
-                                .child(terminal_panel),
-                        )
-                        .into_any_element()
+                        }),
+                    )
+                    .into_any_element()
                 } else {
-                let tab_buttons = terminal_tabs.iter().enumerate().map(|(tab, _)| {
-                    let select_project = terminal_project.clone();
-                    let close_project = terminal_project.clone();
-                    let other_project = terminal_project.clone();
-                    let new_tab_project = terminal_project.clone();
-                    let new_tab_cwd = new_tab_cwd.clone();
-                    let restart_terminal = terminal_tabs[tab].clone();
-                    let select_view = cx.entity().clone();
-                    let close_view = cx.entity().clone();
-                    let other_view = cx.entity().clone();
-                    let new_view = cx.entity().clone();
-                    let is_selected = tab == active_terminal_tab;
-                    let total_tabs = terminal_tabs.len();
-                    let tab_tooltip = match &terminal_project {
-                        Some(project) => format!(
-                            "Shell {} · {}",
-                            tab + 1,
-                            project
-                                .file_name()
-                                .map(|name| name.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| project.to_string_lossy().into_owned())
-                        ),
-                        None => format!("Shell {}", tab + 1),
-                    };
-
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_0p5()
-                        .child(
-                            Button::new(SharedString::from(format!("terminal-tab-{tab}")))
-                                .label(format!("Shell {}", tab + 1))
-                                .icon(IconName::SquareTerminal)
-                                .ghost()
-                                .selected(is_selected)
-                                .xsmall()
-                                .accessibility_label(tab_tooltip.clone())
-                                .tooltip(tab_tooltip)
-                                .on_click(move |_event, window, cx| {
-                                    if let Some(project) = &select_project {
-                                        select_view.update(cx, |this, cx| {
-                                            this.select_terminal_tab(project, tab, window, cx)
-                                        });
-                                    }
-                                })
-                                .context_menu(move |menu, _window, _cx| {
-                                    let c_proj = close_project.clone();
-                                    let c_view = close_view.clone();
-                                    let mut menu =
-                                        menu.item(PopupMenuItem::new("Close Shell").on_click(
-                                            move |_event, _window, cx| {
-                                                if let Some(project) = &c_proj {
-                                                    c_view.update(cx, |this, cx| {
-                                                        this.close_terminal_tab(project, tab, cx);
-                                                    });
-                                                }
-                                            },
-                                        ));
-
-                                    if total_tabs > 1 {
-                                        let o_proj = other_project.clone();
-                                        let o_view = other_view.clone();
-                                        menu = menu.item(
-                                            PopupMenuItem::new("Close Other Tabs").on_click(
-                                                move |_event, _window, cx| {
-                                                    if let Some(project) = &o_proj {
-                                                        o_view.update(cx, |this, cx| {
-                                                            this.close_other_terminal_tabs(
-                                                                project, tab, cx,
-                                                            );
-                                                        });
-                                                    }
-                                                },
-                                            ),
-                                        );
-                                    }
-
-                                    let r_term = restart_terminal.clone();
-                                    menu = menu.item(PopupMenuItem::new("Restart Shell").on_click(
-                                        move |_event, _window, cx| {
-                                            r_term.update(cx, |t, cx| t.restart(cx));
-                                        },
-                                    ));
-
-                                    let n_proj = new_tab_project.clone();
-                                    let n_cwd = new_tab_cwd.clone();
-                                    let n_view = new_view.clone();
-                                    menu.item(PopupMenuItem::new("New Terminal Tab").on_click(
-                                        move |_event, window, cx| {
-                                            if let (Some(project), Some(cwd)) =
-                                                (n_proj.as_ref(), n_cwd.as_ref())
-                                            {
-                                                n_view.update(cx, |this, cx| {
-                                                    this.add_terminal_tab(
-                                                        project.clone(),
-                                                        cwd.clone(),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                });
-                                            }
-                                        },
-                                    ))
-                                }),
-                        )
-                        .child({
-                            let close_p = terminal_project.clone();
-                            let close_v = cx.entity().clone();
-                            let armed = terminal_project.as_ref().is_some_and(|project| {
-                                self.pending_terminal_close == Some((project.clone(), tab))
-                            });
-                            let close_button = Button::new(SharedString::from(format!(
-                                "terminal-tab-close-{tab}"
-                            )))
-                            .ghost()
-                            .xsmall()
-                            .accessibility_label(if armed {
-                                "Confirm close shell with output"
-                            } else {
-                                "Close shell"
-                            })
-                            .tooltip(if armed {
-                                "Shell holds output — click again to close it"
-                            } else {
-                                "Close shell"
-                            });
-                            let close_button = if armed {
-                                close_button.label("Sure?").danger()
-                            } else {
-                                close_button.icon(IconName::Close)
+                    let tab_buttons = terminal_tabs
+                        .iter()
+                        .enumerate()
+                        .map(|(tab, terminal)| {
+                            let project = terminal_project.clone();
+                            let cwd = new_tab_cwd.clone();
+                            let terminal = terminal.clone();
+                            let owner = cx.entity().clone();
+                            let hint = match &project {
+                                Some(project) => format!(
+                                    "Shell {} · {}",
+                                    tab + 1,
+                                    project
+                                        .file_name()
+                                        .map(|name| name.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| project.to_string_lossy().into_owned())
+                                ),
+                                None => format!("Shell {}", tab + 1),
                             };
-                            close_button.on_click(move |_event, _window, cx| {
-                                if let Some(project) = &close_p {
-                                    close_v.update(cx, |this, cx| {
-                                        this.close_terminal_tab(project, tab, cx)
-                                    });
-                                }
+                            let armed = project.as_ref().is_some_and(|project| {
+                                self.pending_terminal_close == Some((project.clone(), terminal.entity_id()))
+                            });
+                            threadlane_ui_kit::TerminalTab::new(
+                                format!("terminal-{:?}", terminal.entity_id()),
+                                format!("Shell {}", tab + 1),
+                                hint,
+                            )
+                            .selected(tab == active_terminal_tab)
+                            .close_armed(armed)
+                            .project_actions(project.is_some())
+                            .close_others(terminal_tabs.len() > 1)
+                            .render(move |action, window, cx| {
+                                owner.update(cx, |this, cx| {
+                                    this.request_terminal_tab(
+                                        action,
+                                        project.as_ref(),
+                                        cwd.as_ref(),
+                                        &terminal,
+                                        window,
+                                        cx,
+                                    );
+                                })
                             })
+                            .into_any_element()
                         })
-                });
-
-                let active_terminal = active_terminal.expect("available terminal");
-                let active_terminal_clear = active_terminal.clone();
-                let active_terminal_restart = active_terminal.clone();
-                let active_terminal_find = active_terminal.clone();
-                let excerpt_block = terminal_excerpt_block_reason(
-                    active_terminal.read(cx).selection_status(),
-                );
-                let handoff_hint = excerpt_block.map(str::to_owned).unwrap_or_else(|| {
-                    format!("Add the selected terminal text to {composer_target} — nothing is sent")
-                });
-                let links_terminal = active_terminal.clone();
-                let handoff_terminal = active_terminal.clone();
-                let handoff_group = terminal_project.clone();
-                let handoff_view = cx.entity().clone();
-                let new_project = terminal_project.clone();
-                let new_cwd = new_tab_cwd.clone();
-                let new_view = cx.entity().clone();
-                let close_panel_view = cx.entity().clone();
-
-                let project_badge = {
-                    let name = terminal_project
+                        .collect();
+                    let active_terminal = active_terminal.expect("available terminal");
+                    let excerpt_block =
+                        terminal_excerpt_block_reason(active_terminal.read(cx).selection_status());
+                    let handoff_hint = excerpt_block.map(str::to_owned).unwrap_or_else(|| {
+                        format!("Add the selected terminal text to {composer_target} — nothing is sent")
+                    });
+                    let project_name = terminal_project
                         .as_ref()
                         .and_then(|p| p.file_name())
                         .and_then(|n| n.to_str())
                         .unwrap_or("Terminal");
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .px_2()
-                        .py_0p5()
-                        .rounded_sm()
-                        .bg(theme.secondary)
-                        .child(
-                            Icon::new(IconName::SquareTerminal)
-                                .xsmall()
-                                .text_color(theme.primary),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme.foreground)
-                                .child(name.to_string()),
-                        )
-                };
-
-                let toolbar_actions = div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .children(new_project.clone().map(|project| {
-                        let cwd = new_cwd.clone().unwrap_or_else(|| project.clone());
-                        Button::new("terminal-new-tab")
-                            .icon(IconName::Plus)
-                            .accessibility_label("New terminal tab")
-                            .tooltip("New terminal tab")
-                            .ghost()
-                            .small()
-                            .on_click(move |_event, window, cx| {
-                                new_view.update(cx, |this, cx| {
-                                    this.add_terminal_tab(project.clone(), cwd.clone(), window, cx)
-                                });
-                            })
-                    }))
-                    .child(
-                        Button::new("terminal-clear-btn")
-                            .icon(IconName::Undo2)
-                            .accessibility_label("Clear terminal")
-                            .tooltip("Clear terminal")
-                            .ghost()
-                            .small()
-                            .on_click(move |_event, _window, cx| {
-                                active_terminal_clear.update(cx, |t, cx| t.clear(cx));
-                            }),
-                    )
-                    .child(
-                        Button::new("terminal-restart-btn")
-                            .icon(IconName::Redo)
-                            .accessibility_label("Restart shell")
-                            .tooltip("Restart shell")
-                            .ghost()
-                            .small()
-                            .on_click(move |_event, _window, cx| {
-                                active_terminal_restart.update(cx, |t, cx| t.restart(cx));
-                            }),
-                    )
-                    .child(
-                        Button::new("terminal-find-btn")
-                            .icon(IconName::Search)
-                            .label("Find")
-                            .accessibility_label("Find in terminal output")
-                            .tooltip(if cfg!(target_os = "macos") {
+                    let project = terminal_project.clone();
+                    let cwd = new_tab_cwd.clone();
+                    let terminal = active_terminal.clone();
+                    let owner = cx.entity().clone();
+                    let toolbar = threadlane_ui_kit::TerminalToolbar::new(project_name.to_owned())
+                        .tabs(tab_buttons)
+                        .new_tab(project.is_some())
+                        .selection(excerpt_block.is_none(), handoff_hint)
+                        .shortcuts(
+                            if cfg!(target_os = "macos") {
                                 "Find in terminal output (Cmd+F)"
                             } else {
                                 "Find in terminal output (Ctrl+Shift+F)"
-                            })
-                            .ghost()
-                            .small()
-                            .on_click(move |_event, window, cx| {
-                                active_terminal_find.update(cx, |t, cx| {
-                                    t.open_find(&FindInTerminalOutput, window, cx)
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new("terminal-open-link")
-                            .label("Open link…")
-                            .tooltip("Links in visible output")
-                            .accessibility_label("Open link… — Links in visible output")
-                            .ghost()
-                            .small()
-                            .on_click(move |_, window, cx| {
-                                links_terminal.update(cx, |terminal, cx| {
-                                    terminal.open_links(window, cx)
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new("terminal-add-selection-to-chat")
-                            .icon(Icon::default().path("icons/square-pen.svg"))
-                            .label("Add selection to chat")
-                            .accessibility_label(if excerpt_block.is_some() {
-                                format!("Add selection to chat — {handoff_hint}")
+                            },
+                            if cfg!(target_os = "macos") {
+                                "Hide terminal (Cmd+J)"
                             } else {
-                                handoff_hint.clone()
-                            })
-                            .tooltip(handoff_hint.clone())
-                            .ghost()
-                            .small()
-                            .disabled(excerpt_block.is_some())
-                            .on_click(move |_event, window, cx| {
-                                handoff_view.update(cx, |this, cx| {
-                                    this.add_terminal_selection_to_chat(
-                                        handoff_terminal.clone(),
-                                        handoff_group.clone(),
+                                "Hide terminal (Ctrl+J)"
+                            },
+                        )
+                        .render(
+                            move |action, window, cx| {
+                                owner.update(cx, |this, cx| {
+                                    this.request_terminal_action(
+                                        action,
+                                        project.clone(),
+                                        cwd.clone(),
+                                        terminal.clone(),
                                         window,
                                         cx,
                                     );
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new("terminal-close-panel-btn")
-                        .accessibility_label("Hide terminal")
-                            .icon(IconName::Close)
-                            .tooltip("Hide terminal (Cmd+J)")
-                            .ghost()
-                            .small()
-                            .on_click(move |_event, _window, cx| {
-                                close_panel_view.update(cx, |this, cx| {
-                                    this.bottom_panel_visible = false;
-                                    cx.notify();
-                                });
-                            }),
-                    );
+                                })
+                            },
+                            cx,
+                        );
+                    let terminal_panel = threadlane_ui_kit::terminal_surface(cx)
+                        .child(toolbar)
+                        .child(div().flex_1().min_h_0().child(active_terminal));
 
-                let terminal_panel = div()
-                    .size_full()
-                    .min_h_0()
-                    .flex()
-                    .flex_col()
-                    .bg(theme.background)
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .child(
-                        div()
-                            .h(rems(2.125))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .px_2()
-                            .gap_2()
-                            .overflow_x_scrollbar()
-                            .bg(theme.title_bar)
-                            .border_b_1()
-                            .border_color(theme.title_bar_border)
-                            .child(project_badge)
-                            .child(div().w(px(1.0)).h_4().bg(theme.border))
-                            .children(tab_buttons)
-                            .child(div().flex_1())
-                            .child(toolbar_actions),
+                    threadlane_ui_kit::workspace_terminal_split(
+                        &self.bottom_panel_resizable_state,
+                        upper_content,
+                        terminal_panel,
+                        rem,
+                        viewport.height,
                     )
-                    .child(div().flex_1().min_h_0().child(active_terminal));
-
-                v_resizable("workspace-main-bottom-split")
-                    .with_state(&self.bottom_panel_resizable_state)
-                    .on_resize(cx.listener(|this, state: &Entity<ResizableState>, window, cx| {
-                        if let Some(size) = state.read(cx).sizes().get(1) {
-                            this.preferred_panel_sizes[2] = *size / window.rem_size();
-                        }
-                    }))
-                    .child(resizable_panel().child(upper_content))
-                    .child(
-                        resizable_panel()
-                            .size(rem * 14.0)
-                            .size_range(rem * 8.0..(viewport.height - rem * 24.0).max(rem * 8.0))
-                            .child(terminal_panel),
+                    .on_resize(
+                        cx.listener(|this, state: &Entity<ResizableState>, window, cx| {
+                            if let Some(size) = state.read(cx).sizes().get(1) {
+                                this.preferred_panel_sizes[2] = *size / window.rem_size();
+                            }
+                        }),
                     )
                     .into_any_element()
                 }
@@ -2979,20 +2571,14 @@ impl Render for WorkspaceView {
             WorkspacePage::Settings => self.settings.clone().into_any_element(),
         };
         let page_content = if workspace_page != WorkspacePage::Settings && show_sidebar {
-            h_resizable("workspace-sidebar-main-split")
-                .with_state(&self.sidebar_resizable_state)
+            threadlane_ui_kit::workspace_sidebar_split(
+                &self.sidebar_resizable_state, self.sidebar.clone(), central_content, rem,
+            )
                 .on_resize(cx.listener(|this, state: &Entity<ResizableState>, window, cx| {
                     if let Some(size) = state.read(cx).sizes().first() {
                         this.preferred_panel_sizes[0] = *size / window.rem_size();
                     }
                 }))
-                .child(
-                    resizable_panel()
-                        .size(rem * 16.5)
-                        .size_range(rem * 12.0..rem * 18.0)
-                        .child(self.sidebar.clone()),
-                )
-                .child(resizable_panel().child(central_content))
                 .into_any_element()
         } else {
             central_content
@@ -3001,12 +2587,7 @@ impl Render for WorkspaceView {
         let view_with_status_bar = if workspace_page == WorkspacePage::GitHub {
             page_content
         } else {
-            div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .child(div().flex_1().min_h_0().child(page_content))
-                .child(self.render_status_bar(cx))
+            threadlane_ui_kit::workspace_with_status(page_content, self.render_status_bar(cx))
                 .into_any_element()
         };
 
@@ -3150,15 +2731,7 @@ impl Render for WorkspaceView {
                     }))
             }))
             .children((workspace_page != WorkspacePage::Settings).then(|| {
-                Button::new("sidebar-collapse-toggle")
-                        .accessibility_label(sidebar_tooltip)
-                    .icon(IconName::PanelLeft)
-                    .tooltip(sidebar_tooltip)
-                    .ghost()
-                    .xsmall()
-                    .absolute()
-                    .top(rems(0.5625))
-                    .left(rems(4.75))
+                threadlane_ui_kit::workspace_sidebar_toggle(self.sidebar_collapsed, layout.sidebar_available)
                     .on_click(cx.listener(|this, _event, window, cx| {
                         this.toggle_sidebar_action(&ToggleSidebar, window, cx);
                     }))
@@ -3188,6 +2761,85 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use threadlane_git::GitStatus;
+
+    #[gpui::test]
+    fn quit_uses_close_guard_with_and_without_a_focused_window(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext as _, InteractiveElement as _, StatefulInteractiveElement as _};
+        use gpui_component::{Root, WindowExt as _};
+        use std::rc::Rc;
+
+        struct QuitHost(gpui::FocusHandle);
+        impl gpui::Render for QuitHost {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+                    .id("quit-host")
+                    .role(gpui::Role::Application)
+                    .track_focus(&self.0)
+            }
+        }
+        let fallback = Rc::new(Cell::new(false));
+        let tracked = fallback.clone();
+        cx.update(move |cx| {
+            gpui_component::init(cx);
+            cx.bind_keys([gpui::KeyBinding::new("cmd-q", super::QuitThreadlane, None)]);
+            cx.on_action(move |_: &super::QuitThreadlane, _| tracked.set(true));
+        });
+        let allowed = Rc::new(Cell::new(false));
+        let calls = Rc::new(Cell::new(0));
+        let close_allowed = allowed.clone();
+        let close_calls = calls.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            super::install_window_close_handler(window, cx, move |window, cx| {
+                close_calls.set(close_calls.get() + 1);
+                if close_allowed.get() {
+                    return true;
+                }
+                if !window.has_active_dialog(cx) {
+                    window.open_alert_dialog(cx, |dialog, _, _| dialog.title("Active work").confirm());
+                }
+                false
+            });
+            let focus = cx.focus_handle();
+            focus.focus(window, cx);
+            Root::new(cx.new(|_| QuitHost(focus)), window, cx)
+        });
+        cx.simulate_keystrokes("cmd-q");
+        cx.run_until_parked();
+        cx.update(|window, cx| assert!(window.has_active_dialog(cx)));
+        assert_eq!(calls.get(), 1);
+        assert!(
+            !fallback.get(),
+            "the startup handler must never bypass the close guard"
+        );
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, cx| assert!(!window.has_active_dialog(cx)));
+
+        cx.deactivate_window();
+        cx.cx.update(|cx| {
+            assert!(cx.active_window().is_none());
+            cx.dispatch_action(&super::QuitThreadlane);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| assert!(window.has_active_dialog(cx)));
+        assert_eq!(calls.get(), 2);
+        assert!(
+            !fallback.get(),
+            "an unfocused window must retain its close guard"
+        );
+
+        allowed.set(true);
+        cx.cx
+            .update(|cx| cx.dispatch_action(&super::QuitThreadlane));
+        cx.run_until_parked();
+        cx.cx.update(|cx| assert!(cx.windows().is_empty()));
+        assert_eq!(calls.get(), 3);
+        assert!(!fallback.get());
+    }
 
     #[gpui::test]
     fn palette_dismissal_restores_focus_once(cx: &mut gpui::TestAppContext) {

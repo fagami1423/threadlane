@@ -1,0 +1,20 @@
+[package]
+name = "threadlane-ui-kit"
+version = "0.1.0"
+edition = "2021"
+autoexamples = false
+description = "Threadlane's native agent UI toolkit: conversation, composer, tools, decisions and navigation"
+
+[dependencies]
+vt100.workspace = true
+threadlane-automation.workspace = true
+gpui.workspace = true
+gpui-kit.workspace = true
+gpui-component.workspace = true
+gpui-kit-assets.workspace = true
+threadlane-protocol.workspace = true
+threadlane-ui-theme.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

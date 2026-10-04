@@ -193,7 +193,7 @@ struct ActiveSession {
     /// Queued question requests; the front entry is rendered.
     /// Toggled options per question item id, for the front request.
     answers: HashMap<String, Vec<String>>,
-    transcript: threadlane_ui_session::transcript::TranscriptState,
+    transcript: threadlane_ui_kit::transcript::TranscriptState,
     confirm_delete: bool,
     /// Repo context mirrored from `SessionInfo` for the header meta row.
     git_branch: Option<String>,
@@ -214,7 +214,7 @@ impl ActiveSession {
             work_dir: info.runtime_work_dir.clone(),
             session_file: info.session_file.clone(),
             answers: HashMap::new(),
-            transcript: threadlane_ui_session::transcript::TranscriptState::new(window),
+            transcript: threadlane_ui_kit::transcript::TranscriptState::new(window),
             confirm_delete: false,
             git_branch: info.git_branch.clone(),
             is_worktree: info.is_worktree,
@@ -254,7 +254,7 @@ pub struct MobileApp {
     seen_links: Vec<String>,
     client: ClientState,
     markdown_states:
-        HashMap<(SharedString, String), threadlane_ui_session::markdown::MarkdownRenderState>,
+        HashMap<(SharedString, String), threadlane_ui_kit::markdown::MarkdownRenderState>,
     active: Option<ActiveSession>,
     sessions_list: ListState,
     session_rows: Vec<MobileSessionRow>,
@@ -425,8 +425,8 @@ impl MobileApp {
                 &composer,
                 window,
                 |this, _, event, window, cx| match event {
-                    InputEvent::Focus => gpui_mobile::show_keyboard(),
-                    InputEvent::Blur => gpui_mobile::hide_keyboard(),
+                    InputEvent::Focus => { gpui_mobile::show_keyboard(); cx.notify(); }
+                    InputEvent::Blur => { gpui_mobile::hide_keyboard(); cx.notify(); }
                     InputEvent::PressEnter { .. } => this.submit_composer(window, cx),
                     _ => {}
                 },
@@ -2134,7 +2134,7 @@ impl MobileApp {
                 )
             })
             .child(div().id("sessions").flex_1().min_h_0().w_full().child(
-                threadlane_ui_session::session_list(
+                threadlane_ui_kit::session_list(
                     self.sessions_list.clone(),
                     cx.processor(Self::render_session_row),
                 ),
@@ -2171,7 +2171,7 @@ impl MobileApp {
     fn render_session_row(
         &mut self,
         ix: usize,
-        _: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match self.session_rows.get(ix) {
@@ -2264,11 +2264,11 @@ impl MobileApp {
                 } else {
                     threadlane_protocol::daemon::SessionAttention::Idle
                 };
-                let identity = threadlane_ui_session::session_identity(session);
+                let identity = threadlane_ui_kit::session_identity(session);
                 div()
                     .px_3()
                     .child(
-                        threadlane_ui_session::session_card(&session.id, false, cx)
+                        threadlane_ui_kit::session_card(&session.id, false, cx)
                             .aria_label(format!("{}, {}", identity.title, attention.label()))
                             .child(
                                 Button::new(format!("session-{}", session.id))
@@ -2298,7 +2298,7 @@ impl MobileApp {
                                                             .child(identity.title),
                                                     )
                                                     .children(
-                                                        threadlane_ui_session::session_attention(
+                                                        threadlane_ui_kit::session_attention(
                                                             &session.id,
                                                             attention,
                                                             cx,
@@ -2550,7 +2550,7 @@ impl MobileApp {
                 )
             })
             .child(div().id("transcript").flex_1().min_h_0().w_full().child(
-                threadlane_ui_session::transcript_list(
+                threadlane_ui_kit::transcript_list(
                     &self.active.as_ref().unwrap().transcript,
                     cx.processor(Self::render_transcript_row),
                 ),
@@ -2566,12 +2566,14 @@ impl MobileApp {
             })
             .child(
                 div().flex_none().w_full().px_3().mb_3().child(
-                    threadlane_ui_session::composer_surface(cx)
+                    threadlane_ui_kit::composer_surface(
+                        self.composer.read(cx).focus_handle(cx).is_focused(window), cx,
+                    )
                         .child(
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .child(threadlane_ui_session::composer_input(&self.composer)),
+                                .child(threadlane_ui_kit::composer_input(&self.composer)),
                         )
                         .when(uncertain_prompt, |this| this.child(
                             div().flex().flex_col().gap_1()
@@ -2623,10 +2625,10 @@ impl MobileApp {
     fn render_transcript_row(
         &mut self,
         ix: usize,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        use threadlane_ui_session::transcript::TranscriptRow;
+        use threadlane_ui_kit::transcript::TranscriptRow;
         let Some(active) = &self.active else {
             return div().into_any_element();
         };
@@ -2634,12 +2636,12 @@ impl MobileApp {
         match active.transcript.rows.get(ix).cloned() {
             Some(TranscriptRow::Message(index)) => messages
                 .get(index)
-                .map(|m| self.render_message(m, cx))
+                .map(|m| self.render_message(m, window, ix, cx))
                 .unwrap_or_else(|| div().into_any_element()),
             Some(TranscriptRow::Activities(range)) => div()
                 .flex()
                 .flex_col()
-                .children(messages[range].iter().map(|m| self.render_message(m, cx)))
+                .children(messages[range].iter().map(|m| self.render_message(m, window, ix, cx)))
                 .into_any_element(),
             Some(TranscriptRow::Working) => div()
                 .px_5()
@@ -2656,11 +2658,17 @@ impl MobileApp {
         }
     }
 
-    fn render_message(&mut self, message: &ChatMessageInfo, cx: &mut Context<Self>) -> AnyElement {
+    fn render_message(
+        &mut self,
+        message: &ChatMessageInfo,
+        window: &mut Window,
+        row_index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let is_user = message.role == MessageRole::User;
         let namespace =
             SharedString::from(self.client.active_session_id.clone().unwrap_or_default());
-        let state = threadlane_ui_session::markdown::markdown_state(
+        let state = threadlane_ui_kit::markdown::markdown_state(
             &mut self.markdown_states,
             namespace,
             message.id.clone(),
@@ -2672,33 +2680,42 @@ impl MobileApp {
             .as_ref()
             .filter(|text| !text.trim().is_empty())
             .map(|reasoning| {
-                let detail = message.reasoning_expanded.then(|| {
+                let motion = threadlane_ui_kit::DisclosureMotion::new(
+                    SharedString::from(format!("reasoning-body-{}", message.id)),
+                    message.reasoning_expanded,
+                    window,
+                    cx,
+                );
+                if let Some(active) = &self.active {
+                    motion.remeasure_list_row(&active.transcript.list, row_index, window);
+                }
+                let detail = motion.is_visible().then(|| {
                     if message.streaming {
-                        threadlane_ui_session::reasoning_detail(cx)
+                        threadlane_ui_kit::reasoning_detail(cx)
                             .child(reasoning.clone())
                             .into_any_element()
                     } else {
                         let namespace = SharedString::from(
                             self.client.active_session_id.clone().unwrap_or_default(),
                         );
-                        let markdown = threadlane_ui_session::markdown::markdown_state(
+                        let markdown = threadlane_ui_kit::markdown::markdown_state(
                             &mut self.markdown_states,
                             namespace,
                             format!("reasoning-{}", message.id),
                             reasoning,
                             cx,
                         );
-                        threadlane_ui_session::reasoning_detail(cx)
-                            .child(threadlane_ui_session::markdown::markdown_view(
+                        threadlane_ui_kit::reasoning_detail(cx)
+                            .child(threadlane_ui_kit::markdown::markdown_view(
                                 &markdown,
                                 |_, _| {},
                             ))
                             .into_any_element()
                     }
-                });
+                }).map(|body| motion.content(body));
                 let owner = cx.entity().downgrade();
                 let id = message.id.clone();
-                threadlane_ui_session::reasoning_card(
+                threadlane_ui_kit::reasoning_card(
                     message,
                     detail,
                     true,
@@ -2728,14 +2745,23 @@ impl MobileApp {
             .tool_activities
             .iter()
             .map(|tool| {
-                let detail = tool.is_expanded.then(|| {
-                    threadlane_ui_session::tool_detail(cx)
+                let motion = threadlane_ui_kit::DisclosureMotion::new(
+                    SharedString::from(format!("tool-body-{}", tool.id)),
+                    tool.is_expanded,
+                    window,
+                    cx,
+                );
+                if let Some(active) = &self.active {
+                    motion.remeasure_list_row(&active.transcript.list, row_index, window);
+                }
+                let detail = motion.is_visible().then(|| {
+                    threadlane_ui_kit::tool_detail(cx)
                         .child(tool.detail.clone())
                         .into_any_element()
-                });
+                }).map(|body| motion.content(body));
                 let owner = cx.entity().downgrade();
                 let id = tool.id.clone();
-                threadlane_ui_session::tool_activity(
+                threadlane_ui_kit::tool_activity(
                     tool,
                     !tool.detail.trim().is_empty(),
                     detail,
@@ -2772,7 +2798,7 @@ impl MobileApp {
             .line_height(relative(1.5))
             .children(reasoning)
             .when(!message.content.is_empty(), |el| {
-                el.child(threadlane_ui_session::markdown::markdown_view(
+                el.child(threadlane_ui_kit::markdown::markdown_view(
                     &state,
                     |_, _| {},
                 ))
@@ -2790,8 +2816,8 @@ impl MobileApp {
             let is_steered = message
                 .id
                 .starts_with(&format!("steered-user-{session_id}-"));
-            let mut row = threadlane_ui_session::message_row(MessageRole::User)
-                .child(threadlane_ui_session::user_message_bubble(cx).child(body));
+            let mut row = threadlane_ui_kit::message_row(MessageRole::User)
+                .child(threadlane_ui_kit::user_message_bubble(cx).child(body));
             if is_steered {
                 row = row.child(
                     div()
@@ -2805,7 +2831,7 @@ impl MobileApp {
             }
             row.into_any_element()
         } else {
-            threadlane_ui_session::message_row(message.role.clone())
+            threadlane_ui_kit::message_row(message.role.clone())
                 .child(body)
                 .into_any_element()
         }
@@ -2822,7 +2848,7 @@ impl MobileApp {
             .client
             .messages
             .iter()
-            .filter(|m| threadlane_ui_session::transcript::is_queued_message(m, generating))
+            .filter(|m| threadlane_ui_kit::transcript::is_queued_message(m, generating))
             .map(|m| (m.id.clone(), m.content.clone()))
             .collect();
         if queued.is_empty() {
@@ -2965,7 +2991,7 @@ impl MobileApp {
     ) -> impl IntoElement {
         let owner = cx.entity().downgrade();
         let connected = self.daemon.as_ref().is_some_and(|d| d.is_connected());
-        threadlane_ui_session::permission_card(
+        threadlane_ui_kit::permission_card(
             request,
             true,
             connected,
@@ -3024,7 +3050,7 @@ impl MobileApp {
             let key = question_key(&request.id, &item.id);
             let owner = cx.entity().downgrade();
             let option_key = key.clone();
-            items.push(threadlane_ui_session::question_item(
+            items.push(threadlane_ui_kit::question_item(
                 &request.id,
                 item,
                 answers.get(&key).map(Vec::as_slice).unwrap_or_default(),
@@ -3055,7 +3081,7 @@ impl MobileApp {
             .queued_questions
             .get(&active.id)
             .map_or(0, Vec::len);
-        threadlane_ui_session::question_surface(cx)
+        threadlane_ui_kit::question_surface(cx)
             .flex_none()
             .child(
                 div()

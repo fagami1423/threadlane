@@ -5,7 +5,6 @@ mod markdown;
 mod model_picker;
 mod tool_detail;
 mod tool_preview;
-mod trajectory;
 mod trajectory_view;
 mod transcript;
 mod view;

@@ -1,53 +1,12 @@
 //! Automation navigation, editor, and paged run history. Execution stays in UI state.
 mod editor;
-use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::collapsible::Collapsible;
-use gpui_component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_component::scroll::ScrollableElement;
-use gpui_component::{ActiveTheme, Disableable, Selectable, Sizable, StyledExt, WindowExt};
 use std::path::PathBuf;
-use threadlane_automation::{display_time, Definition, RunStatus};
+use threadlane_automation::Definition;
 use threadlane_ui_state::{automation::Command, AppState};
 
-actions!(threadlane_automation_ui, [SaveAutomation]);
-pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("cmd-enter", SaveAutomation, Some("AutomationEditor")),
-        KeyBinding::new("ctrl-enter", SaveAutomation, Some("AutomationEditor")),
-    ]);
-}
-
-pub(crate) fn picker(
-    id: &'static str,
-    label: String,
-    choices: Vec<(String, String)>,
-    selected: String,
-    disabled: bool,
-    on_select: impl Fn(String, &mut App) + 'static,
-) -> impl IntoElement {
-    let on_select = std::rc::Rc::new(on_select);
-    Button::new(id)
-        .label(label.clone())
-        .accessibility_label(label)
-        .dropdown_caret(true)
-        .disabled(disabled)
-        .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, window, _| {
-            choices.iter().fold(
-                menu.max_h(window.rem_size() * 20.0).scrollable(true),
-                |menu, (id, label)| {
-                    let id = id.clone();
-                    let callback = on_select.clone();
-                    menu.item(
-                        PopupMenuItem::new(label.clone())
-                            .checked(id == selected)
-                            .on_click(move |_, _, cx| callback(id.clone(), cx)),
-                    )
-                },
-            )
-        })
-}
+pub use threadlane_ui_kit::automation_form::SaveAutomation;
+pub fn init(cx: &mut App) { threadlane_ui_kit::automation_form::init(cx); }
 
 pub struct AutomationsView {
     model: Entity<AppState>,
@@ -55,6 +14,7 @@ pub struct AutomationsView {
     expanded_prompt: Option<String>,
     scope: Option<PathBuf>,
     history: bool,
+    attention_only: bool,
     page: usize,
     error: Option<String>,
     busy: bool,
@@ -69,6 +29,7 @@ impl AutomationsView {
             expanded_prompt: None,
             scope: None,
             history: false,
+            attention_only: false,
             page: 0,
             error: None,
             busy: false,
@@ -112,427 +73,100 @@ impl AutomationsView {
 }
 impl Render for AutomationsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use threadlane_ui_kit::automation::{
+            automation_screen, AutomationAction, AutomationScreen,
+        };
         let state = self.model.read(cx);
         let snapshot = state.automations.snapshot.clone();
-        let error = self
-            .error
-            .clone()
-            .or_else(|| state.automations.error.clone());
-        let empty_projects = state.projects.is_empty();
-        let selected = self.selected.clone();
-        let scope = self.scope.clone();
-        let mut choices = vec![(String::new(), "All projects".into())];
-        choices.extend(
-            state
+        let screen = AutomationScreen {
+            projects: state
                 .projects
                 .iter()
-                .map(|p| (p.work_dir.to_string_lossy().into_owned(), p.name.clone())),
-        );
-        let scope_label = choices
-            .iter()
-            .find(|(id, _)| {
-                *id == scope
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            })
-            .map(|(_, name)| name.clone())
-            .unwrap_or_else(|| "Project unavailable".into());
+                .map(|p| (p.work_dir.to_string_lossy().into_owned(), p.name.clone()))
+                .collect(),
+            selected: self.selected.clone(),
+            expanded_prompt: self.expanded_prompt.clone(),
+            scope: self.scope.clone(),
+            history: self.history,
+            attention_only: self.attention_only,
+            page: self.page,
+            busy: self.busy,
+            error: self
+                .error
+                .clone()
+                .or_else(|| state.automations.error.clone()),
+        };
         let owner = cx.entity().downgrade();
-        let scope_picker = picker(
-            "automation-project-scope",
-            scope_label,
-            choices,
-            scope
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            false,
-            move |id, cx| {
+        automation_screen(
+            &snapshot,
+            &screen,
+            move |action, window, cx| {
                 let _ = owner.update(cx, |this, cx| {
-                    this.scope = (!id.is_empty()).then(|| PathBuf::from(id));
-                    this.selected = None;
-                    this.page = 0;
+                    match action {
+                        AutomationAction::Scope(scope) => {
+                            this.scope = scope;
+                            this.selected = None;
+                            this.page = 0;
+                        }
+                        AutomationAction::Select(id) => {
+                            this.selected = Some(id);
+                            this.page = 0;
+                        }
+                        AutomationAction::Back => {
+                            this.selected = None;
+                            this.page = 0;
+                        }
+                        AutomationAction::History(history) => {
+                            this.history = history;
+                            this.selected = None;
+                            this.page = 0;
+                        }
+                        AutomationAction::AttentionOnly(attention) => {
+                            this.attention_only = attention;
+                            this.page = 0;
+                        }
+                        AutomationAction::ExpandPrompt(id) => this.expanded_prompt = id,
+                        AutomationAction::Page(page) => this.page = page,
+                        AutomationAction::Edit(id) => {
+                            let editing_existing = id.is_some();
+                            let definition = id.and_then(|id| {
+                                this.model
+                                    .read(cx)
+                                    .automations
+                                    .snapshot
+                                    .definitions
+                                    .iter()
+                                    .find(|d| d.id == id)
+                                    .cloned()
+                            });
+                            if editing_existing && definition.is_none() { return; }
+                            this.edit(definition, window, cx);
+                        }
+                        AutomationAction::RunNow(id) => this.command(Command::RunNow(id), cx),
+                        AutomationAction::SetEnabled(id, enabled) => {
+                            this.command(Command::SetEnabled(id, enabled), cx)
+                        }
+                        AutomationAction::Delete(id) => this.command(Command::Delete(id), cx),
+                        AutomationAction::CancelRun(id) => this.command(Command::Cancel(id), cx),
+                        AutomationAction::ReviewRun(id) => this.command(Command::Review(id), cx),
+                        AutomationAction::DeleteRun(id) => this.command(Command::DeleteRun(id), cx),
+                        AutomationAction::OpenChat(id) => {
+                            let result = this.model.update(cx, |state, cx| {
+                                let result = state.open_automation_run(&id);
+                                cx.notify();
+                                result
+                            });
+                            match result {
+                                Ok(()) => this.command(Command::Review(id), cx),
+                                Err(error) => this.error = Some(error),
+                            }
+                        }
+                    }
                     cx.notify();
                 });
             },
-        );
-        let definition = snapshot
-            .definitions
-            .iter()
-            .find(|d| Some(&d.id) == selected.as_ref())
-            .cloned();
-        let muted = cx.theme().muted_foreground;
-        let mut content = div().flex().flex_col().gap_4().p_4();
-        if let Some(error) = error {
-            content = content.child(div().text_color(cx.theme().danger).child(error));
-        }
-        if let Some(d) = definition {
-            let active = snapshot
-                .runs
-                .iter()
-                .any(|r| r.definition.id == d.id && r.status.active());
-            let run_id = d.id.clone();
-            let pause_id = d.id.clone();
-            let delete_id = d.id.clone();
-            let edit = d.clone();
-            let owner = cx.entity().downgrade();
-            let enabled = d.enabled;
-            let prompt_open = self.expanded_prompt.as_ref() == Some(&d.id);
-            let prompt_id = d.id.clone();
-            content = content.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("automation-back")
-                            .ghost()
-                            .label("All automations")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.selected = None;
-                                this.page = 0;
-                                cx.notify();
-                            })),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("automation-run")
-                            .label("Run now")
-                            .disabled(self.busy || active)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.command(Command::RunNow(run_id.clone()), cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("automation-pause")
-                            .label(if enabled { "Pause" } else { "Resume" })
-                            .disabled(self.busy)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.command(Command::SetEnabled(pause_id.clone(), !enabled), cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("automation-edit")
-                            .label("Edit…")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.edit(Some(edit.clone()), window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("automation-more")
-                            .label("More")
-                            .dropdown_caret(true)
-                            .dropdown_menu(move |menu, _, _| {
-                                let owner = owner.clone();
-                                let id = delete_id.clone();
-                                menu.item(
-                                    PopupMenuItem::new("Delete automation")
-                                        .disabled(active)
-                                        .on_click(move |_, _, cx| {
-                                            let _ = owner.update(cx, |this, cx| {
-                                                this.command(Command::Delete(id.clone()), cx)
-                                            });
-                                        }),
-                                )
-                            }),
-                    ),
-            );
-            content = content
-                .child(div().text_xl().font_semibold().child(d.name.clone()))
-                .child(div().text_color(muted).child(format!(
-                    "{} · {}",
-                    if d.enabled { "Scheduled" } else { "Paused" },
-                    d.schedule.label()
-                )))
-                .child(div().text_color(muted).child(format!(
-                    "{} · {} · {}",
-                    d.project.display(),
-                    d.model,
-                    if d.worktree { "Worktree" } else { "Local" }
-                )))
-                .child(
-                    Collapsible::new()
-                        .open(prompt_open)
-                        .child(
-                            Button::new("automation-prompt-toggle")
-                                .debug_selector(|| "automation-prompt-toggle".into())
-                                .ghost()
-                                .small()
-                                .label(if prompt_open {
-                                    "Hide prompt"
-                                } else {
-                                    "Show prompt"
-                                })
-                                .accessibility_label(if prompt_open {
-                                    "Hide automation prompt"
-                                } else {
-                                    "Show automation prompt"
-                                })
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.expanded_prompt =
-                                        (!prompt_open).then(|| prompt_id.clone());
-                                    cx.notify();
-                                })),
-                        )
-                        .content(
-                            div()
-                                .debug_selector(|| "automation-prompt-body".into())
-                                .text_sm()
-                                .p_3()
-                                .bg(cx.theme().muted)
-                                .rounded_md()
-                                .child(d.prompt.clone()),
-                        ),
-                )
-                .children(
-                    d.paused_reason
-                        .clone()
-                        .map(|reason| div().text_color(cx.theme().warning).child(reason)),
-                )
-                .children(d.next_at.map(|at| {
-                    div().child(format!(
-                        "Next run: {}",
-                        display_time(at, d.schedule.timezone())
-                    ))
-                }));
-        } else if !self.history {
-            let definitions: Vec<_> = snapshot
-                .definitions
-                .iter()
-                .filter(|d| scope.as_ref().is_none_or(|p| *p == d.project))
-                .collect();
-            if definitions.is_empty() {
-                content = content.child(if empty_projects {
-                    "Attach a project from the sidebar to create an automation."
-                } else {
-                    "Schedule a prompt to run in a fresh chat. Choose New automation… to begin."
-                });
-            }
-            for d in definitions {
-                let id = d.id.clone();
-                let latest = snapshot.runs.iter().rev().find(|r| r.definition.id == d.id);
-                content = content.child(
-                    Button::new(SharedString::from(format!("automation-{}", d.id)))
-                        .ghost()
-                        .w_full()
-                        .h_auto()
-                        .py_3()
-                        .justify_start()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .w_full()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .items_start()
-                                        .gap_1()
-                                        .child(div().font_semibold().child(d.name.clone()))
-                                        .child(div().text_sm().text_color(muted).child(format!(
-                                                    "{} · {} · {}",
-                                                    d.project
-                                                        .file_name()
-                                                        .unwrap_or_default()
-                                                        .to_string_lossy(),
-                                                    d.schedule.label(),
-                                                    if d.worktree { "Worktree" } else { "Local" }
-                                                ))),
-                                )
-                                .child(div().text_sm().child(if !d.enabled {
-                                    "Paused".into()
-                                } else {
-                                    d.next_at
-                                        .map(|t| display_time(t, d.schedule.timezone()))
-                                        .unwrap_or_else(|| "Manual".into())
-                                }))
-                                .child(
-                                    div().text_sm().child(
-                                        latest.map(|r| r.status.label()).unwrap_or("No runs"),
-                                    ),
-                                ),
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.selected = Some(id.clone());
-                            this.page = 0;
-                            cx.notify();
-                        })),
-                );
-            }
-        }
-        if self.history || selected.is_some() {
-            let runs: Vec<_> = snapshot
-                .runs
-                .iter()
-                .rev()
-                .filter(|r| {
-                    scope.as_ref().is_none_or(|p| *p == r.definition.project)
-                        && selected.as_ref().is_none_or(|id| *id == r.definition.id)
-                })
-                .collect();
-            content = content.child(
-                div()
-                    .font_semibold()
-                    .child(format!("Run history · {}", runs.len())),
-            );
-            let page = self.page.min(runs.len().saturating_sub(1) / 25);
-            if runs.is_empty() {
-                // Name the way out: an empty history is only useful if it
-                // says how a run gets created.
-                let hint = if selected.is_some() {
-                    "No runs yet. Choose Run now above, or wait for the next scheduled run."
-                } else {
-                    "No runs yet. Runs appear here when an automation fires or you choose Run now."
-                };
-                content = content.child(div().text_color(muted).child(hint));
-            }
-            for run in runs.iter().skip(page * 25).take(25) {
-                let id = run.id.clone();
-                let cancel_id = id.clone();
-                let review_id = id.clone();
-                let delete_id = id.clone();
-                let mut row = div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .py_3()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .flex_wrap()
-                            .child(div().flex_1().min_w_0().child(format!(
-                                "{} · {}",
-                                run.definition.name,
-                                display_time(run.created_at, run.definition.schedule.timezone())
-                            )))
-                            .child(run.status.label())
-                            .child(
-                                Button::new(SharedString::from(format!("open-{id}")))
-                                    .small()
-                                    .label("Open chat")
-                                    .disabled(run.session_file.is_none())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        let result = this.model.update(cx, |state, cx| {
-                                            let result = state.open_automation_run(&id);
-                                            cx.notify();
-                                            result
-                                        });
-                                        match result {
-                                            Ok(()) => this.command(Command::Review(id.clone()), cx),
-                                            Err(error) => {
-                                                this.error = Some(error);
-                                                cx.notify();
-                                            }
-                                        }
-                                    })),
-                            )
-                            .when(run.status.active(), |row| {
-                                row.child(
-                                    Button::new(SharedString::from(format!("cancel-{cancel_id}")))
-                                        .small()
-                                        .label("Cancel run")
-                                        .disabled(self.busy)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.command(Command::Cancel(cancel_id.clone()), cx)
-                                        })),
-                                )
-                            })
-                            .when(run.needs_attention() && !run.status.active(), |row| {
-                                row.child(
-                                    Button::new(SharedString::from(format!("review-{review_id}")))
-                                        .small()
-                                        .label("Mark reviewed")
-                                        .disabled(self.busy)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.command(Command::Review(review_id.clone()), cx)
-                                        })),
-                                )
-                            })
-                            .when(!run.status.active(), |row| {
-                                row.child(
-                                    Button::new(SharedString::from(format!("remove-{delete_id}")))
-                                        .debug_selector(move || format!("remove-run-{delete_id}"))
-                                        .small()
-                                        .ghost()
-                                        .label("Remove")
-                                        .tooltip(
-                                            "Remove from run history; keep the chat and worktree",
-                                        )
-                                        .accessibility_label(
-                                            "Remove from run history; keep the chat and worktree",
-                                        )
-                                        .disabled(self.busy)
-                                        .on_click({
-                                            let id = run.id.clone();
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.command(Command::DeleteRun(id.clone()), cx)
-                                            })
-                                        }),
-                                )
-                            }),
-                    )
-                    .child(div().text_xs().text_color(muted).child(format!("{} · {}",
-                        run.definition.project.file_name().unwrap_or_default().to_string_lossy(),
-                        if run.definition.worktree { "Worktree" } else { "Local" })));
-                if let Some(error) = &run.error {
-                    row = row.child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().danger)
-                            .child(error.clone()),
-                    );
-                }
-                if run.status == RunStatus::Queued {
-                    row =
-                        row.child(div().text_sm().text_color(muted).child(
-                            "Waiting for the current automation run to finish or be cancelled",
-                        ));
-                }
-                content = content.child(row);
-            }
-            content = content.child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        Button::new("automation-prev")
-                            .label("Previous")
-                            .disabled(page == 0)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.page = page.saturating_sub(1);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("automation-next")
-                            .label("Next")
-                            .disabled((page + 1) * 25 >= runs.len())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.page = page + 1;
-                                cx.notify();
-                            })),
-                    ),
-            );
-        }
-        div().flex().flex_col().size_full().bg(cx.theme().background)
-            .child(div().flex().items_center().gap_3().px_4().pb_3().pt(threadlane_ui_theme::theme::WINDOW_CONTROLS_CLEARANCE)
-                .child(div().text_lg().font_semibold().child("Automations"))
-                .child(scope_picker).child(div().flex_1())
-                .child(Button::new("automation-history").label(if self.history { "Definitions" } else { "Run history" }).ghost().selected(self.history)
-                    .on_click(cx.listener(|this, _, _, cx| { this.history = !this.history; this.selected = None; this.page = 0; cx.notify(); })))
-                .child(Button::new("new-automation").debug_selector(|| "new-automation".into()).label("New automation…").disabled(empty_projects || self.busy)
-                    .on_click(cx.listener(|this, _, window, cx| this.edit(None, window, cx)))))
-            .child(div().px_4().pb_3().text_sm().text_color(muted).child("Runs while Threadlane is open and your computer is awake. Missed runs are combined into one."))
-            .child(div().flex_1().min_h_0().overflow_y_scrollbar().child(content))
+            cx,
+        )
     }
 }
 
@@ -543,9 +177,7 @@ mod tests {
     use threadlane_ui_state::{activate_test_session, AppState};
 
     #[gpui::test]
-    fn history_keeps_long_prompts_collapsed_and_only_finished_runs_removable(
-        cx: &mut TestAppContext,
-    ) {
+    fn history_filters_attention_keeps_prompts_collapsed_and_retains_chat(cx: &mut TestAppContext) {
         use threadlane_automation::{Definition, Run, RunStatus, Schedule};
         cx.update(gpui_component::init);
         let temp = tempfile::tempdir().unwrap();
@@ -555,7 +187,8 @@ mod tests {
             let definition = Definition {
                 id: "research".into(),
                 revision: 1,
-                name: "Research".into(),
+                name: "Research across Threadlane projects and compare native desktop workflows"
+                    .into(),
                 prompt: "Research without edits. ".repeat(200),
                 project: temp.path().into(),
                 model: "model".into(),
@@ -570,25 +203,35 @@ mod tests {
                 paused_reason: None,
             };
             state.automations.snapshot.definitions = vec![definition.clone()];
-            state.automations.snapshot.runs = [RunStatus::Failed, RunStatus::Running]
-                .into_iter()
-                .enumerate()
-                .map(|(i, status)| Run {
-                    id: i.to_string(),
-                    definition: definition.clone(),
-                    scheduled_for: None,
-                    created_at: 0,
-                    finished_at: None,
-                    status,
-                    session_id: format!("automation_{i}"),
-                    session_file: None,
-                    error: None,
-                    reviewed: false,
-                })
-                .collect();
+            state.automations.snapshot.runs = [
+                RunStatus::Failed,
+                RunStatus::Running,
+                RunStatus::Succeeded,
+                RunStatus::Succeeded,
+                RunStatus::WaitingAnswer,
+                RunStatus::Cancelled,
+                RunStatus::Failed,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, status)| Run {
+                id: i.to_string(),
+                definition: definition.clone(),
+                scheduled_for: None,
+                created_at: 0,
+                finished_at: None,
+                status,
+                session_id: format!("automation_{i}"),
+                session_file: None,
+                error: None,
+                reviewed: i >= 3,
+            })
+            .collect();
             state
         });
         let shared = model.clone();
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let capture = captured.clone();
         let (_, cx) = cx.add_window_view(move |window, cx| {
             let view = cx.new(|cx| {
                 let mut view = super::AutomationsView::new(shared, cx);
@@ -596,18 +239,171 @@ mod tests {
                 view.page = 9; // A removed last page must fall back to existing rows.
                 view
             });
+            *capture.borrow_mut() = Some(view.clone());
             gpui_component::Root::new(view, window, cx)
         });
+        let view = captured.borrow_mut().take().expect("mounted automations");
+        let scroll_history = |cx: &mut gpui::VisualTestContext, delta| {
+            let area = cx
+                .debug_bounds("automation-content")
+                .expect("scrollable history");
+            let viewport = cx.update(|window, _| window.viewport_size());
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                // The selector covers the whole content, including the rows below the window.
+                position: gpui::point(area.center().x, viewport.height / 2.0),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(delta))),
+                ..Default::default()
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+        };
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.debug_bounds("automation-prompt-body").is_none());
         assert!(cx.debug_bounds("remove-run-0").is_some());
         assert!(cx.debug_bounds("remove-run-1").is_none());
+        assert!(
+            cx.debug_bounds("automation-prev").is_none(),
+            "a single page needs no pagination"
+        );
         let toggle = cx.debug_bounds("automation-prompt-toggle").unwrap();
         cx.simulate_click(toggle.center(), Modifiers::default());
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.debug_bounds("automation-prompt-body").is_some());
+        let filter = cx.debug_bounds("automation-attention").unwrap();
+        cx.simulate_click(filter.center(), Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for (selector, visible) in [
+            ("automation-run-0", true),
+            ("automation-run-1", false),
+            ("automation-run-2", true),
+            ("automation-run-3", false),
+            ("automation-run-4", true),
+            ("automation-run-5", false),
+            ("automation-run-6", false),
+        ] {
+            assert_eq!(
+                cx.debug_bounds(selector).is_some(),
+                visible,
+                "attention filtering must use the same contract as the sidebar badge: {selector}"
+            );
+        }
+        let title = cx.debug_bounds("automation-run-title-0").unwrap();
+        let context = cx.debug_bounds("automation-run-context-0").unwrap();
+        assert!(
+            context.top() >= title.bottom(),
+            "run metadata must stay below long titles after filtering"
+        );
+        model.update(cx, |state, cx| {
+            for run in &mut state.automations.snapshot.runs {
+                run.reviewed = true;
+                run.status = RunStatus::Succeeded;
+            }
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("automation-run-0").is_none());
+        let all = cx
+            .debug_bounds("automation-all-runs")
+            .expect("empty attention view has a way out");
+        cx.simulate_click(all.center(), Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("automation-run-0").is_some());
+        model.update(cx, |state, cx| {
+            let template = state.automations.snapshot.runs[0].clone();
+            state.automations.snapshot.runs = (0..31)
+                .map(|i| {
+                    let mut run = template.clone();
+                    run.id = i.to_string();
+                    run
+                })
+                .collect();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        scroll_history(cx, -10000.0);
+        let next = cx
+            .debug_bounds("automation-next")
+            .expect("multiple pages expose navigation");
+        let viewport_height = cx.update(|window, _| window.viewport_size().height);
+        assert!(
+            next.bottom() <= viewport_height,
+            "pagination must be scrolled into view: {next:?}, height {viewport_height:?}"
+        );
+        cx.simulate_click(next.center(), Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        view.read_with(cx, |view, _| assert_eq!(view.page, 1));
+        assert!(
+            cx.debug_bounds("automation-run-0").is_some(),
+            "last page remains reachable"
+        );
+        scroll_history(cx, 10000.0);
+        let filter = cx.debug_bounds("automation-attention").unwrap();
+        cx.simulate_click(filter.center(), Modifiers::default());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.page, 0, "filters reset pagination")
+        });
+        view.update(cx, |view, cx| {
+            view.selected = None;
+            view.history = false;
+            cx.notify();
+        });
+        for (width, rem_size) in [(480.0, 16.0), (800.0, 16.0), (480.0, 20.0)] {
+            cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(900.0)));
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.set_rem_size(gpui::px(rem_size));
+                window.draw(cx).clear(cx);
+            });
+            for selector in [
+                "automation-history",
+                "new-automation",
+                "automation-row-research",
+            ] {
+                let bounds = cx
+                    .debug_bounds(selector)
+                    .expect("automation control is visible");
+                assert!(
+                    bounds.left() >= gpui::px(0.0) && bounds.right() <= gpui::px(width),
+                    "{selector} overflows width {width}, rem {rem_size}: {bounds:?}"
+                );
+            }
+            view.update(cx, |view, cx| {
+                view.history = true;
+                view.attention_only = false;
+                view.page = 0;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+            let title = cx.debug_bounds("automation-run-title-30").unwrap();
+            let context = cx.debug_bounds("automation-run-context-30").unwrap();
+            assert!(title.right() <= gpui::px(width) && context.top() >= title.bottom(),
+                "history must wrap long titles above their metadata at width {width}, rem {rem_size}");
+            view.update(cx, |view, cx| {
+                view.history = false;
+                cx.notify();
+            });
+        }
         model.read_with(cx, |state, _| {
             assert_eq!(state.active_session_id.as_deref(), Some("original"))
         });
@@ -619,6 +415,7 @@ mod tests {
     ) {
         cx.update(gpui_component::init);
         cx.update(super::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
         let temp = tempfile::tempdir().unwrap();
         let model = cx.new(|_| {
             let mut state = AppState::default();
@@ -645,7 +442,20 @@ mod tests {
             assert!(window.has_active_sheet(cx));
             window.draw(cx).clear(cx);
         });
+        let scroll_form = |cx: &mut gpui::VisualTestContext| {
+            let viewport = cx.update(|window, _| window.viewport_size());
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: gpui::point(viewport.width - gpui::px(40.0), viewport.height / 2.0),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(-10000.0))),
+                ..Default::default()
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| { window.refresh(); window.draw(cx).clear(cx); });
+        };
+        scroll_form(cx);
         let save = cx.debug_bounds("automation-editor-save").unwrap();
+        let viewport = cx.update(|window, _| window.viewport_size());
+        assert!(save.right() <= viewport.width && save.bottom() <= viewport.height, "Save must be visible before it is clicked");
         cx.simulate_click(save.center(), Modifiers::default());
         cx.run_until_parked();
         cx.update(|window, cx| {
@@ -654,6 +464,8 @@ mod tests {
                 "invalid fields must keep the editor open"
             )
         });
+        scroll_form(cx);
+        assert!(cx.debug_bounds("automation-editor-error").is_some(), "invalid fields must show validation feedback");
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         cx.update(|window, cx| assert!(!window.has_active_sheet(cx)));

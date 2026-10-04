@@ -5,6 +5,7 @@ edition = "2021"
 description = "Native automation definitions and run history"
 
 [dependencies]
+threadlane-ui-kit.workspace = true
 gpui.workspace = true
 gpui-component.workspace = true
 threadlane-automation.workspace = true

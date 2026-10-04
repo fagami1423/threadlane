@@ -1,13 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Editor, EditorState, InputEvent, TabSize};
-use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
-use gpui_component::scroll::ScrollableElement;
-use gpui_component::text::{TextView, TextViewState};
-use gpui_component::{ActiveTheme, Disableable, IconName, Sizable};
+use gpui_component::input::{EditorState, InputEvent, TabSize};
+use gpui_component::menu::ContextMenuExt;
+use gpui_component::text::TextViewState;
 
 use threadlane_ui_state::AppState;
 
@@ -16,72 +12,8 @@ actions!(editor, [SaveFile]);
 /// How long a save/open status message stays visible before auto-expiring.
 const STATUS_MSG_TTL: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Resolve the language used by the editor and inline file previews.
-pub fn detect_language(path_str: &str) -> &'static str {
-    let path = Path::new(path_str);
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|s| s.to_lowercase())
-        .as_deref()
-    {
-        Some("rs") => "rust",
-        Some("py") => "python",
-        Some("js" | "mjs" | "cjs") => "javascript",
-        Some("ts" | "mts" | "cts" | "jsx" | "tsx") => "typescript",
-        Some("json") => "json",
-        Some("toml") => "toml",
-        Some("yaml" | "yml") => "yaml",
-        Some("html" | "htm") => "html",
-        Some("css") => "css",
-        Some("md" | "markdown") => "markdown",
-        Some("sh" | "bash" | "zsh") => "bash",
-        Some("go") => "go",
-        Some("c" | "h") => "c",
-        Some("cpp" | "hpp" | "cc" | "cxx" | "hh") => "cpp",
-        Some("diff" | "patch") => "diff",
-        Some("zig") => "zig",
-        _ => match path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|s| s.to_lowercase())
-            .as_deref()
-        {
-            Some("dockerfile") => "bash",
-            Some("cargo.lock") => "toml",
-            _ => "text",
-        },
-    }
-}
+pub use threadlane_ui_kit::tool_preview::detect_language;
 
-fn smart_tab_title(path_str: &str, is_diff: bool) -> String {
-    let clean_path = path_str.strip_prefix("diff:").unwrap_or(path_str);
-    let path = Path::new(clean_path);
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(clean_path);
-    let parent_name = path
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str());
-
-    let label = if let Some(parent) = parent_name {
-        if !parent.is_empty() && parent != "." {
-            format!("{parent}/{file_name}")
-        } else {
-            file_name.to_string()
-        }
-    } else {
-        file_name.to_string()
-    };
-
-    if is_diff {
-        format!("Diff · {label}")
-    } else {
-        label
-    }
-}
 
 pub struct EditorTab {
     project_dir: PathBuf,
@@ -244,7 +176,7 @@ impl EditorView {
         }
 
         let markdown_state = cx.new(|cx| TextViewState::markdown(&markdown, cx));
-        let tab_title = smart_tab_title(relative_path, true);
+        let tab_title = threadlane_ui_kit::editor_tab_title(relative_path, true);
 
         self.tabs.push(EditorTab {
             project_dir: self
@@ -336,7 +268,7 @@ impl EditorView {
             }
         });
 
-        let tab_title = smart_tab_title(relative_path, false);
+        let tab_title = threadlane_ui_kit::editor_tab_title(relative_path, false);
 
         self.tabs.push(EditorTab {
             project_dir: project_dir.to_path_buf(),
@@ -755,278 +687,113 @@ impl EditorView {
     }
 
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        let is_active_dirty = self.is_active_dirty();
-        let is_active_diff = self.is_active_diff();
-        let view_entity = cx.entity().clone();
-
-        div()
-            .h(rems(2.125))
-            .w_full()
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_between()
-            .bg(theme.muted.opacity(0.3))
-            .border_b_1()
-            .border_color(theme.border)
-            .px_2()
+        let owner = cx.entity();
+        threadlane_ui_kit::editor_tab_bar(cx)
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .overflow_x_scrollbar()
-                    .children(self.tabs.iter().enumerate().map(|(idx, tab)| {
-                        let is_selected = Some(idx) == self.active_tab_index;
-                        let tab_bg = if is_selected {
-                            theme.background
-                        } else {
-                            theme.background.opacity(0.0)
-                        };
-
-                        let text_color = if is_selected {
-                            theme.foreground
-                        } else {
-                            theme.muted_foreground
-                        };
-
-                        let select_view = view_entity.clone();
-                        let menu_view = view_entity.clone();
-                        let close_view = view_entity.clone();
-
-                        let raw_path = tab
-                            .relative_path
-                            .strip_prefix("diff:")
-                            .unwrap_or(&tab.relative_path);
-                        let tooltip_text = if tab.is_diff {
-                            format!("Git Diff: {raw_path}")
-                        } else {
-                            raw_path.to_string()
-                        };
-
-                        div()
-                            .id(SharedString::from(format!("editor-tab-{}", idx)))
-                            .h(rems(1.625))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .px_2()
-                            .rounded_t_sm()
-                            .bg(tab_bg)
-                            .border_1()
-                            .border_color(if is_selected {
-                                theme.border
-                            } else {
-                                theme.border.opacity(0.0)
+                threadlane_ui_kit::editor_tabs().children(self.tabs.iter().enumerate().map(
+                    |(index, tab)| {
+                        let project = tab.project_dir.clone();
+                        let path = tab.relative_path.clone();
+                        let select_owner = owner.clone();
+                        let select_project = project.clone();
+                        let select_path = path.clone();
+                        let close_owner = owner.clone();
+                        let close_project = project.clone();
+                        let close_path = path.clone();
+                        let menu_owner = owner.clone();
+                        let raw_path = path.strip_prefix("diff:").unwrap_or(&path).to_owned();
+                        threadlane_ui_kit::editor_tab(
+                            format!("editor-tab-{project:?}:{path}"),
+                            tab.file_name.clone(),
+                            raw_path,
+                            self.active_tab_index == Some(index),
+                            tab.is_dirty,
+                            tab.is_diff,
+                            move |_, _, cx| {
+                                select_owner.update(cx, |view, cx| {
+                                    if let Some(index) = view.tabs.iter().position(|tab| {
+                                        tab.project_dir == select_project
+                                            && tab.relative_path == select_path
+                                    }) {
+                                        view.select_tab(index, cx);
+                                    }
+                                });
+                            },
+                            move |_, _, cx| {
+                                close_owner.update(cx, |view, cx| {
+                                    if let Some(index) = view.tabs.iter().position(|tab| {
+                                        tab.project_dir == close_project
+                                            && tab.relative_path == close_path
+                                    }) {
+                                        view.close_tab(index, cx);
+                                    }
+                                });
+                            },
+                            cx,
+                        )
+                        .context_menu(move |menu, _, _| {
+                            let owner = menu_owner.clone();
+                            let project = project.clone();
+                            let path = path.clone();
+                            threadlane_ui_kit::editor_tab_menu(menu, move |action, _, cx| {
+                                owner.update(cx, |view, cx| {
+                                    let Some(index) = view.tabs.iter().position(|tab| {
+                                        tab.project_dir == project && tab.relative_path == path
+                                    }) else {
+                                        return;
+                                    };
+                                    match action {
+                                        threadlane_ui_kit::EditorTabAction::Close => {
+                                            view.close_tab(index, cx)
+                                        }
+                                        threadlane_ui_kit::EditorTabAction::CloseOthers => {
+                                            view.close_other_tabs(index, cx)
+                                        }
+                                        threadlane_ui_kit::EditorTabAction::CloseAll => {
+                                            view.close_all_tabs(cx)
+                                        }
+                                    }
+                                });
                             })
-                            .when(!is_selected, |this| {
-                                this.hover(|s| s.bg(theme.muted.opacity(0.5)))
-                            })
-                            .tooltip(move |window, cx| {
-                                gpui_component::tooltip::Tooltip::new(tooltip_text.clone())
-                                    .build(window, cx)
-                            })
-                            .on_click(move |_event, _window, cx| {
-                                select_view.update(cx, |this, cx| this.select_tab(idx, cx));
-                            })
-                            .context_menu({
-                                let keep_idx = idx;
-                                move |menu, _window, _cx| {
-                                    let v1 = menu_view.clone();
-                                    let v2 = menu_view.clone();
-                                    let v3 = menu_view.clone();
-                                    menu.item(PopupMenuItem::new("Close Tab").on_click(
-                                        move |_event, _window, cx| {
-                                            v1.update(cx, |this, cx| this.close_tab(keep_idx, cx));
-                                        },
-                                    ))
-                                    .item(PopupMenuItem::new("Close Other Tabs").on_click(
-                                        move |_event, _window, cx| {
-                                            v2.update(cx, |this, cx| {
-                                                this.close_other_tabs(keep_idx, cx)
-                                            });
-                                        },
-                                    ))
-                                    .item(
-                                        PopupMenuItem::new("Close All Tabs").on_click(
-                                            move |_event, _window, cx| {
-                                                v3.update(cx, |this, cx| this.close_all_tabs(cx));
-                                            },
-                                        ),
-                                    )
-                                }
-                            })
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(if tab.is_diff {
-                                        theme.warning
-                                    } else {
-                                        text_color
-                                    })
-                                    .child(IconName::File),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(if is_selected {
-                                        FontWeight::MEDIUM
-                                    } else {
-                                        FontWeight::NORMAL
-                                    })
-                                    .text_color(text_color)
-                                    .child(tab.file_name.clone()),
-                            )
-                            .child(if tab.is_dirty && !tab.is_diff {
-                                div()
-                                    .size(rems(0.375))
-                                    .rounded_full()
-                                    .bg(theme.accent)
-                                    .into_any_element()
-                            } else {
-                                div().into_any_element()
-                            })
-                            .child(
-                                Button::new(SharedString::from(format!("tab-close-{}", idx)))
-                                    .accessibility_label("Close tab")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::Close)
-                                    .tooltip("Close tab")
-                                    .on_click(move |_event, _window, cx| {
-                                        close_view.update(cx, |this, cx| this.close_tab(idx, cx));
-                                    }),
-                            )
-                    })),
+                        })
+                    },
+                )),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_1()
-                    .child(if let Some((msg, is_error)) = self.visible_status() {
-                        div()
-                            .text_xs()
-                            .text_color(if is_error {
-                                theme.danger
-                            } else {
-                                theme.muted_foreground
-                            })
-                            .px_2()
-                            .child(msg)
-                            .into_any_element()
-                    } else {
-                        div().into_any_element()
-                    })
-                    .child(
-                        Button::new("editor-save-btn")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Check)
-                            .label(if is_active_diff { "Diff" } else { "Save" })
-                            .disabled(!is_active_dirty || is_active_diff)
-                            .tooltip(if is_active_diff {
-                                "Diff view (read-only)"
-                            } else {
-                                "Save file (Cmd+S)"
-                            })
-                            .on_click({
-                                let save_view = view_entity.clone();
-                                move |_event, _window, cx| {
-                                    save_view.update(cx, |this, cx| this.save_active_file(cx));
-                                }
-                            }),
-                    ),
-            )
+            .child(threadlane_ui_kit::editor_actions(
+                self.visible_status(),
+                threadlane_ui_kit::editor_save_button(
+                    self.is_active_dirty(),
+                    self.is_active_diff(),
+                )
+                .on_click(cx.listener(|view, _, _, cx| view.save_active_file(cx))),
+                cx,
+            ))
     }
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        div()
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_3()
-            .p_6()
-            .child(
-                div()
-                    .size_12()
-                    .rounded_full()
-                    .bg(theme.muted.opacity(0.5))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_2xl()
-                    .text_color(theme.muted_foreground)
-                    .child(IconName::File),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme.foreground)
-                    .child("No files open in Editor"),
-            )
-            .child(
-                div()
-                    .max_w(rems(23.75))
-                    .text_center()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("Click a file in the Files panel or a changed file in Review to open and view here."),
-            )
+        threadlane_ui_kit::editor_empty_state(cx)
     }
+
 }
 
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_pending_file(window, cx);
         self.sync_pending_content(window, cx);
-        let theme = cx.theme().colors;
-
-        div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .h_full()
-            .w_full()
-            .min_w_0()
-            .min_h_0()
-            .bg(theme.background)
+        threadlane_ui_kit::editor_surface(cx)
             .on_action(cx.listener(Self::save_file_action))
             .children(self.has_tabs().then(|| self.render_tab_bar(cx)))
             .child(if let Some(idx) = self.active_tab_index {
                 if let Some(active_tab) = self.tabs.get(idx) {
                     if active_tab.is_diff {
                         if let Some(ref text_view) = active_tab.text_view_state {
-                            div()
-                                .flex_1()
-                                .min_h_0()
-                                .w_full()
-                                .h_full()
-                                .p_4()
-                                .overflow_y_scrollbar()
-                                .child(TextView::new(text_view).selectable(true))
+                            threadlane_ui_kit::editor_diff(text_view, cx)
                                 .into_any_element()
                         } else {
                             self.render_empty_state(cx).into_any_element()
                         }
                     } else if let Some(ref editor) = active_tab.editor_state {
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .w_full()
-                            .h_full()
-                            .child(Editor::new(editor).bordered(false).size_full())
+                        threadlane_ui_kit::editor_buffer(editor)
                             .into_any_element()
                     } else {
                         self.render_empty_state(cx).into_any_element()
@@ -1045,6 +812,92 @@ mod navigation_tests {
     use super::EditorView;
     use gpui::AppContext as _;
 
+    #[gpui::test]
+    fn shared_tabs_support_keyboard_selection_and_close_without_reselecting(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let project = std::path::PathBuf::from("/editor-preview-test");
+        let model = cx.new(|_| {
+            let mut state = threadlane_ui_state::AppState::default();
+            state.projects.clear();
+            state.pending_hydrations.clear();
+            state.active_session_id = None;
+            state.active_work_dir = Some(project.clone());
+            state
+        });
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let editor = cx.new(|cx| {
+                let mut view = EditorView::new(model, window, cx);
+                view.open_diff("one.rs", "+one", cx);
+                view
+            });
+            gpui_component::Root::new(editor, window, cx)
+        });
+        let editor = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<EditorView>().unwrap()
+        });
+        for name in ["two.rs", "three.rs"] {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            editor.update(cx, |view, cx| view.open_diff(name, "+sample", cx));
+        }
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        editor.update(cx, |view, cx| view.select_tab(0, cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let close = cx
+            .debug_bounds(r#"editor-tab-"/editor-preview-test":diff:two.rs-close"#)
+            .unwrap();
+        cx.simulate_click(close.center(), gpui::Modifiers::default());
+        editor.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 2);
+            assert_eq!(
+                view.tabs[view.active_tab_index.unwrap()].relative_path,
+                "diff:one.rs"
+            );
+        });
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.blur(cx);
+            window.focus_next(cx); // Select one.rs
+            window.focus_next(cx); // Close one.rs
+            window.focus_next(cx); // Select three.rs
+            assert!(
+                window.focused(cx).is_some(),
+                "editor controls are tab stops"
+            );
+            window.draw(cx).clear(cx);
+        });
+        let keystroke = gpui::Keystroke::parse("enter").unwrap();
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(gpui::KeyUpEvent { keystroke });
+        editor.read_with(cx, |view, _| {
+            assert_eq!(
+                view.tabs[view.active_tab_index.unwrap()].relative_path,
+                "diff:three.rs"
+            );
+        });
+        // Domain-derived identity stays usable when an earlier tab is removed.
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let close = cx
+            .debug_bounds(r#"editor-tab-"/editor-preview-test":diff:one.rs-close"#)
+            .unwrap();
+        cx.simulate_click(close.center(), gpui::Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let close = cx
+            .debug_bounds(r#"editor-tab-"/editor-preview-test":diff:three.rs-close"#)
+            .unwrap();
+        cx.simulate_click(close.center(), gpui::Modifiers::default());
+        editor.read_with(cx, |view, _| {
+            assert!(view.tabs.is_empty());
+            assert!(view.active_tab_index.is_none());
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("editor-save-btn").is_none());
+    }
     #[gpui::test]
     fn opens_at_requested_line_after_loading_and_reuses_tab(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);

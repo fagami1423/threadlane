@@ -3,41 +3,16 @@ use super::*;
 use threadlane_git::GitFileInventory;
 use threadlane_protocol::repo::FILE_INVENTORY_NOT_A_REPOSITORY;
 
-actions!(
-    threadlane_file_completion,
-    [
-        CompleteFileCompletion,
-        SelectPreviousFileCompletion,
-        SelectNextFileCompletion,
-        DismissFileCompletion,
-    ]
-);
+pub(super) use threadlane_ui_kit::file_completion::{
+    CompleteFileCompletion, DismissFileCompletion, SelectNextFileCompletion,
+    SelectPreviousFileCompletion,
+};
 
 pub(super) fn init_file_completion(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new(
-            "tab",
-            CompleteFileCompletion,
-            Some(FILE_COMPLETION_BINDING_CONTEXT),
-        ),
-        KeyBinding::new(
-            "up",
-            SelectPreviousFileCompletion,
-            Some(FILE_COMPLETION_BINDING_CONTEXT),
-        ),
-        KeyBinding::new(
-            "down",
-            SelectNextFileCompletion,
-            Some(FILE_COMPLETION_BINDING_CONTEXT),
-        ),
-        KeyBinding::new(
-            "escape",
-            DismissFileCompletion,
-            Some(FILE_COMPLETION_BINDING_CONTEXT),
-        ),
-    ]);
+    threadlane_ui_kit::file_completion::init_file_completion(cx);
 }
 
+#[derive(Debug)]
 pub(super) enum FileCompletionStatus {
     /// `git ls-files` is still running for the resolved root.
     Loading,
@@ -101,17 +76,17 @@ impl ChatListView {
         }
         let composer_key = self.composer_key.clone();
         let root = self.model.read(cx).active_git_work_dir();
-        let keep = self.file_completion.as_ref().is_some_and(|state| {
-            state.composer_key == composer_key && state.root == root
-        });
+        let keep = self
+            .file_completion
+            .as_ref()
+            .is_some_and(|state| state.composer_key == composer_key && state.root == root);
         if keep {
             return;
         }
         match root {
             Some(root) => self.request_file_inventory(root, cx),
             None => {
-                self.file_completion_generation =
-                    self.file_completion_generation.wrapping_add(1);
+                self.file_completion_generation = self.file_completion_generation.wrapping_add(1);
                 self.file_completion_task = None;
                 self.file_completion = Some(FileCompletionState {
                     root: None,
@@ -147,15 +122,13 @@ impl ChatListView {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    threadlane_ui_state::project_io::file_inventory(&client, &task_root)
-                        .await
+                    threadlane_ui_state::project_io::file_inventory(&client, &task_root).await
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.file_completion_generation != generation
                     || this.composer_key != composer_key
-                    || this.model.read(cx).active_git_work_dir().as_deref()
-                        != Some(root.as_path())
+                    || this.model.read(cx).active_git_work_dir().as_deref() != Some(root.as_path())
                 {
                     return;
                 }
@@ -253,30 +226,39 @@ impl ChatListView {
         // the inventory refresh below re-asks the daemon and degrades
         // to its own unsupported state.
         let client = self.model.read(cx).daemon_client.clone();
+        let composer_key = self.composer_key.clone();
+        let generation = self.file_completion_generation;
         let path = path.to_string();
         cx.spawn_in(window, async move |this, cx| {
-            let exists = client.supports_project_io()
-                && is_safe_relative_path(&path)
-                && {
-                    // The in-process daemon answers inline on the caller's
-                    // thread, so the probe hops to a background executor
-                    // instead of `stat`ing on the UI thread.
-                    let probe_client = client.clone();
-                    let probe_root = root.clone();
-                    let probe_path = path.clone();
-                    cx.background_executor()
-                        .spawn(async move {
-                            threadlane_ui_state::project_io::file_exists(
-                                &probe_client,
-                                &probe_root,
-                                probe_path,
-                            )
-                            .await
-                            .unwrap_or(false)
-                        })
+            let exists = client.supports_project_io() && is_safe_relative_path(&path) && {
+                // The in-process daemon answers inline on the caller's
+                // thread, so the probe hops to a background executor
+                // instead of `stat`ing on the UI thread.
+                let probe_client = client.clone();
+                let probe_root = root.clone();
+                let probe_path = path.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        threadlane_ui_state::project_io::file_exists(
+                            &probe_client,
+                            &probe_root,
+                            probe_path,
+                        )
                         .await
-                };
+                        .unwrap_or(false)
+                    })
+                    .await
+            };
             let _ = this.update_in(cx, |this, window, cx| {
+                // A remote probe may finish after switching session, checkout,
+                // or dismissing/reopening the picker with the same query.
+                if this.composer_key != composer_key
+                    || this.file_completion_generation != generation
+                    || !this.file_menu_open(cx)
+                    || this.model.read(cx).active_git_work_dir().as_deref() != Some(root.as_path())
+                {
+                    return;
+                }
                 if !exists {
                     this.request_file_inventory(root, cx);
                     return;
@@ -417,11 +399,7 @@ impl ChatListView {
                 cx.stop_propagation();
             }
             "down" => {
-                self.select_next_file_completion_action(
-                    &SelectNextFileCompletion,
-                    window,
-                    cx,
-                );
+                self.select_next_file_completion_action(&SelectNextFileCompletion, window, cx);
                 cx.stop_propagation();
             }
             "tab" => {
@@ -439,277 +417,59 @@ impl ChatListView {
         true
     }
 
-    fn render_file_menu_row(
-        &self,
-        theme: &gpui_component::theme::ThemeColor,
-        path: &str,
-        index: usize,
-        is_active: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let basename = path.rsplit('/').next().unwrap_or(path);
-        let parent = path.strip_suffix(basename).unwrap_or("");
-        let selected_path = path.to_owned();
-        div()
-            .id(SharedString::from(format!("composer-file-{index}")))
-            .role(Role::Button)
-            .aria_label(format!("{path} — insert this path at the caret"))
-            .h(rems(1.875))
-            .flex()
-            .items_center()
-            .gap_2()
-            .rounded_md()
-            .px_2()
-            .text_sm()
-            .bg(if is_active {
-                theme.accent.opacity(0.16)
-            } else {
-                gpui::transparent_black()
-            })
-            .hover(|style| style.bg(theme.list_hover))
-            .child(
-                Icon::default()
-                    .path("icons/file.svg")
-                    .small()
-                    .text_color(if is_active {
-                        theme.primary
-                    } else {
-                        theme.muted_foreground
-                    }),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .truncate()
-                    .font_weight(if is_active {
-                        FontWeight::BOLD
-                    } else {
-                        FontWeight::SEMIBOLD
-                    })
-                    .text_color(if is_active {
-                        theme.primary
-                    } else {
-                        theme.foreground
-                    })
-                    .child(basename.to_owned()),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .text_color(theme.muted_foreground)
-                    .child(parent.to_owned()),
-            )
-            .on_click(cx.listener(move |this, _event, window, cx| {
-                this.apply_file_completion(&selected_path, window, cx);
-            }))
-    }
-
-    /// The `@` picker popup: header names the workspace scope and the hint row
-    /// counts the active result; the list is `Role::List` with an aria label
-    /// that announces scope plus the selected path, and every status state
-    /// (loading / empty / failed / unsupported / capped) is visible text.
     pub(super) fn render_file_menu(
         &mut self,
         trigger: &FileQueryTrigger,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = cx.theme().colors;
+        use threadlane_ui_kit::file_completion::{
+            file_completion_menu, file_completion_popup, FileCompletionMenuStatus,
+            FileCompletionRequest,
+        };
         let (matches, has_more) = self.file_completion_matches(&trigger.query);
-        let match_count = matches.len();
-        let selected_idx = self.selected_file_index.min(match_count.saturating_sub(1));
         let scope = self
             .file_completion
             .as_ref()
-            .and_then(|state| state.root.clone())
-            .and_then(|root| root.file_name().map(|name| name.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| "workspace".to_string());
-        let selected = matches
-            .get(selected_idx)
-            .cloned()
-            .unwrap_or_else(|| "none".to_string());
-        let non_utf8_note = self
-            .file_completion
-            .as_ref()
-            .and_then(|state| match &state.status {
-                FileCompletionStatus::Ready(inventory) if inventory.non_utf8_skipped > 0 => {
-                    Some(format!(
-                        ", {} non-UTF-8 names skipped",
-                        inventory.non_utf8_skipped
-                    ))
-                }
-                _ => None,
-            })
-            .unwrap_or_default();
-        let list_label = match self.file_completion.as_ref().map(|state| &state.status) {
-            None | Some(FileCompletionStatus::Loading) => {
-                format!("Searching files in {scope}")
-            }
+            .and_then(|state| state.root.as_ref())
+            .and_then(|root| root.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "workspace".into());
+        let status = match self.file_completion.as_ref().map(|state| &state.status) {
+            None | Some(FileCompletionStatus::Loading) => FileCompletionMenuStatus::Loading,
             Some(FileCompletionStatus::Unsupported(reason)) => {
-                format!("File completion unavailable: {reason}")
+                FileCompletionMenuStatus::Unavailable(reason)
             }
-            Some(FileCompletionStatus::Failed(error)) => {
-                format!("File search failed in {scope}: {error}")
-            }
-            Some(FileCompletionStatus::Ready(_)) => format!(
-                "Files in {scope}, {} of {match_count}, {selected} selected{non_utf8_note}",
-                if match_count == 0 {
-                    0
-                } else {
-                    selected_idx + 1
-                }
-            ),
+            Some(FileCompletionStatus::Failed(error)) => FileCompletionMenuStatus::Failed(error),
+            Some(FileCompletionStatus::Ready(inventory)) => FileCompletionMenuStatus::Ready {
+                matches: &matches,
+                selected_index: self.selected_file_index,
+                has_more,
+                non_utf8_skipped: inventory.non_utf8_skipped,
+            },
         };
-
-        let body: AnyElement = match self.file_completion.as_ref().map(|state| &state.status) {
-            None | Some(FileCompletionStatus::Loading) => {
-                file_menu_status_row(&theme, "Searching files…").into_any_element()
-            }
-            Some(FileCompletionStatus::Unsupported(reason)) => {
-                file_menu_status_row(&theme, reason.clone()).into_any_element()
-            }
-            Some(FileCompletionStatus::Failed(error)) => div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .h(rems(1.875))
-                .px_2()
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .truncate()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(format!("Could not list files: {error}")),
-                )
-                .child(
-                    Button::new("file-completion-retry")
-                        .debug_selector(|| "file-completion-retry".into())
-                        .label("Retry")
-                        .small()
-                        .ghost()
-                        .accessibility_label("Retry listing workspace files")
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            let root = this
-                                .file_completion
-                                .as_ref()
-                                .and_then(|state| state.root.clone());
-                            if let Some(root) = root {
-                                this.request_file_inventory(root, cx);
-                            }
-                        })),
-                )
-                .into_any_element(),
-            Some(FileCompletionStatus::Ready(_)) => {
-                if match_count == 0 {
-                    file_menu_status_row(&theme, "No matching files".to_string())
-                        .into_any_element()
-                } else {
-                    div()
-                        .children(matches.into_iter().enumerate().map(|(index, path)| {
-                            self.render_file_menu_row(
-                                &theme,
-                                &path,
-                                index,
-                                index == selected_idx,
-                                cx,
-                            )
-                        }))
-                        .into_any_element()
-                }
-            }
-        };
-
-        div()
-            .absolute()
-            .bottom_full()
-            .left(rems(0.0))
-            .mb_2()
-            .w_full()
-            .max_w(rems(40.0))
-            .max_h(rems(20.0))
-            .flex()
-            .flex_col()
-            .rounded_lg()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.title_bar)
-            .shadow_xl()
-            .p_1p5()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .h_7()
-                    .px_2()
-                    .border_b_1()
-                    .border_color(theme.border.opacity(0.4))
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(format!("Files · {scope}")),
-                            )
-                            .child(
-                                div()
-                                    .text_color(theme.muted_foreground)
-                                    .child("↑↓ navigate · Tab/Enter insert · Esc dismiss"),
-                            ),
-                    )
-                    .child(if match_count > 0 {
-                        format!("{}/{}", selected_idx + 1, match_count)
-                    } else {
-                        "0/0".to_string()
-                    }),
-            )
-            .child(
-                div()
-                    .id("file-completion-list")
-                    .debug_selector(|| "file-completion-list".to_string())
-                    .role(Role::List)
-                    .aria_label(list_label)
-                    .relative()
-                    .mt_1()
-                    .track_scroll(&self.file_scroll_handle)
-                    .overflow_y_scroll()
-                    .vertical_scrollbar(&self.file_scroll_handle)
-                    .max_h(rems(16.25))
-                    .child(body)
-                    .when(has_more, |list| {
-                        list.child(
-                            div()
-                                .h(rems(1.875))
-                                .flex()
-                                .items_center()
-                                .px_2()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child("More matches — keep typing"),
-                        )
-                    }),
-            )
-            .into_any_element()
+        let owner = cx.entity().downgrade();
+        file_completion_popup(file_completion_menu(
+            &scope,
+            status,
+            &self.file_scroll_handle,
+            move |request, window, cx| {
+                let _ = owner.update(cx, |host, cx| match request {
+                    FileCompletionRequest::Insert(path) => {
+                        host.apply_file_completion(path, window, cx)
+                    }
+                    FileCompletionRequest::Retry => {
+                        if let Some(root) = host
+                            .file_completion
+                            .as_ref()
+                            .and_then(|state| state.root.clone())
+                        {
+                            host.request_file_inventory(root, cx);
+                        }
+                    }
+                });
+            },
+            cx,
+        ))
+        .into_any_element()
     }
-}
-
-fn file_menu_status_row(
-    theme: &gpui_component::theme::ThemeColor,
-    text: impl Into<SharedString>,
-) -> impl IntoElement {
-    div()
-        .h(rems(1.875))
-        .flex()
-        .items_center()
-        .px_2()
-        .text_sm()
-        .text_color(theme.muted_foreground)
-        .child(text.into())
 }

@@ -14,6 +14,27 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Shared task branch preview and creation use the same deterministic title slug.
+pub fn issue_branch_name(number: u64, title: &str, suffix: &str) -> String {
+    let slug = title
+        .chars()
+        .flat_map(char::to_lowercase)
+        .fold(String::new(), |mut slug, character| {
+            if character.is_ascii_alphanumeric() {
+                slug.push(character);
+            } else if !slug.is_empty() && !slug.ends_with('-') {
+                slug.push('-');
+            }
+            slug
+        })
+        .trim_matches('-')
+        .to_string();
+    format!(
+        "issue/{number}-{}-{suffix}",
+        if slug.is_empty() { "task" } else { &slug }
+    )
+}
+
 /// One node of the project file tree produced by `ListProjectFiles`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectFileNode {
