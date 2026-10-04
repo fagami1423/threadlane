@@ -1273,7 +1273,7 @@ pub(crate) async fn run_subagent_task(
                     },
                     thought_signature: None,
                 }])
-                .await;
+                .await.map_err(|error| error.to_string())?;
             if tool_results[0].is_error {
                 return Err(tool_results[0].content.clone());
             }
@@ -2172,7 +2172,7 @@ mod result_tests {
                 },
                 thought_signature: None,
             };
-            let results = agent.execute_tools(&[call]).await;
+            let results = agent.execute_tools(&[call]).await.unwrap();
             assert_eq!(results[0].is_error, is_error, "{}", results[0].content);
             assert!(results[0].content.contains(expected));
         }

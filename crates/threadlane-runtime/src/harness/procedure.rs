@@ -1726,13 +1726,15 @@ impl ToolBatchProcedure {
                 lane.name
             )));
         }
-        if !store
-            .entries()
-            .iter()
-            .any(|entry| entry.id == assistant_entry_id)
-        {
+        let assistant = store
+            .entry(assistant_entry_id)
+            .ok_or_else(|| ProcedureError::Invalid("assistant entry does not exist".into()))?;
+        let (_, start_seq) = store
+            .open_operation_lane(run_id)
+            .ok_or_else(|| ProcedureError::Invalid("operation start does not exist".into()))?;
+        if assistant.lane != lane.name || assistant.seq <= start_seq {
             return Err(ProcedureError::Invalid(
-                "assistant entry does not exist".into(),
+                "assistant declaration does not belong to this operation".into(),
             ));
         }
         let mut seq = next_seq_with_effects(store, effects);

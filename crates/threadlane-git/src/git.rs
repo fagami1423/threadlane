@@ -161,8 +161,8 @@ pub(crate) fn parse_status(_work_dir: &Path, porcelain: &str) -> GitStatus {
     status
 }
 
-#[cfg(test)]
-fn inspect_files(work_dir: &Path) -> Result<Vec<GitFile>, GitError> {
+/// Inspect changed files and line counts in the current worktree.
+pub fn inspect_files(work_dir: &Path) -> Result<Vec<GitFile>, GitError> {
     let porcelain = command(
         work_dir,
         &[

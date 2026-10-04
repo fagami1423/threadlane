@@ -28,7 +28,8 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           run-id: ${{ github.event.workflow_run.id }}
       - name: Install hotpath-utils
-        run: cargo install hotpath --version '=0.24.0' --bin hotpath-utils --features utils
+        # Match the report schema produced by the workspace's Cargo.lock.
+        run: cargo install hotpath --version '=0.26.1' --bin hotpath-utils --features utils
       - name: Post benchmark comparison
         env:
           GH_TOKEN: ${{ github.token }}
@@ -43,7 +44,7 @@ jobs:
               test -d "$metrics" || continue
               benchmark_id="$(basename "$metrics")"
               case "$benchmark_id" in
-                runtime-timing|runtime-alloc|tools-timing|tools-alloc|mcp-timing|terminal-timing|terminal-alloc) ;;
+                runtime-timing|runtime-alloc|provider-timing|provider-alloc|dispatch-timing|dispatch-alloc|tools-timing|tools-alloc|mcp-timing|terminal-timing|terminal-alloc) ;;
                 *) continue ;;
               esac
               test -f "$metrics/pr_number.txt" || continue
@@ -93,7 +94,7 @@ jobs:
             test -d "$metrics" || continue
             benchmark_id="$(basename "$metrics")"
             case "$benchmark_id" in
-              runtime-timing|runtime-alloc|tools-timing|tools-alloc|mcp-timing|terminal-timing|terminal-alloc) ;;
+              runtime-timing|runtime-alloc|provider-timing|provider-alloc|dispatch-timing|dispatch-alloc|tools-timing|tools-alloc|mcp-timing|terminal-timing|terminal-alloc) ;;
               *)
                 echo "Skipping unexpected benchmark suite: $benchmark_id"
                 continue
@@ -101,6 +102,11 @@ jobs:
             esac
             if ! test -f "$metrics/head.json" || ! test -f "$metrics/base.json"; then
               echo "Missing metrics for $benchmark_id; skipping"
+              continue
+            fi
+            if ! test -s "$metrics/head_fixture.sha256" || ! test -s "$metrics/base_fixture.sha256" || ! cmp -s "$metrics/head_fixture.sha256" "$metrics/base_fixture.sha256"; then
+              echo "$benchmark_id: fixture changed or could not be verified; comparison skipped." >> "$report_file"
+              echo >> "$report_file"
               continue
             fi
             if comparison_output="$(

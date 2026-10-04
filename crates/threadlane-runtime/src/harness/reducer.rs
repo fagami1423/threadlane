@@ -82,6 +82,8 @@ fn deferred_kind_of(entry: &Entry) -> DeferredKind {
 /// check/commit queries in O(1); not part of the projected state.
 #[derive(Debug, Clone, Default)]
 struct LaneAux {
+    /// Start sequence of this lane's currently open operation.
+    open_operation_seq: Option<u64>,
     incomplete_tools_by_run: HashMap<String, usize>,
     /// `(run_id, tool_call_id) -> index into lane.tools`.
     tool_by_call: HashMap<(String, String), usize>,
@@ -462,14 +464,35 @@ impl ReductionContext {
 
     // ── Indexed lookups ───────────────────────────────────────────────
 
+    pub(crate) fn open_operation_lane(&self, run_id: &str) -> Option<(&str, u64)> {
+        let lane = self
+            .lanes
+            .values()
+            .find(|lane| lane.open_operation.as_deref() == Some(run_id))?;
+        self.aux
+            .get(&lane.name)?
+            .open_operation_seq
+            .map(|seq| (lane.name.as_str(), seq))
+    }
+
     /// Whether a `ToolStarted` intent for `(run_id, tool_call_id)` has been
     /// committed on any lane. Equivalent to scanning committed records for a
     /// matching intent: every committed intent inserts one tool slot, and the
     /// only slot removal (a never-replay claim) re-inserts the same key.
     pub(crate) fn has_tool_started(&self, run_id: &str, tool_call_id: &str) -> bool {
-        self.aux.values().any(|aux| {
-            aux.tool_by_call
-                .contains_key(&(run_id.to_owned(), tool_call_id.to_owned()))
+        self.tool_state_for_call(run_id, tool_call_id).is_some()
+    }
+
+    pub(crate) fn tool_state_for_call(
+        &self,
+        run_id: &str,
+        tool_call_id: &str,
+    ) -> Option<(&str, &ToolState)> {
+        let key = (run_id.to_owned(), tool_call_id.to_owned());
+        self.aux.iter().find_map(|(lane, aux)| {
+            let index = *aux.tool_by_call.get(&key)?;
+            let tool = self.lanes.get(lane)?.tools.get(index)?;
+            Some((lane.as_str(), tool))
         })
     }
 
@@ -963,7 +986,10 @@ impl ReductionContext {
                     lane.retry = None;
                     lane.status = LaneStatus::SuspendedCrash;
                 });
-                self.edit_aux(&lane_name, |aux| aux.pending_deferred = pending);
+                self.edit_aux(&lane_name, |aux| {
+                    aux.pending_deferred = pending;
+                    aux.open_operation_seq = Some(*seq);
+                });
             }
             Record::AbortRequested { .. } => {
                 self.edit_lane(&lane_name, |lane| lane.abort_requested = true);
@@ -979,6 +1005,7 @@ impl ReductionContext {
                         _ => LaneStatus::Idle,
                     };
                 });
+                self.edit_aux(&lane_name, |aux| aux.open_operation_seq = None);
             }
             Record::LaneMoved { target_leaf_id, .. } => {
                 let target_leaf_id = target_leaf_id.clone();

@@ -110,6 +110,24 @@ pub trait SessionStore {
     fn reduced_state(&self) -> Option<ReducedState> {
         None
     }
+    /// Lane and start sequence of an operation that has not finished.
+    /// Indexed stores override this to avoid rescanning committed history.
+    fn open_operation_lane(&self, run_id: &str) -> Option<(&str, u64)> {
+        for record in self.records().iter().rev() {
+            match record {
+                Record::OperationFinished {
+                    run_id: finished, ..
+                } if finished == run_id => {
+                    return None;
+                }
+                Record::OperationStarted { id, lane, seq, .. } if id == run_id => {
+                    return Some((lane.as_str(), *seq));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
     /// Commits a related group as one durable unit. Stores that do not support
     /// atomic append groups reject the operation rather than exposing a prefix.
     fn append_actions_atomically(

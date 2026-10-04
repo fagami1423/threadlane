@@ -40,14 +40,16 @@ fn reduce_read_context_with_digests(
             }),
         _ => None,
     };
-    let key = |snapshot: &threadlane_runtime::harness::ContextSnapshot| {
+    fn key(
+        snapshot: &threadlane_runtime::harness::ContextSnapshot,
+    ) -> (&str, Option<usize>, Option<usize>, &str) {
         (
-            snapshot.path.clone(),
+            snapshot.path.as_str(),
             snapshot.start_line,
             snapshot.end_line,
-            snapshot.file_sha256.as_str().to_owned(),
+            snapshot.file_sha256.as_str(),
         )
-    };
+    }
     let mut recent = std::collections::HashSet::new();
     for snapshot in messages.iter().rev().filter_map(snapshot_for) {
         recent.insert(key(snapshot));
@@ -58,7 +60,7 @@ fn reduce_read_context_with_digests(
     let mut visible = HashMap::new();
     messages.iter().map(|message| {
         let Some(snapshot) = snapshot_for(message) else { return message.clone(); };
-        let AgentMessage::Tool { content, .. } = message else { unreachable!() };
+        let AgentMessage::Tool { tool_call_id, name, content, is_error, terminate, images } = message else { unreachable!() };
         let snapshot_key = key(snapshot);
         let replacement = if let Some(first_call) = visible.get(&snapshot_key) {
             Some(format!("{UNCHANGED_READ_REFERENCE_PREFIX}{first_call}. Do not repeat this read without changed arguments or file contents.]"))
@@ -72,11 +74,17 @@ fn reduce_read_context_with_digests(
         // Small bodies cost less than a reference. Only refer to a copy that
         // is actually inline in this request, never to an evicted result.
         if let Some(replacement) = replacement.filter(|text| text.len() < content.len()) {
-            let mut reduced = message.clone();
-            if let AgentMessage::Tool { content, .. } = &mut reduced { *content = replacement; }
-            reduced
+            AgentMessage::Tool {
+                tool_call_id: tool_call_id.clone(),
+                name: name.clone(),
+                content: replacement,
+                is_error: *is_error,
+                terminate: *terminate,
+                images: images.clone(),
+            }
         } else {
-            visible.entry(snapshot_key).or_insert_with(|| snapshot.source_tool_call_id.clone());
+            visible.entry(snapshot_key)
+                .or_insert(snapshot.source_tool_call_id.as_str());
             message.clone()
         }
     }).collect()
@@ -132,6 +140,75 @@ fn reduce_read_context(
 mod reduction_tests {
     use super::{reduce_read_context, AgentMessage};
     use threadlane_runtime::harness::{ContextSnapshot, TraceString};
+
+    /// Local measurement, never a timing assertion in CI. Run with
+    /// `cargo nextest run -p threadlane-coding-agent --lib context_preparation_profile --run-ignored only --no-capture`.
+    #[test]
+    #[ignore]
+    fn context_preparation_profile() {
+        use std::{collections::HashMap, hint::black_box, time::Instant};
+        use threadlane_compaction::{
+            estimate_request_tokens, prune_historical_tool_outputs, CompactionParams,
+        };
+
+        let mut messages = Vec::new();
+        let mut snapshots = Vec::new();
+        let digest = "a".repeat(64);
+        for index in 0..128 {
+            let path = format!("file-{}.rs", index % 16);
+            let content = format!(
+                "[Threadlane read_file SHA-256: {digest}]\n[Threadlane read_file path: \"{path}\"]\n{}",
+                "source 🦀\n".repeat(1_000)
+            );
+            let call = format!("call-{index}");
+            snapshots.push(ContextSnapshot {
+                context_id: format!("ctx-{index}"),
+                source_lane: "main".into(),
+                source_run_id: "run".into(),
+                source_tool_call_id: call.clone(),
+                source_entry_id: format!("result-{index}"),
+                path,
+                start_line: None,
+                end_line: None,
+                file_sha256: TraceString::new(&digest).unwrap(),
+                output_chars: content.chars().count(),
+                captured_at: 0,
+            });
+            messages.push(AgentMessage::Tool {
+                tool_call_id: call,
+                name: "read_file".into(),
+                content,
+                is_error: false,
+                terminate: index == 127,
+                images: Vec::new(),
+            });
+        }
+        let digests = HashMap::new();
+        let reduce = || {
+            super::reduce_read_context_with_digests(&messages, &snapshots, &digests, false)
+        };
+        let prune = || prune_historical_tool_outputs(&messages, 3);
+        let config = CompactionParams::default();
+        let before = estimate_request_tokens(&messages, None, &config);
+        for (name, operation) in [
+            ("duplicate reads", &reduce as &dyn Fn() -> Vec<AgentMessage>),
+            ("historical previews", &prune as &dyn Fn() -> Vec<AgentMessage>),
+        ] {
+            let result = operation();
+            let after = estimate_request_tokens(&result, None, &config);
+            let fingerprint = crate::durable::sha256_hex(&serde_json::to_vec(&result).unwrap());
+            let mut samples = Vec::new();
+            for _ in 0..7 {
+                let start = Instant::now();
+                for _ in 0..250 {
+                    black_box(operation());
+                }
+                samples.push(start.elapsed().as_nanos() / 250);
+            }
+            samples.sort_unstable();
+            eprintln!("{name}: median {} ns/prepare; estimated tokens {before} -> {after}; output SHA-256 {fingerprint}", samples[3]);
+        }
+    }
 
     #[test]
     fn eviction_requires_fresh_recoverable_reads_and_duplicates_require_visible_bodies() {
@@ -198,8 +275,11 @@ mod reduction_tests {
         );
 
         let mut duplicate = messages[0].clone();
-        if let AgentMessage::Tool { tool_call_id, .. } = &mut duplicate {
+        if let AgentMessage::Tool {
+            tool_call_id, terminate, ..
+        } = &mut duplicate {
             *tool_call_id = "duplicate".into();
+            *terminate = true;
         }
         let mut snapshot = snapshots[0].clone();
         snapshot.source_tool_call_id = "duplicate".into();
@@ -208,7 +288,7 @@ mod reduction_tests {
         let reduced = reduce_read_context(&messages, &snapshots, Some(dir.path()), true);
         assert_eq!(reduced[0], messages[0]);
         assert!(
-            matches!(reduced.last(), Some(AgentMessage::Tool { content, .. }) if content.contains("Unchanged read"))
+            matches!(reduced.last(), Some(AgentMessage::Tool { content, terminate: true, .. }) if content.contains("Unchanged read"))
         );
         // Different ranges and failures must retain their own contents.
         snapshots.last_mut().unwrap().start_line = Some(2);

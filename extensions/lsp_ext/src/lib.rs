@@ -688,7 +688,116 @@ fn workspace_edit_changes(
     Ok(changes)
 }
 
+const MAX_LSP_PUMP_STEPS: u64 = 200;
+
+enum LspReply {
+    Complete(serde_json::Value),
+    Pending(Vec<BrokerRequest>),
+}
+
+/// Notifications, server requests, and stale replies can precede our reply.
+/// They do not advance the operation, and each consumes the bounded pump.
+fn receive_lsp_reply(
+    invocation: &Invocation,
+    state: &mut serde_json::Value,
+) -> Result<LspReply, Response> {
+    let message = invocation
+        .events
+        .iter()
+        .find_map(|event| broker_message(event, "recv"))
+        .ok_or_else(|| Response::error("Missing LSP response from language server."))?
+        .map_err(Response::error)?;
+    if message["jsonrpc"] != "2.0" {
+        return Err(Response::error(
+            "Invalid JSON-RPC version from language server.",
+        ));
+    }
+    let method = message.get("method").and_then(serde_json::Value::as_str);
+    if method.is_none()
+        && (message.get("id").is_none()
+            || message.get("result").is_some() == message.get("error").is_some())
+    {
+        return Err(Response::error(
+            "Invalid LSP response: expected id and result or error.",
+        ));
+    }
+    let pending_id = state["pending_request_id"]
+        .as_u64()
+        .ok_or_else(|| Response::error("Missing pending LSP request id."))?;
+    if method.is_none() && message["id"].as_u64() == Some(pending_id) {
+        if message.get("result").is_some() == message.get("error").is_some() {
+            return Err(Response::error(
+                "Invalid LSP response: expected result or error.",
+            ));
+        }
+        if let Some(error) = message.get("error") {
+            let code = error["code"]
+                .as_i64()
+                .ok_or_else(|| Response::error("Invalid LSP error code."))?;
+            let detail: String = error["message"]
+                .as_str()
+                .ok_or_else(|| Response::error("Invalid LSP error message."))?
+                .chars()
+                .take(MAX_PROCESS_FAILURE_DETAIL_CHARS)
+                .collect();
+            let mut response = Response::error(format!("Language server error {code}: {detail}"));
+            // A rejected query does not invalidate a successfully initialized server.
+            if state["phase"] == "requesting" {
+                state["phase"] = serde_json::json!("ready");
+                state["pump_steps"] = serde_json::json!(0);
+                response.state = Some(state.clone());
+            }
+            return Err(response);
+        }
+        state["pump_steps"] = serde_json::json!(0);
+        return Ok(LspReply::Complete(message));
+    }
+    let steps = state["pump_steps"].as_u64().unwrap_or(0).saturating_add(1);
+    if steps > MAX_LSP_PUMP_STEPS {
+        return Err(Response::error(
+            "LSP response budget exhausted; language server must be restarted.",
+        ));
+    }
+    state["pump_steps"] = serde_json::json!(steps);
+    let name = state["process_name"]
+        .as_str()
+        .ok_or_else(|| Response::error("Missing LSP process name."))?;
+    let mut requests = Vec::new();
+    if method.is_some() {
+        if let Some(id) = message.get("id") {
+            let reply = serde_json::json!({"jsonrpc":"2.0", "id":id,
+                "error":{"code":-32601, "message":"Client method not supported"}});
+            requests.push(process_request(
+                "send",
+                serde_json::json!({"name":name, "data":frame_jsonrpc(&reply)}),
+            ));
+        }
+    }
+    requests.push(process_request(
+        "recv",
+        serde_json::json!({"name":name, "framing":"content-length", "timeout_ms":30_000}),
+    ));
+    Ok(LspReply::Pending(requests))
+}
+
 fn prepare_lsp(invocation: &Invocation) -> Result<(Response, Vec<BrokerRequest>), Response> {
+    prepare_lsp_step(invocation).map_err(|mut response| {
+        if response.state.is_none() && invocation.state["process_name"].is_string() {
+            let mut state = invocation.state.clone();
+            // Local argument/file validation before dispatch does not break
+            // an initialized server. Transport/protocol failures do.
+            let phase = match invocation.state["phase"].as_str() {
+                Some("ready" | "format_refreshed" | "refreshing_format") => "ready",
+                _ => "failed",
+            };
+            state["phase"] = serde_json::json!(phase);
+            response.state = Some(state);
+        }
+        response
+    })
+}
+
+fn prepare_lsp_step(invocation: &Invocation) -> Result<(Response, Vec<BrokerRequest>), Response> {
     let path = invocation
         .arguments
         .get("path")
@@ -704,16 +813,20 @@ fn prepare_lsp(invocation: &Invocation) -> Result<(Response, Vec<BrokerRequest>)
     let process_name = format!("lsp-{server}");
 
     match phase {
-        "" => {
+        "" | "failed" => {
+            let mut requests = Vec::new();
+            if phase == "failed" {
+                if let Some(name) = state["process_name"].as_str() {
+                    requests.push(process_request("kill", serde_json::json!({"name":name})));
+                }
+            }
             state = serde_json::json!({
                 "phase": "spawning",
                 "server": server,
                 "process_name": process_name,
                 "next_request_id": 1u64,
             });
-            Ok((
-                lsp_state_response(format!("Starting {server}."), state),
-                vec![
+            requests.extend([
                     process_request(
                         "spawn",
                         serde_json::json!({
@@ -722,8 +835,8 @@ fn prepare_lsp(invocation: &Invocation) -> Result<(Response, Vec<BrokerRequest>)
                     ),
                     fs_request("read_text", serde_json::json!({"path": path})),
                     fs_request("absolute_path", serde_json::json!({"path": path})),
-                ],
-            ))
+                ]);
+            Ok((lsp_state_response(format!("Starting {server}."), state), requests))
         }
         "spawning" => {
             match invocation
@@ -788,25 +901,8 @@ fn prepare_lsp(invocation: &Invocation) -> Result<(Response, Vec<BrokerRequest>)
             ))
         }
         "initializing" => {
-            let message = match invocation
-                .events
-                .iter()
-                .find_map(|event| broker_message(event, "recv"))
-            {
-                Some(Ok(message)) => message,
-                Some(Err(error)) => return Err(Response::error(error)),
-                None => {
-                    return Err(Response::error(
-                        "Missing initialize response from language server.",
-                    ))
-                }
-            };
-            if message.get("id").and_then(|value| value.as_u64())
-                != state["pending_request_id"].as_u64()
-            {
-                return Err(Response::error(format!(
-                    "Unexpected initialize response: {message}"
-                )));
+            if let LspReply::Pending(requests) = receive_lsp_reply(invocation, &mut state)? {
+                return Ok((lsp_state_response("Waiting for initialize response.", state), requests));
             }
             state["phase"] = serde_json::Value::String("requesting".into());
             let request_id = state["next_request_id"].as_u64().unwrap_or(2);
@@ -905,26 +1001,10 @@ fn prepare_lsp(invocation: &Invocation) -> Result<(Response, Vec<BrokerRequest>)
             ))
         }
         "requesting" => {
-            let message = match invocation
-                .events
-                .iter()
-                .find_map(|event| broker_message(event, "recv"))
-            {
-                Some(Ok(message)) => message,
-                Some(Err(error)) => return Err(Response::error(error)),
-                None => {
-                    return Err(Response::error(
-                        "Missing LSP response from language server.",
-                    ))
-                }
+            let message = match receive_lsp_reply(invocation, &mut state)? {
+                LspReply::Complete(message) => message,
+                LspReply::Pending(requests) => return Ok((lsp_state_response("Waiting for LSP response.", state), requests)),
             };
-            if message.get("id").and_then(|value| value.as_u64())
-                != state["pending_request_id"].as_u64()
-            {
-                return Err(Response::error(format!(
-                    "Unexpected LSP response: {message}"
-                )));
-            }
             let result = message
                 .get("result")
                 .cloned()
@@ -1154,8 +1234,9 @@ fn prepare_lsp(invocation: &Invocation) -> Result<(Response, Vec<BrokerRequest>)
             response.state = Some(state);
             Ok((response, vec![]))
         }
-        "ready" => {
-            if invocation.name == "lsp_format" {
+        "ready" | "format_refreshed" => {
+            let refreshed_format = phase == "format_refreshed";
+            if invocation.name == "lsp_format" && !refreshed_format {
                 state["phase"] = serde_json::Value::String("refreshing_format".into());
                 let path = state["path"]
                     .as_str()
@@ -1229,18 +1310,35 @@ fn prepare_lsp(invocation: &Invocation) -> Result<(Response, Vec<BrokerRequest>)
                 .as_str()
                 .unwrap_or(&process_name)
                 .to_owned();
+            let mut requests = Vec::new();
+            if refreshed_format {
+                // Request ids increase across queries, so they also provide a
+                // monotonically increasing document version after didOpen(1).
+                let did_change = lsp_notification(
+                    "textDocument/didChange",
+                    serde_json::json!({
+                        "textDocument": {"uri": uri, "version": request_id},
+                        "contentChanges": [{"text": state["document_text"]}],
+                    }),
+                );
+                requests.push(process_request(
+                    "send",
+                    serde_json::json!({"name": name, "data": frame_jsonrpc(&did_change)}),
+                ));
+            }
+            requests.extend([
+                process_request(
+                    "send",
+                    serde_json::json!({"name": name, "data": frame_jsonrpc(&request)}),
+                ),
+                process_request(
+                    "recv",
+                    serde_json::json!({"name": name, "framing": "content-length", "timeout_ms": 30_000}),
+                ),
+            ]);
             Ok((
                 lsp_state_response(format!("Querying {server}."), state),
-                vec![
-                    process_request(
-                        "send",
-                        serde_json::json!({"name": name, "data": frame_jsonrpc(&request)}),
-                    ),
-                    process_request(
-                        "recv",
-                        serde_json::json!({"name": name, "framing": "content-length", "timeout_ms": 30_000}),
-                    ),
-                ],
+                requests,
             ))
         }
         "refreshing_format" => {
@@ -1254,7 +1352,7 @@ fn prepare_lsp(invocation: &Invocation) -> Result<(Response, Vec<BrokerRequest>)
                 None => return Err(Response::error("Missing fs/read_text broker response.")),
             };
             state["document_text"] = serde_json::Value::String(text);
-            state["phase"] = serde_json::Value::String("ready".into());
+            state["phase"] = serde_json::Value::String("format_refreshed".into());
             prepare_lsp(&Invocation {
                 name: invocation.name.clone(),
                 arguments: invocation.arguments.clone(),
@@ -1677,6 +1775,165 @@ mod tests {
             broker_message(&event, "recv").unwrap().unwrap(),
             serde_json::json!({"jsonrpc": "2.0", "id": 42, "result": {}})
         );
+    }
+
+    #[test]
+    fn lsp_waits_through_notifications_and_server_requests_with_a_budget() {
+        for phase in ["initializing", "requesting"] {
+            let mut invocation = Invocation {
+                name: "lsp_symbols".into(),
+                arguments: serde_json::json!({"path": "src/lib.rs"}),
+                state: serde_json::json!({"phase": phase, "server": "rust-analyzer", "process_name": "lsp-rust-analyzer", "path": "src/lib.rs", "uri": "file:///workspace/src/lib.rs", "pending_request_id": 7, "next_request_id": 8}),
+                events: vec![process_recv_event(
+                    serde_json::json!({"jsonrpc":"2.0", "method":"textDocument/publishDiagnostics", "params":{}}),
+                )],
+            };
+            let (response, requests) = prepare_lsp(&invocation).unwrap();
+            assert_eq!(response.state.as_ref().unwrap()["phase"], phase);
+            assert_eq!(requests.len(), 1, "notifications need no response");
+            assert_eq!(requests[0].operation, "recv");
+            invocation.state = response.state.unwrap();
+            // A server request can use the same numeric id as our request.
+            invocation.events = vec![process_recv_event(
+                serde_json::json!({"jsonrpc":"2.0", "id":7, "method":"server/unknown"}),
+            )];
+            let (response, requests) = prepare_lsp(&invocation).unwrap();
+            assert_eq!(response.state.as_ref().unwrap()["phase"], phase);
+            assert_eq!(requests.len(), 2);
+            let frame = requests[0].arguments["data"].as_str().unwrap();
+            let reply: serde_json::Value =
+                serde_json::from_str(frame.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(reply["id"], 7);
+            assert_eq!(reply["error"]["code"], -32601);
+            invocation.state = response.state.unwrap();
+            invocation.events = vec![process_recv_event(
+                serde_json::json!({"jsonrpc":"2.0", "id":6, "result":[]}),
+            )];
+            let (response, requests) = prepare_lsp(&invocation).unwrap();
+            assert_eq!(response.state.as_ref().unwrap()["phase"], phase);
+            assert_eq!(
+                requests[0].operation, "recv",
+                "stale replies must not satisfy this request"
+            );
+            invocation.state = response.state.unwrap();
+            invocation.events = vec![process_recv_event(
+                serde_json::json!({"jsonrpc":"2.0", "id":7, "result":[]}),
+            )];
+            let (response, _) = prepare_lsp(&invocation).unwrap();
+            assert_eq!(
+                response.state.as_ref().unwrap()["phase"],
+                if phase == "initializing" {
+                    "requesting"
+                } else {
+                    "ready"
+                }
+            );
+
+            invocation.state["pump_steps"] = serde_json::json!(200);
+            invocation.events = vec![process_recv_event(
+                serde_json::json!({"jsonrpc":"2.0", "method":"$/progress"}),
+            )];
+            let error = prepare_lsp(&invocation).unwrap_err();
+            assert!(error.message.contains("budget"));
+            let next = Invocation {
+                state: error.state.unwrap(),
+                events: vec![],
+                ..invocation
+            };
+            let (_, requests) = prepare_lsp(&next).unwrap();
+            assert_eq!(requests[0].operation, "kill");
+            assert_eq!(requests[1].operation, "spawn");
+        }
+    }
+
+    #[test]
+    fn lsp_reports_rpc_errors_and_rejects_malformed_responses() {
+        let mut invocation = Invocation {
+            name: "lsp_symbols".into(),
+            arguments: serde_json::json!({"path":"src/lib.rs"}),
+            state: serde_json::json!({"phase":"requesting", "process_name":"lsp-rust-analyzer", "pending_request_id":7, "next_request_id":8}),
+            events: vec![process_recv_event(
+                serde_json::json!({"jsonrpc":"2.0", "id":7, "error":{"code":-32601,"message":"not supported"}}),
+            )],
+        };
+        let error = prepare_lsp(&invocation).unwrap_err();
+        assert!(error.message.contains("not supported"));
+        assert_eq!(error.state.unwrap()["phase"], "ready");
+        invocation.events = vec![process_recv_event(
+            serde_json::json!({"jsonrpc":"2.0", "id":7}),
+        )];
+        let error = prepare_lsp(&invocation).unwrap_err();
+        assert_eq!(error.state.unwrap()["phase"], "failed");
+        invocation.events = vec![ExtensionEvent {
+            topic: "broker_response".into(),
+            payload: serde_json::json!({"capability":"process", "operation":"recv", "ok":true, "value":{"message":{"data":"", "eof":true}}}),
+        }];
+        let error = prepare_lsp(&invocation).unwrap_err();
+        assert!(error.message.contains("EOF"));
+        assert_eq!(error.state.unwrap()["phase"], "failed");
+    }
+
+    #[test]
+    fn formatting_refresh_sends_a_request_instead_of_reading_again() {
+        let invocation = Invocation {
+            name: "lsp_format".into(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+            state: serde_json::json!({"phase": "ready", "server": "rust-analyzer", "process_name": "lsp-rust-analyzer", "uri": "file:///workspace/src/lib.rs", "path": "src/lib.rs", "document_text": "old", "next_request_id": 8}),
+            events: vec![],
+        };
+        let (response, requests) = prepare_lsp(&invocation).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].capability, "fs");
+        let refreshed = Invocation {
+            state: response.state.unwrap(),
+            events: vec![ExtensionEvent {
+                topic: "broker_response".into(),
+                payload: serde_json::json!({"capability": "fs", "operation": "read_text", "ok": true, "value": {"message": "new text"}}),
+            }],
+            ..invocation
+        };
+        let (response, requests) = prepare_lsp(&refreshed).unwrap();
+        assert_eq!(response.state.as_ref().unwrap()["phase"], "requesting");
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].arguments["data"]
+            .as_str()
+            .unwrap()
+            .contains("textDocument/didChange"));
+        assert!(requests[0].arguments["data"]
+            .as_str()
+            .unwrap()
+            .contains("new text"));
+        assert!(requests[1].arguments["data"]
+            .as_str()
+            .unwrap()
+            .contains("textDocument/formatting"));
+        assert_eq!(requests[2].operation, "recv");
+        let completed = Invocation {
+            state: response.state.unwrap(),
+            events: vec![process_recv_event(serde_json::json!({
+                "jsonrpc": "2.0", "id": 8, "result": [],
+            }))],
+            ..refreshed
+        };
+        let (response, requests) = prepare_lsp(&completed).unwrap();
+        assert_eq!(response.state.as_ref().unwrap()["phase"], "ready");
+        assert!(!response.continue_after_broker);
+        assert!(requests.is_empty(), "formatting only returns an edit plan");
+        let plan: serde_json::Value = serde_json::from_str(&response.message).unwrap();
+        assert_eq!(plan["kind"], "lsp_workspace_edit_plan");
+        // The next independent call must refresh again, rather than reuse the
+        // previous contents or leave the session in a transient phase.
+        let next = Invocation {
+            state: response.state.unwrap(),
+            events: vec![],
+            ..completed
+        };
+        let (response, requests) = prepare_lsp(&next).unwrap();
+        assert_eq!(
+            response.state.as_ref().unwrap()["phase"],
+            "refreshing_format"
+        );
+        assert_eq!(requests[0].operation, "read_text");
     }
 
     #[test]

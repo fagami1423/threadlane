@@ -145,6 +145,7 @@ impl CodingSessionHarness {
             .await?;
         self.append_tool_intent_after_hook(run_id, tool_call_id, tool_name, effective_args)
             .await
+            .map(|_| ())
     }
 
     #[cfg(test)]
@@ -163,6 +164,7 @@ impl CodingSessionHarness {
             tool_arguments: None,
             tool_result_content: None,
             tool_result_is_error: None,
+            tool_execution_identity: None,
         };
         self.store
             .hooks()

@@ -18,7 +18,7 @@ use threadlane_compaction::{
 use threadlane_context::{BudgetConfig, ContextBudget, context_budget};
 use threadlane_permission::PermissionTraceEvent;
 use threadlane_protocol::{
-    AgentMessage, AgentToolResult, ImageAttachment, ReasoningEffort, TokenUsage,
+    AgentMessage, AgentToolResult, ImageAttachment, ReasoningEffort, TokenUsage, ToolExecutionIdentity,
 };
 pub use threadlane_runtime::harness::Record as HarnessRecord;
 use threadlane_runtime::harness::{

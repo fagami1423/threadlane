@@ -31,7 +31,9 @@ const MAX_MANAGED_PROCESSES: usize = 16;
 const DEFAULT_RECV_TIMEOUT_MS: u64 = 5000;
 const MAX_RECV_TIMEOUT_MS: u64 = 30_000;
 const MAX_MANAGED_STDOUT_BYTES: usize = 16 * 1024 * 1024;
-pub(crate) const MAX_BROKER_CONTINUATION_ROUNDS: usize = 4;
+// Protocol tools need multiple setup steps plus notification pumping. Keep a
+// host ceiling above the bundled LSP/DAP 200-step pumps, which fail first.
+pub(crate) const MAX_BROKER_CONTINUATION_ROUNDS: usize = 256;
 
 /// A persistent subprocess managed by the host for WASI extensions.
 /// Extensions reference managed processes by name across invocations.
