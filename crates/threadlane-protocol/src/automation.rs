@@ -52,9 +52,14 @@ pub struct AutomationProjection {
     /// Permission requests raised by the live run, keyed by session id —
     /// answered with the normal `AnswerPermission` command.
     pub permissions: HashMap<String, PermissionRequest>,
-    /// Question requests raised by the live run, keyed by session id —
-    /// answered with the normal `AnswerQuestion` command.
+    /// Latest question request raised by the live run, keyed by session id.
+    /// Retained for older clients; `question_queues` is the complete surface.
     pub questions: HashMap<String, QuestionRequest>,
+    /// Complete pending questions per session, in request order. `Some`
+    /// is authoritative even when empty; `None` denotes an older daemon
+    /// that reports only the latest request through `questions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_queues: Option<HashMap<String, Vec<QuestionRequest>>>,
     /// Session id of the run currently executing, when one is.
     pub active_session_id: Option<String>,
     /// Store-level failure (e.g. the service could not open its state). The
@@ -70,4 +75,40 @@ pub struct AutomationProjection {
 pub enum AutomationResponse {
     /// The store's post-command projection.
     Projection { projection: AutomationProjection },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wire decoding distinguishes an omitted legacy field from an authoritative empty queue.
+    #[test]
+    fn automation_question_queues_distinguish_legacy_from_authoritative_empty() {
+        let legacy = serde_json::to_value(AutomationProjection::default()).unwrap();
+        assert!(legacy.get("question_queues").is_none());
+        let legacy: AutomationProjection = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.question_queues.is_none());
+
+        for queues in [
+            HashMap::new(),
+            HashMap::from([(
+                "session".into(),
+                vec![QuestionRequest {
+                    id: "question".into(),
+                    questions: Vec::new(),
+                }],
+            )]),
+        ] {
+            let projection = AutomationProjection {
+                question_queues: Some(queues),
+                ..Default::default()
+            };
+            let encoded = serde_json::to_value(&projection).unwrap();
+            assert!(encoded.get("question_queues").is_some());
+            assert_eq!(
+                serde_json::from_value::<AutomationProjection>(encoded).unwrap(),
+                projection
+            );
+        }
+    }
 }

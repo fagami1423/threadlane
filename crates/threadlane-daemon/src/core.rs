@@ -230,13 +230,15 @@ impl DaemonCore {
 
     /// The service's process-local projection as it crosses the wire:
     /// `active_runtime` (an in-process handle) becomes the run's session id.
-    fn automation_projection_wire(
+    /// Also used by local UI hosts to share client-side request reconciliation.
+    pub fn automation_projection_wire(
         projection: &crate::automation::Projection,
     ) -> threadlane_protocol::automation::AutomationProjection {
         threadlane_protocol::automation::AutomationProjection {
             snapshot: projection.snapshot.clone(),
             permissions: projection.permissions.clone(),
             questions: projection.questions.clone(),
+            question_queues: Some(projection.question_queues.clone()),
             active_session_id: projection
                 .active_runtime
                 .as_ref()
@@ -1368,7 +1370,7 @@ impl DaemonCore {
                     .parent()
                     .and_then(|sessions| sessions.parent())
                     .and_then(|threadlane| threadlane.parent())
-                    .map(|root| root.to_path_buf())
+                    .map(Self::project_dir_for)
             })
             .ok_or_else(|| {
                 format!(
@@ -1584,6 +1586,62 @@ mod composer_tests {
         let weak = std::sync::Arc::downgrade(&core);
         drop(core);
         assert!(weak.upgrade().is_none(), "automation bridge retained its host");
+    }
+
+    /// Historical worktree hydration resolves the owning project without constructing a runtime.
+    #[tokio::test]
+    async fn remote_worktree_hydration_keeps_the_canonical_project_without_a_runtime() {
+        use threadlane_coding_agent::harness::CodingSessionHarness;
+        use threadlane_protocol::daemon::{SessionEvent, SessionHydrationRequest};
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().to_path_buf();
+        let session_id = "automation-history";
+        let worktree = project.join(".threadlane/worktrees").join(session_id);
+        let transcript = canonical_session_file(&worktree, session_id);
+        let stub = canonical_session_file(&project, session_id);
+        for path in [&stub, &transcript] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            for (key, value) in [
+                ("name", "Historical automation".to_string()),
+                ("is_worktree", "true".to_string()),
+                ("worktree_path", worktree.to_string_lossy().into_owned()),
+            ] {
+                CodingSessionHarness::append_fact_to_path(path, "main", key, &value, None).unwrap();
+            }
+        }
+        let core = DaemonCore::new().unwrap();
+        let mut events = core.subscribe();
+        core.dispatch(SessionCommand::HydrateSession {
+            request: SessionHydrationRequest {
+                session_id: session_id.into(),
+                session_file: transcript.clone(),
+                reload_messages: true,
+                runtime_options: None,
+            },
+        })
+        .await
+        .unwrap();
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let SessionEvent::SessionSnapshot {
+                    session_id: id,
+                    snapshot,
+                } = events.recv().await.unwrap().1
+                {
+                    if id == session_id {
+                        break snapshot;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(snapshot.session.work_dir, project);
+        assert_eq!(snapshot.session.runtime_work_dir, worktree);
+        assert_eq!(snapshot.session.session_file, transcript);
+        assert_eq!(core.identity(session_id).unwrap().work_dir, project);
+        assert!(core.runtimes().is_empty());
     }
 
     #[tokio::test]

@@ -37,8 +37,9 @@ pub struct ClientState {
     /// wire ≥5). Default empty on pre-5 daemons, which never emit it.
     pub automation: threadlane_protocol::automation::AutomationProjection,
     /// Permission/question entries the automation projection contributed
-    /// to `pending_*` — tracked so the next projection can retract only
-    /// those (a request resolved elsewhere leaves no Agent event).
+    /// to the pending/queued request surfaces — tracked so the next
+    /// projection can retract only those (a request resolved elsewhere
+    /// leaves no Agent event).
     pub automation_permissions: HashMap<String, threadlane_protocol::PermissionRequest>,
     pub automation_questions: HashMap<String, threadlane_protocol::QuestionRequest>,
 }
@@ -328,6 +329,76 @@ impl ClientState {
             }
         }
     }
+
+    /// Merge projected questions into the existing FIFO. Complete queues are
+    /// authoritative (including their order); legacy latest-only projections
+    /// cannot distinguish parallel questions from resolved replacements.
+    fn reconcile_automation_questions(
+        &mut self,
+        projection: &threadlane_protocol::automation::AutomationProjection,
+    ) {
+        let sessions: HashSet<_> = self
+            .automation_questions
+            .keys()
+            .chain(projection.questions.keys())
+            .chain(
+                self.automation
+                    .question_queues
+                    .iter()
+                    .flat_map(|queues| queues.keys()),
+            )
+            .chain(
+                projection
+                    .question_queues
+                    .iter()
+                    .flat_map(|queues| queues.keys()),
+            )
+            .chain(self.automation.active_session_id.iter())
+            .chain(projection.active_session_id.iter())
+            .cloned()
+            .collect();
+        for session_id in sessions {
+            let pending = self.pending_questions.remove(&session_id);
+            let queued = self
+                .queued_questions
+                .remove(&session_id)
+                .unwrap_or_default();
+            let mut requests = if let Some(queues) = &projection.question_queues {
+                // A first/coalesced projection can already omit a resolved
+                // Agent request we never saw in a previous projection. Trust
+                // the complete snapshot rather than keeping that stale head.
+                queues.get(&session_id).cloned().unwrap_or_default()
+            } else {
+                let resolved = self
+                    .automation_questions
+                    .get(&session_id)
+                    .filter(|_| !projection.questions.contains_key(&session_id));
+                let mut requests: Vec<_> = pending
+                    .into_iter()
+                    .chain(queued)
+                    .filter(|request| resolved.is_none_or(|old| old.id != request.id))
+                    .collect();
+                if let Some(current) = projection.questions.get(&session_id) {
+                    if let Some(existing) = requests.iter_mut().find(|q| q.id == current.id) {
+                        *existing = current.clone();
+                    } else {
+                        requests.push(current.clone());
+                    }
+                }
+                requests
+            };
+            let mut seen = HashSet::new();
+            requests.retain(|request| seen.insert(request.id.clone()));
+            if !requests.is_empty() {
+                self.pending_questions
+                    .insert(session_id.clone(), requests.remove(0));
+            }
+            if !requests.is_empty() {
+                self.queued_questions.insert(session_id, requests);
+            }
+        }
+    }
+
     /// Wire projection only. Follow-up commands are executed by the client owner.
     pub fn apply_event(&mut self, event: SessionEvent) -> Vec<SessionCommand> {
         let mut commands = Vec::new();
@@ -457,19 +528,9 @@ impl ClientState {
                         self.pending_permissions.remove(session_id);
                     }
                 }
-                for (session_id, old) in &self.automation_questions {
-                    if !projection.questions.contains_key(session_id)
-                        && self
-                            .pending_questions
-                            .get(session_id)
-                            .is_some_and(|q| q.id == old.id)
-                    {
-                        self.pending_questions.remove(session_id);
-                    }
-                }
+                self.reconcile_automation_questions(&projection);
                 self.pending_permissions
                     .extend(projection.permissions.clone());
-                self.pending_questions.extend(projection.questions.clone());
                 self.automation_permissions = projection.permissions.clone();
                 self.automation_questions = projection.questions.clone();
                 self.automation = projection;
@@ -593,6 +654,262 @@ mod tests {
         assert!(!state.pending_questions.contains_key("two"));
         assert!(!state.queued_questions.contains_key("two"));
     }
+
+    /// Build a minimal request with a stable identity for reconciliation tests.
+    fn question(id: &str) -> QuestionRequest {
+        QuestionRequest {
+            id: id.into(),
+            questions: Vec::new(),
+        }
+    }
+
+    /// Apply a legacy latest-only projection, including an empty retraction.
+    fn project_question(state: &mut ClientState, session_id: &str, id: Option<&str>) {
+        let mut projection = threadlane_protocol::automation::AutomationProjection::default();
+        if let Some(id) = id {
+            projection.questions.insert(session_id.into(), question(id));
+        }
+        state.apply_event(SessionEvent::AutomationChanged { projection });
+    }
+
+    /// Deliver a request through the production Agent-event path.
+    fn emit_question(state: &mut ClientState, session_id: &str, id: &str) {
+        state.apply_event(SessionEvent::Agent {
+            session_id: session_id.into(),
+            event: AgentEvent::QuestionRequested {
+                request: question(id),
+            },
+        });
+    }
+
+    /// Apply a complete authoritative queue while retaining the legacy latest entry.
+    fn project_question_queue(state: &mut ClientState, session_id: &str, ids: &[&str]) {
+        let questions: Vec<_> = ids.iter().map(|id| question(id)).collect();
+        let mut projection = threadlane_protocol::automation::AutomationProjection {
+            question_queues: Some(HashMap::new()),
+            ..Default::default()
+        };
+        if let Some(last) = questions.last() {
+            projection.questions.insert(session_id.into(), last.clone());
+            projection
+                .question_queues
+                .as_mut()
+                .unwrap()
+                .insert(session_id.into(), questions);
+        }
+        state.apply_event(SessionEvent::AutomationChanged { projection });
+    }
+
+    /// An unchanged latest question must not hide resolution of an earlier queued request.
+    #[test]
+    fn automation_complete_queue_reconciles_an_earlier_question_answered_on_another_client() {
+        let mut state = state();
+        emit_question(&mut state, "one", "first");
+        emit_question(&mut state, "one", "second");
+        project_question_queue(&mut state, "one", &["first", "second"]);
+        project_question_queue(&mut state, "one", &["first", "second"]);
+        assert_eq!(state.pending_questions["one"].id, "first");
+        assert_eq!(state.queued_questions["one"], vec![question("second")]);
+
+        // The latest-only map still says "second" after another client
+        // answers "first". The full queue identifies the exact resolution.
+        project_question_queue(&mut state, "one", &["second"]);
+        assert_eq!(state.pending_questions["one"].id, "second");
+        assert!(!state.queued_questions.contains_key("one"));
+        project_question_queue(&mut state, "one", &[]);
+        assert!(!state.pending_questions.contains_key("one"));
+    }
+
+    /// A coalesced replacement snapshot retires the resolved request without an empty intermediate state.
+    #[test]
+    fn automation_complete_queue_handles_coalesced_resolution_and_new_question() {
+        let mut state = state();
+        project_question_queue(&mut state, "one", &["first"]);
+        emit_question(&mut state, "one", "second");
+        // A watch consumer may never see the intermediate empty projection.
+        project_question_queue(&mut state, "one", &["second"]);
+        assert_eq!(state.pending_questions["one"].id, "second");
+        assert!(!state.queued_questions.contains_key("one"));
+    }
+
+    /// The first complete snapshot can retire requests observed only through Agent events.
+    #[test]
+    fn automation_complete_queue_removes_requests_resolved_before_the_first_projection() {
+        let mut state = state();
+        emit_question(&mut state, "one", "first");
+        emit_question(&mut state, "one", "second");
+        // The watch coalesced the projection containing the first request,
+        // which another client has already answered.
+        project_question_queue(&mut state, "one", &["second"]);
+        assert_eq!(state.pending_questions["one"].id, "second");
+        assert!(!state.queued_questions.contains_key("one"));
+    }
+
+    /// A reconnect snapshot restores FIFO order even when only the later Agent event was replayed.
+    #[test]
+    fn automation_complete_queue_restores_snapshot_order_after_partial_agent_replay() {
+        let mut state = state();
+        emit_question(&mut state, "one", "second");
+        project_question_queue(&mut state, "one", &["first", "second"]);
+        assert_eq!(state.pending_questions["one"].id, "first");
+        assert_eq!(state.queued_questions["one"], vec![question("second")]);
+    }
+
+    /// An authoritative empty queue clears the active automation without touching unrelated sessions.
+    #[test]
+    fn automation_complete_empty_queue_clears_unprojected_requests_for_the_active_run_only() {
+        let mut state = state();
+        emit_question(&mut state, "one", "resolved");
+        emit_question(&mut state, "two", "unrelated");
+        state.apply_event(SessionEvent::AutomationChanged {
+            projection: threadlane_protocol::automation::AutomationProjection {
+                active_session_id: Some("one".into()),
+                question_queues: Some(HashMap::new()),
+                ..Default::default()
+            },
+        });
+        assert!(!state.pending_questions.contains_key("one"));
+        assert_eq!(state.pending_questions["two"].id, "unrelated");
+    }
+
+    /// Complete snapshots can restore and resolve queues without replaying their Agent events.
+    #[test]
+    fn automation_complete_queue_restores_pending_questions_without_agent_replay() {
+        let mut state = state();
+        project_question_queue(&mut state, "two", &["first", "second", "third"]);
+        emit_question(&mut state, "two", "second");
+        project_question_queue(&mut state, "two", &["first", "third"]);
+        assert_eq!(state.pending_questions["two"].id, "first");
+        assert_eq!(state.queued_questions["two"], vec![question("third")]);
+        state.pop_question("two");
+        assert_eq!(state.pending_questions["two"].id, "third");
+        state.pop_question("two");
+        assert!(!state.pending_questions.contains_key("two"));
+        assert!(!state.queued_questions.contains_key("two"));
+    }
+
+    /// An upgraded daemon can authoritatively replace a request first seen through a legacy payload.
+    #[test]
+    fn automation_complete_queue_reconciles_a_previous_legacy_projection() {
+        let mut state = state();
+        project_question(&mut state, "one", Some("first"));
+        project_question_queue(&mut state, "one", &["second"]);
+        assert_eq!(state.pending_questions["one"].id, "second");
+        assert!(!state.queued_questions.contains_key("one"));
+    }
+
+    /// Legacy projections preserve the visible question and deduplicate both active/background replay.
+    #[test]
+    fn automation_projection_preserves_question_fifo_without_replaying_duplicates() {
+        // Exercise both active and background Agent-event insertion paths.
+        for session_id in ["one", "two"] {
+            let mut state = state();
+            emit_question(&mut state, session_id, "first");
+            emit_question(&mut state, session_id, "second");
+            project_question(&mut state, session_id, Some("second"));
+            project_question(&mut state, session_id, Some("second"));
+            emit_question(&mut state, session_id, "second");
+
+            assert_eq!(state.pending_questions[session_id].id, "first");
+            assert_eq!(state.queued_questions[session_id], vec![question("second")]);
+            state.pop_question(session_id);
+            assert_eq!(state.pending_questions[session_id].id, "second");
+            state.pop_question(session_id);
+            assert!(!state.pending_questions.contains_key(session_id));
+            assert!(!state.queued_questions.contains_key(session_id));
+        }
+    }
+
+    /// A newer legacy question joins the FIFO rather than replacing an unanswered predecessor.
+    #[test]
+    fn automation_projection_appends_new_questions_and_preserves_earlier_projected_requests() {
+        let mut state = state();
+        project_question(&mut state, "one", Some("first"));
+        emit_question(&mut state, "one", "second");
+        project_question(&mut state, "one", Some("third"));
+        emit_question(&mut state, "one", "third");
+
+        assert_eq!(state.pending_questions["one"].id, "first");
+        assert_eq!(
+            state.queued_questions["one"],
+            vec![question("second"), question("third")]
+        );
+        for id in ["first", "second", "third"] {
+            assert_eq!(state.pending_questions["one"].id, id);
+            state.pop_question("one");
+        }
+        assert!(!state.pending_questions.contains_key("one"));
+        assert!(!state.queued_questions.contains_key("one"));
+    }
+
+    /// Legacy retraction removes only its contributed queued ID and preserves other requests.
+    #[test]
+    fn automation_projection_retracts_resolved_queued_request_without_dropping_other_questions() {
+        let mut state = state();
+        for id in ["first", "second", "third"] {
+            emit_question(&mut state, "one", id);
+        }
+        emit_question(&mut state, "two", "unrelated");
+        project_question(&mut state, "one", Some("second"));
+        project_question(&mut state, "one", None);
+
+        assert_eq!(state.pending_questions["one"].id, "first");
+        assert_eq!(state.queued_questions["one"], vec![question("third")]);
+        assert_eq!(state.pending_questions["two"].id, "unrelated");
+        state.pop_question("one");
+        assert_eq!(state.pending_questions["one"].id, "third");
+        state.pop_question("one");
+        assert!(!state.pending_questions.contains_key("one"));
+        assert!(!state.queued_questions.contains_key("one"));
+    }
+
+    /// Resolving the visible projected request promotes the next unanswered question exactly once.
+    #[test]
+    fn automation_projection_promotes_next_question_when_visible_request_resolves_elsewhere() {
+        let mut state = state();
+        emit_question(&mut state, "one", "first");
+        emit_question(&mut state, "one", "second");
+        project_question(&mut state, "one", Some("first"));
+        project_question(&mut state, "one", None);
+        project_question(&mut state, "one", None);
+
+        assert_eq!(state.pending_questions["one"].id, "second");
+        assert!(!state.queued_questions.contains_key("one"));
+    }
+
+    /// Reconciliation repairs duplicate IDs across both request surfaces before promotion.
+    #[test]
+    fn automation_projection_deduplicates_pending_and_queued_questions_before_promotion() {
+        let mut state = state();
+        state
+            .pending_questions
+            .insert("one".into(), question("first"));
+        state.queued_questions.insert(
+            "one".into(),
+            vec![question("first"), question("second"), question("second")],
+        );
+        project_question(&mut state, "one", Some("first"));
+        assert_eq!(state.queued_questions["one"], vec![question("second")]);
+        project_question(&mut state, "one", None);
+        assert_eq!(state.pending_questions["one"].id, "second");
+        state.pop_question("one");
+        assert!(!state.pending_questions.contains_key("one"));
+        assert!(!state.queued_questions.contains_key("one"));
+    }
+
+    /// A late retraction cannot remove a newer Agent request with a different identity.
+    #[test]
+    fn automation_projection_removes_only_the_last_contributed_question_id() {
+        let mut state = state();
+        project_question(&mut state, "one", Some("resolved"));
+        state.pop_question("one");
+        emit_question(&mut state, "one", "newer");
+        project_question(&mut state, "one", None);
+
+        assert_eq!(state.pending_questions["one"].id, "newer");
+        assert!(!state.queued_questions.contains_key("one"));
+    }
+
     #[test]
     fn snapshot_and_background_stream_cannot_replace_another_session() {
         let mut state = state();

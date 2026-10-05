@@ -439,7 +439,7 @@ impl WorkspaceView {
         let chat_list = cx.new(|cx| ChatListView::new(model.clone(), window, cx));
         let github = cx.new(|cx| GitHubView::new(model.clone(), window, cx));
         let automations = cx.new(|cx| AutomationsView::new(model.clone(), cx));
-        let mut automation_updates = model.update(cx, |state, _| state.start_automations());
+        let automation_updates = model.update(cx, |state, _| state.start_automations());
         let settings = cx.new(|cx| SettingsView::new(model.clone(), window, cx));
         let right_panel = cx.new(|cx| RightPanelView::new(model.clone(), window, cx));
         // The trajectory is a chat-crate view hosted by the right panel;
@@ -467,21 +467,23 @@ impl WorkspaceView {
 
         let model_clone = model.clone();
         let view = cx.new(|cx| {
-            cx.spawn_in(window, async move |this, cx| {
-                let mut last_notification = None;
-                while automation_updates.changed().await.is_ok() {
-                    let projection = automation_updates.borrow_and_update().clone();
-                    if this.update_in(cx, |this: &mut Self, window, cx| {
-                        if let Some((id, message)) = &projection.notification {
-                            if last_notification.as_ref() != Some(id) {
-                                window.push_notification(message.clone(), cx);
-                                last_notification = Some(id.clone());
+            if let Some(mut automation_updates) = automation_updates {
+                cx.spawn_in(window, async move |this, cx| {
+                    let mut last_notification = None;
+                    while automation_updates.changed().await.is_ok() {
+                        let projection = automation_updates.borrow_and_update().clone();
+                        if this.update_in(cx, |this: &mut Self, window, cx| {
+                            if let Some((id, message)) = &projection.notification {
+                                if last_notification.as_ref() != Some(id) {
+                                    window.push_notification(message.clone(), cx);
+                                    last_notification = Some(id.clone());
+                                }
                             }
-                        }
-                        this.model.update(cx, |state, cx| { state.apply_automation_projection(projection); cx.notify(); });
-                    }).is_err() { break; }
-                }
-            }).detach();
+                            this.model.update(cx, |state, cx| { state.apply_automation_projection(projection); cx.notify(); });
+                        }).is_err() { break; }
+                    }
+                }).detach();
+            }
             let focus_handle = cx.focus_handle();
             focus_handle.focus(window, cx);
             let sub = cx.observe(&model_clone, move |this: &mut Self, model, cx| {
