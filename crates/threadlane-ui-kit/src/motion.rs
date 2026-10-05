@@ -3,7 +3,7 @@ use gpui::{
     div, AnyElement, App, ElementId, IntoElement, ParentElement, RenderOnce, Styled, Window,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::{ActiveTheme, Icon, Sizable};
+use gpui_component::{ActiveTheme, Icon, Selectable, Sizable};
 use gpui_kit::base::{spring, MotionReveal, Presence, PresenceSample, Transition};
 
 /// Sample before constructing a disclosure's body. Closed content stays lazy;
@@ -18,7 +18,7 @@ impl DisclosureMotion {
     pub fn new(id: impl Into<ElementId>, open: bool, window: &mut Window, cx: &mut App) -> Self {
         let id = id.into();
         let tokens = cx.theme().motion_tokens();
-        let transition = Transition::new(tokens.duration_normal).easing(tokens.easing_move.clone());
+        let transition = Transition::new(tokens.duration_fast).easing(tokens.easing_move.clone());
         let sample = Presence::new(id.clone(), open)
             .transition(transition)
             .sample(window, cx);
@@ -89,6 +89,7 @@ pub fn disclosure_button(
     let description = description.into();
     Button::new(id.clone())
         .ghost()
+        .open(open)
         .small()
         .w_full()
         .justify_between()

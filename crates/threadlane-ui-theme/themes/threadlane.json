@@ -6,6 +6,10 @@
     {
       "name": "Threadlane Light",
       "mode": "light",
+      "font.family": "IBM Plex Sans",
+      "font.size": 16,
+      "mono_font.family": "JetBrains Mono",
+      "mono_font.size": 13,
       "colors": {
         "base.yellow": "#a16207",
         "base.cyan": "#0e7490",
@@ -130,6 +134,10 @@
     {
       "name": "Threadlane Dark",
       "mode": "dark",
+      "font.family": "IBM Plex Sans",
+      "font.size": 16,
+      "mono_font.family": "JetBrains Mono",
+      "mono_font.size": 13,
       "colors": {
         "base.yellow": "#fbbf24",
         "base.cyan": "#2dd4bf",

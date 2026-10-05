@@ -5,7 +5,6 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::spinner::Spinner;
-use gpui_component::tag::{Tag, TagVariant};
 use gpui_component::{ActiveTheme, Disableable, Selectable, Sizable, StyledExt};
 use threadlane_protocol::daemon::{MessageRole, SessionAttention, SessionInfo};
 use threadlane_protocol::QuestionItem;
@@ -87,7 +86,7 @@ pub use terminal_find::*;
 mod terminal_links;
 pub use terminal_links::*;
 mod surfaces;
-pub use surfaces::{result_header, result_surface, result_viewport};
+pub use surfaces::{result_header, result_scroll_body, result_surface, result_viewport};
 mod agents;
 #[cfg(test)]
 mod agents_worktree_tests;
@@ -102,6 +101,8 @@ mod trajectory;
 pub use trajectory::*;
 mod activity;
 pub use activity::{completed_activity_group, tool_activity, tool_group_summary};
+#[cfg(test)]
+mod refinement_tests;
 mod motion;
 pub use motion::{disclosure_button, DisclosureMotion};
 
@@ -159,7 +160,7 @@ pub fn session_card(id: &str, selected: bool, cx: &App) -> Stateful<Div> {
         .items_stretch()
         .w_full()
         .my(rems(0.1875))
-        .rounded_xl()
+        .rounded_lg()
         .bg(if selected {
             theme.sidebar_accent
         } else {
@@ -167,12 +168,12 @@ pub fn session_card(id: &str, selected: bool, cx: &App) -> Stateful<Div> {
         })
         .border_1()
         .border_color(if selected {
-            theme.primary.opacity(0.28)
+            theme.border.opacity(0.5)
         } else {
             transparent_black()
         })
         .when(selected, |el| {
-            el.shadow_sm().child(
+            el.child(
                 div()
                     .absolute()
                     .left_1()
@@ -280,7 +281,7 @@ pub fn composer_surface(focused: bool, cx: &App) -> Div {
         .flex_col()
         .justify_between()
         .px_4()
-        .pt_3p5()
+        .pt_3()
         .pb_3()
         .rounded_2xl()
         .border_1()
@@ -290,9 +291,8 @@ pub fn composer_surface(focused: bool, cx: &App) -> Div {
             theme.border.opacity(0.5)
         })
         .bg(theme.popover)
-        .shadow_sm()
         .when(!focused, |surface| {
-            surface.hover(|style| style.border_color(theme.primary.opacity(0.28)))
+            surface.hover(|style| style.border_color(theme.border))
         })
 }
 
@@ -356,17 +356,17 @@ pub fn question_item(
     div()
         .flex()
         .flex_col()
-        .gap_1()
+        .gap_2()
         .child(
             div()
-                .text_xs()
+                .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.foreground)
                 .child(item.header.clone()),
         )
         .child(
             div()
-                .text_xs()
+                .text_sm()
                 .text_color(theme.muted_foreground)
                 .child(item.question.clone()),
         )
@@ -429,9 +429,13 @@ pub fn permission_card(
             .on_click(move |_, window, cx| callback(&request_id, decision, window, cx))
     };
     div()
-        .id(SharedString::from(format!("permission-prompt-card-{}", request.id)))
+        .id(SharedString::from(format!(
+            "permission-prompt-card-{}",
+            request.id
+        )))
         .role(Role::Alert)
         .aria_label("Permission request")
+        .debug_selector(|| "permission-card".into())
         .w_full()
         .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
         .mx_auto()
@@ -441,22 +445,21 @@ pub fn permission_card(
         .border_1()
         .border_color(theme.warning.opacity(0.4))
         .bg(theme.secondary.opacity(0.35))
-        .shadow_sm()
         .flex()
-        .flex_wrap()
-        .items_center()
-        .gap_2()
+        .flex_col()
+        .gap_3()
         .child(
             div()
-                .flex_1()
+                .w_full()
                 .min_w_0()
                 .flex()
                 .flex_col()
                 .gap_1()
                 .child(
                     div()
-                        .text_xs()
-                        .font_weight(FontWeight::MEDIUM)
+                        .debug_selector(|| "permission-title".into())
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme.foreground)
                         .child(request.title.clone()),
                 )
@@ -468,42 +471,51 @@ pub fn permission_card(
                 ),
         )
         .children(details)
-        .child(button(
-            "permission-deny",
-            "Deny",
-            PermissionDecision::Deny,
-            false,
-        ))
-        .when(request.scopes.contains(&PermissionScope::Once), |el| {
-            el.child(button(
-                "permission-allow-once",
-                "Allow once",
-                PermissionDecision::AllowOnce,
-                true,
-            ))
-        })
-        .when(request.scopes.contains(&PermissionScope::Session), |el| {
-            el.child(
-                button(
-                    "permission-allow-session",
-                    "Allow session",
-                    PermissionDecision::AllowSession,
+        .child(
+            div()
+                .debug_selector(|| "permission-actions".into())
+                .w_full()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .child(button(
+                    "permission-deny",
+                    "Deny",
+                    PermissionDecision::Deny,
                     false,
-                )
-                .debug_selector(|| "permission-inline-session".into()),
-            )
-        })
-        .when(request.scopes.contains(&PermissionScope::Always), |el| {
-            el.child(
-                button(
-                    "permission-allow-always",
-                    "Always allow",
-                    PermissionDecision::AllowAlways,
-                    false,
-                )
-                .debug_selector(|| "permission-inline-always".into()),
-            )
-        })
+                ))
+                .when(request.scopes.contains(&PermissionScope::Once), |el| {
+                    el.child(button(
+                        "permission-allow-once",
+                        "Allow once",
+                        PermissionDecision::AllowOnce,
+                        true,
+                    ))
+                })
+                .when(request.scopes.contains(&PermissionScope::Session), |el| {
+                    el.child(
+                        button(
+                            "permission-allow-session",
+                            "Allow session",
+                            PermissionDecision::AllowSession,
+                            false,
+                        )
+                        .debug_selector(|| "permission-inline-session".into()),
+                    )
+                })
+                .when(request.scopes.contains(&PermissionScope::Always), |el| {
+                    el.child(
+                        button(
+                            "permission-allow-always",
+                            "Always allow",
+                            PermissionDecision::AllowAlways,
+                            false,
+                        )
+                        .debug_selector(|| "permission-inline-always".into()),
+                    )
+                }),
+        )
 }
 
 pub fn question_surface(cx: &App) -> Div {
@@ -518,7 +530,6 @@ pub fn question_surface(cx: &App) -> Div {
         .border_1()
         .border_color(theme.border.opacity(0.5))
         .bg(theme.popover)
-        .shadow_sm()
         .flex()
         .flex_col()
         .gap_2()
@@ -612,27 +623,29 @@ pub fn reasoning_card(
         is_streaming,
         msg.reasoning_content.as_ref().map_or(0, String::len),
     );
-    let token_badge = Tag::new()
-        .child(approx_badge)
-        .small()
-        .with_variant(TagVariant::Secondary);
+    let disclosure_label = format!(
+        "{} thought process, {approx_badge}",
+        if is_expanded { "Collapse" } else { "Expand" },
+    );
+    let token_badge = div()
+        .debug_selector(|| "reasoning-token-label".into())
+        .min_w_0()
+        .truncate()
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .child(approx_badge);
 
     let header = Button::new(SharedString::from(format!("reasoning-toggle-{}", msg.id)))
         .debug_selector(|| "reasoning-disclosure".into())
-        .accessibility_label(if is_expanded {
-            "Collapse thought process"
-        } else {
-            "Expand thought process"
-        })
-        .tooltip(if is_expanded {
-            "Collapse thought process"
-        } else {
-            "Expand thought process"
-        })
+        .accessibility_label(disclosure_label.clone())
+        .tooltip(disclosure_label)
         .ghost()
         .small()
         .w_full()
-        .when(is_expanded, |button| button.px_3().rounded_none())
+        .open(is_expanded)
+        .when(is_expanded, |button| {
+            button.px_3().rounded_none().bg(theme.muted.opacity(0.25))
+        })
         .flex()
         .items_center()
         .justify_between()
@@ -655,7 +668,7 @@ pub fn reasoning_card(
                 )
                 .child(
                     div()
-                        .text_xs()
+                        .text_sm()
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(theme.muted_foreground)
                         .child(if is_streaming {
@@ -664,7 +677,7 @@ pub fn reasoning_card(
                             "Thought process"
                         }),
                 )
-                .child(token_badge),
+                .when(!is_streaming, |row| row.child(token_badge)),
         )
         .child(
             crate::motion::chevron(SharedString::from(format!("reasoning-{}", msg.id)), is_expanded),
@@ -703,7 +716,6 @@ pub fn reasoning_detail(cx: &App) -> gpui_component::scroll::Scrollable<Div> {
 pub fn tool_detail(cx: &App) -> gpui_component::scroll::Scrollable<Div> {
     let theme = cx.theme().colors;
     div()
-        .ml(rems(1.625))
         .mt_1()
         .p_2p5()
         .max_h(rems(15.0))

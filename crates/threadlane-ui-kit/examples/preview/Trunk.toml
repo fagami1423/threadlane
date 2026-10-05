@@ -8,3 +8,5 @@ headers = { "Cross-Origin-Embedder-Policy" = "require-corp", "Cross-Origin-Opene
 
 [watch]
 watch = [".", "../../src", "../../../threadlane-ui-theme/src", "../../../threadlane-ui-theme/themes", "../../../threadlane-ui-theme/assets/fonts"]
+# Standalone parser probes have their own Cargo outputs and do not change the UI.
+ignore = ["experiments"]

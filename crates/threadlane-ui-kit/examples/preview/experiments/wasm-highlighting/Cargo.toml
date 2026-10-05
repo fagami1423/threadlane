@@ -1,0 +1,18 @@
+[package]
+name = "threadlane-highlight-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Isolate the experiment: these features are not enabled in the product yet.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tree-sitter = "=0.26.13"
+tree-sitter-language = "=0.1.7"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-json = "=0.24.8"
+tree-sitter-bash = "=0.23.3"

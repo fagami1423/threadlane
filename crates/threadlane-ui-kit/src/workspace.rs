@@ -389,6 +389,7 @@ pub fn composer_effort_button(label: impl Into<SharedString>) -> Button {
     let label = label.into();
     Button::new("composer-reasoning-effort-picker")
         .debug_selector(|| "composer-reasoning-effort-picker".into())
+        .small()
         .icon(Icon::default().path("icons/effort.svg"))
         .label(label.clone())
         .accessibility_label(format!("Reasoning effort: {label}"))
@@ -416,18 +417,13 @@ pub fn composer_mode_button(label: impl Into<SharedString>, enabled: bool) -> Bu
         .disabled(!enabled)
 }
 
-pub fn composer_send_button(queue: bool, enabled: bool, hint: impl Into<SharedString>) -> Button {
+pub fn composer_send_button(enabled: bool, hint: impl Into<SharedString>) -> Button {
     let hint = hint.into();
     Button::new("send-btn")
         .debug_selector(|| "send-btn".into())
         .size_8()
         .rounded_full()
-        .icon(if queue {
-            gpui_component::IconName::Plus
-        } else {
-            gpui_component::IconName::ArrowUp
-        })
-        .when(queue, |button| button.label("Queue").w_auto().px_2())
+        .icon(gpui_component::IconName::ArrowUp)
         .accessibility_label(hint.clone())
         .tooltip(hint)
         .when(enabled, |button| button.primary())

@@ -132,12 +132,8 @@ use threadlane_ui_kit::plan_tracker_texts;
 #[cfg(test)]
 use threadlane_ui_kit::{reasoning_token_badge, tool_activity_glyph};
 
-fn progress_header_prefix(is_error: bool) -> &'static str {
-    if is_error {
-        "Needs attention:"
-    } else {
-        "Latest activity:"
-    }
+fn progress_header_prefix(is_error: bool) -> Option<&'static str> {
+    is_error.then_some("Needs attention:")
 }
 
 #[cfg(test)]
@@ -620,7 +616,7 @@ impl ChatListView {
                                 && threadlane_acp_engine::is_acp_model(&model_clone.read(cx).selected_model)
                             {
                                 model_clone.update(cx, |state, cx| {
-                                    state.session_status = Some("This agent does not support live steering. Use Queue to send your message after this turn.".into());
+                                    state.session_status = Some("This agent does not support live steering. Send your message to queue it after this turn.".into());
                                     cx.notify();
                                 });
                                 return;
@@ -1710,7 +1706,7 @@ impl ChatListView {
         let code_state = self.markdown_state(format!("code-{key}"), &formatted_code, cx);
         threadlane_ui_kit::code_block_surface(&key, cx)
             .child(threadlane_ui_kit::code_block_header(&key, language, path_opt.as_deref(), actions, cx))
-            .child(threadlane_ui_kit::code_block_body().child(self.chat_markdown_view(&code_state)))
+            .child(threadlane_ui_kit::code_block_body(cx).child(self.chat_markdown_view(&code_state)))
     }
 
     fn render_reasoning_block(
@@ -3034,7 +3030,7 @@ impl ChatListView {
         let steer_tooltip = if supports_live_steering {
             "Steer current turn immediately (Cmd+Enter)"
         } else {
-            "This agent does not support live steering. Use Queue for the next turn."
+            "This agent does not support live steering. Send your message to queue it after this turn."
         };
         let has_composer_text = !self.input_state.read(cx).value().trim().is_empty();
         // Queued sends are text-only: an images-only draft cannot stage for
@@ -3057,11 +3053,7 @@ impl ChatListView {
         let has_models = !model_options.is_empty();
         let needs_provider = !has_models;
         let preparing_worktree = self.model.read(cx).active_worktree_setup().is_some();
-        let composer_shortcut_hint = if is_generating {
-            "Enter to queue · Shift+Enter for a new line"
-        } else {
-            "Enter to send · Shift+Enter for a new line"
-        };
+        let composer_shortcut_hint = "Enter to send · Shift+Enter for a new line";
         let model_label = selected_option
             .as_ref()
             .map(|option| option.label.clone())
@@ -4319,11 +4311,11 @@ impl ChatListView {
                                         } else if !has_prompt {
                                             "Type a message to send"
                                         } else if is_generating {
-                                            "Queue for next turn (Enter)"
+                                            "Send message (Enter); queues after this turn"
                                         } else {
                                             "Send message (Enter)"
                                         };
-                                        threadlane_ui_kit::composer_send_button(is_generating, has_prompt && !needs_provider && !preparing_worktree, send_hint)
+                                        threadlane_ui_kit::composer_send_button(has_prompt && !needs_provider && !preparing_worktree, send_hint)
                                             .on_click(cx.listener(move |this, _event, window, cx| {
                                                 let text = send_input.read(cx).value().to_string();
                                                 if !text.trim().is_empty()
@@ -4447,6 +4439,7 @@ impl ChatListView {
 
         let mut container = div()
             .id("chat-progress-summary")
+            .debug_selector(|| "chat-progress-summary".into())
             .flex_none()
             .w_full()
             .max_w(rems(CHAT_CONTENT_MAX_WIDTH))
@@ -4472,42 +4465,42 @@ impl ChatListView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(
+                    .children(progress_header_prefix(is_latest_error).map(|prefix| {
                         div()
                             .flex_none()
                             .text_xs()
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(if is_latest_error {
-                                theme.danger
-                            } else {
-                                theme.foreground
-                            })
-                            .child(progress_header_prefix(is_latest_error)),
-                    )
+                            .text_color(theme.danger)
+                            .child(prefix)
+                    }))
                     .child(
                         div()
                             .truncate()
                             .text_xs()
                             .text_color(summary_color)
+                            .debug_selector(|| "progress-summary-text".into())
+                            .min_w_0()
+                            .flex_1()
                             .child(summary),
                     ),
             )
-            .child(
+            .children(subagent_label.or_else(|| (!is_latest_error).then_some(category)).map(|label| {
                 div()
                     .flex_none()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(subagent_label.unwrap_or(category)),
-            )
+                    .child(label)
+            }))
             .children(elapsed.map(|elapsed| {
                 div()
+                    .debug_selector(|| "progress-summary-elapsed".into())
                     .flex_none()
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .child(elapsed)
             }))
             .child(
-                div().flex_none().text_color(theme.muted_foreground).child(
+                div().debug_selector(|| "progress-summary-chevron".into()).flex_none().text_color(theme.muted_foreground).child(
                     Icon::new(if self.progress_summary_expanded {
                         IconName::ChevronDown
                     } else {
@@ -4519,6 +4512,8 @@ impl ChatListView {
 
         container = container.child(
             Button::new("progress-summary-disclosure")
+                .debug_selector(|| "progress-summary-disclosure".into())
+                .tooltip(disclosure_label.clone())
                 .accessibility_label(disclosure_label)
                 .ghost()
                 .h_auto()
@@ -4530,6 +4525,7 @@ impl ChatListView {
 
         if self.progress_summary_expanded {
             let mut expanded_content = div()
+                .debug_selector(|| "progress-summary-details".into())
                 .flex()
                 .flex_col()
                 .gap_1p5()

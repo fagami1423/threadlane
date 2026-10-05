@@ -95,13 +95,22 @@ impl Gallery {
             selected: vec!["Compact".into()],
             completed_expanded: false,
             tools: [
-                ("read", "read_file", "Read src/app.rs", "Result", "pub fn render() {\n    // Component output\n}"),
+                ("read", "read_file", "Read src/app.rs", "Result", "40:a3f|pub fn render() {\n41:b4e|    // Shared controls preserve keyboard navigation, theme typography, scroll ownership, and source details on native and web. End of source line.\n42:c5d|}"),
                 ("search", "grep_search", "Search for composer", "Working", "src/app.rs:42: Composer::new(input)"),
-                ("command", "run_command", "Run cargo check", "Result", "Finished dev profile\n0 errors"),
-                ("failed", "run_command", "Run cargo nextest", "Error", "One test failed.\nInspect the assertion before rerunning."),
+                ("command", "run_command", "Run cargo check", "Result", "Exit Status: 0\n--- STDOUT ---\nChecking crates/threadlane-ui-kit/examples/preview/components/a-long-component-path-for-shared-native-and-web-rendering.rs — End of output line\nFinished dev profile\n0 errors\n--- STDERR ---\n"),
+                ("running", "run_command", "Run cargo metadata", "Working", ""),
+                ("failed", "run_command", "Run cargo nextest", "Error", "Exit Status: 1\n--- STDOUT ---\nOne test failed.\n--- STDERR ---\nInspect the assertion before rerunning."),
             ].into_iter().map(|(id, title, summary, category, detail)| ToolActivityInfo {
                 id: id.into(), title: title.into(), display_summary: summary.into(),
-                category: category.into(), detail: detail.into(), arguments: String::new(), is_expanded: false,
+                category: category.into(), detail: detail.into(),
+                arguments: match id {
+                    "read" => serde_json::json!({"path": "src/app.rs"}),
+                    "search" => serde_json::json!({"path": "src", "pattern": "Composer"}),
+                    "command" => serde_json::json!({"command": "cargo check -p threadlane-gpui", "cwd": "/sample/project"}),
+                    "running" => serde_json::json!({"command": "cargo metadata --no-deps", "cwd": "/sample/project"}),
+                    _ => serde_json::json!({"command": "cargo nextest run", "cwd": "/sample/project"}),
+                }.to_string(),
+                is_expanded: false,
             }).collect(),
             reasoning: ChatMessageInfo {
                 id: "gallery-reasoning".into(), role: MessageRole::Assistant,
@@ -526,7 +535,6 @@ impl Gallery {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = cx.theme().colors;
         let motion = kit::DisclosureMotion::new(
             SharedString::from(format!("gallery-tool-{}", tool.id)),
             tool.is_expanded,
@@ -536,21 +544,39 @@ impl Gallery {
         let detail = motion
             .is_visible()
             .then(|| {
-                kit::result_surface(&theme)
-                    .child(kit::result_header(&theme).text_xs().child("Output"))
-                    .child(
-                        kit::result_viewport(format!("gallery-output-{}", tool.id)).child(
-                            div()
-                                .id(SharedString::from(format!("gallery-scroll-{}", tool.id)))
-                                .h_full()
-                                .overflow_y_scrollbar()
-                                .p_3()
-                                .font_family(cx.theme().mono_font_family.clone())
-                                .text_xs()
-                                .child(tool.detail.clone()),
-                        ),
+                let args = kit::tool_detail::args_json(&tool.arguments).unwrap_or_default();
+                let path = kit::tool_detail::args_path(&args).unwrap_or_else(|| ".".into());
+                kit::tool_preview::render(
+                    tool,
+                    path.clone(),
+                    std::path::PathBuf::from(path),
+                    |id, path, line, folder| {
+                        kit::tool_preview::open_button(
+                            id,
+                            &path,
+                            line,
+                            folder,
+                            true,
+                            |_, window, cx| {
+                                window.push_notification(
+                                    gpui_component::notification::Notification::info(
+                                        "Sample file action · no file was opened",
+                                    ),
+                                    cx,
+                                );
+                            },
+                        )
+                    },
+                    cx,
+                )
+                .or_else(|| {
+                    kit::tool_detail::render_activity_detail_card(
+                        tool,
+                        None::<fn(String, &mut App)>,
+                        cx,
                     )
-                    .into_any_element()
+                })
+                .expect("gallery samples use supported tool renderers")
             })
             .map(|body| motion.content(body));
         kit::tool_activity(

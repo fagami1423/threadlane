@@ -586,11 +586,11 @@ pub fn agent_tool_activity(
                 )
                 .child(
                     crate::result_viewport(format!("agent-output-{id}")).child(
-                        div()
+                        crate::result_scroll_body(format!("agent-output-scroll-{id}"), div()
                             .p_3()
                             .text_xs()
                             .font_family(cx.theme().mono_font_family.clone())
-                            .child(activity.detail.clone()),
+                            .child(activity.detail.clone())),
                     ),
                 )
                 .into_any_element()

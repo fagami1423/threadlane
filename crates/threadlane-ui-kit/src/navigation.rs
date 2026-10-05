@@ -33,8 +33,6 @@ pub fn sidebar_navigation(
         div()
             .w_full()
             .p_1()
-            .rounded_xl()
-            .bg(theme.muted.opacity(0.28))
             .flex()
             .items_center()
             .child(
@@ -59,7 +57,7 @@ pub fn sidebar_navigation(
                             .child(
                                 div()
                                     .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_weight(FontWeight::MEDIUM)
                                     .text_color(theme.foreground)
                                     .child(label),
                             )
@@ -106,7 +104,10 @@ pub fn sidebar_navigation(
             SidebarDestination::Automations,
             attention_count,
             true,
-            format!("Automations, {attention_count} runs need attention"),
+            current_label(
+                SidebarDestination::Automations,
+                &format!("Automations, {attention_count} runs need attention"),
+            ),
         ))
         .child(row(
             "sidebar-issues",
@@ -855,4 +856,3 @@ pub fn session_history_group(
 pub fn session_history_card_row(card: impl IntoElement) -> Div {
     div().px_2().child(card)
 }
-

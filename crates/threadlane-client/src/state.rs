@@ -569,7 +569,8 @@ mod tests {
         assert_eq!(tools[0].detail, "file content");
         assert_eq!(tools[0].category, "Completed");
         assert_eq!(tools[1].category, "Working");
-        assert_eq!(tools[0].display_summary, "read file: a.rs");
+        assert_eq!(tools[0].display_summary, "Read · a.rs");
+        assert_eq!(tools[1].display_summary, "Read · a.rs");
     }
     #[test]
     fn background_questions_survive_navigation_and_replay_without_duplicates() {

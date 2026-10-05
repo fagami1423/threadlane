@@ -34,17 +34,15 @@ pub fn queued_message_panel(
                 .items_center()
                 .gap_2()
                 .text_xs()
-                .child(div().text_color(theme.foreground).child("Queued Messages"))
                 .child(
-                    Tag::new()
-                        .child(count.to_string())
-                        .with_variant(TagVariant::Secondary)
-                        .small(),
+                    div()
+                        .text_color(theme.foreground)
+                        .child(format!("Queued · {count}")),
                 )
                 .child(
                     div()
                         .text_color(theme.muted_foreground)
-                        .child("Sends after agent finishes working"),
+                        .child("Sends after this turn"),
                 ),
         )
         .child(

@@ -667,11 +667,11 @@ impl SessionPreview {
                         )
                         .child(
                             kit::result_viewport(format!("preview-output-{}", tool.id)).child(
-                                div()
+                                kit::result_scroll_body(format!("preview-output-scroll-{}", tool.id), div()
                                     .p_3()
                                     .text_xs()
                                     .font_family(cx.theme().mono_font_family.clone())
-                                    .child(tool.detail.clone()),
+                                    .child(tool.detail.clone())),
                             ),
                         )
                         .into_any_element()
@@ -1474,7 +1474,7 @@ impl Render for SessionPreview {
                                         if host.recall_unavailable_reason(cx).is_none() { host.step_prompt_recall(true, window, cx); }
                                     }))
                             ).child(context_meter).child(
-                                kit::composer_send_button(false, false, "Saved session preview"),
+                                kit::composer_send_button(false, "Saved session preview"),
                             )),
                     ),
                 )

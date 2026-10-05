@@ -75,10 +75,8 @@ pub fn sidebar_session_card(
     let pin = request.clone();
     let archive = request.clone();
 
-    // Full-row screen-reader label: the inner title button only carries
-    // the title, so status, project, branch, and recency live here.
-    // Keyboard users operate the row through its focusable title button
-    // (Tab, Enter to select); this label makes the row itself announce.
+    // Mirror the context on the focusable title, since keyboard and
+    // screen-reader users activate the session through that button.
     let branch_suffix = session
         .git_branch
         .as_deref()
@@ -343,7 +341,6 @@ pub fn sidebar_session_card(
     }
 
     crate::session_card(&session.id, is_active, cx)
-        .tooltip(move |window, cx| Tooltip::new(session_tooltip.clone()).build(window, cx))
         .aria_label(session_row_label.clone())
         .on_mouse_down(MouseButton::Left, move |_, window, cx| {
             select_row(crate::SidebarSessionAction::Open, window, cx)
@@ -361,15 +358,8 @@ pub fn sidebar_session_card(
                                 let id = session.id.clone();
                                 move || format!("session-title-{id}")
                             })
-                            .accessibility_label(format!(
-                                "{session_title}{}{}",
-                                if has_unseen_result {
-                                    " — New result"
-                                } else {
-                                    ""
-                                },
-                                snooze_suffix
-                            ))
+                            .accessibility_label(session_row_label.clone())
+                            .tooltip(session_tooltip)
                             .ghost()
                             .xsmall()
                             .compact()

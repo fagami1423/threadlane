@@ -96,7 +96,7 @@ impl SessionPreview {
                             cx,
                         ))
                         .child(
-                            kit::code_block_body()
+                            kit::code_block_body(cx)
                                 .child(kit::markdown::markdown_view(&state, |_, _| {})),
                         )
                         .into_any_element()

@@ -22,6 +22,13 @@ use threadlane_updater::UpdateStatus;
 
 use threadlane_ui_kit::SidebarSessionRemoval as SessionRemovalKind;
 
+fn session_card_git_status<'a>(statuses: &'a std::collections::HashMap<PathBuf, threadlane_git::GitStatus>, session: &SessionInfo) -> Option<&'a threadlane_git::GitStatus> {
+    if session.is_worktree && !session.worktree_available {
+        return None;
+    }
+    statuses.get(&session.runtime_work_dir)
+}
+
 fn open_session_removal_dialog(
     window: &mut Window,
     cx: &mut App,
@@ -1053,11 +1060,7 @@ impl SidebarView {
             snooze: state
                 .session_snooze(&session.work_dir, &session.id)
                 .map(sidebar_snooze_status),
-            git_status: state
-                .git_statuses
-                .get(&session.runtime_work_dir)
-                .or_else(|| state.git_statuses.get(&session.work_dir))
-                .cloned(),
+            git_status: session_card_git_status(&state.git_statuses, session).cloned(),
             pr: session_pr_info(session, &state.git_prs).cloned(),
             now: now_unix_secs(),
         };
@@ -1581,6 +1584,21 @@ mod tests {
             worktree_available: true,
             completion_summary: SessionCompletionSummary::Unknown,
         }
+    }
+
+    #[test]
+    fn sidebar_git_badge_only_uses_the_available_session_checkout() {
+        let mut statuses = std::collections::HashMap::new();
+        let mut task = session("git-badge");
+        statuses.insert(task.work_dir.clone(), threadlane_git::GitStatus::default());
+        assert!(super::session_card_git_status(&statuses, &task).is_some());
+        task.is_worktree = true;
+        task.runtime_work_dir = "/project/worktree".into();
+        assert!(super::session_card_git_status(&statuses, &task).is_none());
+        statuses.insert(task.runtime_work_dir.clone(), threadlane_git::GitStatus::default());
+        assert!(super::session_card_git_status(&statuses, &task).is_some());
+        task.worktree_available = false;
+        assert!(super::session_card_git_status(&statuses, &task).is_none());
     }
 
     #[gpui::test]

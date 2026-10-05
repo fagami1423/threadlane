@@ -63,14 +63,16 @@ pub fn token_efficiency(
             )
             .into_any_element();
     }
-    for (label, value) in [
+    for (label, value, visible) in [
         (
             "Processed tokens",
             format_meter_tokens(report.usage.processed_tokens()),
+            true,
         ),
         (
             "Uncached input",
             format_meter_tokens(report.usage.uncached_input_tokens),
+            true,
         ),
         (
             "Cache reads / writes",
@@ -79,29 +81,36 @@ pub fn token_efficiency(
                 format_meter_tokens(report.usage.cache_read_tokens),
                 format_meter_tokens(report.usage.cache_write_tokens)
             ),
+            report.usage.cache_read_tokens > 0 || report.usage.cache_write_tokens > 0,
         ),
         (
             "Output tokens",
             format_meter_tokens(report.usage.output_tokens),
+            true,
         ),
-        ("Child tokens", format_meter_tokens(child_tokens)),
+        ("Child tokens", format_meter_tokens(child_tokens), child_tokens > 0),
         (
             "Tokens / completed run",
             report
                 .session_tokens_per_completed_foreground_run
                 .map(|tokens| format_meter_tokens(tokens.round() as u64))
                 .unwrap_or_else(|| "—".into()),
+            report.completed_foreground_runs > 1,
         ),
-        ("Requests / failed", format!("{requests} / {failures}")),
-        ("Reduced context items", reductions.to_string()),
+        ("Requests / failed", format!("{requests} / {failures}"), true),
+        ("Reduced context items", reductions.to_string(), reductions > 0),
         (
             "Compactions / rereads",
             format!(
                 "{} / {}",
                 report.compactions, report.repeated_snapshot_reads
             ),
+            report.compactions > 0 || report.repeated_snapshot_reads > 0,
         ),
     ] {
+        if !visible {
+            continue;
+        }
         section = section.child(
             div()
                 .debug_selector(move || format!("efficiency-{label}").into())

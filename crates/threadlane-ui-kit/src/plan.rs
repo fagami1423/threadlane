@@ -146,7 +146,7 @@ pub fn plan_tracker(
                             .flex_shrink_1()
                             .overflow_hidden(),
                     )
-                    .content(move |_state, _window, _cx| {
+                    .content(move |_state, window, _cx| {
                         let colors = theme;
                         let rows = content_plan.items.iter().enumerate().map(|(index, item)| {
                             let marker = plan_step_marker(item.status, is_generating, colors);
@@ -162,7 +162,7 @@ pub fn plan_tracker(
                         div()
                             .debug_selector(|| "session-plan-details".into())
                             .w(rems(32.0))
-                            .max_w(rems(CHAT_CONTENT_MAX_WIDTH - 2.0))
+                            .max_w(window.viewport_size().width - window.rem_size() * 2.0)
                             .p_3()
                             .rounded_xl()
                             .border_1()

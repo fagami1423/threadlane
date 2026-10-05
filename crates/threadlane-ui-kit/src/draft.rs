@@ -25,8 +25,8 @@ pub fn saved_draft_banner(
         .py_2()
         .rounded_lg()
         .border_1()
-        .border_color(theme.accent.opacity(0.3))
-        .bg(theme.accent.opacity(0.1))
+        .border_color(theme.border)
+        .bg(theme.muted.opacity(0.25))
         .flex()
         .flex_wrap()
         .items_center()
@@ -39,7 +39,11 @@ pub fn saved_draft_banner(
                 .gap_2()
                 .flex_1()
                 .min_w_0()
-                .child(IconName::File)
+                .child(
+                    Icon::new(IconName::File)
+                        .xsmall()
+                        .text_color(theme.muted_foreground),
+                )
                 .child(
                     div()
                         .id("stashed-draft-preview")
@@ -73,7 +77,7 @@ pub fn restore_saved_draft_button() -> Button {
         .debug_selector(|| "restore-stashed-draft".into())
         .label("Restore draft")
         .small()
-        .primary()
+        .secondary()
         .accessibility_label("Restore saved draft into an empty composer")
 }
 

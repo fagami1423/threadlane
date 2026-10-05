@@ -2,7 +2,6 @@
 use gpui::{prelude::*, *};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::scroll::ScrollableElement;
-use gpui_component::tag::{Tag, TagVariant};
 use gpui_component::{ActiveTheme, Icon, IconName, Sizable};
 
 pub fn code_block_surface(key: &str, cx: &App) -> Stateful<Div> {
@@ -40,10 +39,12 @@ pub fn code_block_header(
                 .items_center()
                 .gap_2()
                 .child(
-                    Tag::new()
-                        .child(language.to_owned())
-                        .with_variant(TagVariant::Secondary)
-                        .small(),
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_color(cx.theme().muted_foreground)
+                        .child(language.to_owned()),
                 )
                 .children(path.map(|path| {
                     let path: SharedString = path.to_owned().into();
@@ -84,7 +85,7 @@ pub fn code_block_run_button(key: &str) -> Button {
     Button::new(SharedString::from(selector.clone()))
         .debug_selector(move || selector.clone())
         .icon(IconName::SquareTerminal)
-        .label("Run in Terminal")
+        .label("Run in terminal")
         .accessibility_label("Run in active project terminal")
         .tooltip("Run in active project terminal")
         .xsmall()
@@ -96,7 +97,7 @@ pub fn code_block_open_button(key: &str) -> Button {
     Button::new(SharedString::from(selector.clone()))
         .debug_selector(move || selector.clone())
         .icon(IconName::File)
-        .label("Open in Editor")
+        .label("Open in editor")
         .accessibility_label("Open file in central editor")
         .tooltip("Open file in central editor")
         .xsmall()
@@ -117,11 +118,11 @@ pub fn code_block_copy_button(key: &str, copied: bool, cx: &App) -> Button {
         })
 }
 
-pub fn code_block_body() -> impl IntoElement + ParentElement {
+pub fn code_block_body(cx: &App) -> impl IntoElement + ParentElement {
     div()
         .min_w_0()
         .overflow_x_scrollbar()
         .p_3()
-        .font_family("monospace")
+        .font_family(cx.theme().mono_font_family.clone())
         .text_xs()
 }

@@ -309,7 +309,7 @@ pub fn session_archive_button(id: &str, active: bool) -> Button {
 pub fn session_actions_button(id: &str, active: bool) -> Button {
     let id = format!("session-actions-{id}");
     let selector = id.clone();
-    // Let the ancestor popover receive mouse-down; opening also selects the row.
+    // The popover receives mouse-down and stops it before the session row.
     Button::new(SharedString::from(id))
         .debug_selector(move || selector.clone())
         .icon(IconName::Ellipsis)

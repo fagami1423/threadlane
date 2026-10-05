@@ -10,6 +10,14 @@ Conversation code blocks use the production kit frame and Markdown parser. The
 Components gallery includes completed shell/Rust and streaming samples with long
 file paths. Imported snapshots record desktop shell availability; preview
 Run/Open actions show local notices and preserve the captured conversation.
+The gallery's tool disclosures use the production file, search, and command
+renderers, including source line numbers, match highlights, exit status, and
+running/error states. Short results fit their content; long output stays within
+the shared scroll limit. Long source and command lines scroll horizontally inside
+the output region while the header stays fixed. Gallery file actions show a local notice.
+Output cards include the same accessible Copy action on desktop and web. Source
+copies omit line-number anchors and snapshot notices; command copies include
+stdout and stderr. Copy feedback resets when streaming output changes.
 On macOS browsers, scoped Command shortcuts support Select All, Copy, Cut,
 Paste, Undo and Redo alongside the existing Control bindings.
 
@@ -80,12 +88,21 @@ The setup follows Zed's [GPUI Web hello_web example](https://github.com/zed-indu
 one canvas window, a retained `ApplicationHandle`, embedded fonts, WASM atomics,
 rebuilt standard library, and COOP/COEP response headers. It uses Threadlane's
 existing pinned GPUI backend. WebGPU is preferred with a WebGL fallback.
+The preview uses GPUI's single-threaded web host, matching GPUI Kit's gallery.
+This avoids Markdown channel contention calling `Atomics.wait` on the browser's
+main thread when opening components. Parsing still uses the shared Markdown
+implementation; large fixtures may take longer than the native worker path.
 Serve over localhost or HTTPS, with the headers in `Trunk.toml`; opening
 `index.html` as a local file does not provide the required isolation.
 
 The web theme uses bundled defaults; it does not load or persist host settings.
 Browser accessibility and platform behavior remain bounded by GPUI Web's current
 canvas backend. Native checks are still required for desktop changes.
+The pinned GPUI Kit omits tree-sitter grammars on WASM, so source, shell and
+Markdown code currently appear without syntax colors in web previews. Native
+syntax highlighting remains intact; diff and search highlights are portable.
+The [browser highlighting probe](experiments/wasm-highlighting/README.md) records
+the tested parser path and the dependency changes still needed for parity.
 
 ## Fonts
 
@@ -97,6 +114,10 @@ synthetic styling. Font provenance and pinned revisions are in the
 are covered by the [SIL Open Font License](../../../threadlane-ui-theme/assets/fonts/OFL.txt).
 Custom native themes can still override the font families. The Components view
 includes matching upright and italic specimens at all four UI weights.
+Both bundled themes explicitly use a 16px UI base and 13px monospace base;
+code chrome and identifiers use the theme's monospace family as well.
+Compare native and web at 100% browser zoom: browser zoom scales the whole
+canvas independently of GPUI's shared font size and rem geometry.
 
 ## Extraction coverage
 

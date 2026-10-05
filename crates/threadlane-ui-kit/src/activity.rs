@@ -1,7 +1,7 @@
 //! Controlled tool result disclosure used by desktop and iOS.
 use gpui::{prelude::*, *};
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Sizable};
+use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable};
 
 /// Completed rows share one reveal; running, thinking, and failed rows remain
 /// visible. Hosts own expansion and construct row content only when requested.
@@ -21,6 +21,11 @@ pub fn completed_activity_group<'a>(
         .clone()
         .filter(|activity| !needs_attention(activity))
         .count();
+    let summary = tool_group_summary(
+        activities
+            .clone()
+            .filter(|activity| !needs_attention(activity)),
+    );
     let mut rows = Vec::new();
     let mut completed = Vec::new();
     let mut start_id = None;
@@ -59,16 +64,11 @@ pub fn completed_activity_group<'a>(
         .my_1()
         .px_4()
         .children((hidden_count > 0).then(|| {
-            let label = if expanded {
-                "Collapse activities".to_owned()
-            } else {
-                completed_activities_text(hidden_count)
-            };
-            let description = if expanded {
-                "Collapse completed tool activity".to_owned()
-            } else {
-                expand_activities_a11y(hidden_count)
-            };
+            let label = format!("Completed · {summary}");
+            let description = format!(
+                "{}: {summary}",
+                activities_disclosure_a11y(hidden_count, expanded)
+            );
             crate::disclosure_button(
                 SharedString::from(format!("activity-group-{id}")),
                 expanded,
@@ -82,6 +82,7 @@ pub fn completed_activity_group<'a>(
                     .child(label),
             )
             .debug_selector(|| "activity-group-disclosure".into())
+            .when(expanded, |button| button.bg(theme.muted.opacity(0.25)))
             .xsmall()
             .on_click(move |_, window, cx| on_toggle(window, cx))
         }))
@@ -89,16 +90,10 @@ pub fn completed_activity_group<'a>(
         .into_any_element()
 }
 
-fn completed_activities_text(count: usize) -> String {
+fn activities_disclosure_a11y(count: usize, expanded: bool) -> String {
     format!(
-        "{count} completed {}",
-        if count == 1 { "activity" } else { "activities" }
-    )
-}
-
-fn expand_activities_a11y(count: usize) -> String {
-    format!(
-        "Expand {count} completed tool {}",
+        "{} {count} completed tool {}",
+        if expanded { "Collapse" } else { "Expand" },
         if count == 1 { "activity" } else { "activities" }
     )
 }
@@ -117,7 +112,7 @@ pub fn tool_activity(
         "Working" => ("Running", theme.primary),
         "Thinking" => ("Thinking", theme.primary),
         "Completed" | "Result" | "Edited" | "Created" | "Ran" | "Loaded" | "Explored" => {
-            ("Completed", theme.success)
+            ("Completed", theme.muted_foreground)
         }
         other => (other, theme.muted_foreground),
     };
@@ -137,13 +132,6 @@ pub fn tool_activity(
     } else {
         format!("{display_summary}, {status}")
     };
-    let is_error = activity.category == "Error";
-    let summary_color = if is_error {
-        theme.danger
-    } else {
-        theme.muted_foreground
-    };
-
     div()
         .debug_selector({
             let id = activity.id.clone();
@@ -160,6 +148,10 @@ pub fn tool_activity(
                 .accessibility_label(disclosure_label.clone())
                 .tooltip(disclosure_label)
                 .ghost()
+                .open(has_detail && activity.is_expanded)
+                .when(has_detail && activity.is_expanded, |button| {
+                    button.bg(theme.muted.opacity(0.25))
+                })
                 .small()
                 .when(touch, |button| button.h_11())
                 .w_full()
@@ -180,7 +172,7 @@ pub fn tool_activity(
                         .flex_1()
                         .truncate()
                         .text_sm()
-                        .text_color(summary_color)
+                        .text_color(theme.foreground)
                         .child(display_summary.clone()),
                 )
                 .child(
@@ -190,9 +182,24 @@ pub fn tool_activity(
                         .items_center()
                         .gap_1p5()
                         .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(div().flex_none().size_1().rounded_full().bg(status_color))
-                        .child(status.to_owned()),
+                        .text_color(status_color)
+                        .child(match status {
+                            "Running" | "Thinking" => gpui_component::spinner::Spinner::new()
+                                .xsmall()
+                                .color(status_color)
+                                .into_any_element(),
+                            "Completed" => Icon::new(IconName::Check)
+                                .xsmall()
+                                .text_color(status_color)
+                                .into_any_element(),
+                            _ => div()
+                                .flex_none()
+                                .size_1()
+                                .rounded_full()
+                                .bg(status_color)
+                                .into_any_element(),
+                        })
+                        .when(status != "Completed", |el| el.child(status.to_owned())),
                 )
                 .children(has_detail.then(|| {
                     crate::motion::chevron(
@@ -201,7 +208,7 @@ pub fn tool_activity(
                     )
                 })),
         )
-        .children(detail.map(|body| div().ml_6().mt_1().min_w_0().child(body)))
+        .children(detail.map(|body| div().ml_6().mr_2().mt_1().min_w_0().child(body)))
         .into_any_element()
 }
 
@@ -227,24 +234,32 @@ fn tool_icon(title: &str) -> IconName {
 
 #[cfg(test)]
 mod tests {
-    use super::{completed_activities_text, expand_activities_a11y};
+    use super::activities_disclosure_a11y;
 
     #[test]
     fn completed_activity_labels_use_singular_for_one() {
-        assert_eq!(completed_activities_text(1), "1 completed activity");
-        assert_eq!(completed_activities_text(2), "2 completed activities");
         assert_eq!(
-            expand_activities_a11y(1),
+            activities_disclosure_a11y(1, false),
             "Expand 1 completed tool activity"
         );
         assert_eq!(
-            expand_activities_a11y(3),
+            activities_disclosure_a11y(3, false),
             "Expand 3 completed tool activities"
+        );
+        assert_eq!(
+            activities_disclosure_a11y(1, true),
+            "Collapse 1 completed tool activity"
+        );
+        assert_eq!(
+            activities_disclosure_a11y(3, true),
+            "Collapse 3 completed tool activities"
         );
     }
 }
 
-pub fn tool_group_summary<'a>(tools: impl IntoIterator<Item = &'a threadlane_protocol::daemon::ToolActivityInfo>) -> String {
+pub fn tool_group_summary<'a>(
+    tools: impl IntoIterator<Item = &'a threadlane_protocol::daemon::ToolActivityInfo>,
+) -> String {
     let mut counts = [0_usize; 6];
     for tool in tools {
         let kind = if crate::tool_detail::is_command_tool(&tool.title) {

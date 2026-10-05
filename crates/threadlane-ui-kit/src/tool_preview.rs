@@ -4,7 +4,6 @@ use super::tool_detail::{
 };
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Sizable};
 use threadlane_protocol::daemon::ToolActivityInfo;
 /// Resolve the language used by the editor and inline file previews.
@@ -18,8 +17,8 @@ pub fn detect_language(path_str: &str) -> &'static str {
     {
         Some("rs") => "rust",
         Some("py") => "python",
-        Some("js" | "mjs" | "cjs") => "javascript",
-        Some("ts" | "mts" | "cts" | "jsx" | "tsx") => "typescript",
+        Some("js" | "mjs" | "cjs" | "jsx") => "javascript",
+        Some("ts" | "mts" | "cts" | "tsx") => "typescript",
         Some("json") => "json",
         Some("toml") => "toml",
         Some("yaml" | "yml") => "yaml",
@@ -126,14 +125,17 @@ pub fn render(
     let pending = activity.category == "Working"
         && (activity.detail.trim().is_empty()
             || activity.detail.trim() == activity.arguments.trim());
-    let mut header = card_header(&theme).child(
-        Icon::new(match tool.as_str() {
-            "grep_search" => IconName::Search,
-            "list_dir" => IconName::Folder,
-            _ => IconName::File,
-        })
-        .xsmall(),
-    );
+    let mut copy_text = (!pending && !activity.detail.is_empty()).then(|| activity.detail.clone());
+    let mut header = card_header(&theme)
+        .debug_selector(|| "tool-preview-header".into())
+        .child(
+            Icon::new(match tool.as_str() {
+                "grep_search" => IconName::Search,
+                "list_dir" => IconName::Folder,
+                _ => IconName::File,
+            })
+            .xsmall(),
+        );
     let title = if tool == "grep_search" {
         format!(
             "Search · {}",
@@ -199,7 +201,7 @@ pub fn render(
                     )
                     .debug_selector(|| "tool-preview-open".into())
                     .icon(IconName::ExternalLink)
-                    .label("Open in editor"),
+                    .label("Open"),
                 );
             let numbers = source
                 .iter()
@@ -211,6 +213,7 @@ pub fn render(
                 .map(|(_, text)| *text)
                 .collect::<Vec<_>>()
                 .join("\n");
+            copy_text = Some(code.clone());
             rows.push(
                 div()
                     .flex()
@@ -336,6 +339,8 @@ pub fn render(
             );
         }
     }
+    header = header
+        .children(copy_text.map(|text| crate::surfaces::result_copy_button(&activity.id, text)));
     Some(
         card_container(&theme)
             .debug_selector(|| "tool-preview-card".into())
@@ -343,18 +348,12 @@ pub fn render(
             .child(
                 preview_viewport(format!("tool-preview-{}", activity.id))
                     .debug_selector(|| "tool-preview-viewport".into())
-                    .child(
+                    .child(crate::result_scroll_body(
+                        format!("tool-preview-scroll-{}", activity.id),
                         div()
-                            .h_full()
-                            .min_h_0()
                             .text_color(theme.foreground)
                             .font_family(cx.theme().mono_font_family.clone())
                             .text_xs()
-                            .overflow_y_scrollbar()
-                            .id(SharedString::from(format!(
-                                "tool-preview-scroll-{}",
-                                activity.id
-                            )))
                             .child(
                                 div()
                                     .debug_selector(|| "tool-preview-content".into())
@@ -365,7 +364,7 @@ pub fn render(
                                     .gap_1()
                                     .children(rows),
                             ),
-                    ),
+                    )),
             )
             .into_any_element(),
     )

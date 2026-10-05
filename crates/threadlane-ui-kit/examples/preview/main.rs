@@ -88,7 +88,9 @@ fn main() {
         static APPLICATION: RefCell<Option<ApplicationHandle>> = const { RefCell::new(None) };
     }
     gpui_platform::web_init();
-    let handle = gpui_platform::application()
+    // Markdown channel notifications can contend with worker threads and try
+    // Atomics.wait on the browser's main thread. Use GPUI's gallery-safe host.
+    let handle = gpui_platform::single_threaded_web()
         .with_assets(threadlane_ui_theme::Assets)
         .run_embedded(|cx| {
             open_gallery(cx);

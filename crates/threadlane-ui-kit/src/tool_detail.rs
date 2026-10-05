@@ -560,18 +560,22 @@ pub fn render_command_card(activity: &ToolActivityInfo, cx: &mut App) -> AnyElem
     };
     let has_output =
         !detail.pending && (!detail.output.stdout.is_empty() || !detail.output.stderr.is_empty());
+    let copy_text = has_output.then(|| {
+        [&detail.output.stdout, &detail.output.stderr]
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
 
     card_container(&theme)
         .debug_selector(|| "command-card".into())
-        .p_3()
         .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .text_sm()
+            card_header(&theme)
+                .text_xs()
                 .text_color(theme.muted_foreground)
-                .child(Icon::new(IconName::SquareTerminal).small())
+                .child(Icon::new(IconName::SquareTerminal).xsmall())
                 .child(
                     div()
                         .id(SharedString::from(format!("tool-cwd-{}", activity.id)))
@@ -584,12 +588,7 @@ pub fn render_command_card(activity: &ToolActivityInfo, cx: &mut App) -> AnyElem
                                 gpui_component::tooltip::Tooltip::new(cwd.clone()).build(window, cx)
                             }
                         })
-                        .child(
-                            detail
-                                .cwd
-                                .map(|cwd| format!("Command in {cwd}"))
-                                .unwrap_or_else(|| "Command".into()),
-                        ),
+                        .child(detail.cwd.unwrap_or_else(|| "Terminal".into())),
                 )
                 .child(
                     div()
@@ -601,6 +600,9 @@ pub fn render_command_card(activity: &ToolActivityInfo, cx: &mut App) -> AnyElem
                             theme.muted_foreground
                         })
                         .child(status),
+                )
+                .children(
+                    copy_text.map(|text| crate::surfaces::result_copy_button(&activity.id, text)),
                 ),
         )
         .child(
@@ -609,29 +611,20 @@ pub fn render_command_card(activity: &ToolActivityInfo, cx: &mut App) -> AnyElem
                 .flex()
                 .items_start()
                 .gap_2()
-                .mt_3()
+                .px_3()
+                .py_2()
                 .child(
                     div()
                         .flex_none()
-                        .text_color(if is_error {
-                            theme.danger
-                        } else {
-                            theme.muted_foreground
-                        })
-                        .child(if running {
-                            "◌"
-                        } else if is_error {
-                            "!"
-                        } else {
-                            "$"
-                        }),
+                        .text_color(theme.muted_foreground)
+                        .child("$"),
                 )
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
                         .font_family(cx.theme().mono_font_family.clone())
-                        .text_sm()
+                        .text_xs()
                         .text_color(theme.foreground)
                         .child(highlighted_command(command_text, cx)),
                 ),
@@ -640,23 +633,17 @@ pub fn render_command_card(activity: &ToolActivityInfo, cx: &mut App) -> AnyElem
             card.child(
                 preview_viewport(format!("command-output-{}", activity.id))
                     .debug_selector(|| "command-output".into())
-                    .mt_2()
                     .border_t_1()
                     .border_color(theme.border.opacity(0.3))
-                    .child(
+                    .child(crate::result_scroll_body(
+                        format!("command-output-scroll-{}", activity.id),
                         div()
                             .debug_selector(|| "command-output-content".into())
-                            .h_full()
-                            .min_h_0()
-                            .pt_2()
+                            .px_3()
+                            .py_2()
                             .font_family(cx.theme().mono_font_family.clone())
                             .text_xs()
                             .text_color(theme.foreground)
-                            .overflow_y_scrollbar()
-                            .id(SharedString::from(format!(
-                                "command-output-scroll-{}",
-                                activity.id
-                            )))
                             .children(
                                 (!detail.output.stdout.is_empty()).then(|| {
                                     div().child(highlighted_output(detail.output.stdout, cx))
@@ -671,7 +658,7 @@ pub fn render_command_card(activity: &ToolActivityInfo, cx: &mut App) -> AnyElem
                                     })
                                     .child(highlighted_output(detail.output.stderr, cx))
                             })),
-                    ),
+                    )),
             )
         })
         .into_any_element()
@@ -882,8 +869,8 @@ pub fn render_activity_detail_card(
 #[cfg(test)]
 mod tests {
     use super::{
-        command_detail, diff_rows, diff_stats, exit_status_label, parse_command_output,
-        parse_unified_diff, result_path, DiffRow, DiffRowKind,
+        DiffRow, DiffRowKind, command_detail, diff_rows, diff_stats, exit_status_label,
+        parse_command_output, parse_unified_diff, result_path,
     };
     use threadlane_protocol::daemon::ToolActivityInfo;
 
@@ -975,12 +962,14 @@ mod tests {
             "Working",
         );
         let rows = diff_rows(&act);
-        assert!(rows
-            .iter()
-            .any(|row| row.kind == DiffRowKind::Add && row.text == "fn b() {}"));
-        assert!(rows
-            .iter()
-            .any(|row| row.kind == DiffRowKind::Remove && row.text.contains("20–22")));
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == DiffRowKind::Add && row.text == "fn b() {}")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == DiffRowKind::Remove && row.text.contains("20–22"))
+        );
     }
 
     #[test]

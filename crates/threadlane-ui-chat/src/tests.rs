@@ -589,7 +589,7 @@ fn unsupported_acp_steer_keeps_the_composer_text_and_images(cx: &mut gpui::TestA
             .session_status
             .as_deref()
             .unwrap()
-            .contains("Use Queue"));
+            .contains("Send your message to queue it after this turn."));
         assert!(state.active_pending_composer_message().is_none());
     });
 }
@@ -2119,12 +2119,89 @@ fn tool_previews_stay_compact_until_expanded_and_bound_output(cx: &mut gpui::Tes
     }
 }
 
-// Check the painted content masks, not only the outer button bounds: Button's
-// inner label clips children even when the disclosure itself has enough height.
+// Activity summaries must leave the disclosure reachable at narrow widths and zoom.
 #[gpui::test]
-fn transcript_disclosure_badges_are_not_vertically_clipped(cx: &mut gpui::TestAppContext) {
+fn progress_summary_fits_at_narrow_width_and_zoom(cx: &mut gpui::TestAppContext) {
     use gpui::{AppContext as _, ParentElement as _, Styled as _};
-    use gpui_component::ActiveTheme as _;
+    struct Harness(gpui::Entity<super::ChatListView>);
+    impl gpui::Render for Harness {
+        fn render(&mut self, _: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+            self.0.update(cx, |chat, cx| {
+                gpui::div().size_full().child(chat.render_progress_summary(cx))
+            })
+        }
+    }
+    cx.update(gpui_component::init);
+    let project = tempfile::tempdir().unwrap();
+    let file = project.path().join("activity.jsonl");
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::for_tests();
+        threadlane_ui_state::activate_test_session(&mut state, "activity", &file);
+        state.run_timings.insert(
+            threadlane_protocol::daemon::SessionProjectionKey {
+                session_id: "activity".into(), session_file: file,
+            },
+            threadlane_protocol::daemon::RunTiming {
+                start_seq: 1, source_seq: 2, started_at_ms: Some(0),
+                finished_at_ms: Some(3_723_000), finished: true, suppressed: false,
+            },
+        );
+        std::sync::Arc::make_mut(&mut state.messages).push(ChatMessageInfo {
+            id: "activity-layout".into(), role: MessageRole::Assistant,
+            content: String::new(), streaming: true,
+            reasoning_content: None, reasoning_expanded: false,
+            tool_activities: vec![ToolActivityInfo {
+                id: "command".into(), category: "Running".into(),
+                title: "run_command".into(),
+                display_summary: "Run cargo check for a very long workspace package name".into(),
+                detail: "Command details remain available".into(),
+                arguments: String::new(), is_expanded: false,
+            }],
+        });
+        state
+    });
+    let retained = model.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        let host = cx.new(|_| Harness(chat));
+        gpui_component::Root::new(host, window, cx)
+    });
+    for category in ["Running", "Error", "Completed"] {
+        retained.update(cx, |state, cx| {
+            std::sync::Arc::make_mut(&mut state.messages)[0].tool_activities[0].category = category.into();
+            cx.notify();
+        });
+        for font in [14.0, 20.0] {
+            cx.update(|_, cx| gpui_component::Theme::global_mut(cx).font_size = gpui::px(font));
+            for width in [320.0, 800.0] {
+                cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(300.0)));
+                cx.run_until_parked();
+                cx.update(|window, cx| { window.refresh(); window.draw(cx).clear(cx); });
+                let row = cx.debug_bounds("chat-progress-summary").unwrap();
+                let disclosure = cx.debug_bounds("progress-summary-disclosure").unwrap();
+                let summary = cx.debug_bounds("progress-summary-text").unwrap();
+                let chevron = cx.debug_bounds("progress-summary-chevron").unwrap();
+                let elapsed = cx.debug_bounds("progress-summary-elapsed").unwrap();
+                assert_eq!(disclosure.intersect(&row), disclosure);
+                assert_eq!(chevron.intersect(&disclosure), chevron);
+                assert_eq!(elapsed.intersect(&disclosure), elapsed);
+                assert_eq!(summary.intersect(&disclosure), summary,
+                    "activity text clips controls: {category}, {font}, {width}");
+                assert!(summary.size.width > gpui::px(0.0), "{category}, {font}, {width}");
+                for expanded in [true, false] {
+                    cx.simulate_click(disclosure.center(), gpui::Modifiers::default());
+                    cx.run_until_parked();
+                    cx.update(|window, cx| { window.refresh(); window.draw(cx).clear(cx); });
+                    assert_eq!(cx.debug_bounds("progress-summary-details").is_some(), expanded);
+                }
+            }
+        }
+    }
+}
+
+#[gpui::test]
+fn transcript_disclosure_metadata_fits_at_narrow_width_and_zoom(cx: &mut gpui::TestAppContext) {
+    use gpui::{AppContext as _, ParentElement as _, Styled as _};
 
     struct Harness {
         chat: gpui::Entity<super::ChatListView>,
@@ -2204,16 +2281,17 @@ fn transcript_disclosure_badges_are_not_vertically_clipped(cx: &mut gpui::TestAp
                 cx.run_until_parked();
                 cx.update(|window, cx| {
                     window.draw(cx).clear(cx);
-                    let badges = window.painted_quads().into_iter()
-                        .filter(|quad| quad.background == gpui::Background::from(cx.theme().secondary))
-                        .collect::<Vec<_>>();
-                    assert_eq!(badges.len(), 1, "reasoning badge must be painted; tool counts are in the summary");
-                    for badge in badges {
-                        let visible = badge.bounds.intersect(&badge.content_mask.bounds);
-                        assert_eq!(visible.size.height, badge.bounds.size.height,
-                            "badge clipped at font={font_size}, width={width}, expanded={expanded}: {badge:?}");
-                    }
                 });
+                if expanded {
+                    assert!(cx.debug_bounds("reasoning-token-label").is_none(),
+                        "streaming reasoning names Thinking once instead of repeating it as metadata");
+                    continue;
+                }
+                let metadata = cx.debug_bounds("reasoning-token-label").expect("completed reasoning retains token metadata");
+                let disclosure = cx.debug_bounds("reasoning-disclosure").unwrap();
+                assert!(metadata.size.height > gpui::px(0.0));
+                assert_eq!(metadata.intersect(&disclosure), metadata,
+                    "metadata clipped at font={font_size}, width={width}, expanded={expanded}");
             }
         }
     }
@@ -2770,8 +2848,8 @@ fn tool_activity_glyph_marks_unknown_categories_neutral() {
 
 #[test]
 fn progress_header_prefix_names_errors_explicitly() {
-    assert_eq!(super::progress_header_prefix(false), "Latest activity:");
-    assert_eq!(super::progress_header_prefix(true), "Needs attention:");
+    assert_eq!(super::progress_header_prefix(false), None);
+    assert_eq!(super::progress_header_prefix(true), Some("Needs attention:"));
 }
 
 #[test]
@@ -2926,6 +3004,62 @@ fn question_card_toggles_option_selection(cx: &mut gpui::TestAppContext) {
         })
         .is_empty()
     );
+}
+
+#[gpui::test]
+fn normal_send_automatically_queues_while_generating(cx: &mut gpui::TestAppContext) {
+    let project = tempfile::tempdir().unwrap();
+    let (chat, model, cx) = mount_chat_with_work_dir(cx, Some(project.path().into()));
+    let runtime = model.update(cx, |state, cx| {
+        state.active_session_id = Some("busy-send".into());
+        state.selected_model = "gpt-4o".into();
+        state.test_set_available_models(vec![picker_model_option(
+            "gpt-4o", "GPT-4o", threadlane_daemon::catalog::ModelProvider::OpenAi,
+        )]);
+        let session_file = project.path().join(".threadlane/sessions/busy-send.jsonl");
+        let options = threadlane_daemon::projection::coding_agent_options(
+            project.path().into(), session_file.clone(), "gpt-4o".into(),
+            Default::default(), threadlane_protocol::browser::BrowserBridge::unavailable(),
+        );
+        let runtime = std::thread::Builder::new().stack_size(8 * 1024 * 1024)
+            .spawn(move || threadlane_coding_agent::controller::SessionRuntime::new(options))
+            .unwrap().join().unwrap();
+        // Leave the supervisor off so the test can inspect the durable queue without running a provider.
+        state.daemon_core.register_runtime("busy-send", project.path().into(), session_file, runtime.clone());
+        runtime.begin_generation().unwrap();
+        state.is_generating = true;
+        cx.notify();
+        runtime
+    });
+    for method in ["click", "enter"] {
+        cx.update(|window, cx| chat.update(cx, |chat, cx| chat.focus_composer(window, cx)));
+        let text = format!("Follow up via {method}");
+        cx.simulate_input(&text);
+        cx.run_until_parked();
+        cx.update(|window, cx| { window.refresh(); window.draw(cx).clear(cx); });
+        let send = cx.debug_bounds("send-btn").unwrap();
+        assert!((send.size.width - send.size.height).abs() <= gpui::px(1.),
+            "busy send keeps the same circular send control");
+        if method == "click" {
+            cx.simulate_click(send.center(), gpui::Modifiers::default());
+        } else {
+            cx.simulate_keystrokes("enter");
+        }
+        cx.run_until_parked();
+        let entry_id = model.read_with(cx, |state, _| {
+            assert!(state.active_pending_composer_message().is_none(), "sending needs no staging step");
+            let message = state.messages.last().unwrap();
+            assert_eq!(message.content, text);
+            super::queued_entry_id(&message.id, Some("busy-send")).expect("sent message is queued")
+        });
+        let (queued_text, images) = runtime.work_handle.cancel_queued_entry(&entry_id).unwrap();
+        assert_eq!(queued_text, text, "the durable queue receives the sent message");
+        assert!(images.is_empty());
+        chat.read_with(cx, |chat, cx| assert!(chat.input_state.read(cx).value().is_empty()));
+        assert!(runtime.is_generating(), "queuing preserves the current response");
+        cx.update(|window, cx| { window.refresh(); window.draw(cx).clear(cx); });
+        assert!(cx.debug_bounds("pending-preview-row").is_none());
+    }
 }
 
 #[gpui::test]
@@ -3123,6 +3257,10 @@ fn environment_token_efficiency_follows_durable_session_hydration(cx: &mut gpui:
     assert!(cx.debug_bounds("environment-token-efficiency").is_some());
     assert!(cx.debug_bounds("efficiency-Processed tokens").is_some());
     assert!(cx.debug_bounds("efficiency-Child tokens").is_some());
+    assert!(cx.debug_bounds("efficiency-Cache reads / writes").is_some());
+    assert!(cx.debug_bounds("efficiency-Reduced context items").is_none());
+    assert!(cx.debug_bounds("efficiency-Compactions / rereads").is_none());
+    assert!(cx.debug_bounds("efficiency-Tokens / completed run").is_none());
     model.read_with(cx, |state, _| {
         let report = state.active_token_efficiency().unwrap();
         assert_eq!(report.usage.processed_tokens(), 200);

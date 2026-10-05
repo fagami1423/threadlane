@@ -215,4 +215,23 @@ mod tests {
             .iter()
             .any(|theme| theme.name == "Threadlane Light"));
     }
+
+    #[test]
+    fn bundled_theme_switches_restore_shared_typography() {
+        let themes: ThemeSet = serde_json::from_str(BUNDLED_THEMES).unwrap();
+        let mut theme = gpui_component::Theme::default();
+        for config in themes.themes {
+            // A prior custom theme must not leak platform fonts or sizing into
+            // either bundled theme, including after a registry reload.
+            theme.font_family = ".SystemUIFont".into();
+            theme.mono_font_family = "monospace".into();
+            theme.font_size = gpui::px(20.);
+            theme.mono_font_size = gpui::px(18.);
+            theme.apply_config(&std::rc::Rc::new(config));
+            assert_eq!(theme.font_family, "IBM Plex Sans");
+            assert_eq!(theme.mono_font_family, "JetBrains Mono");
+            assert_eq!(theme.font_size, gpui::px(16.));
+            assert_eq!(theme.mono_font_size, gpui::px(13.));
+        }
+    }
 }

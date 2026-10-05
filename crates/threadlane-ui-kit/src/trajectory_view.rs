@@ -673,12 +673,12 @@ impl<S: TrajectorySource> TrajectoryView<S> {
                                 .children(entry.diagnostics.parent_id.as_ref().map(|p| {
                                     div().flex().flex_col().gap_1()
                                         .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(theme.muted_foreground).child("PARENT ENTRY"))
-                                        .child(div().text_sm().font_family("monospace").child(p.clone()))
+                                        .child(div().text_sm().font_family(cx.theme().mono_font_family.clone()).child(p.clone()))
                                 }))
                                 .children(entry.diagnostics.result_id.as_ref().map(|r| {
                                     div().flex().flex_col().gap_1()
                                         .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(theme.muted_foreground).child("RESULT ENTRY"))
-                                        .child(div().text_sm().font_family("monospace").child(r.clone()))
+                                        .child(div().text_sm().font_family(cx.theme().mono_font_family.clone()).child(r.clone()))
                                 }))
                                 .children(entry.correlation_id.clone().map(|id| div().text_sm().child(format!("Correlation: {id}"))))
                                 .into_any_element(),
