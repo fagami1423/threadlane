@@ -2776,6 +2776,260 @@ fn shared_code_blocks_preserve_native_guards_and_copy(cx: &mut gpui::TestAppCont
         }
     }
 }
+#[gpui::test]
+fn code_block_wrap_toggles_layout_and_preserves_copy(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    cx.update(gpui_component::init);
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::for_tests();
+        state.is_new_task = false;
+        state.active_session_id = Some("wrap-task".into());
+        state.messages = vec![ChatMessageInfo {
+            id: "code".into(),
+            role: MessageRole::Assistant,
+            content: format!(
+                "```shell scripts/check.sh\n$ printf '{}'\n```",
+                "x".repeat(400)
+            ),
+            tool_activities: Vec::new(),
+            streaming: false,
+            reasoning_content: None,
+            reasoning_expanded: false,
+        }]
+        .into();
+        state
+    });
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        gpui_component::Root::new(chat, window, cx)
+    });
+    let redraw = |cx: &mut gpui::VisualTestContext| {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+    };
+    // Narrow pane: the header action group must keep the toggle in bounds.
+    // Tall window so the grown wrapped block stays inside the viewport even
+    // while the transcript follows the tail.
+    cx.simulate_resize(gpui::size(gpui::px(320.), gpui::px(1600.)));
+    redraw(cx);
+    assert!(cx.debug_bounds("code-body-scroll-code-0").is_some());
+    assert!(cx.debug_bounds("code-body-wrap-code-0").is_none());
+    let wrap = cx
+        .debug_bounds("wrap-lines-code-0")
+        .expect("wrap toggle present");
+    assert!(
+        wrap.left() >= gpui::px(0.) && wrap.right() <= gpui::px(320.),
+        "wrap toggle must stay in bounds at narrow width"
+    );
+    let unwrapped_height = cx.debug_bounds("code-block-code-0").unwrap().size.height;
+    cx.simulate_click(wrap.center(), gpui::Modifiers::default());
+    redraw(cx);
+    assert!(cx.debug_bounds("code-body-wrap-code-0").is_some());
+    assert!(cx.debug_bounds("code-body-scroll-code-0").is_none());
+    let wrapped_height = cx.debug_bounds("code-block-code-0").unwrap().size.height;
+    assert!(
+        wrapped_height > unwrapped_height,
+        "a wrapped long line must lay out taller than one scrolled line"
+    );
+    // Copy still yields the raw code, not visual line breaks.
+    let copy = cx.debug_bounds("copy-code-code-0").unwrap();
+    cx.simulate_click(copy.center(), gpui::Modifiers::default());
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some(format!("$ printf '{}'\n", "x".repeat(400)))
+    );
+    let wrap = cx.debug_bounds("wrap-lines-code-0").unwrap();
+    cx.simulate_click(wrap.center(), gpui::Modifiers::default());
+    redraw(cx);
+    assert!(cx.debug_bounds("code-body-scroll-code-0").is_some());
+    assert!(cx.debug_bounds("code-body-wrap-code-0").is_none());
+}
+
+#[gpui::test]
+fn code_block_wrap_is_per_block(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    cx.update(gpui_component::init);
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::for_tests();
+        state.is_new_task = false;
+        state.active_session_id = Some("wrap-task".into());
+        state.messages = vec![ChatMessageInfo {
+            id: "code".into(),
+            role: MessageRole::Assistant,
+            content: "```text\nfirst\n```\n```text\nsecond\n```".into(),
+            tool_activities: Vec::new(),
+            streaming: false,
+            reasoning_content: None,
+            reasoning_expanded: false,
+        }]
+        .into();
+        state
+    });
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        gpui_component::Root::new(chat, window, cx)
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    });
+    let wrap = cx
+        .debug_bounds("wrap-lines-code-0")
+        .expect("first block toggle");
+    cx.simulate_click(wrap.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    });
+    assert!(cx.debug_bounds("code-body-wrap-code-0").is_some());
+    assert!(
+        cx.debug_bounds("code-body-scroll-code-1").is_some(),
+        "the sibling block keeps its own scroll layout"
+    );
+    assert!(cx.debug_bounds("code-body-wrap-code-1").is_none());
+}
+
+#[gpui::test]
+fn code_block_wrap_survives_append_and_resets_on_replace(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    cx.update(gpui_component::init);
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::for_tests();
+        state.is_new_task = false;
+        state.active_session_id = Some("wrap-task".into());
+        state.messages = vec![ChatMessageInfo {
+            id: "code".into(),
+            role: MessageRole::Assistant,
+            content: "```text\nfirst line\n".into(),
+            tool_activities: Vec::new(),
+            streaming: true,
+            reasoning_content: None,
+            reasoning_expanded: false,
+        }]
+        .into();
+        state
+    });
+    let retained_model = model.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        gpui_component::Root::new(chat, window, cx)
+    });
+    let redraw = |cx: &mut gpui::VisualTestContext| {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+    };
+    redraw(cx);
+    // Wrap stays available mid-stream even while other actions are deferred.
+    let wrap = cx
+        .debug_bounds("wrap-lines-code-0")
+        .expect("wrap toggle present");
+    cx.simulate_click(wrap.center(), gpui::Modifiers::default());
+    redraw(cx);
+    assert!(cx.debug_bounds("code-body-wrap-code-0").is_some());
+    retained_model.update(cx, |state, cx| {
+        state.messages = vec![ChatMessageInfo {
+            id: "code".into(),
+            role: MessageRole::Assistant,
+            content: "```text\nfirst line\nsecond streamed line\n".into(),
+            tool_activities: Vec::new(),
+            streaming: true,
+            reasoning_content: None,
+            reasoning_expanded: false,
+        }]
+        .into();
+        cx.notify();
+    });
+    redraw(cx);
+    assert!(
+        cx.debug_bounds("code-body-wrap-code-0").is_some(),
+        "streamed appends keep the wrap choice"
+    );
+    retained_model.update(cx, |state, cx| {
+        state.messages = vec![ChatMessageInfo {
+            id: "code".into(),
+            role: MessageRole::Assistant,
+            content: "```text\nreplaced body\n```".into(),
+            tool_activities: Vec::new(),
+            streaming: false,
+            reasoning_content: None,
+            reasoning_expanded: false,
+        }]
+        .into();
+        cx.notify();
+    });
+    redraw(cx);
+    assert!(
+        cx.debug_bounds("code-body-scroll-code-0").is_some(),
+        "a non-append replacement drops the stale wrap choice"
+    );
+    assert!(cx.debug_bounds("code-body-wrap-code-0").is_none());
+}
+
+#[gpui::test]
+fn code_block_wrap_resets_on_session_change(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    cx.update(gpui_component::init);
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::for_tests();
+        state.is_new_task = false;
+        state.active_work_dir = Some("/projects/one".into());
+        state.active_session_id = Some("first".into());
+        state.messages = vec![ChatMessageInfo {
+            id: "code".into(),
+            role: MessageRole::Assistant,
+            content: "```text\nbody\n```".into(),
+            tool_activities: Vec::new(),
+            streaming: false,
+            reasoning_content: None,
+            reasoning_expanded: false,
+        }]
+        .into();
+        state
+    });
+    let retained_model = model.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        gpui_component::Root::new(chat, window, cx)
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    });
+    let wrap = cx
+        .debug_bounds("wrap-lines-code-0")
+        .expect("wrap toggle present");
+    cx.simulate_click(wrap.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    });
+    assert!(cx.debug_bounds("code-body-wrap-code-0").is_some());
+    retained_model.update(cx, |state, cx| {
+        state.active_session_id = Some("second".into());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        cx.debug_bounds("code-body-scroll-code-0").is_some(),
+        "a new session must not inherit wrap choices"
+    );
+    assert!(cx.debug_bounds("code-body-wrap-code-0").is_none());
+}
+
 #[test]
 fn sendable_prompt_accepts_text_or_images() {
     assert!(!super::has_sendable_prompt("", 0));

@@ -342,6 +342,9 @@ pub struct SessionPreview {
     outline_selected_id: Option<String>,
     prompt_recall: Option<(String, String)>,
     segment_cache: HashMap<String, (String, Vec<kit::markdown::MarkdownSegment>)>,
+    /// Per-code-block soft-wrap choices, message id then block index — the
+    /// same view-only state ChatListView keeps for its blocks.
+    code_wrap_blocks: HashMap<String, HashSet<usize>>,
     copied_message: Option<String>,
     copy_feedback_task: Option<Task<()>>,
     find_input: Entity<InputState>,
@@ -537,7 +540,7 @@ impl SessionPreview {
             prompt_rail_active_id: None,
             outline_list: ListState::new(0, ListAlignment::Top, window.rem_size() * 20.0),
             outline_open: false, outline_focus: cx.focus_handle(), outline_focus_id: None, outline_selected_id: None,
-            prompt_recall: None, segment_cache: HashMap::new(), copied_message: None, copy_feedback_task: None,
+            prompt_recall: None, segment_cache: HashMap::new(), code_wrap_blocks: HashMap::new(), copied_message: None, copy_feedback_task: None,
             find_input, find_open: false, find_query: String::new(), find_results: Vec::new(),
             find_selected: None, find_previous_focus: None, _find_subscription: find_subscription,
             split: cx.new(|_| ResizableState::default()),
