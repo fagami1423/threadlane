@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.41](https://github.com/wheregmis/threadlane/compare/v0.1.40...v0.1.41) (2026-10-05)
+
+
+### Bug Fixes
+
+* reconcile automation questions and remote projections ([0664d1a](https://github.com/wheregmis/threadlane/commit/0664d1ac6309cfd0447559d15f72f625d991a5b9))
+
 ## [0.1.40](https://github.com/wheregmis/threadlane/compare/v0.1.39...v0.1.40) (2026-10-03)
 
 
