@@ -46,9 +46,13 @@ pub fn environment_changes_label(status: Option<&GitStatus>) -> String {
     }
 }
 /// Menu builders read host state when opened, preserving current Git capabilities.
+/// `checkout_path` is the session's effective working directory — for a
+/// worktree session that differs from the project root, and keeping it on
+/// screen is what separates "chat looks familiar" from "context changed".
 pub fn environment_panel(
     name: String,
     location: &'static str,
+    checkout_path: Option<String>,
     status: Option<&GitStatus>,
     checkout_available: bool,
     git_menu: impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
@@ -158,6 +162,25 @@ pub fn environment_panel(
                         .text_color(theme.muted_foreground)
                         .child(location),
                 )
+                .children(checkout_path.map(|path| {
+                    let full_path = path.clone();
+                    div()
+                        .id("environment-checkout-path")
+                        .debug_selector(|| "environment-checkout-path".into())
+                        .px_2()
+                        .min_w_0()
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(full_path.clone())
+                                .build(window, cx)
+                        })
+                        .child(
+                            div()
+                                .truncate()
+                                .text_xs()
+                                .text_color(theme.muted_foreground.opacity(0.8))
+                                .child(path),
+                        )
+                }))
                 .child(
                     Button::new("environment-branch")
                         .ghost()

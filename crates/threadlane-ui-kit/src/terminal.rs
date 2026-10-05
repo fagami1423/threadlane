@@ -218,6 +218,8 @@ fn action_button(id: &'static str, hint: impl Into<SharedString>) -> Button {
 /// Controlled toolbar. Only the tab strip scrolls; actions stay reachable at narrow widths.
 pub struct TerminalToolbar {
     project: SharedString,
+    project_hint: Option<SharedString>,
+    worktree: bool,
     tabs: Vec<AnyElement>,
     new_tab: bool,
     selection_enabled: bool,
@@ -230,6 +232,8 @@ impl TerminalToolbar {
     pub fn new(project: impl Into<SharedString>) -> Self {
         Self {
             project: project.into(),
+            project_hint: None,
+            worktree: false,
             tabs: Vec::new(),
             new_tab: true,
             selection_enabled: false,
@@ -237,6 +241,17 @@ impl TerminalToolbar {
             find_hint: "Find in terminal output".into(),
             hide_hint: "Hide terminal".into(),
         }
+    }
+    /// Full shell working directory for the project chip's tooltip and
+    /// accessibility label, when the chip label is a shortened basename.
+    pub fn path_hint(mut self, hint: impl Into<SharedString>) -> Self {
+        self.project_hint = Some(hint.into());
+        self
+    }
+    /// Marks the visible shell as running inside an isolated worktree.
+    pub fn worktree(mut self, worktree: bool) -> Self {
+        self.worktree = worktree;
+        self
     }
     pub fn tabs(mut self, tabs: Vec<AnyElement>) -> Self {
         self.tabs = tabs;
@@ -269,13 +284,16 @@ impl TerminalToolbar {
         let new_tab = callback.clone();
         let hide = callback.clone();
         let theme = cx.theme().colors;
-        let project_hint = self.project.clone();
+        let project_hint = self
+            .project_hint
+            .clone()
+            .unwrap_or_else(|| self.project.clone());
         let header = terminal_bar(cx)
             .child(
                 div()
                     .id("terminal-project")
                     .role(Role::Group)
-                    .aria_label(format!("Terminal project: {}", self.project))
+                    .aria_label(format!("Terminal working directory: {project_hint}"))
                     .flex_none()
                     .max_w(rems(12.0))
                     .flex()
@@ -303,6 +321,29 @@ impl TerminalToolbar {
                             .child(self.project),
                     ),
             )
+            .children(self.worktree.then(|| {
+                div()
+                    .id("terminal-worktree-badge")
+                    .debug_selector(|| "terminal-worktree-badge".into())
+                    .flex_none()
+                    .px_1p5()
+                    .py(rems(0.125))
+                    .rounded_full()
+                    .bg(theme.muted.opacity(0.35))
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(
+                            "This shell runs inside the session's isolated worktree",
+                        )
+                        .build(window, cx)
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.muted_foreground)
+                            .child("Worktree"),
+                    )
+            }))
             .child(div().w(px(1.0)).h_4().bg(theme.border))
             .child(
                 div()

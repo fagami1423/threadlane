@@ -326,6 +326,30 @@ fn format_terminal_excerpt(shell: usize, launched_in: &Path, text: &str) -> Stri
     )
 }
 
+/// A threadlane-managed worktree lives at `<project>/.threadlane/worktrees/<name>`.
+fn path_is_threadlane_worktree(cwd: &Path) -> bool {
+    cwd.components()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|pair| pair[0].as_os_str() == ".threadlane" && pair[1].as_os_str() == "worktrees")
+}
+
+/// Toolbar chip label for a shell's working directory. Worktrees keep
+/// their `.threadlane/worktrees/<name>` tail — the bare leaf is a session
+/// id — while every other directory shows its last component.
+fn shell_cwd_label(cwd: &Path) -> String {
+    let components: Vec<_> = cwd.components().collect();
+    if let Some(index) = components.windows(2).position(|pair| {
+        pair[0].as_os_str() == ".threadlane" && pair[1].as_os_str() == "worktrees"
+    }) {
+        let tail: PathBuf = components[index + 1..].iter().map(|c| c.as_os_str()).collect();
+        return format!(".threadlane/{}", tail.display());
+    }
+    cwd.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| cwd.to_string_lossy().into_owned())
+}
+
 fn git_result_matches_active(requested: &Path, active: &Path) -> bool {
     requested == active
 }
@@ -1950,6 +1974,13 @@ impl WorkspaceView {
                     .map(|s| s.to_string())
             })
             .unwrap_or_else(|| "No Project".into());
+        let checkout_display = state
+            .active_git_work_dir()
+            .map(|dir| dir.display().to_string());
+        let git_context = match checkout_display.as_deref() {
+            Some(checkout) => format!("{active_project} · {branch}\n{checkout}"),
+            None => format!("{active_project} · {branch}"),
+        };
 
         let pr_badge = git_status.and_then(|s| s.pr.as_ref()).map(|pr| {
             let pr_url = pr.url.clone();
@@ -2004,9 +2035,9 @@ impl WorkspaceView {
                             .ghost()
                             .xsmall()
                             .accessibility_label(format!(
-                                "{active_project} · {branch} — Switch or manage branches"
+                                "{git_context} — Switch or manage branches"
                             ))
-                            .tooltip(format!("{active_project} · {branch} — Switch or manage branches"))
+                            .tooltip(format!("{git_context} — Switch or manage branches"))
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.open_git_branches(cx);
                             })),
@@ -2455,17 +2486,11 @@ impl Render for WorkspaceView {
                             let cwd = new_tab_cwd.clone();
                             let terminal = terminal.clone();
                             let owner = cx.entity().clone();
-                            let hint = match &project {
-                                Some(project) => format!(
-                                    "Shell {} · {}",
-                                    tab + 1,
-                                    project
-                                        .file_name()
-                                        .map(|name| name.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|| project.to_string_lossy().into_owned())
-                                ),
-                                None => format!("Shell {}", tab + 1),
-                            };
+                            let hint = format!(
+                                "Shell {} · launched in {}",
+                                tab + 1,
+                                terminal.read(cx).project().display()
+                            );
                             let armed = project.as_ref().is_some_and(|project| {
                                 self.pending_terminal_close == Some((project.clone(), terminal.entity_id()))
                             });
@@ -2499,16 +2524,15 @@ impl Render for WorkspaceView {
                     let handoff_hint = excerpt_block.map(str::to_owned).unwrap_or_else(|| {
                         format!("Add the selected terminal text to {composer_target} — nothing is sent")
                     });
-                    let project_name = terminal_project
-                        .as_ref()
-                        .and_then(|p| p.file_name())
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("Terminal");
+                    let shell_cwd = active_terminal.read(cx).project().clone();
+                    let worktree_shell = path_is_threadlane_worktree(&shell_cwd);
                     let project = terminal_project.clone();
                     let cwd = new_tab_cwd.clone();
                     let terminal = active_terminal.clone();
                     let owner = cx.entity().clone();
-                    let toolbar = threadlane_ui_kit::TerminalToolbar::new(project_name.to_owned())
+                    let toolbar = threadlane_ui_kit::TerminalToolbar::new(shell_cwd_label(&shell_cwd))
+                        .path_hint(shell_cwd.display().to_string())
+                        .worktree(worktree_shell)
                         .tabs(tab_buttons)
                         .new_tab(project.is_some())
                         .selection(excerpt_block.is_none(), handoff_hint)
@@ -2752,9 +2776,9 @@ impl Render for WorkspaceView {
 mod tests {
     use super::{
         active_project_git_status, format_terminal_excerpt, git_result_matches_active,
-        next_workspace_event, open_github_from_palette, session_pr_refresh_delay,
-        session_pr_target_is_active, terminal_excerpt_block_reason, GitEvent,
-        WorkspacePumpEvent, TERMINAL_EXCERPT_LIMIT,
+        next_workspace_event, open_github_from_palette, path_is_threadlane_worktree,
+        session_pr_refresh_delay, session_pr_target_is_active, shell_cwd_label,
+        terminal_excerpt_block_reason, GitEvent, WorkspacePumpEvent, TERMINAL_EXCERPT_LIMIT,
     };
     use threadlane_ui_terminal::SelectionStatus;
     use threadlane_ui_state::updater::UpdaterEvent;
@@ -3047,6 +3071,24 @@ mod tests {
         // Ordinary text still gets the minimum three-backtick fence.
         let plain = format_terminal_excerpt(1, Path::new("/repo"), "line");
         assert_eq!(plain, "Terminal · Shell 1 · launched in /repo\n```\nline\n```");
+    }
+
+    #[test]
+    fn shell_cwd_label_marks_threadlane_worktrees() {
+        assert!(path_is_threadlane_worktree(Path::new(
+            "/repo/.threadlane/worktrees/agent-7"
+        )));
+        assert!(!path_is_threadlane_worktree(Path::new("/repo")));
+        assert!(!path_is_threadlane_worktree(Path::new(
+            "/repo/.threadlane/sessions"
+        )));
+
+        assert_eq!(
+            shell_cwd_label(Path::new("/repo/.threadlane/worktrees/agent-7")),
+            ".threadlane/worktrees/agent-7"
+        );
+        assert_eq!(shell_cwd_label(Path::new("/repo")), "repo");
+        assert_eq!(shell_cwd_label(Path::new("/")), "/");
     }
 
     #[tokio::test]
