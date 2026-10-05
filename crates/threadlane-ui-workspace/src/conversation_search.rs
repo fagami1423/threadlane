@@ -369,7 +369,6 @@ impl WorkspaceView {
     /// palette, with its own header (scope), footer (progress/coverage), and
     /// honest empty states.
     pub(super) fn render_conversation_search(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
         let search = self.conversation_search.as_ref();
         let (scanned, total, report, in_flight, query_hint) = match search {
             Some(search) => (
@@ -417,145 +416,66 @@ impl WorkspaceView {
                 .clone()
                 .unwrap_or_else(|| project_name.clone());
             let excerpt = hit.excerpt.clone();
-            results_group = results_group.item(
-                CommandItem::new()
-                    .label(title.clone())
-                    .icon(IconName::SquareTerminal)
-                    .child(move |_window, cx| {
-                        let colors = cx.theme().colors;
-                        v_flex()
-                            .gap_0p5()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .overflow_hidden()
-                                    .child(title.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(colors.muted_foreground)
-                                    .overflow_hidden()
-                                    .child(context.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(colors.muted_foreground)
-                                    .overflow_hidden()
-                                    .child(excerpt.clone()),
-                            )
-                    }),
-            );
+            results_group = results_group.item(threadlane_ui_kit::palette_conversation_item(
+                title, context, excerpt,
+            ));
         }
         if retry_row {
-            results_group = results_group.item(
-                CommandItem::new()
-                    .label("Retry search")
-                    .icon(IconName::Redo)
-                    .child(move |_window, cx| {
-                        let colors = cx.theme().colors;
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(colors.muted_foreground)
-                            .child("Retry search — rescan skipped sessions".to_string())
-                    }),
-            );
+            results_group = results_group.item(threadlane_ui_kit::palette_item(
+                "Retry search",
+                "Rescan skipped sessions",
+                IconName::Redo,
+            ));
         }
 
-        let footer_text = search_footer_text(scanned, total, report.as_ref(), in_flight, query_hint);
-        let scope_text = format!("Conversations in {project_name} · saved user and assistant messages");
+        let footer_text =
+            search_footer_text(scanned, total, report.as_ref(), in_flight, query_hint);
+        let scope_text =
+            format!("Conversations in {project_name} · saved user and assistant messages");
         let view_query = cx.weak_entity();
         let view_cancel = cx.weak_entity();
         let view_confirm = cx.weak_entity();
 
-        div()
-            .id("command-palette-backdrop")
-            .absolute()
-            .inset_0()
-            .bg(threadlane_ui_theme::overlay_scrim())
-            .flex()
-            .items_start()
-            .justify_center()
-            .pt_20()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _event, window, cx| {
+        let view_backdrop = cx.weak_entity();
+        let command = threadlane_ui_kit::workspace_palette_command(&self.command_state)
+            .placeholder("Search messages in this project's conversations…")
+            .filterable(false)
+            .header(move |_, _, cx| threadlane_ui_kit::palette_scope(scope_text.clone(), cx))
+            .group(results_group)
+            .empty(move |_, _, cx| {
+                threadlane_ui_kit::palette_empty(search_empty_text(query_hint, in_flight), cx)
+            })
+            .footer(move |_, _, cx| threadlane_ui_kit::palette_footer(footer_text.clone(), cx))
+            .on_query(move |query, window, cx| {
+                let _ = view_query.update(cx, |this, cx| {
+                    this.schedule_conversation_search(query, window, cx);
+                });
+            })
+            .on_cancel(move |window, cx| {
+                let _ = view_cancel.update(cx, |this, cx| {
                     this.close_command_palette(window, cx);
                     cx.notify();
-                }),
-            )
-            .child(
-                div()
-                    .id("command-palette-modal")
-                    .w(rems(35.0))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.title_bar)
-                    .shadow_lg()
-                    .overflow_hidden()
-                    .on_mouse_down(MouseButton::Left, |_event, _window, cx| cx.stop_propagation())
-                    .child(
-                        Command::new(&self.command_state)
-                            .bordered(false)
-                            .placeholder("Search messages in this project's conversations…")
-                            .max_h(rems(26.25))
-                            .filterable(false)
-                            .header(move |_state, _window, cx| {
-                                let colors = cx.theme().colors;
-                                div()
-                                    .px_3()
-                                    .pt_2()
-                                    .pb_1()
-                                    .text_xs()
-                                    .text_color(colors.muted_foreground)
-                                    .child(scope_text.clone())
-                            })
-                            .group(results_group)
-                            .empty(move |_state, _window, cx| {
-                                let colors = cx.theme().colors;
-                                div()
-                                    .px_3()
-                                    .py_4()
-                                    .text_sm()
-                                    .text_color(colors.muted_foreground)
-                                    .child(search_empty_text(query_hint, in_flight))
-                            })
-                            .footer(move |_state, _window, cx| {
-                                let colors = cx.theme().colors;
-                                div()
-                                    .px_3()
-                                    .py_2()
-                                    .border_t_1()
-                                    .border_color(colors.border)
-                                    .text_xs()
-                                    .text_color(colors.muted_foreground)
-                                    .child(footer_text.clone())
-                            })
-                            .on_query(move |query, window, cx| {
-                                let _ = view_query.update(cx, |this, cx| {
-                                    this.schedule_conversation_search(query, window, cx);
-                                });
-                            })
-                            .on_cancel(move |window, cx| {
-                                let _ = view_cancel.update(cx, |this, cx| {
-                                    this.close_command_palette(window, cx);
-                                    cx.notify();
-                                });
-                            })
-                            .on_confirm(move |index, window, cx| {
-                                let _ = view_confirm.update(cx, |this, cx| {
-                                    this.confirm_conversation_search(index.row, window, cx);
-                                });
-                            }),
-                    ),
-            )
-            .into_any_element()
+                });
+            })
+            .on_confirm(move |index, window, cx| {
+                let _ = view_confirm.update(cx, |this, cx| {
+                    this.confirm_conversation_search(index.row, window, cx);
+                });
+            });
+        threadlane_ui_kit::workspace_palette_frame(
+            command,
+            move |window, cx| {
+                let _ = view_backdrop.update(cx, |this, cx| {
+                    this.close_command_palette(window, cx);
+                    cx.notify();
+                });
+            },
+            cx,
+        )
+        .into_any_element()
     }
+
+
 }
 
 fn search_empty_text(query_hint: bool, in_flight: bool) -> &'static str {

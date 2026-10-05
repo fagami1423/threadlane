@@ -8,7 +8,9 @@ description = "Shared GPUI visual language for Threadlane: theme registry wiring
 gpui.workspace = true
 gpui-component.workspace = true
 gpui-kit-assets.workspace = true
-threadlane-project.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+threadlane-project.workspace = true

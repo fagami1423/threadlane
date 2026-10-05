@@ -1,0 +1,24 @@
+[package]
+name = "threadlane-ui-kit"
+version = "0.1.0"
+edition = "2021"
+autoexamples = false
+description = "Threadlane's native agent UI toolkit: conversation, composer, tools, decisions and navigation"
+
+[dependencies]
+vt100.workspace = true
+threadlane-automation.workspace = true
+gpui.workspace = true
+gpui-kit.workspace = true
+gpui-component.workspace = true
+gpui-kit-assets.workspace = true
+threadlane-protocol.workspace = true
+threadlane-ui-theme.workspace = true
+serde_json.workspace = true
+
+# The standalone native gallery needs the same grammars as the desktop host.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+gpui-component = { workspace = true, features = ["tree-sitter-rust", "tree-sitter-python", "tree-sitter-javascript", "tree-sitter-typescript", "tree-sitter-html", "tree-sitter-css", "tree-sitter-bash", "tree-sitter-toml", "tree-sitter-yaml", "tree-sitter-markdown", "tree-sitter-diff"] }
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

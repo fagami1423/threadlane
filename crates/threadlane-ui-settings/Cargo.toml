@@ -19,6 +19,7 @@ threadlane-runtime.workspace = true
 threadlane-daemon.workspace = true
 threadlane-ui-state.workspace = true
 threadlane-ui-theme.workspace = true
+threadlane-ui-kit.workspace = true
 threadlane-updater.workspace = true
 threadlane-wasi.workspace = true
 tokio = { workspace = true, features = ["full"] }

@@ -21,6 +21,7 @@ threadlane-ui-sidebar.workspace = true
 threadlane-ui-state.workspace = true
 threadlane-ui-terminal.workspace = true
 threadlane-ui-theme.workspace = true
+threadlane-ui-kit.workspace = true
 threadlane-protocol.workspace = true
 threadlane-updater.workspace = true
 tokio = { workspace = true, features = ["full"] }

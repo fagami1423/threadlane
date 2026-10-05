@@ -196,21 +196,7 @@ pub(crate) fn cue_row(
 
 /// Index of the next/previous match with wraparound. A settled query with no
 /// selection starts at the newest (last) matching line.
-pub(crate) fn next_find_match(
-    selected: Option<usize>,
-    count: usize,
-    previous: bool,
-) -> Option<usize> {
-    if count == 0 {
-        return None;
-    }
-    Some(match (selected, previous) {
-        (Some(index), true) => (index + count - 1) % count,
-        (Some(index), false) => (index + 1) % count,
-        (None, true) => 0,
-        (None, false) => count - 1,
-    })
-}
+pub(crate) use threadlane_ui_kit::next_terminal_find_match as next_find_match;
 
 #[cfg(test)]
 mod tests {

@@ -1,1 +1,1 @@
-pub use threadlane_ui_session::markdown::*;
+pub use threadlane_ui_kit::markdown::*;

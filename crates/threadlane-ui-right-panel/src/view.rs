@@ -4,24 +4,21 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
-use gpui_component::dialog::DialogButtonProps;
-use gpui_component::checkbox::Checkbox;
-use gpui_component::input::{Editor, EditorState, Input, InputEvent, InputState, TabSize};
-use gpui_component::list::ListItem;
-use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
+use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::input::{EditorState, InputEvent, InputState, TabSize};
+use gpui_component::menu::ContextMenuExt;
 use gpui_component::notification::Notification;
-use gpui_component::radio::{Radio, RadioGroup};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::separator::Separator;
 use gpui_component::spinner::Spinner;
-use gpui_component::tab::{Tab, TabBar};
-use gpui_component::tag::{Tag, TagVariant};
 use gpui_component::text::{TextView, TextViewState};
-use gpui_component::tree::{Tree, TreeEvent, TreeItem, TreeState};
+use gpui_component::tree::{TreeEvent, TreeItem, TreeState};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, WindowExt};
-use threadlane_git::{can_create_pull_request, GitBranchInfo, GitCommitInfo, GitFile, GitStatus};
+use threadlane_git::{can_create_pull_request, GitCommitInfo, GitFile, GitStatus};
+
+#[cfg(test)]
+use threadlane_git::GitBranchInfo;
 
 use threadlane_project::watcher::WorkspaceWatcher;
 use threadlane_ui_state::AppState;
@@ -29,13 +26,15 @@ use threadlane_ui_state::next_event_batch;
 
 use super::agents::AgentsPanel;
 use super::browser::BrowserView;
-use super::draft_pr::{DraftPrContextKey, DraftPrDialogView, draft_pr_prefill};
+use super::draft_pr::{DraftPrContextKey, DraftPrDialogView};
+use super::types::discard_git_action;
+
 pub use super::types::{
-    can_publish_branch, detect_language, discard_options, message_generated_matches_active_project,
-    normalize_generated_commit_message, selection_bar_discard_options, DiscardOption, FileNode,
+    can_publish_branch, detect_language, message_generated_matches_active_project,
+    normalize_generated_commit_message, DiscardOption, FileNode,
     GitAction, PanelEvent, ReviewTab, ReviewViewMode, Surface,
 };
-use super::types::{ReviewDiffRequest, ReviewDiffState, ReviewDiffTarget};
+use super::types::{available_surfaces, ReviewDiffRequest, ReviewDiffState, ReviewDiffTarget};
 
 pub struct RightPanelView {
     pub(crate) model: Entity<AppState>,
@@ -129,17 +128,17 @@ impl RightPanelView {
         let commit_message_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Summary (required)"));
         let branch_filter_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Filter branches…"));
+            cx.new(|cx| InputState::new(window, cx).placeholder(threadlane_ui_kit::REVIEW_BRANCH_FILTER_PLACEHOLDER));
         let new_branch_name_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("e.g. feature/new-workflow"));
+            cx.new(|cx| InputState::new(window, cx).placeholder(threadlane_ui_kit::REVIEW_BRANCH_NAME_PLACEHOLDER));
         let merge_filter_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Filter branches to merge…"));
+            cx.new(|cx| InputState::new(window, cx).placeholder(threadlane_ui_kit::REVIEW_MERGE_FILTER_PLACEHOLDER));
         let history_filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter commits…"));
         let review_filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter changes…"));
         let stash_message_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Stash message (optional)"));
+            cx.new(|cx| InputState::new(window, cx).placeholder(threadlane_ui_kit::REVIEW_STASH_MESSAGE_PLACEHOLDER));
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
 
         cx.spawn(async move |this, cx| {
@@ -632,7 +631,7 @@ impl RightPanelView {
         let Some(status) = self.git_status.as_ref() else {
             return;
         };
-        let fields = draft_pr_prefill(status);
+        let fields = threadlane_ui_kit::review_draft_pr_prefill(status);
         let panel = cx.entity().downgrade();
         let dialog_state =
             cx.new(|dialog_cx| DraftPrDialogView::new(panel, key, fields, window, dialog_cx));
@@ -640,10 +639,8 @@ impl RightPanelView {
         window.open_dialog(cx, move |dialog, _window, _cx| {
             let submit_state = content.clone();
             let cancel_state = content.clone();
-            dialog
-                .title("Create draft pull request")
+            threadlane_ui_kit::review_draft_pr_dialog(dialog)
                 .child(content.clone())
-                .close_button(false)
                 .on_ok(move |_, window, cx| {
                     submit_state.update(cx, |state, cx| state.start_request(false, window, cx));
                     false
@@ -1457,8 +1454,10 @@ impl RightPanelView {
     }
 
     /// Native browser views must be hidden explicitly when the panel leaves the layout.
+    /// The workspace retains its panel-open preference on other pages.
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
-        self.visible = visible;
+        self.visible = visible
+            && self.model.read(cx).workspace_page == threadlane_ui_state::WorkspacePage::Chat;
         self.sync_browser_visibility(cx);
     }
 
@@ -1618,7 +1617,6 @@ impl RightPanelView {
     }
 
     fn render_workspace_context(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
         // `self.project` is the session's git checkout: for worktree sessions
         // that is a `session_<id>` directory, which is meaningless to show.
         // Name the attached project and flag the worktree instead.
@@ -1665,262 +1663,50 @@ impl RightPanelView {
             .document_title
             .clone()
             .unwrap_or_else(|| "No active file".to_owned());
-        div()
-            .flex_none()
-            .px_3()
-            .py_1p5()
-            .bg(theme.list_head)
-            .text_xs()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(div().font_weight(FontWeight::MEDIUM).child(repository))
-                    .children(is_worktree_session.then(|| {
-                        Tag::secondary().child("worktree").xsmall()
-                    }))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(theme.muted_foreground)
-                            .child(format!("· {branch}")),
-                    )
-                    // Synara EnvironmentPanel "Changes" row pattern: expose an
-                    // explicit labeled Review entry when reliable change data
-                    // exists. Scope is workspace changes, not per-turn diffs.
-                    .when(has_changes, |this| {
-                        this.child(
-                            Button::new("open-review-from-context")
-                                .label(git_state.clone())
-                                .ghost()
-                                .xsmall()
-                                .accessibility_label(format!("Open Review, {}", git_state))
-                                .tooltip("Open Review (workspace changes)")
-                                .on_click(cx.listener(|this, _event, _window, cx| {
-                                    this.open_surface(Surface::Review, cx);
-                                })),
-                        )
-                    })
-                    .when(!has_changes, |this| {
-                        this.child(
-                            div()
-                                .text_color(theme.muted_foreground)
-                                .child(git_state.clone()),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .mt_0p5()
-                    .text_color(theme.muted_foreground)
-                    .truncate()
-                    .child(format!(
-                        "{} · {}",
-                        if self.worktree_unavailable {
-                            "worktree unavailable"
-                        } else {
-                            "active worktree"
-                        },
-                        file_context
-                    )),
-            )
+        threadlane_ui_kit::review_workspace_context(
+            &threadlane_ui_kit::ReviewWorkspaceContext { repository, branch, git_state, worktree: is_worktree_session,
+                unavailable: self.worktree_unavailable, file: file_context, has_changes },
+            cx.listener(|this, _, _, cx| this.open_surface(Surface::Review, cx)), cx)
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        let surfaces = Surface::all();
-        let selected_surface = self
-            .active_surface
-            .and_then(|active| surfaces.iter().position(|surface| *surface == active));
-        let selected_index = selected_surface.unwrap_or(0);
-        div()
-            .flex_none()
-            // Keep the top 3rem clear for the workspace's floating overlay
-            // buttons. Surface controls occupy a separate small row below it.
-            .flex()
-            .flex_col()
-            .border_b_1()
-            .border_color(theme.title_bar_border)
-            .bg(theme.title_bar)
-            .child(div().h(rems(3.0)).flex_none())
-            .child(
-                div()
-                    .flex_none()
-                    .min_h(rems(2.0))
-                    .flex()
-                    .items_center()
-                    .px_3()
-                    .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .w_full()
-                        .child(
-                            TabBar::new("right-panel-surface-tabs")
-                                .flex_1()
-                                .min_w_0()
-                                .segmented()
-                                .small()
-                                .selected_index(selected_index)
-                                .children(surfaces.iter().map(|surface| {
-                                    Tab::new()
-                                        .icon(surface.icon())
-                                        .debug_selector({
-                                            let label = surface.label();
-                                            move || format!("right-panel-tab-{label}")
-                                        })
-                                        .aria_label(format!("{} panel", surface.label()))
-                                        .tooltip({
-                                            let label = surface.label();
-                                            move |window, cx| Tooltip::new(label).build(window, cx)
-                                        })
-                                }))
-                                .on_click(cx.listener(move |this, ix, _window, cx| {
-                                    if let Some(surface) = Surface::all().get(*ix).copied() {
-                                        this.open_surface(surface, cx);
-                                    }
-                                })),
-                        )
-                        .children((!matches!(self.active_surface, Some(Surface::Agents | Surface::Trajectory))).then(|| {
-                            Button::new("right-panel-refresh")
-                                .accessibility_label("Refresh surface")
-                                .icon(Icon::default().path("icons/refresh-cw.svg"))
-                                .tooltip("Refresh surface")
-                                .ghost()
-                                .xsmall()
-                                .on_click(cx.listener(|this, _event, _window, cx| {
-                                    this.refresh_active_surface(cx);
-                                    cx.notify();
-                                }))
-                        })),
-                ),
-            )
+        let refresh = (!matches!(self.active_surface, Some(Surface::Agents | Surface::Trajectory))).then(|| {
+            threadlane_ui_kit::right_panel_refresh_button()
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.refresh_active_surface(cx);
+                    cx.notify();
+                }))
+        });
+        threadlane_ui_kit::right_panel_header(
+            self.active_surface,
+            &available_surfaces(),
+            refresh,
+            cx.listener(|this, surface: &Surface, _window, cx| this.open_surface(*surface, cx)),
+            cx,
+        )
     }
 
     fn render_chooser(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        div()
-            .min_w_0()
-            .flex_1()
-            .flex()
-            .items_center()
-            .justify_center()
-            .p_6()
-            .child(
-                div()
-                    .w_full()
-                    .max_w(rems(26.0))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Open a surface"),
-                    )
-                    .child(
-                        div()
-                            .mt_1()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child("Choose what to show in the right panel"),
-                    )
-                    .child(div().mt_4().w_full().flex().flex_col().gap_2().children(
-                        Surface::all().into_iter().map(|surface| {
-                            Button::new(SharedString::from(format!(
-                                "right-panel-card-{}",
-                                surface.label().to_lowercase()
-                            )))
-                            .accessibility_label(surface.label())
-                            .debug_selector({
-                                let label = surface.label();
-                                move || format!("right-panel-choice-{label}")
-                            })
-                            .icon(surface.icon())
-                            .label(surface.label())
-                            .outline()
-                            .w_full()
-                            .justify_start()
-                            .on_click(cx.listener(
-                                move |this, _event, _window, cx| {
-                                    this.open_surface(surface, cx);
-                                },
-                            ))
-                        }),
-                    )),
-            )
+        threadlane_ui_kit::right_panel_chooser(
+            &available_surfaces(),
+            cx.listener(|this, surface: &Surface, _window, cx| this.open_surface(*surface, cx)),
+            cx,
+        )
     }
 
     fn render_review_diff(&self, state: &ReviewDiffState, cx: &mut Context<Self>) -> AnyElement {
-        let body = div().flex_1().min_h_0().overflow_y_scrollbar().p_3();
-        match state {
-            ReviewDiffState::Loading => body
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(Spinner::new().small())
-                        .child("Updating diff…"),
-                )
-                .into_any_element(),
-            ReviewDiffState::Failed(error) => body
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_start()
-                        .gap_2()
-                        .child("Could not load diff")
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(error.clone()),
-                        )
-                        .child(
-                            Button::new("retry-review-diff")
-                                .debug_selector(|| "retry-review-diff".into())
-                                .small()
-                                .label("Retry")
-                                .on_click(cx.listener(|this, _event, _window, cx| {
-                                    this.reload_review_diff(cx)
-                                })),
-                        ),
-                )
-                .into_any_element(),
-            ReviewDiffState::Ready { empty: true } => body
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_start()
-                        .gap_2()
-                        .child(if self.review_diff_options.ignore_whitespace {
-                            "No text changes to show with whitespace ignored"
-                        } else {
-                            "No text changes to show"
-                        })
-                        .children(self.review_diff_options.ignore_whitespace.then(|| {
-                            Button::new("show-whitespace-changes")
-                                .debug_selector(|| "show-whitespace-changes".into())
-                                .small()
-                                .label("Show whitespace changes")
-                                .on_click(cx.listener(|this, _event, _window, cx| {
-                                    this.set_ignore_whitespace(false, cx)
-                                }))
-                        })),
-                )
-                .into_any_element(),
-            ReviewDiffState::Ready { empty: false } => body
-                .child(TextView::new(&self.document_state).selectable(true))
-                .into_any_element(),
-        }
+        use threadlane_ui_kit::{ReviewDiffAction, ReviewDiffContent};
+        let content = match state {
+            ReviewDiffState::Loading => ReviewDiffContent::Loading,
+            ReviewDiffState::Failed(error) => ReviewDiffContent::Failed(error),
+            ReviewDiffState::Ready { empty: true } => ReviewDiffContent::Empty,
+            ReviewDiffState::Ready { empty: false } => ReviewDiffContent::Ready(&self.document_state),
+        };
+        threadlane_ui_kit::review_diff_body(content, self.review_diff_options.ignore_whitespace,
+            cx.listener(|this, action: &ReviewDiffAction, _, cx| match action {
+                ReviewDiffAction::Retry => this.reload_review_diff(cx),
+                ReviewDiffAction::ShowWhitespace => this.set_ignore_whitespace(false, cx),
+            }), cx)
     }
 
     fn render_files(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1933,129 +1719,29 @@ impl RightPanelView {
                 .min_h_0()
                 .flex()
                 .flex_col()
-                .child(
-                    div()
-                        .h(rems(2.375))
-                        .px_2()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .min_w_0()
-                                .flex_1()
-                                .child(
-                                    Button::new("right-panel-document-back")
-                                        .debug_selector(|| "right-panel-document-back".into())
-                                        .accessibility_label(match self.active_surface {
-                                            Some(Surface::Review) => "Back to changed files",
-                                            _ => "Back to project files",
-                                        })
-                                        .icon(IconName::ArrowLeft)
-                                        .tooltip(match self.active_surface {
-                                            Some(Surface::Review) => "Back to changed files",
-                                            _ => "Back to project files",
-                                        })
-                                        .ghost()
-                                        .xsmall()
-                                        .on_click(cx.listener(|this, _event, _window, cx| {
-                                            this.close_document(cx);
-                                        })),
-                                )
-                                .child(IconName::File)
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_xs()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .child(title.clone()),
-                                )
-                                .children(
-                                    is_dirty.then(|| Tag::warning().child("modified").xsmall()),
-                                )
-                                .children(
-                                    has_editor
-                                        .then(|| Tag::secondary().child(lang).outline().xsmall()),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .children(has_editor.then(|| {
-                                    Button::new("save-document")
-                                        .small()
-                                        .label("Save")
-                                        .icon(IconName::Check)
-                                        .accessibility_label(if is_dirty {
-                                            "Save the open document"
-                                        } else {
-                                            "No unsaved changes"
-                                        })
-                                        .tooltip(if is_dirty {
-                                            "Save the open document"
-                                        } else {
-                                            "No unsaved changes"
-                                        })
-                                        .disabled(!is_dirty)
-                                        .on_click(cx.listener(|this, _event, _window, cx| {
-                                            this.save_active_document(cx);
-                                        }))
-                                }))
-                                .child(
-                                    Button::new("close-document")
-                                        .debug_selector(|| "close-document".into())
-                                        .accessibility_label("Close document")
-                                        .small()
-                                        .ghost()
-                                        .icon(IconName::Close)
-                                        .tooltip("Close document")
-                                        .on_click(cx.listener(|this, _event, _window, cx| {
-                                            this.close_document(cx);
-                                        })),
-                                ),
-                        ),
-                )
+                .child(threadlane_ui_kit::panel_document_header(
+                    title,
+                    is_dirty,
+                    has_editor.then_some(lang),
+                    self.active_surface == Some(Surface::Review),
+                    cx.listener(|this, action: &threadlane_ui_kit::PanelDocumentAction, _, cx| {
+                        use threadlane_ui_kit::PanelDocumentAction;
+                        match action {
+                            PanelDocumentAction::Save => this.save_active_document(cx),
+                            PanelDocumentAction::Back | PanelDocumentAction::Close => this.close_document(cx),
+                        }
+                    }),
+                ))
                 .children(self.review_diff_request.as_ref().map(|_| {
-                    div()
-                        .px_3()
-                        .py_2()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(
-                            Checkbox::new("review-ignore-whitespace")
-                                .debug_selector(|| "review-ignore-whitespace".into())
-                                .small()
-                                .label("Ignore whitespace")
-                                .checked(self.review_diff_options.ignore_whitespace)
-                                .accessibility_label("Ignore whitespace. Ignores whitespace when comparing lines. Whitespace can affect program behavior. File counts and commit selection are unchanged.")
-                                .tooltip("Ignores whitespace when comparing lines. Whitespace can affect program behavior. File counts and commit selection are unchanged.")
-                                .on_click(cx.listener(|this, checked, _window, cx| {
-                                    this.set_ignore_whitespace(*checked, cx);
-                                })),
-                        )
-                        .children(self.review_diff_options.ignore_whitespace.then(|| {
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("Whitespace ignored · Display only")
-                        }))
+                    threadlane_ui_kit::review_whitespace_control(
+                        self.review_diff_options.ignore_whitespace,
+                        cx.listener(|this, checked: &bool, _, cx| this.set_ignore_whitespace(*checked, cx)),
+                        cx,
+                    )
                 }))
                 .child(Separator::horizontal())
                 .child(if let Some(ref editor) = self.editor_state {
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .w_full()
-                        .h_full()
-                        .child(Editor::new(editor).bordered(false).size_full())
-                        .into_any_element()
+                    threadlane_ui_kit::editor_buffer(editor).into_any_element()
                 } else if let Some(state) = &self.review_diff_state {
                     self.render_review_diff(state, cx)
                 } else {
@@ -2071,131 +1757,44 @@ impl RightPanelView {
         }
         let model = self.model.clone();
 
-        div()
-            .flex_1()
-            .min_h_0()
-            .py_2()
-            .child(Button::new("find-in-files").label("Find in files…").ghost().small()
+        threadlane_ui_kit::project_files_surface()
+            .child(threadlane_ui_kit::project_files_find_button()
                 .on_click(cx.listener(|this, _, window, cx| {
                     super::file_search::open(this.model.clone(), window, cx);
                 })))
-            .child(
-                Tree::new(
-                    &self.tree_state,
-                    move |ix, entry, is_selected, _window, cx| {
-                        let relative_path = entry.item().id.to_string();
-                        let name = entry.item().label.to_string();
-                        let is_folder = entry.is_folder();
-                        let is_expanded = entry.is_expanded();
-                        let depth = entry.depth();
-
-                        let target_path = relative_path.clone();
-                        let click_model = model.clone();
-                        let theme = cx.theme().colors;
-
-                        ListItem::new(format!("tree-item-{ix}"))
-                            .mx_1()
-                            .rounded_md()
-                            .px_1p5()
-                            .py_1()
-                            .pl(rems(0.375 + depth as f32 * 0.75))
-                            .selected(is_selected)
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1p5()
-                                    .text_xs()
-                                    .text_color(if is_selected {
-                                        theme.foreground
-                                    } else {
-                                        theme.muted_foreground
-                                    })
-                                    .child(if is_folder {
-                                        div()
-                                            .w(rems(0.875))
-                                            .flex_none()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .child(if is_expanded {
-                                                Icon::new(IconName::ChevronDown)
-                                                    .xsmall()
-                                                    .into_any_element()
-                                            } else {
-                                                Icon::new(IconName::ChevronRight)
-                                                    .xsmall()
-                                                    .into_any_element()
-                                            })
-                                            .into_any_element()
-                                    } else {
-                                        div().w(rems(0.875)).flex_none().into_any_element()
-                                    })
-                                    .child(if is_folder {
-                                        Icon::new(IconName::Folder).xsmall().into_any_element()
-                                    } else {
-                                        Icon::new(IconName::File).xsmall().into_any_element()
-                                    })
-                                    .child(name),
-                            )
-                            .when(!is_folder, move |item| {
-                                item.on_click(move |_event, _window, cx| {
-                                    click_model.update(cx, |state, cx| {
-                                        state.request_open_file(target_path.clone());
-                                        cx.notify();
-                                    });
-                                })
-                            })
-                    },
-                )
-                .context_menu({
+            .child(threadlane_ui_kit::project_file_tree(
+                &self.tree_state,
+                move |path, _, cx| {
+                    model.update(cx, |state, cx| {
+                        state.request_open_file(path.to_owned());
+                        cx.notify();
+                    });
+                },
+                {
                     let model = self.model.clone();
                     let project = self.project.clone();
-                    move |_ix, entry, menu, _window, _cx| {
-                        let relative_path = entry.item().id.to_string();
-                        let is_folder = entry.is_folder();
-                        let absolute_path = project
-                            .as_ref()
-                            .map(|p| p.join(&relative_path).display().to_string());
-                        let ed_path = relative_path.clone();
-                        let text = relative_path.clone();
-                        let model_ref = model.clone();
-
-                        let mut menu = menu;
-                        if !is_folder {
-                            menu = menu.item(PopupMenuItem::new("Open in Editor Tab").on_click(
-                                move |_event, _window, cx| {
-                                    model_ref.update(cx, |state, cx| {
-                                        state.request_open_file(ed_path.clone());
-                                        cx.notify();
-                                    });
-                                },
-                            ));
-                        }
-                        menu = menu.item(PopupMenuItem::new("Copy Relative Path").on_click(
-                            move |_event, window, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                                window.push_notification(
-                                    Notification::info("Copied relative path"),
-                                    cx,
-                                );
-                            },
-                        ));
-                        if let Some(abs) = absolute_path {
-                            menu = menu.item(PopupMenuItem::new("Copy Absolute Path").on_click(
-                                move |_event, window, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(abs.clone()));
-                                    window.push_notification(
-                                        Notification::info("Copied absolute path"),
-                                        cx,
-                                    );
-                                },
-                            ));
-                        }
-                        menu
+                    move |path, folder, menu, _, _| {
+                        let absolute = project.as_ref().map(|project| project.join(path).display().to_string());
+                        let model = model.clone();
+                        threadlane_ui_kit::project_file_menu(menu, path, folder, absolute, move |action, window, cx| {
+                            use threadlane_ui_kit::ProjectFileAction;
+                            match action {
+                                ProjectFileAction::Open(path) => model.update(cx, |state, cx| {
+                                    state.request_open_file(path.clone());
+                                    cx.notify();
+                                }),
+                                ProjectFileAction::CopyRelative(path) | ProjectFileAction::CopyAbsolute(path) => {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                                    window.push_notification(Notification::info(match action {
+                                        ProjectFileAction::CopyRelative(_) => "Copied relative path",
+                                        _ => "Copied absolute path",
+                                    }), cx);
+                                }
+                            }
+                        })
                     }
-                }),
-            )
+                },
+            ))
             .into_any_element()
     }
 
@@ -2210,7 +1809,7 @@ impl RightPanelView {
                 "Discard changes?".into(),
                 "Are you sure you want to discard these changes? This cannot be undone.".into(),
             ));
-            let action = opt.git_action();
+            let action = discard_git_action(&opt);
             cx.spawn(async move |cx| {
                 let confirmed = rfd::AsyncMessageDialog::new()
                     .set_title(&title)
@@ -2226,7 +1825,7 @@ impl RightPanelView {
             })
             .detach();
         } else {
-            let action = opt.git_action();
+            let action = discard_git_action(&opt);
             panel.update(cx, |this, cx| {
                 this.run_git_action(action, window, cx);
             });
@@ -2252,11 +1851,7 @@ impl RightPanelView {
     }
 
     pub(crate) fn diff_addition_percent(additions: u32, deletions: u32) -> f32 {
-        match (additions, deletions) {
-            (0, _) => 0.0,
-            (_, 0) => 100.0,
-            _ => (additions as f32 / (additions + deletions) as f32 * 100.0).clamp(5.0, 95.0),
-        }
+        threadlane_ui_kit::review_diff_addition_percent(additions, deletions)
     }
 
     fn render_file_item(
@@ -2265,355 +1860,82 @@ impl RightPanelView {
         is_tree_node: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = cx.theme().colors;
         let panel_entity = cx.entity().clone();
-
         let path = file.path.clone();
-        let (directory, filename) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
-        let filename = filename.to_owned();
-        let directory = directory.to_owned();
         let path_for_chk = path.clone();
         let is_selected = self.selected_files.contains(&path);
-        let absolute_path = self
-            .project
-            .as_ref()
-            .map(|root| root.join(&path).display().to_string());
-        let status = file.status_char().to_string();
-        let is_staged = file.staged;
-        let context_path = path.clone();
-        let is_open = self
-            .document_title
-            .as_deref()
-            .is_some_and(|title| title == format!("Review · {path}").as_str());
-
-        let (status_color, status_bg) = match file.status_char() {
-            'A' | '?' => (theme.success, theme.success.opacity(0.15)),
-            'D' => (theme.danger, theme.danger.opacity(0.15)),
-            'R' => (theme.link, theme.link.opacity(0.15)),
-            _ => (theme.warning, theme.warning.opacity(0.15)),
-        };
-
-        let row_id = SharedString::from(format!("review-file-{path}"));
-        let row = div()
-            .id(row_id)
-            .debug_selector(|| "review-file-row".into())
-            .w_full()
-            .min_w_0()
-            .h_8()
-            .min_h_8()
-            .max_h_8()
-            .flex_shrink_0()
-            .overflow_hidden()
-            .px_2()
-            .rounded_md()
-            .flex()
-            .items_center()
-            .gap_2()
-            .bg(if is_selected {
-                theme.list_active
-            } else {
-                gpui::transparent_black()
-            })
-            .hover(|row| {
-                row.bg(if is_selected {
-                    theme.list_active_border.opacity(0.35)
-                } else {
-                    theme.list_hover
-                })
-            })
-            .focus(|row| row.border_color(theme.ring))
-            .child(
-                Checkbox::new(SharedString::from(format!("chk-{path}")))
-                    .accessibility_label(format!("Select {path} for Git actions"))
-                    .checked(is_selected)
-                    .small()
-                    .on_click(cx.listener(move |this, checked, _window, cx| {
-                        if *checked {
-                            this.selected_files.insert(path_for_chk.clone());
-                        } else {
-                            this.selected_files.remove(&path_for_chk);
-                        }
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Button::new(SharedString::from(format!("review-file-btn-{path}")))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .debug_selector(|| "review-filename".into())
-                                    .min_w(px(40.0))
-                                    .max_w_full()
-                                    .truncate()
-                                    .child(filename),
-                            )
-                            .when(!directory.is_empty() && !is_tree_node, |row| {
-                                row.child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .truncate()
-                                        .text_ellipsis_start()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child(directory),
-                                )
-                            }),
-                    )
-                    .accessibility_label(format!(
-                        "Review {path}, status {status}, {} additions, {} deletions",
-                        file.additions, file.deletions
-                    ))
-                    .tooltip(format!(
-                        "Review {path} · {status} · +{} −{}{}",
-                        file.additions,
-                        file.deletions,
-                        absolute_path
-                            .as_deref()
-                            .map(|abs| format!("\n{abs}"))
-                            .unwrap_or_default()
-                    ))
-                    .ghost()
-                    .small()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .justify_start()
-                    .selected(is_open)
-                    .on_click(cx.listener({
-                        let path = path.clone();
-                        move |this, _, _, cx| {
-                            this.open_file_diff(path.clone(), cx);
-                        }
-                    })),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "review-file-status".into())
-                    .flex_none()
-                    .px_1p5()
-                    .py_0p5()
-                    .rounded_sm()
-                    .bg(status_bg)
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(status_color)
-                    .child(status),
-            )
-            .children((file.additions > 0 || file.deletions > 0).then(|| {
-                div()
-                    .debug_selector(|| "review-file-stats".into())
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .text_xs()
-                    .children((file.additions > 0).then(|| {
-                        div()
-                            .text_color(theme.success)
-                            .child(format!("+{}", file.additions))
-                    }))
-                    .children((file.deletions > 0).then(|| {
-                        div()
-                            .text_color(theme.danger)
-                            .child(format!("\u{2212}{}", file.deletions))
-                    }))
-            }))
+        let absolute_path = self.project.as_ref().map(|root| root.join(&path).display().to_string());
+        let is_open = self.document_title.as_deref().is_some_and(|title| title == format!("Review · {path}").as_str());
+        let row = threadlane_ui_kit::review_file_row(
+            file,
+            threadlane_ui_kit::ReviewFileAppearance {
+                selected: is_selected, open: is_open, tree_node: is_tree_node, absolute_path: absolute_path.as_deref(),
+            },
+            cx.listener(move |this, checked: &bool, _, cx| {
+                if *checked { this.selected_files.insert(path_for_chk.clone()); }
+                else { this.selected_files.remove(&path_for_chk); }
+                cx.notify();
+            }),
+            cx.listener({ let path = path.clone(); move |this, _, _, cx| this.open_file_diff(path.clone(), cx) }),
+            cx,
+        )
             .context_menu({
-                let path = context_path.clone();
-                let absolute_path = absolute_path.clone();
-                let project = self.project.clone();
-                let model = self.model.clone();
-                let panel = panel_entity.clone();
-                let ext = std::path::Path::new(&path)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.to_string());
-                move |menu, _window, _cx| {
-                    let diff_path = path.clone();
-                    let discard_path = path.clone();
-                    let ignore_path = path.clone();
-                    let rel_path_1 = path.clone();
-                    let project_ref = project.clone();
-                    let model_ref = model.clone();
-                    let panel_ignore = panel.clone();
-                    let panel_ignore_ext = panel.clone();
-                    let panel_stage = panel.clone();
-
-                    let mut menu = menu;
-                    if is_staged {
-                        let unstage_p = path.clone();
-                        menu = menu.item(PopupMenuItem::new("Unstage File").on_click(
-                            move |_event, window, cx| {
-                                panel_stage.update(cx, |this, cx| {
-                                    this.run_git_action(
-                                        GitAction::UnstageFile(unstage_p.clone()),
-                                        window,
-                                        cx,
-                                    );
-                                });
-                            },
-                        ));
-                    } else {
-                        let stage_p = path.clone();
-                        menu = menu.item(PopupMenuItem::new("Stage File").on_click(
-                            move |_event, window, cx| {
-                                panel_stage.update(cx, |this, cx| {
-                                    this.run_git_action(
-                                        GitAction::StageFile(stage_p.clone()),
-                                        window,
-                                        cx,
-                                    );
-                                });
-                            },
-                        ));
-                    }
-
-                    let (selected_paths, total_files) = {
-                        let panel_ref = panel.read(_cx);
-                        let selected_paths: Vec<String> =
-                            panel_ref.selected_files.iter().cloned().collect();
-                        (selected_paths, panel_ref.review_files.len())
-                    };
-                    for opt in discard_options(&discard_path, &selected_paths, total_files) {
-                        let panel_action = panel.clone();
-                        let label = opt.label();
-                        let opt_action = opt.clone();
-                        menu = menu.item(PopupMenuItem::new(label).on_click(
-                            move |_event, window, cx| {
-                                Self::handle_discard_option(
-                                    panel_action.clone(),
-                                    opt_action.clone(),
-                                    window,
-                                    cx,
-                                );
-                            },
-                        ));
-                    }
-
-                    menu = menu.separator().item(
-                        PopupMenuItem::new("Ignore File (.gitignore)").on_click(
-                            move |_event, window, cx| {
-                                panel_ignore.update(cx, |this, cx| {
-                                    this.run_git_action(
-                                        GitAction::IgnoreFile(ignore_path.clone()),
-                                        window,
-                                        cx,
-                                    );
-                                });
-                            },
-                        ),
-                    );
-
-                    if let Some(ref ext) = ext {
-                        let ext_label = format!("Ignore all *.{ext} files");
-                        let ext_to_ignore = ext.clone();
-                        menu = menu.item(PopupMenuItem::new(ext_label).on_click(
-                            move |_event, window, cx| {
-                                panel_ignore_ext.update(cx, |this, cx| {
-                                    this.run_git_action(
-                                        GitAction::IgnoreExtension(ext_to_ignore.clone()),
-                                        window,
-                                        cx,
-                                    );
-                                });
-                            },
-                        ));
-                    }
-
-                    menu = menu.separator().item(
-                        PopupMenuItem::new("Open Diff in Editor Tab").on_click(
-                            move |_event, _window, cx| {
-                                let Some(proj) = project_ref.clone() else {
-                                    return;
-                                };
-                                let diff_project = proj.clone();
-                                let target = diff_path.clone();
-                                let m = model_ref.clone();
-                                let client = m.read(cx).daemon_client.clone();
-                                cx.spawn(async move |cx| {
-                                    let diff_target = target.clone();
-                                    let content = cx
-                                        .background_executor()
-                                        .spawn(async move {
-                                            threadlane_ui_state::project_io::diff_file(
-                                                &client,
-                                                &diff_project,
-                                                diff_target,
-                                                threadlane_git::DiffOptions::default(),
-                                            )
-                                            .await
-                                            .unwrap_or_else(|error| error)
-                                        })
-                                        .await;
-                                    let _ = m.update(cx, |state, cx| {
-                                        state.request_open_diff(proj, target, content);
-                                        cx.notify();
-                                    });
-                                })
-                                .detach();
-                            },
-                        ),
-                    );
-
-                    menu = menu
-                        .separator()
-                        .item(PopupMenuItem::new("Copy File Path").on_click(
-                            move |_event, window, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                    rel_path_1.clone(),
-                                ));
-                                window
-                                    .push_notification(Notification::info("Copied file path"), cx);
-                            },
-                        ));
-
-                    if let Some(ref abs_path) = absolute_path {
-                        let abs_text = abs_path.clone();
-                        let reveal_text = abs_path.clone();
-                        #[cfg(target_os = "macos")]
-                        let reveal_label = "Reveal in Finder";
-                        #[cfg(target_os = "windows")]
-                        let reveal_label = "Reveal in File Explorer";
-                        #[cfg(all(unix, not(target_os = "macos")))]
-                        let reveal_label = "Reveal in File Manager";
-
-                        menu = menu
-                            .item(PopupMenuItem::new("Copy Absolute File Path").on_click(
-                                move |_event, window, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        abs_text.clone(),
-                                    ));
-                                    window.push_notification(
-                                        Notification::info("Copied absolute file path"),
-                                        cx,
-                                    );
-                                },
-                            ))
-                            .separator()
-                            .item(PopupMenuItem::new(reveal_label).on_click(
-                                move |_event, _window, _cx| {
-                                    threadlane_git::reveal_in_file_manager(std::path::Path::new(
-                                        &reveal_text,
-                                    ));
-                                },
-                            ));
-                    }
-                    menu
+                let file = file.clone();
+                move |menu, window, cx| {
+                    let host = panel_entity.read(cx);
+                    let selected: Vec<_> = host.selected_files.iter().cloned().collect();
+                    let panel = panel_entity.clone();
+                    let project = host.project.clone();
+                    threadlane_ui_kit::review_file_menu(menu, &threadlane_ui_kit::ReviewFileMenu {
+                        file: &file, selected_paths: &selected, total_files: host.review_files.len(),
+                        absolute_path: absolute_path.as_deref(), reveal_label: threadlane_ui_kit::review_file_manager_label(), busy: host.git_busy,
+                    }, move |action, window, cx| {
+                        Self::handle_review_file_action(panel.clone(), project.clone(), action, window, cx);
+                    }, window, cx)
                 }
             });
-        div()
-            .w_full()
-            .min_w_0()
-            .px_2()
-            .child(row)
-            .into_any_element()
+        threadlane_ui_kit::review_file_inset(row).into_any_element()
+    }
+
+    fn handle_review_file_action(panel: Entity<Self>, project: Option<PathBuf>, action: &threadlane_ui_kit::ReviewFileAction, window: &mut Window, cx: &mut App) {
+        use threadlane_ui_kit::ReviewFileAction;
+        if panel.read(cx).project != project {
+            window.push_notification(Notification::info("The review checkout changed. Open the file menu again."), cx);
+            return;
+        }
+        let git_action = match action {
+            ReviewFileAction::Stage(path) => Some(GitAction::StageFile(path.clone())),
+            ReviewFileAction::Unstage(path) => Some(GitAction::UnstageFile(path.clone())),
+            ReviewFileAction::IgnoreFile(path) => Some(GitAction::IgnoreFile(path.clone())),
+            ReviewFileAction::IgnoreExtension(ext) => Some(GitAction::IgnoreExtension(ext.clone())),
+            _ => None,
+        };
+        if let Some(action) = git_action { panel.update(cx, |host, cx| host.run_git_action(action, window, cx)); return; }
+        match action {
+            ReviewFileAction::Discard(target) => Self::handle_discard_option(panel, target.clone(), window, cx),
+            ReviewFileAction::OpenDiff(target) => {
+                let host = panel.read(cx);
+                let Some(project) = host.project.clone() else { return; };
+                let model = host.model.clone();
+                let client = model.read(cx).daemon_client.clone();
+                let target = target.clone();
+                cx.spawn(async move |cx| {
+                    let diff_project = project.clone();
+                    let diff_target = target.clone();
+                    let content = cx.background_executor().spawn(async move {
+                        threadlane_ui_state::project_io::diff_file(&client, &diff_project, diff_target, threadlane_git::DiffOptions::default()).await.unwrap_or_else(|error| error)
+                    }).await;
+                    let _ = model.update(cx, |state, cx| { state.request_open_diff(project, target, content); cx.notify(); });
+                }).detach();
+            }
+            ReviewFileAction::CopyRelative(path) | ReviewFileAction::CopyAbsolute(path) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                window.push_notification(Notification::info(if matches!(action, ReviewFileAction::CopyAbsolute(_)) {
+                    "Copied absolute file path" } else { "Copied file path" }), cx);
+            }
+            ReviewFileAction::Reveal(path) => threadlane_git::reveal_in_file_manager(std::path::Path::new(path)),
+            _ => {}
+        }
     }
 
     fn render_review_file_row(
@@ -2629,6 +1951,28 @@ impl RightPanelView {
         self.render_file_item(&file, false, cx)
     }
 
+    fn handle_review_ui_action(&mut self, action: threadlane_ui_kit::ReviewAction, window: &mut Window, cx: &mut Context<Self>) {
+        use threadlane_ui_kit::ReviewAction;
+        match action {
+            ReviewAction::ClearFilter => self.review_filter_input.update(cx, |input, cx| input.set_value("", window, cx)),
+            ReviewAction::SelectList => self.review_view_mode = ReviewViewMode::List,
+            ReviewAction::SelectTree => self.review_view_mode = ReviewViewMode::Tree,
+            ReviewAction::SelectAll(selected) => {
+                if selected { self.selected_files = self.review_files.iter().map(|file| file.path.clone()).collect(); }
+                else { self.selected_files.clear(); }
+            }
+            ReviewAction::OpenCombinedDiff => self.open_combined_diff(cx),
+            ReviewAction::StageAll => self.run_git_action(GitAction::StageAll, window, cx),
+            ReviewAction::UnstageAll => self.run_git_action(GitAction::UnstageAll, window, cx),
+            ReviewAction::ClearCommit => self.commit_message_input.update(cx, |input, cx| input.set_value("", window, cx)),
+            ReviewAction::GenerateCommit => self.generate_commit_message(cx),
+            ReviewAction::Commit => self.run_git_action(GitAction::Commit, window, cx),
+            ReviewAction::CommitAndPush => self.run_git_action(GitAction::CommitAndPush, window, cx),
+            ReviewAction::Push => self.run_git_action(GitAction::Push, window, cx),
+        }
+        cx.notify();
+    }
+
     fn render_review(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let filtered_count = self.filtered_review_files(cx).len();
         if self.review_files_list_state.item_count() != filtered_count {
@@ -2636,13 +1980,11 @@ impl RightPanelView {
                 .reset_with_uniform_height(filtered_count, window.rem_size() * 2.0);
         }
         let panel_entity = cx.entity().clone();
-        let theme = cx.theme().colors;
         if let Some(error) = self.review_error.clone() {
             return self.render_review_error(&error, cx);
         }
         let total_files = self.review_files.len();
         let selected_count = self.selected_files.len();
-        let all_selected = total_files > 0 && selected_count == total_files;
 
         let selected_additions: u32 = self
             .review_files
@@ -2690,417 +2032,35 @@ impl RightPanelView {
         let can_create_pr =
             can_create_pull_request(self.project.is_some() && !self.worktree_unavailable, status);
 
-        let sync_button = if can_publish {
-            Button::new("git-sync-action-btn")
-                .icon(IconName::ArrowUp)
-                .label("Publish branch")
-                .accessibility_label("Publish this branch to origin")
-                .small()
-                .tooltip("Publish this branch to origin")
-                .on_click(cx.listener(|this, _event, window, cx| {
-                    this.run_git_action(GitAction::Push, window, cx);
-                }))
-        } else if behind > 0 {
-            Button::new("git-sync-action-btn")
-                .icon(IconName::ArrowDown)
-                .label(format!("Pull ({behind})"))
-                .accessibility_label("Pull latest changes from origin")
-                .small()
-                .tooltip("Pull latest changes from origin")
-                .on_click(cx.listener(|this, _event, window, cx| {
-                    this.run_git_action(GitAction::Pull, window, cx);
-                }))
-        } else if ahead > 0 {
-            Button::new("git-sync-action-btn")
-                .icon(IconName::ArrowUp)
-                .label(format!("Push ({ahead})"))
-                .accessibility_label("Push local commits to origin")
-                .small()
-                .tooltip("Push local commits to origin")
-                .on_click(cx.listener(|this, _event, window, cx| {
-                    this.run_git_action(GitAction::Push, window, cx);
-                }))
-        } else {
-            Button::new("git-sync-action-btn")
-                .icon(Icon::default().path("icons/download.svg"))
-                .label("Fetch")
-                .accessibility_label(&last_fetched_str)
-                .ghost()
-                .small()
-                .tooltip(last_fetched_str)
-                .on_click(cx.listener(|this, _event, window, cx| {
-                    this.run_git_action(GitAction::Fetch, window, cx);
-                }))
-        };
+        let sync_kind = if can_publish { threadlane_ui_kit::ReviewSyncKind::Publish }
+            else if behind > 0 { threadlane_ui_kit::ReviewSyncKind::Pull }
+            else if ahead > 0 { threadlane_ui_kit::ReviewSyncKind::Push }
+            else { threadlane_ui_kit::ReviewSyncKind::Fetch };
+        let sync_button = threadlane_ui_kit::review_sync_button(sync_kind, if behind > 0 { behind } else { ahead }, &last_fetched_str, self.git_busy)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                let action = match sync_kind {
+                    threadlane_ui_kit::ReviewSyncKind::Publish | threadlane_ui_kit::ReviewSyncKind::Push => GitAction::Push,
+                    threadlane_ui_kit::ReviewSyncKind::Pull => GitAction::Pull,
+                    threadlane_ui_kit::ReviewSyncKind::Fetch => GitAction::Fetch,
+                };
+                this.run_git_action(action, window, cx);
+            }));
+        let sync_actions = threadlane_ui_kit::review_sync_actions(sync_button,
+            (total_files > 0).then(|| threadlane_ui_kit::review_stash_button(self.git_busy)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.close_all_git_dialogs(); this.stash_dialog_open = true;
+                    this.stash_message_input.update(cx, |input, cx| input.focus(window, cx));
+                    cx.notify();
+                }))),
+            can_create_pr.then(|| threadlane_ui_kit::review_create_pr_button(self.git_busy)
+                .on_click(cx.listener(|this, _, window, cx| this.open_draft_pr_dialog(window, cx)))),
+        );
 
-        let sync_actions = div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .child(sync_button.disabled(self.git_busy))
-            .when(total_files > 0, |row| {
-                row.child(
-                    Button::new("git-stash-changes")
-                        .label("Stash…")
-                        .outline()
-                        .small()
-                        .tooltip("Stash changes…")
-                        .disabled(self.git_busy)
-                        .on_click(cx.listener(|this, _event, window, cx| {
-                            this.close_all_git_dialogs();
-                            this.stash_dialog_open = true;
-                            this.stash_message_input
-                                .update(cx, |input, cx| input.focus(window, cx));
-                            cx.notify();
-                        })),
-                )
-            })
-            .when(can_create_pr, |row| {
-                row.child(
-                    Button::new("git-create-pull-request")
-                        .icon(IconName::Github)
-                        .label("Create draft PR…")
-                        .accessibility_label("Review and create a draft pull request on GitHub")
-                        .outline()
-                        .small()
-                        .tooltip("Review and create a draft pull request on GitHub")
-                        .disabled(self.git_busy)
-                        .on_click(cx.listener(|this, _event, window, cx| {
-                            this.open_draft_pr_dialog(window, cx);
-                        })),
-                )
-            });
+        let branch_header = threadlane_ui_kit::review_branch_header(branch, self.branch_popover_open, sync_actions,
+            cx.listener(|this, _, _, cx| { this.branch_popover_open = !this.branch_popover_open; cx.notify(); }), cx);
 
-        let branch_header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .px_3()
-            .py_2()
-            .gap_2()
-            .border_b_1()
-            .border_color(theme.border)
-            .bg(theme.list_head)
-            .child(
-                Button::new("git-branch-selector-btn")
-                    .accessibility_label(format!("Manage branches, current branch {branch}"))
-                    .ghost()
-                    .small()
-                    .selected(self.branch_popover_open)
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .min_w_0()
-                    .flex_1()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.branch_popover_open = !this.branch_popover_open;
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .size_4()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_color(theme.muted_foreground)
-                            .child(Icon::default().path("icons/git/branch.svg")),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .truncate()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.foreground)
-                            .child(branch.to_string()),
-                    )
-                    .child(
-                        div()
-                            .size(rems(0.875))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_color(theme.muted_foreground)
-                            .child(if self.branch_popover_open {
-                                IconName::ChevronUp
-                            } else {
-                                IconName::ChevronDown
-                            }),
-                    ),
-            )
-            .child(sync_actions);
-
-        let pr_expanded = self.pr_expanded;
-        let pr_card = self.git_status.as_ref().and_then(|s| s.pr.as_ref()).map(|pr| {
-            let comments_pr = pr.clone();
-            let pr_url = pr.url.clone();
-            let pr_num = pr.number;
-            let pr_title = pr.title.clone();
-            let pr_title_display = if pr.title.is_empty() {
-                format!("PR #{pr_num}")
-            } else {
-                format!("#{pr_num} {}", pr.title)
-            };
-
-            let failing_checks = pr.failing_checks;
-            let pending_checks = pr.pending_checks;
-            let total_checks = pr.total_checks;
-            let comments_count = threadlane_git::collect_actionable_pr_feedback(pr).len();
-
-            let failing_check_names: Vec<String> = pr
-                .checks
-                .iter()
-                .filter(|c| {
-                    let concl = c.conclusion.as_deref().unwrap_or("").to_uppercase();
-                    matches!(
-                        concl.as_str(),
-                        "FAILURE" | "TIMED_OUT" | "ACTION_REQUIRED" | "CANCELLED" | "ERROR"
-                    )
-                })
-                .map(|c| c.name.clone())
-                .collect();
-            let failed_summary = failing_check_names.join(", ");
-
-            div()
-                .flex()
-                .flex_col()
-                .gap_1p5()
-                .mx_3()
-                .my_2()
-                .p_2p5()
-                .rounded_lg()
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.group_box)
-                .child(
-                    Button::new("pr-card-toggle")
-                        .accessibility_label(if pr_expanded {
-                            "Collapse pull request details"
-                        } else {
-                            "Expand pull request details"
-                        })
-                        .ghost()
-                        .h_auto()
-                        .w_full()
-                        .p_0()
-                        .tooltip(if pr_expanded { "Collapse" } else { "Expand" })
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.pr_expanded = !this.pr_expanded;
-                            cx.notify();
-                        }))
-                        .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1p5()
-                                .min_w_0()
-                                .flex_1()
-                                .child(
-                                    div()
-                                        .size(rems(0.875))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .text_color(theme.muted_foreground)
-                                        .child(if pr_expanded {
-                                            IconName::ChevronDown
-                                        } else {
-                                            IconName::ChevronRight
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .size_4()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .text_color(theme.muted_foreground)
-                                        .child(Icon::default().path("icons/git/actions.svg")),
-                                )
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_xs()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(theme.foreground)
-                                        .child(pr_title_display),
-                                ),
-                        )
-                        .when(!pr_url.is_empty(), |row| {
-                            let target_url = pr_url.clone();
-                            row.child(
-                                Button::new("pr-link-btn")
-                                    .accessibility_label("Open pull request in browser")
-                                    .icon(IconName::ExternalLink)
-                                    .ghost()
-                                    .xsmall()
-                                    .tooltip("Open pull request in browser")
-                                    .on_click(move |_event, _window, cx| {
-                                        cx.open_url(&target_url);
-                                    }),
-                            )
-                        }),
-                        ),
-                )
-                .when(pr_expanded, |card| {
-                    card.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .pt_0p5()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1p5()
-                                .min_w_0()
-                                .child(
-                                    div()
-                                        .size(rems(0.875))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .text_color(if failing_checks > 0 {
-                                            theme.danger
-                                        } else if pending_checks > 0 {
-                                            theme.warning
-                                        } else {
-                                            theme.success
-                                        })
-                                        .child(if failing_checks > 0 {
-                                            IconName::Close
-                                        } else if pending_checks > 0 {
-                                            IconName::Asterisk
-                                        } else {
-                                            IconName::Check
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(if failing_checks > 0 {
-                                            theme.danger
-                                        } else {
-                                            theme.muted_foreground
-                                        })
-                                        .child(if failing_checks > 0 {
-                                            format!(
-                                                "{failing_checks} failing check{}",
-                                                if failing_checks == 1 { "" } else { "s" }
-                                            )
-                                        } else if pending_checks > 0 {
-                                            format!("{pending_checks} in progress")
-                                        } else {
-                                            format!("All {} checks passed", total_checks.max(1))
-                                        }),
-                                ),
-                        )
-                        .child(if failing_checks > 0 {
-                            let fix_pr_num = pr_num;
-                            let fix_pr_title = pr_title.clone();
-                            let fix_failed_summary = failed_summary.clone();
-                            Button::new("fix-ci-btn")
-                                .label("Fix CI")
-                                .accessibility_label("Ask AI to fix failing CI checks")
-                                .outline()
-                                .xsmall()
-                                .tooltip("Ask AI to fix failing CI checks")
-                                .on_click(cx.listener(move |this, _event, _window, cx| {
-                                    let prompt = format!(
-                                        "Please inspect and fix the failing CI check on PR #{fix_pr_num} ({fix_pr_title}): {fix_failed_summary}"
-                                    );
-                                    this.model.update(cx, |state, _cx| {
-                                        state.request_composer_prompt(prompt);
-                                    });
-                                    cx.notify();
-                                }))
-                                .into_any_element()
-                        } else {
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(format!("{}/{}", pr.passing_checks, pr.total_checks))
-                                .into_any_element()
-                        }),
-                )
-                .when(comments_count > 0, |card| {
-                    let comments_pr = comments_pr.clone();
-                    let comments_project = self.project.clone();
-                    card.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .pt_0p5()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1p5()
-                                    .min_w_0()
-                                    .child(
-                                        div()
-                                            .size(rems(0.875))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .text_color(theme.muted_foreground)
-                                            .child(IconName::File),
-                                    )
-                                    .child(
-                                        div()
-                                            .truncate()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(format!(
-                                                "{comments_count} review comment{}",
-                                                if comments_count == 1 { "" } else { "s" }
-                                            )),
-                                    ),
-                            )
-                            .child(
-                                Button::new("address-comments-btn")
-                                    .label("Address")
-                                    .accessibility_label("Ask AI to address PR comments")
-                                    .ghost()
-                                    .xsmall()
-                                    .tooltip("Ask AI to address PR comments")
-                                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                                        let Some(work_dir) = comments_project.clone() else {
-                                            return;
-                                        };
-                                        this.model.update(cx, |state, cx| {
-                                            match state.address_pr_reviews_manual(
-                                                work_dir,
-                                                comments_pr.head_ref.clone(),
-                                                &comments_pr,
-                                            ) {
-                                                Ok(_) => state.session_status = Some(
-                                                    "Addressing PR review feedback…".into(),
-                                                ),
-                                                Err(error) => state.session_status = Some(error),
-                                            }
-                                            cx.notify();
-                                        });
-                                    })),
-                            ),
-                    )
-                })
-                })
-        });
+        let pr_card = self.git_status.as_ref().and_then(|status| status.pr.as_ref())
+            .map(|pr| self.render_review_pr(pr, cx));
 
         let staged_count = self.review_files.iter().filter(|f| f.staged).count();
         let unstaged_count = self.review_files.iter().filter(|f| f.unstaged).count();
@@ -3108,135 +2068,13 @@ impl RightPanelView {
 
         let total_additions_all: u32 = self.review_files.iter().map(|f| f.additions).sum();
         let total_deletions_all: u32 = self.review_files.iter().map(|f| f.deletions).sum();
-        let total_delta = total_additions_all + total_deletions_all;
-        let diff_ratio_bar = (total_delta > 0).then(|| {
-            let add_pct = Self::diff_addition_percent(total_additions_all, total_deletions_all);
-            let del_pct = 100.0 - add_pct;
-            div().px_3().py_0p5().child(
-                div()
-                    .w_full()
-                    .h(rems(0.25))
-                    .rounded_full()
-                    .overflow_hidden()
-                    .bg(theme.muted)
-                    .flex()
-                    .child(
-                        div()
-                            .h_full()
-                            .w(relative(add_pct / 100.0))
-                            .bg(theme.success),
-                    )
-                    .child(div().h_full().w(relative(del_pct / 100.0)).bg(theme.danger)),
-            )
-        });
+        let diff_ratio_bar = threadlane_ui_kit::review_diff_ratio(total_additions_all, total_deletions_all, cx);
 
         let review_toolbar = (total_files > 0).then(|| {
             let panel_sb = panel_entity.clone();
-            div()
-                .flex()
-                .flex_col()
-                .border_b_1()
-                .border_color(theme.border)
-                .bg(theme.title_bar)
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_1p5()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .bg(theme.input)
-                                .border_1()
-                                .border_color(theme.border)
-                                .flex()
-                                .items_center()
-                                .gap_1p5()
+            let discard = div()
                                 .child(
-                                    div()
-                                        .size(rems(0.875))
-                                        .text_color(theme.muted_foreground)
-                                        .child(IconName::Search),
-                                )
-                                .child(
-                                    div().flex_1().min_w_0().child(
-                                        Input::new(&self.review_filter_input)
-                                            .aria_label("Filter changes")
-                                            .appearance(false)
-                                            .bordered(false),
-                                    ),
-                                )
-                                .children(
-                                    (!self.review_filter_input.read(cx).value().is_empty()).then(
-                                        || {
-                                            Button::new("clear-review-filter-btn")
-                                                .icon(IconName::Close)
-                                                .accessibility_label("Clear filter")
-                                                .ghost()
-                                                .xsmall()
-                                                .tooltip("Clear filter")
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.review_filter_input
-                                                        .update(cx, |input, cx| {
-                                                            input.set_value("", window, cx)
-                                                        });
-                                                    cx.notify();
-                                                }))
-                                        },
-                                    ),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_0p5()
-                                .rounded_md()
-                                .bg(theme.tab_bar_segmented)
-                                .p_0p5()
-                                .child(
-                                    Button::new("review-view-list")
-                                        .icon(IconName::Menu)
-                                        .accessibility_label("Flat list view")
-                                        .ghost()
-                                        .xsmall()
-                                        .selected(self.review_view_mode == ReviewViewMode::List)
-                                        .tooltip("Flat list view")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.review_view_mode = ReviewViewMode::List;
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    Button::new("review-view-tree")
-                                        .icon(IconName::FolderOpen)
-                                        .accessibility_label("Tree view")
-                                        .ghost()
-                                        .xsmall()
-                                        .selected(self.review_view_mode == ReviewViewMode::Tree)
-                                        .tooltip("Tree view")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.review_view_mode = ReviewViewMode::Tree;
-                                            cx.notify();
-                                        })),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .child(
-                                    Button::new("selection-bar-discard-btn")
-                                        .icon(IconName::Undo2)
-                                        .accessibility_label("Discard changes")
-                                        .ghost()
-                                        .xsmall()
-                                        .tooltip("Discard changes (right-click for more options)")
-                                        .disabled(self.git_busy)
+                                    threadlane_ui_kit::review_discard_button(self.git_busy)
                                         .on_click(cx.listener(|this, _event, window, cx| {
                                             let paths: Vec<String> =
                                                 this.selected_files.iter().cloned().collect();
@@ -3255,194 +2093,41 @@ impl RightPanelView {
                                 )
                                 .context_menu({
                                     let panel = panel_sb.clone();
-                                    move |menu, _window, cx| {
+                                    move |menu, window, cx| {
                                         let (selected_paths, total_files) = {
                                             let panel_ref = panel.read(cx);
                                             let selected_paths: Vec<String> =
                                                 panel_ref.selected_files.iter().cloned().collect();
                                             (selected_paths, panel_ref.review_files.len())
                                         };
-                                        let mut menu = menu;
-                                        for opt in selection_bar_discard_options(
-                                            &selected_paths,
-                                            total_files,
-                                        ) {
-                                            let panel_action = panel.clone();
-                                            let label = opt.label();
-                                            let opt_action = opt.clone();
-                                            menu = menu.item(PopupMenuItem::new(label).on_click(
-                                                move |_event, window, cx| {
-                                                    Self::handle_discard_option(
-                                                        panel_action.clone(),
-                                                        opt_action.clone(),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                },
-                                            ));
-                                        }
-                                        menu
+                                        let busy = panel.read(cx).git_busy;
+                                        let panel = panel.clone();
+                                        threadlane_ui_kit::review_discard_menu(menu,
+                                            threadlane_ui_kit::review_selection_discard_targets(&selected_paths, total_files), busy,
+                                            move |target, window, cx| Self::handle_discard_option(panel.clone(), target.clone(), window, cx), window, cx)
                                     }
-                                }),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .px_3()
-                        .py_1()
-                        .border_t_1()
-                        .border_color(theme.border)
-                        .bg(theme.list_head)
-                        .text_xs()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    Checkbox::new("select-all-files")
-                                        .checked(all_selected)
-                                        .small()
-                                        .disabled(self.git_busy)
-                                        .on_click(cx.listener(
-                                            move |this, checked, _window, cx| {
-                                                if *checked {
-                                                    this.selected_files = this
-                                                        .review_files
-                                                        .iter()
-                                                        .map(|f| f.path.clone())
-                                                        .collect();
-                                                } else {
-                                                    this.selected_files.clear();
-                                                }
-                                                cx.notify();
-                                            },
-                                        )),
-                                )
-                                .child(
-                                    div()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(theme.foreground)
-                                        .child(format!("{selected_count}/{total_files} files")),
-                                )
-                                .when(selected_additions > 0 || selected_deletions > 0, |stats| {
-                                    stats
-                                        .child(
-                                            div()
-                                                .text_color(theme.success)
-                                                .child(format!("+{selected_additions}")),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_color(theme.danger)
-                                                .child(format!("\u{2212}{selected_deletions}")),
-                                        )
-                                })
-                                .child(
-                                    Button::new("view-combined-diff-btn")
-                                        .label("View Diff")
-                                        .accessibility_label(
-                                            "Open combined diff of all changes",
-                                        )
-                                        .ghost()
-                                        .xsmall()
-                                        .tooltip("Open combined diff of all changes")
-                                        .on_click(cx.listener(|this, _event, _window, cx| {
-                                            this.open_combined_diff(cx);
-                                        })),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .child(
-                                    Button::new("git-stage-all-btn")
-                                        .label("Stage all")
-                                        .accessibility_label("Stage all changes (git add -A)")
-                                        .ghost()
-                                        .xsmall()
-                                        .disabled(self.git_busy || unstaged_count == 0)
-                                        .tooltip("Stage all changes (git add -A)")
-                                        .on_click(cx.listener(|this, _event, window, cx| {
-                                            this.run_git_action(GitAction::StageAll, window, cx);
-                                        })),
-                                )
-                                .when(has_staged, |row| {
-                                    row.child(
-                                        Button::new("git-unstage-all-btn")
-                                            .label("Unstage all")
-                                            .accessibility_label(
-                                                "Unstage all changes (git restore --staged .)",
-                                            )
-                                            .ghost()
-                                            .xsmall()
-                                            .disabled(self.git_busy)
-                                            .tooltip("Unstage all changes (git restore --staged .)")
-                                            .on_click(cx.listener(|this, _event, window, cx| {
-                                                this.run_git_action(
-                                                    GitAction::UnstageAll,
-                                                    window,
-                                                    cx,
-                                                );
-                                            })),
-                                    )
-                                }),
-                        ),
-                )
+                                }).into_any_element();
+            threadlane_ui_kit::review_toolbar_surface(cx)
+                .child(threadlane_ui_kit::review_filters(
+                    &self.review_filter_input, self.review_view_mode, discard,
+                    cx.listener(|this, action: &threadlane_ui_kit::ReviewAction, window, cx| this.handle_review_ui_action(*action, window, cx)), cx,
+                ))
+                .child(threadlane_ui_kit::review_selection_bar(
+                    &threadlane_ui_kit::ReviewSelectionState {
+                        selected_count, total_files, additions: selected_additions, deletions: selected_deletions,
+                        unstaged_count, has_staged, busy: self.git_busy,
+                    },
+                    cx.listener(|this, action: &threadlane_ui_kit::ReviewAction, window, cx| this.handle_review_ui_action(*action, window, cx)), cx,
+                ))
                 .children(diff_ratio_bar)
         });
         let file_list_content = if self.review_files.is_empty() {
-            div()
-                .flex_1()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .p_4()
-                .text_center()
-                .child(
-                    div()
-                        .mb_2()
-                        .size_8()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_full()
-                        .bg(theme.success.opacity(0.12))
-                        .text_color(theme.success)
-                        .child(Icon::new(IconName::Check)),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme.foreground)
-                        .child("No changes"),
-                )
-                .child(
-                    div()
-                        .mt_1()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child("Working tree is clean"),
-                )
-                .child(div().mt_3().child(
-                    Button::new("refresh-clean-review")
-                        .label("Refresh review")
-                        .ghost()
-                        .small()
-                        .tooltip("Refresh the working tree review")
-                        .disabled(self.git_busy)
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.refresh_active_surface(cx);
-                        })),
-                ))
-                .into_any_element()
+            threadlane_ui_kit::review_clean_state(
+                threadlane_ui_kit::review_refresh_button(self.git_busy)
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh_active_surface(cx))), cx).into_any_element()
+        } else if filtered_count == 0 {
+            threadlane_ui_kit::review_no_results(
+                cx.listener(|this, _, window, cx| this.handle_review_ui_action(threadlane_ui_kit::ReviewAction::ClearFilter, window, cx)), cx).into_any_element()
         } else if self.review_view_mode == ReviewViewMode::Tree {
             let filtered = self.filtered_review_files(cx);
             let mut dir_map: std::collections::BTreeMap<String, Vec<GitFile>> =
@@ -3451,85 +2136,23 @@ impl RightPanelView {
                 let (dir, _) = f.path.rsplit_once('/').unwrap_or(("", &f.path));
                 dir_map.entry(dir.to_string()).or_default().push(f);
             }
-            div()
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scrollbar()
-                .py_1()
+            threadlane_ui_kit::review_tree_viewport()
                 .children(dir_map.into_iter().map(|(dir, dir_files)| {
                     let is_collapsed = self.collapsed_tree_folders.contains(&dir);
                     let dir_key = dir.clone();
-                    let folder_label = if dir.is_empty() {
-                        "(root)".to_string()
-                    } else {
-                        dir.clone()
-                    };
                     let count = dir_files.len();
                     div()
                         .flex()
                         .flex_col()
                         .child(
-                            Button::new(SharedString::from(format!("folder-btn-{dir}")))
-                                .ghost()
-                                .xsmall()
-                                .w_full()
-                                .justify_start()
-                                .px_2()
-                                .py_1()
+                            threadlane_ui_kit::review_folder_header(&dir, count, is_collapsed, cx)
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    if this.collapsed_tree_folders.contains(&dir_key) {
-                                        this.collapsed_tree_folders.remove(&dir_key);
-                                    } else {
-                                        this.collapsed_tree_folders.insert(dir_key.clone());
-                                    }
+                                    if !this.collapsed_tree_folders.remove(&dir_key) { this.collapsed_tree_folders.insert(dir_key.clone()); }
                                     cx.notify();
-                                }))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1p5()
-                                        .child(
-                                            Icon::new(if is_collapsed {
-                                                IconName::ChevronRight
-                                            } else {
-                                                IconName::ChevronDown
-                                            })
-                                            .size_3()
-                                            .text_color(theme.muted_foreground),
-                                        )
-                                        .child(
-                                            Icon::new(if is_collapsed {
-                                                IconName::Folder
-                                            } else {
-                                                IconName::FolderOpen
-                                            })
-                                            .size_3p5()
-                                            .text_color(theme.muted_foreground),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(theme.foreground)
-                                                .child(folder_label),
-                                        )
-                                        .child(
-                                            Tag::new()
-                                                .child(count.to_string())
-                                                .with_variant(TagVariant::Secondary)
-                                                .small(),
-                                        ),
-                                ),
+                                })),
                         )
                         .children((!is_collapsed).then(|| {
-                            div()
-                                .pl_3()
-                                .border_l_1()
-                                .border_color(theme.border.opacity(0.4))
-                                .ml_3()
-                                .flex()
-                                .flex_col()
+                            threadlane_ui_kit::review_folder_files(cx)
                                 .children(
                                     dir_files
                                         .into_iter()
@@ -3539,1215 +2162,244 @@ impl RightPanelView {
                 }))
                 .into_any_element()
         } else {
-            div()
-                .relative()
-                .flex_1()
-                .min_h_0()
-                .child(
-                    list(
-                        self.review_files_list_state.clone(),
-                        cx.processor(Self::render_review_file_row),
-                    )
-                    .size_full()
-                    .py_1()
-                    .with_sizing_behavior(ListSizingBehavior::Auto),
-                )
-                .child(div().absolute().inset_0().child(
-                    gpui_component::scroll::Scrollbar::vertical(&self.review_files_list_state),
-                ))
-                .into_any_element()
+            threadlane_ui_kit::review_file_list(&self.review_files_list_state, cx.processor(Self::render_review_file_row)).into_any_element()
         };
 
-        let commit_label = if selected_count > 0 && selected_count < total_files {
-            format!("Commit {selected_count}")
-        } else {
-            "Commit".to_string()
-        };
-        let commit_push_label = if selected_count > 0 && selected_count < total_files {
-            format!("Commit {selected_count} & push")
-        } else {
-            "Commit & push".to_string()
-        };
+        let commit_footer = threadlane_ui_kit::review_commit_footer(
+            &self.commit_message_input,
+            &threadlane_ui_kit::ReviewCommitState {
+                selected_count, total_files, busy: self.git_busy, generating: self.git_message_pending, can_push,
+            },
+            cx.listener(|this, action: &threadlane_ui_kit::ReviewAction, window, cx| this.handle_review_ui_action(*action, window, cx)), cx,
+        );
+        let stash_banner = self.git_status.as_ref().and_then(|status| status.current_stash.as_ref())
+            .map(|stash| self.render_current_stash(stash, cx));
 
-        let commit_val = self.commit_message_input.read(cx).value();
-        let first_line = commit_val.lines().next().unwrap_or("");
-        let subject_len = first_line.chars().count();
-        let counter_color = if subject_len > 72 {
-            theme.danger
-        } else if subject_len > 50 {
-            theme.warning
-        } else {
-            theme.muted_foreground
-        };
-
-        let is_empty = commit_val.trim().is_empty();
-        let can_commit = !is_empty && selected_count > 0 && !self.git_busy;
-
-        let commit_footer = div()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .gap_2p5()
-            .p_3()
-            .border_t_1()
-            .border_color(theme.border)
-            .bg(theme.title_bar)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme.muted_foreground)
-                                    .child("COMMIT"),
-                            )
-                            .when(subject_len > 0, |header| {
-                                header.child(
-                                    div()
-                                        .px_1p5()
-                                        .py_0p5()
-                                        .rounded_sm()
-                                        .bg(counter_color.opacity(0.12))
-                                        .text_xs()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(counter_color)
-                                        .child(if subject_len > 72 {
-                                            format!("{subject_len}/72 (too long)")
-                                        } else if subject_len > 50 {
-                                            format!("{subject_len}/50")
-                                        } else {
-                                            format!("{subject_len}")
-                                        }),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .children((!commit_val.is_empty()).then(|| {
-                                Button::new("clear-commit-input")
-                                    .icon(IconName::Close)
-                                    .accessibility_label("Clear message")
-                                    .ghost()
-                                    .xsmall()
-                                    .tooltip("Clear message")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.commit_message_input.update(cx, |input, cx| {
-                                            input.set_value("", window, cx)
-                                        });
-                                        cx.notify();
-                                    }))
-                            }))
-                            .child(if self.git_message_pending {
-                                Button::new("git-generate-commit-msg")
-                                    .child(Spinner::new().xsmall())
-                                    .accessibility_label("Generating commit message with AI…")
-                                    .ghost()
-                                    .xsmall()
-                                    .disabled(true)
-                                    .tooltip("Generating commit message with AI…")
-                            } else {
-                                Button::new("git-generate-commit-msg")
-                                    .icon(IconName::Bot)
-                                    .accessibility_label("Generate commit message with AI")
-                                    .ghost()
-                                    .xsmall()
-                                    .tooltip("Generate commit message with AI")
-                                    .disabled(self.git_busy || total_files == 0)
-                                    .on_click(cx.listener(|this, _event, _window, cx| {
-                                        this.generate_commit_message(cx);
-                                    }))
-                            }),
-                    ),
-            )
-            .child(
-                div()
-                    .px_2p5()
-                    .py_2()
-                    .rounded_md()
-                    .bg(theme.input)
-                    .border_1()
-                    .border_color(theme.border)
-                    .focus(|d| d.border_color(theme.ring))
-                    .child(
-                        Input::new(&self.commit_message_input)
-                            .aria_label("Commit summary")
-                            .disabled(self.git_busy),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("git-commit-and-push")
-                            .icon(Icon::default().path("icons/git/commit.svg"))
-                            .label(commit_push_label)
-                            .primary()
-                            .small()
-                            .flex_1()
-                            .tooltip(if can_commit {
-                                "Commit the selected changes and push"
-                            } else {
-                                "Select files and write a message to commit"
-                            })
-                            .disabled(!can_commit)
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.run_git_action(GitAction::CommitAndPush, window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("git-commit-only")
-                            .label(commit_label)
-                            .outline()
-                            .small()
-                            .tooltip(if can_commit {
-                                "Commit the selected changes locally"
-                            } else {
-                                "Select files and write a message to commit"
-                            })
-                            .disabled(!can_commit)
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.run_git_action(GitAction::Commit, window, cx);
-                            })),
-                    )
-                    .when(can_push, |row| {
-                        row.child(
-                            Button::new("git-push-only")
-                                .accessibility_label("Push commits")
-                                .icon(Icon::default().path("icons/git/actions.svg"))
-                                .tooltip("Push commits")
-                                .ghost()
-                                .small()
-                                .on_click(cx.listener(|this, _event, window, cx| {
-                                    this.run_git_action(GitAction::Push, window, cx);
-                                })),
-                        )
-                    }),
-            );
-        let stash_banner = self
-            .git_status
-            .as_ref()
-            .and_then(|s| s.current_stash.as_ref())
-            .map(|stash| {
-                let stash_msg = if stash.message.is_empty() {
-                    "Stashed changes on this branch".to_string()
-                } else {
-                    stash.message.clone()
-                };
-                let time_str = if stash.relative_time.is_empty() {
-                    String::new()
-                } else {
-                    format!(" • {}", stash.relative_time)
-                };
-                let idx = stash.index;
-                let is_expanded = self.stash_expanded;
-                let files_clone = self
-                    .stash_files
-                    .as_ref()
-                    .filter(|(index, _)| *index == idx)
-                    .map(|(_, files)| files.clone())
-                    .unwrap_or_default();
-                let is_loading = self.loading_stash_index == Some(idx);
-                let count_label = if is_loading {
-                    "Loading files…".to_string()
-                } else if self
-                    .stash_files
-                    .as_ref()
-                    .is_some_and(|(index, _)| *index == idx)
-                {
-                    if files_clone.len() == 1 {
-                        "1 file".to_string()
-                    } else {
-                        format!("{} files", files_clone.len())
-                    }
-                } else {
-                    "Stashed changes".to_string()
-                };
-                let project = self.project.clone();
-                let model = self.model.clone();
-
-                div()
-                    .id("stash-banner")
-                    .mx_3()
-                    .my_2()
-                    .p_2p5()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.group_box)
-                    .flex()
-                    .flex_col()
-                    .gap_1p5()
-                    .child(
-                        Button::new("stash-header-toggle")
-                            .accessibility_label(if is_expanded {
-                                "Hide stashed changes"
-                            } else {
-                                "Show stashed changes"
-                            })
-                            .tooltip(if is_expanded { "Collapse" } else { "Expand" })
-                            .ghost()
-                            .h_auto()
-                            .w_full()
-                            .p_0()
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                this.stash_expanded = !this.stash_expanded;
-                                if this.stash_expanded
-                                    && this.loading_stash_index != Some(idx)
-                                    && this
-                                        .stash_files
-                                        .as_ref()
-                                        .is_none_or(|(index, _)| *index != idx)
-                                {
-                                    if let Some(project) = this.project.clone() {
-                                        this.loading_stash_index = Some(idx);
-                                        let tx = this.event_tx.clone();
-                                        let client =
-                                            this.model.read(cx).daemon_client.clone();
-                                        if let Ok(executor) =
-                                            threadlane_ui_state::chat::executor()
-                                        {
-                                            executor.spawn(async move {
-                                                let files =
-                                                    threadlane_ui_state::project_io::stash_files(
-                                                        &client, &project, idx,
-                                                    )
-                                                    .await
-                                                    .unwrap_or_default();
-                                                let _ = tx.send(PanelEvent::StashFilesLoaded {
-                                                    project,
-                                                    index: idx,
-                                                    files,
-                                                });
-                                            });
-                                        }
-                                    }
-                                }
-                                cx.notify();
-                            }))
-                            .child(
-                                div()
-                                    .w_full()
-                                    .whitespace_normal()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1p5()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .child(
-                                                div()
-                                                    .size(rems(0.875))
-                                                    .text_color(theme.primary)
-                                                    .child(if is_expanded {
-                                                        IconName::ChevronDown
-                                                    } else {
-                                                        IconName::ChevronRight
-                                                    }),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .font_weight(FontWeight::BOLD)
-                                                    .text_color(theme.foreground)
-                                                    .child("Stashed changes"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(theme.muted_foreground)
-                                                    .child(format!("({count_label}{time_str})")),
-                                            ),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(stash_msg),
-                    )
-                    .children(is_expanded.then(|| {
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .my_1()
-                            .p_1p5()
-                            .rounded_md()
-                            .bg(theme.background)
-                            .border_1()
-                            .border_color(theme.border)
-                            .children(files_clone.into_iter().map(|file| {
-                                let path = file.path.clone();
-                                let status = file.status_char().to_string();
-                                let status_color = match file.status_char() {
-                                    'A' | '?' => theme.success,
-                                    'D' => theme.danger,
-                                    _ => theme.warning,
-                                };
-                                let adds = file.additions;
-                                let dels = file.deletions;
-                                let file_path_for_click = path.clone();
-                                let project_for_click = project.clone();
-                                let model_for_click = model.clone();
-
-                                Button::new(SharedString::from(format!("stash-file-{path}")))
-                                    .accessibility_label(format!("Review stashed file {path}"))
-                                    .ghost()
-                                    .h_auto()
-                                    .w_full()
-                                    .p_0()
-                                    .on_click(cx.listener(move |_this, _event, _window, cx| {
-                                        let Some(proj) = project_for_click.clone() else {
-                                            return;
-                                        };
-                                        let target_path = file_path_for_click.clone();
-                                        let diff_project = proj.clone();
-                                        let m = model_for_click.clone();
-                                        let client = m.read(cx).daemon_client.clone();
-                                        cx.spawn(async move |_this, cx| {
-                                            let diff_target = target_path.clone();
-                                            let content = cx
-                                                .background_executor()
-                                                .spawn(async move {
-                                                    threadlane_ui_state::project_io::diff_stash_file(
-                                                        &client,
-                                                        &diff_project,
-                                                        idx,
-                                                        diff_target,
-                                                    )
-                                                    .await
-                                                    .unwrap_or_else(|err| err)
-                                                })
-                                                .await;
-                                            let _ = m.update(cx, |state, cx| {
-                                                state.request_open_diff(proj, target_path, content);
-                                                cx.notify();
-                                            });
-                                        })
-                                        .detach();
-                                    }))
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            .whitespace_normal()
-                                            .h(rems(1.625))
-                                            .px_2()
-                                            .rounded_sm()
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .gap_2()
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap_1p5()
-                                                    .min_w_0()
-                                                    .flex_1()
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .font_weight(FontWeight::BOLD)
-                                                            .text_color(status_color)
-                                                            .child(status),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .truncate()
-                                                            .text_xs()
-                                                            .text_color(theme.foreground)
-                                                            .child(path),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap_1()
-                                                    .text_xs()
-                                                    .child(
-                                                        div()
-                                                            .text_color(theme.success)
-                                                            .child(format!("+{adds}")),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_color(theme.danger)
-                                                            .child(format!("-{dels}")),
-                                                    ),
-                                            ),
-                                    )
-                            }))
-                            .when(is_loading, |container| {
-                                container.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child("Loading stashed files…"),
-                                )
-                            })
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .gap_2()
-                            .pt_1()
-                            .child(
-                                Button::new("discard-stash-btn")
-                                    .label("Discard")
-                                    .danger()
-                                    .xsmall()
-                                    .tooltip("Discard the stashed changes")
-                                    .disabled(self.git_busy)
-                                    .on_click(cx.listener(move |this, _event, window, cx| {
-                                        this.run_git_action(
-                                            GitAction::DropStash(Some(idx)),
-                                            window,
-                                            cx,
-                                        );
-                                    })),
-                            )
-                            .child(
-                                Button::new("restore-stash-btn")
-                                    .label("Restore stash")
-                                    .outline()
-                                    .xsmall()
-                                    .tooltip("Restore the stashed changes")
-                                    .disabled(self.git_busy)
-                                    .on_click(cx.listener(move |this, _event, window, cx| {
-                                        this.run_git_action(
-                                            GitAction::PopStash(Some(idx)),
-                                            window,
-                                            cx,
-                                        );
-                                    })),
-                            ),
-                    )
-            });
-
-        let changes_active = self.review_tab == ReviewTab::Changes;
-        let total_changes = self.review_files.len();
-
-        let staged_in_tab = self.review_files.iter().filter(|f| f.staged).count();
-        let changes_label = if total_changes > 0 {
-            if staged_in_tab > 0 {
-                format!("Changes ({total_changes}, {staged_in_tab} staged)")
-            } else {
-                format!("Changes ({total_changes})")
-            }
-        } else {
-            "Changes".to_string()
-        };
-        let commit_count = self
-            .git_status
-            .as_ref()
-            .map(|status| status.recent_commits.len())
-            .unwrap_or(0);
-        let history_label = if commit_count > 0 {
-            format!("History ({commit_count})")
-        } else {
-            "History".to_string()
-        };
-        let review_sub_tabs = div()
-            .flex_none()
-            .border_b_1()
-            .border_color(theme.title_bar_border)
-            .bg(theme.title_bar)
-            .px_3()
-            .child(
-                TabBar::new("review-sub-tabs")
-                    .segmented()
-                    .small()
-                    .selected_index(if changes_active { 0 } else { 1 })
-                    .children(vec![
-                        Tab::new().label(changes_label.clone()).aria_label(format!(
-                            "Changes, {} files, {} staged",
-                            total_changes, staged_in_tab
-                        )),
-                        Tab::new()
-                            .label(history_label.clone())
-                            .aria_label(format!("History, {commit_count} recent commits")),
-                    ])
-                    .on_click(cx.listener(|this, ix, _window, cx| {
-                        this.review_tab = if *ix == 0 {
-                            ReviewTab::Changes
-                        } else {
-                            ReviewTab::History
-                        };
-                        cx.notify();
-                    })),
-            );
+        let commit_count = self.git_status.as_ref().map_or(0, |status| status.recent_commits.len());
+        let review_sub_tabs = threadlane_ui_kit::review_tabs(self.review_tab, total_files, staged_count, commit_count,
+            cx.listener(|this, ix: &usize, _, cx| {
+                this.review_tab = if *ix == 0 { ReviewTab::Changes } else { ReviewTab::History };
+                cx.notify();
+            }), cx);
 
         let review_body = if self.branch_popover_open {
             self.render_branch_manager(cx).into_any_element()
         } else if self.review_tab == ReviewTab::History {
             self.render_history(cx).into_any_element()
         } else {
-            div()
-                .flex_1()
-                .min_h_0()
-                .flex()
-                .flex_col()
-                .children(stash_banner)
-                .children(pr_card)
-                .children(review_toolbar)
-                .child(file_list_content)
+            threadlane_ui_kit::review_changes_body()
+                .child(threadlane_ui_kit::review_changes_content()
+                    .children(stash_banner)
+                    .children(pr_card)
+                    .children(review_toolbar)
+                    .child(threadlane_ui_kit::review_changes_files(file_list_content)))
                 .child(commit_footer)
                 .into_any_element()
         };
 
-        div()
-            .flex_1()
-            .min_h_0()
-            .relative()
-            .flex()
-            .flex_col()
+        threadlane_ui_kit::review_panel_surface()
             .child(branch_header)
             .children((!self.branch_popover_open).then(|| review_sub_tabs))
             .child(review_body)
             .into_any_element()
     }
 
-    fn render_history(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        let filter_text = self
-            .history_filter_input
-            .read(cx)
-            .value()
-            .trim()
-            .to_lowercase();
-        let commits = self.git_status.as_ref().map(|s| &s.recent_commits);
-
-        let filtered_commits: Vec<&GitCommitInfo> = if let Some(commits) = commits {
-            if filter_text.is_empty() {
-                commits.iter().collect()
-            } else {
-                commits
-                    .iter()
-                    .filter(|c| {
-                        c.summary.to_lowercase().contains(&filter_text)
-                            || c.author_name.to_lowercase().contains(&filter_text)
-                            || c.short_sha.to_lowercase().contains(&filter_text)
-                            || c.sha.to_lowercase().contains(&filter_text)
-                    })
-                    .collect()
+    fn render_review_pr(&self, pr: &threadlane_protocol::repo::GitHubPrInfo, cx: &mut Context<Self>) -> impl IntoElement {
+        let pr = pr.clone();
+        let project = self.project.clone();
+        threadlane_ui_kit::review_pr_card(&pr, &threadlane_ui_kit::ReviewPrState {
+            expanded: self.pr_expanded,
+            feedback_count: Some(threadlane_git::collect_actionable_pr_feedback(&pr).len()),
+            can_address: self.project.is_some(),
+            busy: self.git_busy,
+        }, cx.listener({ let pr = pr.clone(); move |this, action: &threadlane_ui_kit::ReviewPrAction, _, cx| {
+            use threadlane_ui_kit::ReviewPrAction;
+            match action {
+                ReviewPrAction::Toggle => this.pr_expanded = !this.pr_expanded,
+                ReviewPrAction::Open => cx.open_url(&pr.url),
+                ReviewPrAction::FixCi => {
+                    let failed = pr.checks.iter().filter(|check| matches!(check.conclusion.as_deref().unwrap_or("").to_uppercase().as_str(),
+                        "FAILURE" | "TIMED_OUT" | "ACTION_REQUIRED" | "CANCELLED" | "ERROR"))
+                        .map(|check| check.name.clone()).collect::<Vec<_>>().join(", ");
+                    let prompt = format!("Please inspect and fix the failing CI check on PR #{} ({}): {failed}", pr.number, pr.title);
+                    this.model.update(cx, |state, _| state.request_composer_prompt(prompt));
+                }
+                ReviewPrAction::AddressComments => {
+                    let Some(work_dir) = project.clone() else { return; };
+                    this.model.update(cx, |state, cx| {
+                        state.session_status = Some(match state.address_pr_reviews_manual(work_dir, pr.head_ref.clone(), &pr) {
+                            Ok(_) => "Addressing PR review feedback…".into(), Err(error) => error,
+                        });
+                        cx.notify();
+                    });
+                }
             }
-        } else {
-            Vec::new()
-        };
+            cx.notify();
+        }}), cx)
+    }
 
-        let commit_list = if filtered_commits.is_empty() {
-            div()
-                .flex_1()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .p_4()
-                .text_center()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme.foreground)
-                        .child("No commits found"),
-                )
-                .child(
-                    div()
-                        .mt_1()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(if filter_text.is_empty() {
-                            "This branch has no recent commits."
-                        } else {
-                            "No commits match your filter."
-                        }),
-                )
-                .children((!filter_text.is_empty()).then(|| {
-                    Button::new("history-clear-filter")
-                        .label("Clear filter")
-                        .ghost()
-                        .small()
-                        .tooltip("Clear the commit filter")
-                        .on_click(cx.listener(|this, _event, window, cx| {
-                            this.history_filter_input.update(cx, |input, cx| {
-                                input.set_value("", window, cx);
-                            });
+    fn render_current_stash(&self, stash: &threadlane_protocol::repo::GitStashInfo, cx: &mut Context<Self>) -> impl IntoElement {
+        let index = stash.index;
+        let loading = self.loading_stash_index == Some(index);
+        let files = self.stash_files.as_ref().filter(|(loaded, _)| *loaded == index);
+        let body = self.stash_expanded.then(|| {
+            let rows = files.into_iter().flat_map(|(_, files)| files).map(|file| {
+                let project = self.project.clone();
+                let model = self.model.clone();
+                let target = file.path.clone();
+                threadlane_ui_kit::review_stash_file(index, file, cx.listener(move |_, _, _, cx| {
+                    let Some(project) = project.clone() else { return; };
+                    let target = target.clone();
+                    let diff_project = project.clone();
+                    let model = model.clone();
+                    let client = model.read(cx).daemon_client.clone();
+                    cx.spawn(async move |_, cx| {
+                        let diff_target = target.clone();
+                        let content = cx.background_executor().spawn(async move {
+                            threadlane_ui_state::project_io::diff_stash_file(&client, &diff_project, index, diff_target).await.unwrap_or_else(|error| error)
+                        }).await;
+                        let _ = model.update(cx, |state, cx| {
+                            state.request_open_diff(project, target, content);
                             cx.notify();
-                        }))
-                }))
-                .into_any_element()
+                        });
+                    }).detach();
+                }), cx).into_any_element()
+            }).collect();
+            threadlane_ui_kit::review_stash_files(loading, rows, cx).into_any_element()
+        });
+        threadlane_ui_kit::review_stash_card(stash, &threadlane_ui_kit::ReviewStashState {
+            expanded: self.stash_expanded, loading, files_count: files.map(|(_, files)| files.len()), busy: self.git_busy,
+        }, body, cx.listener(move |this, action: &threadlane_ui_kit::ReviewStashAction, window, cx| {
+            match action {
+                threadlane_ui_kit::ReviewStashAction::Discard => this.run_git_action(GitAction::DropStash(Some(index)), window, cx),
+                threadlane_ui_kit::ReviewStashAction::Restore => this.run_git_action(GitAction::PopStash(Some(index)), window, cx),
+                threadlane_ui_kit::ReviewStashAction::Toggle => {
+                    this.stash_expanded = !this.stash_expanded;
+                    if this.stash_expanded && this.loading_stash_index != Some(index)
+                        && this.stash_files.as_ref().is_none_or(|(loaded, _)| *loaded != index) {
+                        if let Some(project) = this.project.clone() {
+                            this.loading_stash_index = Some(index);
+                            let tx = this.event_tx.clone();
+                            let client = this.model.read(cx).daemon_client.clone();
+                            if let Ok(executor) = threadlane_ui_state::chat::executor() {
+                                executor.spawn(async move {
+                                    let files = threadlane_ui_state::project_io::stash_files(&client, &project, index).await.unwrap_or_default();
+                                    let _ = tx.send(PanelEvent::StashFilesLoaded { project, index, files });
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            cx.notify();
+        }), cx)
+    }
+
+    fn render_history(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let query = self.history_filter_input.read(cx).value();
+        let commits = self.git_status.as_ref().map_or(&[][..], |status| status.recent_commits.as_slice());
+        let filtered = threadlane_ui_kit::review_filtered_commits(commits, &query);
+        let content = if filtered.is_empty() {
+            threadlane_ui_kit::review_history_empty(!query.trim().is_empty(), cx.listener(|this, _, window, cx| {
+                this.history_filter_input.update(cx, |input, cx| input.set_value("", window, cx));
+                cx.notify();
+            }), cx).into_any_element()
         } else {
-            let project = self.project.clone();
-            let selected_sha = self.selected_commit_sha.clone();
-            let selected_files = self.selected_commit_files.clone();
-            let loading_sha = self.loading_commit_sha.clone();
-            let model = self.model.clone();
-            let event_tx = self.event_tx.clone();
-
-            div()
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scrollbar()
-                .py_1()
-                .children(filtered_commits.into_iter().map(|commit| {
-                    let sha = commit.sha.clone();
-                    let short_sha = commit.short_sha.clone();
-                    let summary = commit.summary.clone();
-                    let author = commit.author_name.clone();
-                    let rel_time = commit.relative_time.clone();
-                    let is_expanded = selected_sha.as_deref() == Some(&sha);
-                    let is_loading = loading_sha.as_deref() == Some(&sha);
-                    let click_sha = sha.clone();
-                    let click_tx = event_tx.clone();
-                    let click_project = project.clone();
-                    let click_model = model.clone();
-
-                    div()
-                        .id(SharedString::from(format!("commit-{sha}")))
-                        .flex()
-                        .flex_col()
-                        .mx_3()
-                        .my_0p5()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(if is_expanded {
-                            theme.primary.opacity(0.6)
-                        } else {
-                            theme.border
-                        })
-                        .bg(theme.group_box)
-                        .child(
-                            Button::new(SharedString::from(format!("commit-header-{sha}")))
-                                .accessibility_label(format!(
-                                    "Inspect commit {short_sha}: {summary}"
-                                ))
-                                .ghost()
-                                .h_auto()
-                                .w_full()
-                                .p_0()
-                                .on_click(cx.listener(move |this, _event, _window, cx| {
-                                    if this.selected_commit_sha.as_deref() == Some(&click_sha) {
-                                        this.selected_commit_sha = None;
-                                        this.loading_commit_sha = None;
-                                        this.selected_commit_files.clear();
-                                    } else {
-                                        this.selected_commit_sha = Some(click_sha.clone());
-                                        this.loading_commit_sha = Some(click_sha.clone());
-                                        this.selected_commit_files.clear();
-                                        if let Some(proj) = click_project.clone() {
-                                            let tx = click_tx.clone();
-                                            let fetch_sha = click_sha.clone();
-                                            let click_client = click_model
-                                                .read(cx)
-                                                .daemon_client
-                                                .clone();
-                                            if let Ok(executor) =
-                                                threadlane_ui_state::chat::executor()
-                                            {
-                                                executor.spawn(async move {
-                                                    let files =
-                                                        threadlane_ui_state::project_io::commit_files(
-                                                            &click_client,
-                                                            &proj,
-                                                            fetch_sha.clone(),
-                                                        )
-                                                        .await
-                                                        .unwrap_or_default();
-                                                    let _ = tx.send(
-                                                        PanelEvent::CommitFilesLoaded {
-                                                            sha: fetch_sha,
-                                                            files,
-                                                        },
-                                                    );
-                                                });
-                                            }
-                                        }
-                                    }
+            threadlane_ui_kit::review_history_viewport().children(filtered.into_iter().map(|commit| {
+                let expanded = self.selected_commit_sha.as_deref() == Some(&commit.sha);
+                let loading = self.loading_commit_sha.as_deref() == Some(&commit.sha);
+                let body = expanded.then(|| {
+                    let rows = self.selected_commit_files.iter().map(|file| {
+                        let project = self.project.clone();
+                        let model = self.model.clone();
+                        let target = file.path.clone();
+                        let sha = commit.sha.clone();
+                        let short = commit.short_sha.clone();
+                        threadlane_ui_kit::review_commit_file(&commit.sha, file, cx.listener(move |_, _, _, cx| {
+                            let Some(project) = project.clone() else { return; };
+                            let diff_project = project.clone();
+                            let target = target.clone();
+                            let diff_target = target.clone();
+                            let sha = sha.clone();
+                            let label = format!("{target} @ {short}");
+                            let model = model.clone();
+                            let client = model.read(cx).daemon_client.clone();
+                            cx.spawn(async move |_, cx| {
+                                let content = cx.background_executor().spawn(async move {
+                                    threadlane_ui_state::project_io::diff_commit_file(&client, &diff_project, sha, diff_target).await.unwrap_or_else(|error| error)
+                                }).await;
+                                let _ = model.update(cx, |state, cx| {
+                                    state.request_open_diff(project, label, content);
                                     cx.notify();
-                                }))
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .whitespace_normal()
-                                        .p_2p5()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_start()
-                                                .justify_between()
-                                                .gap_2()
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .truncate()
-                                                        .text_xs()
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .text_color(theme.foreground)
-                                                        .child(summary),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex_none()
-                                                        .flex_shrink_0()
-                                                        .px_1p5()
-                                                        .py_0p5()
-                                                        .rounded_sm()
-                                                        .bg(theme.muted)
-                                                        .text_xs()
-                                                        .text_color(theme.muted_foreground)
-                                                        .child(short_sha.clone()),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_1p5()
-                                                .text_xs()
-                                                .text_color(theme.muted_foreground)
-                                                .child(
-                                                    div()
-                                                        .size_3()
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .child(IconName::User),
-                                                )
-                                                .child(format!("{author} • {rel_time}")),
-                                        ),
-                                ),
-                        )
-                        .children(is_expanded.then(|| {
-                            let commit_files = selected_files.clone();
-                            let commit_sha = sha.clone();
-                            let short_sha_disp = short_sha.clone();
-                            let proj_for_diff = project.clone();
-                            let model_ref = model.clone();
-
-                            div()
-                                .border_t_1()
-                                .border_color(theme.border)
-                                .bg(theme.background)
-                                .p_2()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .children(is_loading.then(|| {
-                                    div()
-                                        .p_2()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child(Spinner::new().xsmall())
-                                        .child("Loading changed files…")
-                                }))
-                                .children((!is_loading && commit_files.is_empty()).then(|| {
-                                    div()
-                                        .p_2()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child("No files changed in this commit.")
-                                }))
-                                .children(commit_files.into_iter().map(|file| {
-                                    let path = file.path.clone();
-                                    let status = file.status_char().to_string();
-                                    let status_color = match file.status_char() {
-                                        'A' | '?' => theme.success,
-                                        'D' => theme.danger,
-                                        _ => theme.warning,
-                                    };
-                                    let target_path = path.clone();
-                                    let diff_sha = commit_sha.clone();
-                                    let disp_sha = short_sha_disp.clone();
-                                    let diff_proj = proj_for_diff.clone();
-                                    let m = model_ref.clone();
-
-                                    Button::new(SharedString::from(format!(
-                                        "commit-file-{commit_sha}-{path}"
-                                    )))
-                                    .accessibility_label(format!(
-                                        "Review {path} in commit {commit_sha}"
-                                    ))
-                                    .ghost()
-                                    .h_auto()
-                                    .w_full()
-                                    .p_0()
-                                    .on_click(cx.listener(move |_this, _event, _window, cx| {
-                                        let Some(proj) = diff_proj.clone() else {
-                                            return;
-                                        };
-                                        let p = proj.clone();
-                                        let target = target_path.clone();
-                                        let sha_str = diff_sha.clone();
-                                        let label = format!("{target} @ {disp_sha}");
-                                        let state_model = m.clone();
-                                        let client = m.read(cx).daemon_client.clone();
-                                        cx.spawn(async move |_this, cx| {
-                                            let content = cx
-                                                .background_executor()
-                                                .spawn(async move {
-                                                    threadlane_ui_state::project_io::diff_commit_file(
-                                                        &client, &p, sha_str, target,
-                                                    )
-                                                    .await
-                                                    .unwrap_or_else(|e| e)
-                                                })
-                                                .await;
-                                            let _ = state_model.update(cx, |state, cx| {
-                                                state.request_open_diff(proj, label, content);
-                                                cx.notify();
-                                            });
-                                        })
-                                        .detach();
-                                    }))
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            .whitespace_normal()
-                                            .h(rems(1.625))
-                                            .px_2()
-                                            .rounded_md()
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .gap_2()
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap_1p5()
-                                                    .child(
-                                                        div()
-                                                            .size_3()
-                                                            .text_color(theme.muted_foreground)
-                                                            .child(IconName::File),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .truncate()
-                                                            .text_xs()
-                                                            .text_color(theme.foreground)
-                                                            .child(path),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap_1p5()
-                                                    .when(file.additions > 0, |r| {
-                                                        r.child(
-                                                            div()
-                                                                .text_xs()
-                                                                .text_color(theme.success)
-                                                                .child(format!(
-                                                                    "+{}",
-                                                                    file.additions
-                                                                )),
-                                                        )
-                                                    })
-                                                    .when(file.deletions > 0, |r| {
-                                                        r.child(
-                                                            div()
-                                                                .text_xs()
-                                                                .text_color(theme.danger)
-                                                                .child(format!(
-                                                                    "-{}",
-                                                                    file.deletions
-                                                                )),
-                                                        )
-                                                    })
-                                                    .child(
-                                                        div()
-                                                            .size(rems(0.875))
-                                                            .rounded_sm()
-                                                            .flex()
-                                                            .items_center()
-                                                            .justify_center()
-                                                            .text_xs()
-                                                            .font_weight(FontWeight::BOLD)
-                                                            .text_color(status_color)
-                                                            .child(status),
-                                                    ),
-                                            ),
-                                    )
-                                }))
-                        }))
-                }))
-                .into_any_element()
+                                });
+                            }).detach();
+                        }), cx).into_any_element()
+                    }).collect();
+                    threadlane_ui_kit::review_commit_files(loading, rows, cx).into_any_element()
+                });
+                let sha = commit.sha.clone();
+                threadlane_ui_kit::review_commit_card(commit, expanded, body, cx.listener(move |this, _, _, cx| {
+                    if this.selected_commit_sha.as_deref() == Some(&sha) {
+                        this.selected_commit_sha = None;
+                        this.loading_commit_sha = None;
+                        this.selected_commit_files.clear();
+                    } else {
+                        this.selected_commit_sha = Some(sha.clone());
+                        this.loading_commit_sha = Some(sha.clone());
+                        this.selected_commit_files.clear();
+                        if let Some(project) = this.project.clone() {
+                            let tx = this.event_tx.clone();
+                            let fetch_sha = sha.clone();
+                            let client = this.model.read(cx).daemon_client.clone();
+                            if let Ok(executor) = threadlane_ui_state::chat::executor() {
+                                executor.spawn(async move {
+                                    let files = threadlane_ui_state::project_io::commit_files(&client, &project, fetch_sha.clone()).await.unwrap_or_default();
+                                    let _ = tx.send(PanelEvent::CommitFilesLoaded { sha: fetch_sha, files });
+                                });
+                            }
+                        }
+                    }
+                    cx.notify();
+                }), cx)
+            })).into_any_element()
         };
-
-        div()
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .bg(theme.title_bar)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.input)
-                            .child(
-                                div()
-                                    .size(rems(0.875))
-                                    .text_color(theme.muted_foreground)
-                                    .child(IconName::Search),
-                            )
-                            .child(
-                                div().flex_1().child(
-                                    Input::new(&self.history_filter_input)
-                                        .aria_label("Filter commits")
-                                        .appearance(false)
-                                        .bordered(false),
-                                ),
-                            ),
-                    ),
-            )
-            .child(commit_list)
+        threadlane_ui_kit::review_history_surface(&self.history_filter_input, content, cx)
     }
 
     fn render_branch_manager(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        let filter_text = self
-            .branch_filter_input
-            .read(cx)
-            .value()
-            .trim()
-            .to_lowercase();
-        let current_branch = self
-            .git_status
-            .as_ref()
-            .and_then(|s| s.branch.as_deref())
-            .unwrap_or("main");
+        let project = self.project.clone();
+        threadlane_ui_kit::review_branch_manager(&self.branch_filter_input, self.git_status.as_ref(), self.git_busy,
+            self.project.is_some(), cx.listener(move |this, action: &threadlane_ui_kit::ReviewBranchAction, window, cx| {
+                this.handle_review_branch_action(&project, action, window, cx);
+            }), cx)
+    }
 
-        let branch_details = self.git_status.as_ref().map(|s| &s.branch_details);
-        let default_branch_name = self
-            .git_status
-            .as_ref()
-            .and_then(|s| s.default_branch.as_deref())
-            .unwrap_or("main");
-
-        let all_branches: Vec<GitBranchInfo> = if let Some(details) = branch_details {
-            details.clone()
-        } else if let Some(status) = &self.git_status {
-            status
-                .branches
-                .iter()
-                .filter(|b| b.as_str() != "origin" && !b.ends_with("/HEAD"))
-                .map(|b| GitBranchInfo {
-                    name: b.clone(),
-                    is_current: b == current_branch,
-                    is_default: b == default_branch_name,
-                    is_remote: b.starts_with("origin/"),
-                    relative_time: String::new(),
-                    committer_date_unix: 0,
-                    upstream: None,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        let filtered_branches: Vec<GitBranchInfo> = all_branches
-            .into_iter()
-            .filter(|b| {
-                b.name != "origin"
-                    && !b.name.ends_with("/HEAD")
-                    && (filter_text.is_empty() || b.name.to_lowercase().contains(&filter_text))
-            })
-            .collect();
-
-        let default_branches: Vec<GitBranchInfo> = filtered_branches
-            .iter()
-            .filter(|b| b.is_default && !b.is_remote)
-            .cloned()
-            .collect();
-
-        let recent_branches: Vec<GitBranchInfo> = filtered_branches
-            .iter()
-            .filter(|b| !b.is_default && !b.is_remote)
-            .cloned()
-            .collect();
-
-        let other_branches: Vec<GitBranchInfo> = filtered_branches
-            .iter()
-            .filter(|b| b.is_remote)
-            .cloned()
-            .collect();
-
-        let current_branch_str = current_branch.to_string();
-
-        div()
-            .id("git-branch-manager")
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .bg(theme.title_bar)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .p_3()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .px_2()
-                            .h_8()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.background)
-                            .child(
-                                div()
-                                    .size(rems(0.875))
-                                    .text_color(theme.muted_foreground)
-                                    .child(IconName::Search),
-                            )
-                            .child(
-                                div().flex_1().child(
-                                    Input::new(&self.branch_filter_input).aria_label("Filter branches")
-                                        .appearance(false)
-                                        .bordered(false),
-                                ),
-                            ),
-                    )
-                    .child(
-                        Button::new("open-new-branch-modal-btn")
-                            .icon(IconName::Plus)
-                            .label("New branch…")
-                            .outline()
-                            .small()
-                            .tooltip("Create a new branch…")
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.open_new_branch_dialog(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("close-branch-manager-btn")
-                                    .accessibility_label("Back to review")
-                            .icon(IconName::Close)
-                            .ghost()
-                            .small()
-                            .tooltip("Back to review")
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.branch_popover_open = false;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scrollbar()
-                    .p_3()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(
-                        Button::new("quick-merge-banner")
-                            .accessibility_label("Merge a branch…")
-                            .ghost().h_auto().w_full().p_0()
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.open_merge_dialog(window, cx);
-                            }))
-                            .child(div().w_full().whitespace_normal()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .px_2p5()
-                            .py_2()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.muted.opacity(0.35))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .size_4()
-                                            .text_color(theme.primary)
-                                            .child(Icon::default().path("icons/git/branch.svg")),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(theme.foreground)
-                                            .child(format!("Choose a branch to merge into {current_branch_str}…")),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .size(rems(0.875))
-                                    .text_color(theme.muted_foreground)
-                                    .child(IconName::ChevronRight),
-                            )),
-                    )
-                    .when(!default_branches.is_empty(), |el| {
-                        el.child(self.render_branch_section("DEFAULT BRANCH", default_branches, cx))
-                    })
-                    .when(!recent_branches.is_empty(), |el| {
-                        el.child(self.render_branch_section("RECENT BRANCHES", recent_branches, cx))
-                    })
-                    .when(!other_branches.is_empty(), |el| {
-                        el.child(self.render_branch_section("OTHER BRANCHES", other_branches, cx))
-                    }),
-            )
+    fn handle_review_branch_action(&mut self, project: &Option<PathBuf>, action: &threadlane_ui_kit::ReviewBranchAction, window: &mut Window, cx: &mut Context<Self>) {
+        use threadlane_ui_kit::ReviewBranchAction;
+        if self.project != *project { return; }
+        match action {
+            ReviewBranchAction::Close => self.branch_popover_open = false,
+            ReviewBranchAction::Copy(name) => cx.write_to_clipboard(ClipboardItem::new_string(name.clone())),
+            _ if self.git_busy => return,
+            ReviewBranchAction::New => self.open_new_branch_dialog(window, cx),
+            ReviewBranchAction::Merge => self.open_merge_dialog(window, cx),
+            ReviewBranchAction::Select(name) => {
+                let branches = threadlane_ui_kit::review_branches(self.git_status.as_ref(), "");
+                if !branches.iter().any(|branch| branch.name == *name && !branch.is_current) { return; }
+                if self.git_status.as_ref().is_some_and(|status| !status.files.is_empty()) {
+                    self.switch_target_branch = Some(name.clone());
+                    self.switch_dialog_open = true;
+                    self.switch_stash_mode = true;
+                } else {
+                    self.run_git_action(GitAction::Checkout(name.clone()), window, cx);
+                    self.branch_popover_open = false;
+                }
+            }
+            ReviewBranchAction::Delete(name) => {
+                if let Some(project) = project { self.confirm_delete_branch(project.clone(), name.clone(), window, cx); }
+            }
+        }
+        cx.notify();
     }
 
     fn can_delete_branch(&self, project: &Path, branch: &str) -> bool {
@@ -4777,16 +2429,7 @@ impl RightPanelView {
             let panel = panel.clone();
             let project = project.clone();
             let branch = branch.clone();
-            alert
-                .title(format!("Delete branch “{branch}”?"))
-                .description(format!(
-                    "Delete the local branch in {}. Remote branches and worktrees will not be removed. Unmerged branches and branches checked out in a worktree cannot be deleted.",
-                    project.display()
-                ))
-                .button_props(DialogButtonProps::default()
-                    .ok_text("Delete")
-                    .ok_variant(ButtonVariant::Danger)
-                    .show_cancel(true))
+            threadlane_ui_kit::review_delete_branch_alert(alert, &branch, &project.display().to_string())
                 .on_ok(move |_, window, cx| {
                     let _ = panel.update(cx, |panel, cx| {
                         // Recheck after confirmation: the panel may now show another project.
@@ -4799,164 +2442,13 @@ impl RightPanelView {
         });
     }
 
-    fn render_branch_section(
-        &self,
-        title: &'static str,
-        branches: Vec<GitBranchInfo>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .text_xs()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme.muted_foreground)
-                    .px_1()
-                    .pb_0p5()
-                    .child(title),
-            )
-            .children(branches.into_iter().map(|branch| {
-                let name = branch.name.clone();
-                let is_current = branch.is_current;
-                let rel_time = branch.relative_time.clone();
-                let branch_name_for_click = name.clone();
-                let menu_name = name.clone();
-                let panel = cx.entity().downgrade();
-                let project = self.project.clone();
-                Button::new(SharedString::from(format!("branch-row-{}", name)))
-                    .debug_selector({
-                        let name = name.clone();
-                        move || format!("branch-row-{name}")
-                    })
-                    .accessibility_label(if is_current {
-                        format!("Current branch {name}, already checked out")
-                    } else {
-                        format!("Switch to branch {name}")
-                    })
-                    .ghost()
-                    .h_auto()
-                    .w_full()
-                    .p_0()
-                    .on_click(cx.listener(move |this, _event, window, cx| {
-                        if !is_current {
-                            let has_dirty = this
-                                .git_status
-                                .as_ref()
-                                .map_or(false, |s| !s.files.is_empty());
-                            if has_dirty {
-                                this.switch_target_branch = Some(branch_name_for_click.clone());
-                                this.switch_dialog_open = true;
-                                this.switch_stash_mode = true;
-                                cx.notify();
-                            } else {
-                                this.run_git_action(
-                                    GitAction::Checkout(branch_name_for_click.clone()),
-                                    window,
-                                    cx,
-                                );
-                                this.branch_popover_open = false;
-                            }
-                        }
-                    }))
-                    .child(
-                        div()
-                            .w_full()
-                            .whitespace_normal()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .px_2p5()
-                            .py_2()
-                            .rounded_md()
-                            .bg(if is_current {
-                                theme.muted.opacity(0.7)
-                            } else {
-                                gpui::transparent_black()
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .child(
-                                        div()
-                                            .size_4()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .text_color(if is_current {
-                                                theme.primary
-                                            } else {
-                                                theme.muted_foreground
-                                            })
-                                            .child(if is_current {
-                                                Icon::new(IconName::Check)
-                                            } else {
-                                                Icon::default().path("icons/git/branch.svg")
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .truncate()
-                                            .text_xs()
-                                            .font_weight(if is_current {
-                                                FontWeight::BOLD
-                                            } else {
-                                                FontWeight::MEDIUM
-                                            })
-                                            .text_color(if is_current {
-                                                theme.foreground
-                                            } else {
-                                                theme.foreground.opacity(0.9)
-                                            })
-                                            .child(name),
-                                    )
-                                    .children(is_current.then(|| {
-                                        Tag::new()
-                                            .child("current")
-                                            .with_variant(TagVariant::Info)
-                                            .small()
-                                    })),
-                            )
-                            .children((!rel_time.is_empty()).then(|| {
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(rel_time)
-                            })),
-                    )
-                    .context_menu(move |menu, _, cx| {
-                        let copy_name = menu_name.clone();
-                        let delete_name = menu_name.clone();
-                        let delete_panel = panel.clone();
-                        let delete_project = project.clone();
-                        let can_delete = panel.upgrade().is_some_and(|panel| {
-                            project.as_deref().is_some_and(|project| {
-                                panel.read(cx).can_delete_branch(project, &menu_name)
-                            })
-                        });
-                        menu.item(PopupMenuItem::new("Copy branch name").on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(copy_name.clone()));
-                        }))
-                        .separator()
-                        .item(PopupMenuItem::new("Delete branch…")
-                            .disabled(!can_delete)
-                            .on_click(move |_, window, cx| {
-                                if let Some(project) = delete_project.clone() {
-                                    let _ = delete_panel.update(cx, |panel, cx| {
-                                        panel.confirm_delete_branch(project, delete_name.clone(), window, cx);
-                                    });
-                                }
-                            }))
-                    })
-            }))
+    #[cfg(test)]
+    fn render_branch_section(&self, title: &'static str, branches: Vec<GitBranchInfo>, cx: &mut Context<Self>) -> impl IntoElement {
+        let project = self.project.clone();
+        threadlane_ui_kit::review_branch_section(title, branches, self.git_busy, self.project.is_some(),
+            cx.listener(move |this, action: &threadlane_ui_kit::ReviewBranchAction, window, cx| {
+                this.handle_review_branch_action(&project, action, window, cx);
+            }), cx)
     }
 
     fn close_all_git_dialogs(&mut self) {
@@ -4982,32 +2474,18 @@ impl RightPanelView {
             return;
         }
         let panel = cx.entity().downgrade();
-        let width = if self.new_branch_dialog_open || self.stash_dialog_open {
-            26.25
-        } else {
-            28.75
-        };
-        let title = if self.new_branch_dialog_open {
-            "Create a branch".to_string()
-        } else if self.merge_dialog_open {
-            "Merge branches".to_string()
-        } else if self.stash_dialog_open {
-            "Stash changes".to_string()
-        } else {
-            format!(
-                "Switch to {}",
-                self.switch_target_branch.as_deref().unwrap_or("main")
-            )
-        };
+        let kind = if self.new_branch_dialog_open { threadlane_ui_kit::ReviewGitDialog::NewBranch }
+            else if self.merge_dialog_open { threadlane_ui_kit::ReviewGitDialog::Merge }
+            else if self.stash_dialog_open { threadlane_ui_kit::ReviewGitDialog::Stash }
+            else { threadlane_ui_kit::ReviewGitDialog::Switch };
+        let target = self.switch_target_branch.clone();
         window.open_dialog(cx, move |dialog, window, cx| {
             let close_panel = panel.clone();
             let content = panel
                 .update(cx, |panel, cx| panel.render_git_dialog_layer(cx))
                 .ok()
                 .flatten();
-            dialog
-                .w(window.rem_size() * width)
-                .title(title.clone())
+            threadlane_ui_kit::review_git_dialog(dialog, kind, target.as_deref(), window)
                 .children(content)
                 .on_ok(|_, _, _| false)
                 .on_close(move |_, _, cx| {
@@ -5034,558 +2512,62 @@ impl RightPanelView {
         }
     }
 
-    fn render_stash_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        let include_untracked = self.stash_include_untracked;
+    fn review_git_form_state(&self) -> threadlane_ui_kit::ReviewGitFormState<'_> {
+        threadlane_ui_kit::ReviewGitFormState {
+            current_branch: self.git_status.as_ref().and_then(|status| status.branch.as_deref()).unwrap_or("main"),
+            target_branch: self.switch_target_branch.as_deref(), selected_merge: self.merge_selected_branch.as_deref(),
+            busy: self.git_busy, stash_changes: self.switch_stash_mode, include_untracked: self.stash_include_untracked,
+        }
+    }
 
-        div()
-            .id("stash-dialog")
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.foreground)
-                            .child("Stash message (optional)"),
-                    )
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1p5()
-                            .rounded_md()
-                            .bg(theme.input)
-                            .border_1()
-                            .border_color(theme.border)
-                            .child(
-                                Input::new(&self.stash_message_input).aria_label("Stash message"),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Checkbox::new("stash-include-untracked-chk")
-                            .checked(include_untracked)
-                            .on_click(cx.listener(|this, checked, _window, cx| {
-                                this.stash_include_untracked = *checked;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.foreground)
-                            .child("Include untracked files"),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap_2()
-                    .pt_2()
-                    .child(
-                        Button::new("cancel-stash-btn")
-                            .label("Cancel")
-                            .ghost()
-                            .small()
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.close_all_git_dialogs();
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("confirm-stash-btn")
-                            .label("Stash changes")
-                            .primary()
-                            .small()
-                            .disabled(self.git_busy)
-                            .on_click(cx.listener(move |this, _event, window, cx| {
-                                let message =
-                                    this.stash_message_input.read(cx).value().trim().to_string();
-                                let msg_opt = (!message.is_empty()).then_some(message);
-                                let include_untracked = this.stash_include_untracked;
-                                this.run_git_action(
-                                    GitAction::StashPush {
-                                        message: msg_opt,
-                                        include_untracked,
-                                    },
-                                    window,
-                                    cx,
-                                );
-                                this.close_all_git_dialogs();
-                            })),
-                    ),
-            )
+    fn handle_review_git_form_action(&mut self, action: &threadlane_ui_kit::ReviewGitFormAction, window: &mut Window, cx: &mut Context<Self>) {
+        use threadlane_ui_kit::ReviewGitFormAction;
+        match action {
+            ReviewGitFormAction::Close => { if !self.git_busy || self.stash_dialog_open { self.close_all_git_dialogs(); } }
+            _ if self.git_busy => return,
+            ReviewGitFormAction::IncludeUntracked(include) => self.stash_include_untracked = *include,
+            ReviewGitFormAction::SwitchStash(stash) => self.switch_stash_mode = *stash,
+            ReviewGitFormAction::SelectMerge(name) => self.merge_selected_branch = Some(name.clone()),
+            ReviewGitFormAction::Create => {
+                let name = self.new_branch_name_input.read(cx).value().trim().to_string();
+                if !name.is_empty() { self.run_git_action(GitAction::CreateBranch(name), window, cx); self.close_all_git_dialogs(); }
+            }
+            ReviewGitFormAction::Merge => {
+                if let Some(name) = self.merge_selected_branch.clone() { self.run_git_action(GitAction::Merge(name), window, cx); self.close_all_git_dialogs(); }
+            }
+            ReviewGitFormAction::Switch => {
+                if let Some(target) = self.switch_target_branch.clone() {
+                    let action = if self.switch_stash_mode { GitAction::CheckoutStash(target) } else { GitAction::CheckoutCarry(target) };
+                    self.run_git_action(action, window, cx); self.close_all_git_dialogs(); self.branch_popover_open = false;
+                }
+            }
+            ReviewGitFormAction::Stash => {
+                let message = self.stash_message_input.read(cx).value().trim().to_string();
+                self.run_git_action(GitAction::StashPush { message: (!message.is_empty()).then_some(message), include_untracked: self.stash_include_untracked }, window, cx);
+                self.close_all_git_dialogs();
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_stash_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        threadlane_ui_kit::review_stash_form(&self.stash_message_input, &self.review_git_form_state(),
+            cx.listener(|this, action: &threadlane_ui_kit::ReviewGitFormAction, window, cx| this.handle_review_git_form_action(action, window, cx)), cx)
     }
 
     fn render_new_branch_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        let current_branch = self
-            .git_status
-            .as_ref()
-            .and_then(|s| s.branch.as_deref())
-            .unwrap_or("main")
-            .to_string();
-        let name = self
-            .new_branch_name_input
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        let can_create = !name.is_empty() && !self.git_busy;
-
-        div()
-            .id("new-branch-dialog")
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("Based on")
-                    .child(
-                        Tag::new()
-                            .child(current_branch)
-                            .with_variant(TagVariant::Secondary)
-                            .small(),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.foreground)
-                            .child("Branch name"),
-                    )
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.background)
-                            .child(
-                                Input::new(&self.new_branch_name_input)
-                                    .aria_label("New branch name")
-                                    .bordered(false),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap_2()
-                    .pt_2()
-                    .child(
-                        Button::new("cancel-new-branch-btn")
-                            .label("Cancel")
-                            .ghost()
-                            .small()
-                            // Synara busy guard: block dismiss while Git is running.
-                            .disabled(self.git_busy)
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                if this.git_busy {
-                                    return;
-                                }
-                                this.close_all_git_dialogs();
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("submit-new-branch-btn")
-                            .label(if name.is_empty() {
-                                "Create branch".to_string()
-                            } else {
-                                format!("Create {name}")
-                            })
-                            .accessibility_label(if name.is_empty() {
-                                "Create branch".to_string()
-                            } else {
-                                format!("Create branch {name}")
-                            })
-                            .tooltip(if name.is_empty() {
-                                "Enter a branch name".to_string()
-                            } else {
-                                format!("Create branch {name}")
-                            })
-                            .primary()
-                            .small()
-                            .disabled(!can_create)
-                            .on_click(cx.listener(move |this, _event, window, cx| {
-                                let name = this
-                                    .new_branch_name_input
-                                    .read(cx)
-                                    .value()
-                                    .trim()
-                                    .to_string();
-                                if !name.is_empty() {
-                                    this.run_git_action(GitAction::CreateBranch(name), window, cx);
-                                    this.close_all_git_dialogs();
-                                }
-                            })),
-                    ),
-            )
+        threadlane_ui_kit::review_new_branch_form(&self.new_branch_name_input, &self.review_git_form_state(),
+            cx.listener(|this, action: &threadlane_ui_kit::ReviewGitFormAction, window, cx| this.handle_review_git_form_action(action, window, cx)), cx)
     }
 
     fn render_merge_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        let current_branch = self
-            .git_status
-            .as_ref()
-            .and_then(|s| s.branch.as_deref())
-            .unwrap_or("main")
-            .to_string();
-        let filter = self
-            .merge_filter_input
-            .read(cx)
-            .value()
-            .trim()
-            .to_lowercase();
-
-        let branch_details = self.git_status.as_ref().map(|s| &s.branch_details);
-        let branches: Vec<GitBranchInfo> = if let Some(details) = branch_details {
-            details
-                .iter()
-                .filter(|b| {
-                    b.name != "origin"
-                        && !b.name.ends_with("/HEAD")
-                        && b.name != current_branch
-                        && (filter.is_empty() || b.name.to_lowercase().contains(&filter))
-                })
-                .cloned()
-                .collect()
-        } else if let Some(status) = &self.git_status {
-            status
-                .branches
-                .iter()
-                .filter(|b| {
-                    b.as_str() != "origin"
-                        && !b.ends_with("/HEAD")
-                        && b.as_str() != current_branch.as_str()
-                        && (filter.is_empty() || b.to_lowercase().contains(&filter))
-                })
-                .map(|b| GitBranchInfo {
-                    name: b.clone(),
-                    is_current: false,
-                    is_default: false,
-                    is_remote: b.starts_with("origin/"),
-                    relative_time: String::new(),
-                    committer_date_unix: 0,
-                    upstream: None,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        let selected = self.merge_selected_branch.clone();
-        let can_merge = selected.is_some() && !self.git_busy;
-
-        div()
-            .id("merge-branch-dialog")
-            .w_full()
-            .max_h(rems(32.5))
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("Select a branch to merge into your current working tree:"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .px_2()
-                    .h_8()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.background)
-                    .child(
-                        div()
-                            .size(rems(0.875))
-                            .text_color(theme.muted_foreground)
-                            .child(IconName::Search),
-                    )
-                    .child(
-                        div().flex_1().child(
-                            Input::new(&self.merge_filter_input)
-                                .aria_label("Filter branches to merge")
-                                .appearance(false)
-                                .bordered(false),
-                        ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .max_h(rems(15.0))
-                    .overflow_y_scrollbar()
-                    .gap_1()
-                    .children(branches.into_iter().map(|b| {
-                        let name = b.name.clone();
-                        let is_selected = selected.as_deref() == Some(&name);
-                        let name_for_click = name.clone();
-                        Button::new(SharedString::from(format!("merge-select-{}", name)))
-                            .accessibility_label(format!("Select branch {name} to merge"))
-                            .toggled(is_selected)
-                            .ghost()
-                            .h_auto()
-                            .w_full()
-                            .p_0()
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                this.merge_selected_branch = Some(name_for_click.clone());
-                                cx.notify();
-                            }))
-                            .child(
-                                div()
-                                    .w_full()
-                                    .whitespace_normal()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap_2()
-                                    .px_2p5()
-                                    .py_2()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(if is_selected {
-                                        theme.primary
-                                    } else {
-                                        gpui::transparent_black()
-                                    })
-                                    .bg(if is_selected {
-                                        theme.muted.opacity(0.8)
-                                    } else {
-                                        gpui::transparent_black()
-                                    })
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .child(
-                                                div()
-                                                    .size_4()
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .text_color(if is_selected {
-                                                        theme.primary
-                                                    } else {
-                                                        theme.muted_foreground
-                                                    })
-                                                    .child(
-                                                        Icon::default()
-                                                            .path("icons/git/branch.svg"),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .font_weight(if is_selected {
-                                                        FontWeight::BOLD
-                                                    } else {
-                                                        FontWeight::NORMAL
-                                                    })
-                                                    .text_color(theme.foreground)
-                                                    .child(name),
-                                            ),
-                                    )
-                                    .children((!b.relative_time.is_empty()).then(|| {
-                                        div()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(b.relative_time)
-                                    })),
-                            )
-                    })),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap_2()
-                    .pt_2()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .child(
-                        Button::new("cancel-merge-btn")
-                            .label("Cancel")
-                            .ghost()
-                            .small()
-                            .disabled(self.git_busy)
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                if this.git_busy {
-                                    return;
-                                }
-                                this.close_all_git_dialogs();
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("submit-merge-btn")
-                            .label(if let Some(target) = &selected {
-                                format!("Merge {target} into {current_branch}")
-                            } else {
-                                format!("Merge into {current_branch}")
-                            })
-                            .primary()
-                            .small()
-                            .disabled(!can_merge)
-                            .on_click(cx.listener(move |this, _event, window, cx| {
-                                if let Some(branch_to_merge) = this.merge_selected_branch.clone() {
-                                    this.run_git_action(
-                                        GitAction::Merge(branch_to_merge),
-                                        window,
-                                        cx,
-                                    );
-                                    this.close_all_git_dialogs();
-                                }
-                            })),
-                    ),
-            )
+        threadlane_ui_kit::review_merge_form(&self.merge_filter_input, self.git_status.as_ref(), &self.review_git_form_state(),
+            cx.listener(|this, action: &threadlane_ui_kit::ReviewGitFormAction, window, cx| this.handle_review_git_form_action(action, window, cx)), cx)
     }
 
     fn render_switch_branch_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        let current_branch = self
-            .git_status
-            .as_ref()
-            .and_then(|s| s.branch.as_deref())
-            .unwrap_or("main")
-            .to_string();
-        let target_branch = self
-            .switch_target_branch
-            .clone()
-            .unwrap_or_else(|| "main".to_string());
-        let is_stash = self.switch_stash_mode;
-
-        div()
-                    .id("switch-branch-dialog")
-                    .w_full()
-
-
-
-
-
-
-                    .flex()
-                    .flex_col()
-                    .gap_3p5()
-
-
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(format!("You have uncommitted changes on {current_branch}. What would you like to do with them?")),
-                    )
-                    .child(
-                        RadioGroup::vertical("switch-stash-mode")
-                            .selected_index(Some(if is_stash { 0 } else { 1 }))
-                            .child(
-                                Radio::new("switch-opt-stash")
-                                    .label(format!("Leave my changes on {current_branch} (Stash)"))
-                                    .accessibility_label("Leave changes on this branch using a stash")
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child("Your in-progress changes will be stashed and restored when you switch back."),
-                                    ),
-                            )
-                            .child(
-                                Radio::new("switch-opt-carry")
-                                    .label(format!("Bring my changes to {target_branch}"))
-                                    .accessibility_label("Carry changes to the selected branch")
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(format!("Your in-progress changes will be carried over to {target_branch}.")),
-                                    ),
-                            )
-                            .on_click(cx.listener(|this, selected: &usize, _window, cx| {
-                                this.switch_stash_mode = *selected == 0;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .gap_2()
-                            .pt_2()
-                            .child(
-                                Button::new("cancel-switch-dialog-btn")
-                                    .label("Cancel")
-                                    .ghost()
-                                    .small()
-                                    .disabled(self.git_busy)
-                                    .on_click(cx.listener(|this, _event, _window, cx| {
-                                        if this.git_busy {
-                                            return;
-                                        }
-                                        this.close_all_git_dialogs();
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("submit-switch-dialog-btn")
-                                    .label(format!("Switch to {target_branch}"))
-                                    .accessibility_label(format!(
-                                        "Switch to branch {target_branch}"
-                                    ))
-                                    .tooltip(format!("Check out {target_branch}"))
-                                    .primary()
-                                    .small()
-                                    .disabled(self.git_busy)
-                                    .on_click(cx.listener(move |this, _event, window, cx| {
-                                        let target = this.switch_target_branch.clone().unwrap_or_else(|| "main".to_string());
-                                        if this.switch_stash_mode {
-                                            this.run_git_action(GitAction::CheckoutStash(target), window, cx);
-                                        } else {
-                                            this.run_git_action(GitAction::CheckoutCarry(target), window, cx);
-                                        }
-                                        this.close_all_git_dialogs();
-                                        this.branch_popover_open = false;
-                                    })),
-                            ),
-                    )
+        threadlane_ui_kit::review_switch_form(&self.review_git_form_state(),
+            cx.listener(|this, action: &threadlane_ui_kit::ReviewGitFormAction, window, cx| this.handle_review_git_form_action(action, window, cx)), cx)
     }
 
     fn render_review_error(&self, error: &str, cx: &mut Context<Self>) -> AnyElement {
@@ -6281,7 +3263,7 @@ mod dialog_keyboard_tests {
 
 #[cfg(test)]
 mod review_layout_tests {
-    use super::{RightPanelView, Surface};
+    use super::{available_surfaces, RightPanelView};
     use gpui::{
         AppContext, Context, Entity, IntoElement, ListSizingBehavior, ParentElement, Render, Styled,
         TestAppContext, Window, div, list, px,
@@ -6331,6 +3313,11 @@ mod review_layout_tests {
                     window.set_rem_size(px(rem_size));
                     window.draw(cx).clear(cx);
                 });
+                let title = cx.debug_bounds("right-panel-title").expect("tool title rendered");
+                assert!(
+                    title.left() >= px(0.0) && title.right() <= px(width),
+                    "tool title overflows at width {width}, rem {rem_size}: {title:?}"
+                );
                 let mut previous_choice = None;
                 for (tab, choice) in [
                     ("right-panel-tab-Trajectory", "right-panel-choice-Trajectory"),
@@ -6338,7 +3325,7 @@ mod review_layout_tests {
                     ("right-panel-tab-Review", "right-panel-choice-Review"),
                     ("right-panel-tab-Files", "right-panel-choice-Files"),
                     ("right-panel-tab-Browser", "right-panel-choice-Browser"),
-                ].into_iter().take(Surface::all().len()) {
+                ].into_iter().take(available_surfaces().len()) {
                     for selector in [tab, choice] {
                         let bounds = cx.debug_bounds(selector).expect("surface control rendered");
                         assert!(bounds.left() >= px(0.0) && bounds.right() <= px(width),
@@ -6457,6 +3444,48 @@ mod browser_editor_safety_tests {
     }
 
     #[gpui::test]
+    fn retained_browser_panel_hides_on_other_workspace_pages(cx: &mut TestAppContext) {
+        use threadlane_ui_state::WorkspacePage;
+
+        cx.update(gpui_component::init);
+        let model = cx.new(|_| AppState::default());
+        let retained = model.clone();
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let capture = captured.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let panel = cx.new(|cx| RightPanelView::new(model, window, cx));
+            *capture.borrow_mut() = Some(panel.clone());
+            gpui_component::Root::new(panel, window, cx)
+        });
+        let panel = captured.borrow_mut().take().expect("mounted panel");
+        panel.update(cx, |panel, _| panel.active_surface = Some(Surface::Browser));
+        for page in [
+            WorkspacePage::Chat,
+            WorkspacePage::GitHub,
+            WorkspacePage::Automations,
+            WorkspacePage::Settings,
+            WorkspacePage::Chat,
+        ] {
+            retained.update(cx, |state, cx| {
+                state.workspace_page = page;
+                cx.notify();
+            });
+            panel.update(cx, |panel, cx| {
+                panel.set_visible(true, cx);
+                assert_eq!(panel.visible, page == WorkspacePage::Chat);
+                assert_eq!(
+                    panel.active_surface, Some(Surface::Browser),
+                    "returning to chat must retain the selected tool"
+                );
+            });
+        }
+        panel.update(cx, |panel, cx| {
+            panel.set_visible(false, cx);
+            assert!(!panel.visible);
+        });
+    }
+
+    #[gpui::test]
     fn browser_commands_preserve_dirty_document(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
         let model = cx.new(|_| AppState::default());
@@ -6524,10 +3553,44 @@ mod review_diff_tests {
     }
 
     #[gpui::test]
+    fn review_menu_rejects_changed_checkout(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let model = cx.new(|_| {
+            let mut state = AppState::default();
+            state.active_session_id = None;
+            state.active_work_dir = Some(PathBuf::from("/workspace"));
+            state
+        });
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let capture = captured.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let panel = cx.new(|cx| RightPanelView::new(model, window, cx));
+            *capture.borrow_mut() = Some(panel.clone());
+            Root::new(panel, window, cx)
+        });
+        let panel = captured.borrow_mut().take().unwrap();
+        cx.update(|window, cx| {
+            panel.update(cx, |host, _| host.project = Some(PathBuf::from("/new-checkout")));
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("unchanged".into()));
+            for action in [threadlane_ui_kit::ReviewFileAction::Stage("src/file.rs".into()),
+                threadlane_ui_kit::ReviewFileAction::CopyRelative("src/file.rs".into())] {
+                RightPanelView::handle_review_file_action(panel.clone(), Some(PathBuf::from("/workspace")), &action, window, cx);
+            }
+            assert!(!panel.read(cx).git_busy);
+            assert_eq!(cx.read_from_clipboard().unwrap().text().as_deref(), Some("unchanged"));
+            RightPanelView::handle_review_file_action(panel.clone(), Some(PathBuf::from("/new-checkout")),
+                &threadlane_ui_kit::ReviewFileAction::CopyRelative("src/file.rs".into()), window, cx);
+            assert_eq!(cx.read_from_clipboard().unwrap().text().as_deref(), Some("src/file.rs"));
+        });
+    }
+
+    #[gpui::test]
     fn review_refresh_invalidates_then_starts_one_diff_after_status(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
         let model = cx.new(|_| {
             let mut state = AppState::default();
+            // Default restores a persisted chat; this fixture owns only a project.
+            state.active_session_id = None;
             state.active_work_dir = Some(PathBuf::from("/workspace"));
             state
         });
@@ -6580,6 +3643,8 @@ mod review_diff_tests {
         cx.update(gpui_component::init);
         let model = cx.new(|_| {
             let mut state = AppState::default();
+            // Default restores a persisted chat; this fixture owns only a project.
+            state.active_session_id = None;
             state.active_work_dir = Some(PathBuf::from("/workspace"));
             state
         });
@@ -6688,6 +3753,8 @@ mod review_diff_tests {
         cx.update(gpui_component::init);
         let model = cx.new(|_| {
             let mut state = AppState::default();
+            // Default restores a persisted chat; this fixture owns only a project.
+            state.active_session_id = None;
             state.active_work_dir = Some(PathBuf::from("/workspace"));
             state
         });
@@ -6750,6 +3817,8 @@ mod review_diff_tests {
         cx.update(gpui_component::init);
         let model = cx.new(|_| {
             let mut state = AppState::default();
+            // Default restores a persisted chat; this fixture owns only a project.
+            state.active_session_id = None;
             state.active_work_dir = Some(PathBuf::from("/workspace"));
             state
         });
@@ -6808,6 +3877,8 @@ mod review_diff_tests {
         cx.update(gpui_component::init);
         let model = cx.new(|_| {
             let mut state = AppState::default();
+            // Default restores a persisted chat; this fixture owns only a project.
+            state.active_session_id = None;
             state.active_work_dir = Some(PathBuf::from("/workspace"));
             state
         });

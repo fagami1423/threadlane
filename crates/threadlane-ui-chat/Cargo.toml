@@ -6,12 +6,12 @@ description = "Chat surface for the Threadlane desktop app: composer, transcript
 
 [dependencies]
 threadlane-client.workspace = true
-threadlane-ui-session.workspace = true
+threadlane-ui-kit.workspace = true
 base64.workspace = true
 image.workspace = true
 gpui.workspace = true
 gpui-kit.workspace = true
-gpui-component = { workspace = true, features = ["tree-sitter-rust", "tree-sitter-python", "tree-sitter-javascript", "tree-sitter-typescript", "tree-sitter-html", "tree-sitter-css", "tree-sitter-bash", "tree-sitter-toml", "tree-sitter-yaml", "tree-sitter-markdown", "tree-sitter-diff"] }
+gpui-component.workspace = true
 rfd.workspace = true
 serde_json.workspace = true
 threadlane-acp.workspace = true

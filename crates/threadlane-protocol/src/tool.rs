@@ -184,3 +184,13 @@ pub trait ToolExecutor: Send + Sync {
             .map(|result| result.map(ToolOutput::from))
     }
 }
+
+/// Extract the resolved file identity carried by a read-file snapshot.
+pub fn read_file_snapshot_path(output: &str) -> Option<String> {
+    output.lines().take(3).find_map(|line| {
+        let path = line
+            .strip_prefix("[Threadlane read_file path: ")?
+            .strip_suffix(']')?;
+        serde_json::from_str(path).ok()
+    })
+}

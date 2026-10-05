@@ -1,1 +1,1 @@
-pub use threadlane_ui_session::transcript::*;
+pub use threadlane_ui_kit::transcript::*;

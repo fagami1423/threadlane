@@ -9,13 +9,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use gpui::prelude::FluentBuilder;
-use gpui::{
-    AnyElement, App, IntoElement, ParentElement, SharedString, Styled, Task, Window, div, px,
-    relative,
-};
-use gpui_component::searchable_list::{SearchableListDelegate, SearchableListItem};
-use gpui_component::{ActiveTheme, Icon, IndexPath, Sizable, h_flex};
 
 use threadlane_daemon::catalog::{
     ModelOption, ModelProvider, cached_acp_config_options, cached_acp_error,
@@ -65,96 +58,11 @@ pub enum ModelPickerValue {
     OpenAgentSettings,
 }
 
-/// One row in the picker: a model, an agent, one of an agent's advertised
-/// models, or the Settings recovery action.
-#[derive(Debug, Clone)]
-pub struct ModelPickerItem {
-    value: ModelPickerValue,
-    title: SharedString,
-    /// Muted trailing text — a distinguishing id when labels collide, or an
-    /// agent's status ("Connecting…", error) / the model it will run.
-    secondary: Option<SharedString>,
-    icon_path: Option<&'static str>,
-    /// The committed "current model" mark, rendered as the check icon and
-    /// kept visually distinct from the keyboard highlight.
-    current: bool,
-    /// Rows nested under an agent row (choices, the Settings recovery row)
-    /// indent one icon width so the grouping reads at a glance.
-    indented: bool,
-    /// Lowercased search haystack: label, id, and provider/agent names.
-    haystack: String,
-}
-
-impl ModelPickerItem {
-    fn haystack_for(parts: &[&str]) -> String {
-        parts.join("\u{0}").to_lowercase()
-    }
-}
-
-impl SearchableListItem for ModelPickerItem {
-    type Value = ModelPickerValue;
-
-    fn title(&self) -> SharedString {
-        self.title.clone()
-    }
-
-    fn value(&self) -> &Self::Value {
-        &self.value
-    }
-
-    fn matches(&self, query: &str) -> bool {
-        query
-            .split_whitespace()
-            .all(|token| self.haystack.contains(&token.to_lowercase()))
-    }
-
-    fn render(&self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        h_flex()
-            .w_full()
-            .min_w_0()
-            .items_center()
-            .gap_2()
-            .when(self.indented && self.icon_path.is_none(), |this| {
-                this.child(div().w(px(14.)).flex_shrink_0())
-            })
-            .when_some(self.icon_path, |this, path| {
-                this.child(
-                    Icon::default()
-                        .path(path)
-                        .xsmall()
-                        .flex_shrink_0()
-                        .text_color(cx.theme().muted_foreground),
-                )
-            })
-            .child(
-                div()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .truncate()
-                    .child(self.title.clone()),
-            )
-            .when_some(self.secondary.clone(), |this, secondary| {
-                this.child(
-                    div()
-                        .min_w_0()
-                        .max_w(relative(0.6))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .truncate()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(secondary),
-                )
-            })
-    }
-}
-
-/// A provider group in the picker list.
-#[derive(Debug, Clone)]
-pub struct PickerSection {
-    pub header: SharedString,
-    pub items: Vec<ModelPickerItem>,
-}
+pub type ModelPickerItem = threadlane_ui_kit::PickerItem<ModelPickerValue>;
+pub type PickerSection = threadlane_ui_kit::PickerSection<ModelPickerValue>;
+pub type ModelPickerDelegate = threadlane_ui_kit::PickerDelegate<ModelPickerValue>;
+#[cfg(test)]
+use threadlane_ui_kit::filter_picker_sections as filter_sections;
 
 /// Builds the picker's sections from a catalog snapshot.
 ///
@@ -188,7 +96,7 @@ pub fn picker_sections(
                 value: ModelPickerValue::Model(option.id.clone()),
                 title: option.label.clone().into(),
                 secondary: None,
-                icon_path: Some(option.provider.icon_path()),
+                icon_path: Some(option.provider.icon_path().into()),
                 current: is_current,
                 indented: false,
                 haystack: ModelPickerItem::haystack_for(&[
@@ -230,7 +138,7 @@ pub fn picker_sections(
             value: ModelPickerValue::Model(option.id.clone()),
             title: option.label.clone().into(),
             secondary: Some(agent_secondary.into()),
-            icon_path: Some(option.provider.icon_path()),
+            icon_path: Some(option.provider.icon_path().into()),
             current: is_current,
             indented: false,
             haystack: ModelPickerItem::haystack_for(&[
@@ -308,38 +216,6 @@ pub fn picker_sections(
     sections
 }
 
-/// Re-filters a snapshot: every whitespace-separated token must appear in a
-/// row's haystack, case-insensitively; sections left empty are pruned so no
-/// heading is left dangling.
-pub fn filter_sections(sections: &[PickerSection], query: &str) -> Vec<PickerSection> {
-    let tokens: Vec<String> = query
-        .split_whitespace()
-        .map(|token| token.to_lowercase())
-        .collect();
-    if tokens.is_empty() {
-        return sections.to_vec();
-    }
-    sections
-        .iter()
-        .filter_map(|section| {
-            let items: Vec<ModelPickerItem> = section
-                .items
-                .iter()
-                .filter(|item| {
-                    tokens
-                        .iter()
-                        .all(|token| item.haystack.contains(token.as_str()))
-                })
-                .cloned()
-                .collect();
-            (!items.is_empty()).then(|| PickerSection {
-                header: section.header.clone(),
-                items,
-            })
-        })
-        .collect()
-}
-
 /// Whether a row captured at open can no longer be applied to `state`:
 /// the owner is checked by the caller, this checks the choice's exact
 /// identity (model id, config id, choice value) against the live catalog.
@@ -375,96 +251,13 @@ pub fn choice_is_stale(value: &ModelPickerValue, state: &AppState) -> bool {
     }
 }
 
-/// `SearchableListDelegate` over one open's snapshot.
-///
-/// `sections` is the filtered view the list reads; `all` is the captured
-/// snapshot `perform_search` re-filters from, so discovery finishing while
-/// the popup is open never reorders rows under the keyboard cursor.
-pub struct ModelPickerDelegate {
-    all: Vec<PickerSection>,
-    sections: Vec<PickerSection>,
-}
-
-impl ModelPickerDelegate {
-    pub fn new(
-        options: &[ModelOption],
-        acp_sections: &HashMap<String, Vec<AcpConfigOption>>,
-        selected_model: &str,
-    ) -> Self {
-        let all = picker_sections(options, acp_sections, selected_model);
-        Self {
-            sections: all.clone(),
-            all,
-        }
-    }
-}
-
-impl SearchableListDelegate for ModelPickerDelegate {
-    type Item = ModelPickerItem;
-
-    fn sections_count(&self, _: &App) -> usize {
-        self.sections.len()
-    }
-
-    fn items_count(&self, section: usize) -> usize {
-        self.sections.get(section).map_or(0, |s| s.items.len())
-    }
-
-    fn item(&self, ix: IndexPath) -> Option<&Self::Item> {
-        self.sections.get(ix.section)?.items.get(ix.row)
-    }
-
-    fn position<V>(&self, value: &V) -> Option<IndexPath>
-    where
-        Self::Item: SearchableListItem<Value = V>,
-        V: PartialEq,
-    {
-        self.sections.iter().enumerate().find_map(|(section_ix, section)| {
-            <Vec<ModelPickerItem> as SearchableListDelegate>::position(&section.items, value)
-                .map(|ix| ix.section(section_ix))
-        })
-    }
-
-    fn perform_search(&mut self, query: &str, _: &mut Window, _: &mut App) -> Task<()> {
-        self.sections = filter_sections(&self.all, query);
-        Task::ready(())
-    }
-
-    fn render_section_header(
-        &self,
-        section: usize,
-        _window: &mut Window,
-        cx: &mut App,
-    ) -> Option<AnyElement> {
-        let header = self.sections.get(section)?.header.clone();
-        Some(
-            div()
-                .py_0p5()
-                .px_2()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(header)
-                .into_any_element(),
-        )
-    }
-
-    /// The check icon answers "which model runs now", not "which row is
-    /// highlighted" — it reads the captured current flag, not the list's
-    /// keyboard selection.
-    fn is_item_checked(
-        &self,
-        _ix: IndexPath,
-        item: &Self::Item,
-        _current_selection: &[(IndexPath, Self::Item)],
-        _cx: &App,
-    ) -> bool {
-        item.current
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{ModelPickerValue, choice_is_stale, filter_sections, picker_sections};
+    use std::collections::HashMap;
+    use threadlane_daemon::catalog::{ModelOption, ModelProvider};
+    use threadlane_protocol::AcpConfigOption;
+    use threadlane_ui_state::AppState;
 
     fn model(id: &str, label: &str, provider: ModelProvider) -> ModelOption {
         ModelOption {
@@ -568,6 +361,7 @@ mod tests {
 
     #[test]
     fn colliding_labels_get_distinguishing_secondary() {
+        use gpui_component::searchable_list::SearchableListItem as _;
         let options = vec![
             model("openai/a", "Dup", ModelProvider::OpenAi),
             model("openai/b", "Dup", ModelProvider::OpenAi),
@@ -577,6 +371,9 @@ mod tests {
         assert_eq!(sections[0].items[0].secondary.as_deref(), Some("openai/a"));
         assert_eq!(sections[0].items[1].secondary.as_deref(), Some("openai/b"));
         assert!(sections[0].items[2].secondary.is_none());
+        assert_eq!(sections[0].items[0].title().as_ref(), "Dup · openai/a");
+        assert_eq!(sections[0].items[1].title().as_ref(), "Dup · openai/b");
+        assert_eq!(sections[0].items[2].title().as_ref(), "Unique");
     }
 
     #[test]

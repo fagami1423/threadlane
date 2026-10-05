@@ -9,6 +9,159 @@ use crate::types::{
     TrajectoryEntry,
 };
 
+// Canonical diagnostic presentation projections shared by live hosts and saved previews.
+pub fn project_model_context_diagnostics(projection: &threadlane_runtime::harness::SessionDiagnostics) -> Vec<TrajectoryEntry> {
+        projection
+            .model_context
+            .iter()
+            .map(|entry| {
+                let json_text = serde_json::to_string_pretty(&entry.message)
+                    .unwrap_or_else(|_| format!("{:?}", entry.message));
+                TrajectoryEntry {
+                    seq: Some(entry.seq),
+                    run_id: None,
+                    turn: None,
+                    request: None,
+                    category: "Model Context".into(),
+                    summary: format!("{} · {}", entry.id, entry.message.role_str()),
+                    detail: format!(
+                        "**Entry ID**: `{}`\n**Role**: `{}`\n**Lane**: `{}`\n\n```json\n{}\n```",
+                        entry.id,
+                        entry.message.role_str(),
+                        entry.lane,
+                        json_text
+                    ),
+                    lane: Some(entry.lane.clone()),
+                    correlation_id: Some(entry.id.clone()),
+                    diagnostics: TrajectoryDiagnostics {
+                        model_visible: true,
+                        source: Some("Model context projection".into()),
+                        raw: Some(json_text),
+                        ..Default::default()
+                    },
+                }
+            })
+            .collect()
+}
+
+pub fn project_durable_event_diagnostics(projection: &threadlane_runtime::harness::SessionDiagnostics) -> Vec<TrajectoryEntry> {
+        projection
+            .durable_events
+            .iter()
+            .map(|event| {
+                let (category, summary, detail) = match &event.kind {
+                    threadlane_runtime::harness::DurableEventKind::Entry { role, parent_id } => (
+                        "Entry",
+                        format!("{} · {role}", event.id),
+                        format!("parent={parent_id:?}"),
+                    ),
+                    threadlane_runtime::harness::DurableEventKind::Record => (
+                        "Record",
+                        format!("{} · durable record", event.id),
+                        format!(
+                            "seq={} lane={} run={}",
+                            event.seq,
+                            event.lane,
+                            event.run_id.as_deref().unwrap_or("—")
+                        ),
+                    ),
+                };
+                TrajectoryEntry {
+                    seq: Some(event.seq),
+                    run_id: event.run_id.clone(),
+                    turn: event.turn,
+                    request: None,
+                    category: category.into(),
+                    summary,
+                    detail: detail.clone(),
+                    lane: Some(event.lane.clone()),
+                    correlation_id: Some(event.id.clone()),
+                    diagnostics: TrajectoryDiagnostics {
+                        source: Some("Canonical durable event".into()),
+                        raw: Some(detail.clone()),
+                        ..Default::default()
+                    },
+                }
+            })
+            .collect()
+}
+
+pub fn project_recovery_diagnostics(
+    lanes: &[threadlane_runtime::harness::LaneRecoveryDiagnostic],
+) -> Vec<TrajectoryEntry> {
+    let mut rows = Vec::new();
+    for lane in lanes {
+        let decision = match lane.decision {
+            threadlane_runtime::harness::RecoveryDecision::None => "No recovery required",
+            threadlane_runtime::harness::RecoveryDecision::ResumeFromLeaf => {
+                "Resume interrupted operation from durable leaf"
+            }
+            threadlane_runtime::harness::RecoveryDecision::ReplaySafeToolsThenResume => {
+                "Replay safe interrupted tools, then resume"
+            }
+            threadlane_runtime::harness::RecoveryDecision::AbortUnsafeTool => {
+                "Abort interrupted run; unsafe tool cannot be replayed"
+            }
+            threadlane_runtime::harness::RecoveryDecision::WaitForDeferredResult => {
+                "Wait for deferred provider result"
+            }
+            threadlane_runtime::harness::RecoveryDecision::ExplicitRetryRequired => {
+                "Keep failed; require explicit retry"
+            }
+        };
+        rows.push(TrajectoryEntry {
+            seq: None,
+            run_id: lane.open_operation.clone(),
+            turn: None,
+            request: None,
+            category: "Decision".into(),
+            summary: format!("{} · {decision}", lane.lane),
+            detail: format!(
+                "status={:?} attempts={} abort_requested={} leaf={}",
+                lane.status,
+                lane.attempts,
+                lane.abort_requested,
+                lane.leaf_id.as_deref().unwrap_or("—")
+            ),
+            lane: Some(lane.lane.clone()),
+            correlation_id: lane.open_operation.clone(),
+            diagnostics: TrajectoryDiagnostics::default(),
+        });
+        for tool in &lane.interrupted_tools {
+            rows.push(TrajectoryEntry {
+                seq: None,
+                run_id: Some(tool.run_id.clone()),
+                turn: None,
+                request: None,
+                category: "Interrupted Tool".into(),
+                summary: format!("{} · replay {:?}", tool.name, tool.replay),
+                detail: format!(
+                    "call={} result_entry={}",
+                    tool.call_id, tool.result_entry_id
+                ),
+                lane: Some(lane.lane.clone()),
+                correlation_id: Some(tool.call_id.clone()),
+                diagnostics: TrajectoryDiagnostics::default(),
+            });
+        }
+        for queued in &lane.queued_work {
+            rows.push(TrajectoryEntry {
+                seq: None,
+                run_id: lane.open_operation.clone(),
+                turn: None,
+                request: None,
+                category: "Queued Work".into(),
+                summary: format!("{:?} · {}", queued.queue, queued.entry_id),
+                detail: String::new(),
+                lane: Some(lane.lane.clone()),
+                correlation_id: Some(queued.entry_id.clone()),
+                diagnostics: TrajectoryDiagnostics::default(),
+            });
+        }
+    }
+    rows
+}
+
 pub fn load_session_messages(session_file: &Path) -> Vec<ChatMessageInfo> {
     compute_session_messages(session_file).unwrap_or_default()
 }

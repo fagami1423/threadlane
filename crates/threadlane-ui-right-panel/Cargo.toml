@@ -18,6 +18,7 @@ threadlane-project.workspace = true
 threadlane-protocol.workspace = true
 threadlane-provider.workspace = true
 threadlane-tools.workspace = true
+threadlane-ui-kit.workspace = true
 threadlane-ui-state.workspace = true
 threadlane-ui-theme.workspace = true
 tokio = { workspace = true, features = ["full"] }

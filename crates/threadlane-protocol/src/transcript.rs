@@ -1,7 +1,7 @@
 //! GPUI-free transcript row projection and conversation matching over
 //! [`ChatMessageInfo`]. Shared by the chat find strip, prompt recall,
 //! and the daemon's saved-conversation scan; the interactive
-//! [`TranscriptState`](gpui) wrapper stays in `threadlane-ui-session`.
+//! [`TranscriptState`](gpui) wrapper stays in `threadlane-ui-kit`.
 use std::ops::Range;
 
 use crate::daemon::{ChatMessageInfo, MessageRole, ToolActivityInfo};
