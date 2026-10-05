@@ -1256,7 +1256,14 @@ impl AppState {
             .cloned()
     }
 
-    pub fn start_automations(&mut self) -> tokio::sync::watch::Receiver<crate::automation::Projection> {
+    pub fn start_automations(
+        &mut self,
+    ) -> Option<tokio::sync::watch::Receiver<crate::automation::Projection>> {
+        if self.daemon_remote {
+            // Remote projections arrive through the daemon event stream;
+            // a local watch would overwrite them with this host's store.
+            return None;
+        }
         let service = crate::automation::AutomationService::shared();
         // The daemon core's automation bridge forwards the service's agent
         // events into the same broadcast `daemon_client.subscribe()` feeds
@@ -1264,19 +1271,12 @@ impl AppState {
         let updates = service.projection.clone();
         self.automation_service = Some(service);
         self.apply_automation_projection(updates.borrow().clone());
-        updates
+        Some(updates)
     }
 
     pub fn apply_automation_projection(&mut self, projection: crate::automation::Projection) {
-        for (session, old) in &self.automations.permissions {
-            if !projection.permissions.contains_key(session) && self.client.pending_permissions.get(session).is_some_and(|p| p.id == old.id) {
-                self.client.pending_permissions.remove(session);
-            }
-        }
-        for (session, old) in &self.automations.questions {
-            if !projection.questions.contains_key(session) && self.client.pending_questions.get(session).is_some_and(|q| q.id == old.id) {
-                self.client.pending_questions.remove(session);
-            }
+        if self.daemon_remote {
+            return;
         }
         if let Some(runtime) = &projection.active_runtime {
             let path = runtime.session_file().to_path_buf();
@@ -1318,8 +1318,9 @@ impl AppState {
         for (project, session_id) in to_register {
             self.register_session_seen(&project, &session_id);
         }
-        self.client.pending_permissions.extend(projection.permissions.clone());
-        self.client.pending_questions.extend(projection.questions.clone());
+        self.client.apply_event(SessionEvent::AutomationChanged {
+            projection: threadlane_daemon::core::DaemonCore::automation_projection_wire(&projection),
+        });
         self.automations = projection;
     }
 
@@ -5179,10 +5180,21 @@ impl AppState {
                     }
                 }
                 SessionEvent::ProjectChanged { .. } => {}
-                SessionEvent::AutomationChanged { .. } => {
-                    // `apply_automation_projection` already applies the
-                    // service's watch channel directly — the journaled copy
-                    // exists for transport clients.
+                SessionEvent::AutomationChanged { projection } => {
+                    // Local mode uses the service watch, including its
+                    // runtime handle. Remote mode has only the wire event.
+                    if self.daemon_remote {
+                        self.automations = crate::automation::Projection {
+                            snapshot: projection.snapshot.clone(),
+                            permissions: projection.permissions.clone(),
+                            questions: projection.questions.clone(),
+                            question_queues: projection.question_queues.clone().unwrap_or_default(),
+                            error: projection.error.clone(),
+                            ..Default::default()
+                        };
+                        self.client.apply_event(SessionEvent::AutomationChanged { projection });
+                        changed = true;
+                    }
                 }
                 SessionEvent::WorkspaceChanged { .. } => {
                     // Files/git surfaces hold their own daemon

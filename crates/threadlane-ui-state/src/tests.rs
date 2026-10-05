@@ -140,6 +140,337 @@ fn automation_projection_refreshes_each_changed_project_once() {
 }
 
 #[test]
+fn remote_automation_projection_refreshes_client_and_view() {
+    use threadlane_protocol::automation::{AutomationProjection, Definition, Schedule};
+
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.daemon_remote = true;
+    let (tx, rx) = mpsc::channel();
+    state.session_refresh_tx = tx;
+    let mut projection = AutomationProjection {
+        permissions: HashMap::from([(
+            "automation-session".into(),
+            permission_request("permission"),
+        )]),
+        questions: HashMap::from([("automation-session".into(), question_request("question"))]),
+        question_queues: Some(HashMap::from([(
+            "automation-session".into(),
+            vec![question_request("question")],
+        )])),
+        active_session_id: Some("automation-session".into()),
+        error: Some("Remote store warning".into()),
+        ..Default::default()
+    };
+    projection.snapshot.revision = 17;
+    projection.snapshot.definitions.push(Definition {
+        id: "remote-automation".into(),
+        revision: 1,
+        name: "Remote automation".into(),
+        prompt: "Check remote project".into(),
+        project: PathBuf::from("/remote/project"),
+        model: "model".into(),
+        effort: "medium".into(),
+        worktree: false,
+        schedule: Schedule::Manual,
+        enabled: false,
+        notify_all: false,
+        anchor: 0,
+        next_at: None,
+        failures: 0,
+        paused_reason: None,
+    });
+    projection.snapshot.runs.push(threadlane_automation::Run {
+        id: "remote-run".into(),
+        definition: projection.snapshot.definitions[0].clone(),
+        scheduled_for: None,
+        created_at: 0,
+        finished_at: None,
+        status: threadlane_automation::RunStatus::WaitingAnswer,
+        session_id: "automation-session".into(),
+        session_file: Some(PathBuf::from(
+            "/remote/project/.threadlane/sessions/automation-session.jsonl",
+        )),
+        error: None,
+        reviewed: false,
+    });
+
+    assert!(
+        state.drain_chat_stream(vec![SessionEvent::AutomationChanged {
+            projection: projection.clone(),
+        }])
+    );
+    assert_eq!(state.client.automation, projection);
+    assert_eq!(state.automations.snapshot, projection.snapshot);
+    assert_eq!(state.automations.permissions, projection.permissions);
+    assert_eq!(state.automations.questions, projection.questions);
+    assert_eq!(
+        Some(&state.automations.question_queues),
+        projection.question_queues.as_ref()
+    );
+    assert_eq!(state.automations.error, projection.error);
+    assert_eq!(state.pending_permissions, projection.permissions);
+    assert_eq!(state.pending_questions, projection.questions);
+    assert!(state.automations.active_runtime.is_none());
+    assert!(state.automation_service.is_none());
+    assert!(
+        rx.try_recv().is_err(),
+        "remote paths must not trigger local discovery"
+    );
+}
+
+#[test]
+fn remote_automation_projection_resolves_requests_and_promotes_next_question() {
+    use threadlane_protocol::automation::AutomationProjection;
+
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.daemon_remote = true;
+    state.active_session_id = Some("automation-session".into());
+    let projection = AutomationProjection {
+        permissions: HashMap::from([(
+            "automation-session".into(),
+            permission_request("permission"),
+        )]),
+        questions: HashMap::from([(
+            "automation-session".into(),
+            question_request("queued-question"),
+        )]),
+        question_queues: Some(HashMap::from([(
+            "automation-session".into(),
+            vec![
+                question_request("question"),
+                question_request("queued-question"),
+            ],
+        )])),
+        ..Default::default()
+    };
+    assert!(state.drain_chat_stream(vec![SessionEvent::AutomationChanged { projection }]));
+    state
+        .pending_permissions
+        .insert("unrelated-session".into(), permission_request("unrelated"));
+
+    // The first question is answered elsewhere while the latest one stays
+    // unchanged. The complete queue is the only indication of that answer.
+    let mut partial = state.client.automation.clone();
+    partial
+        .question_queues
+        .as_mut()
+        .unwrap()
+        .get_mut("automation-session")
+        .unwrap()
+        .remove(0);
+    assert!(
+        state.drain_chat_stream(vec![SessionEvent::AutomationChanged {
+            projection: partial,
+        }])
+    );
+    assert_eq!(
+        state.pending_questions["automation-session"].id,
+        "queued-question"
+    );
+    assert!(!state.queued_questions.contains_key("automation-session"));
+    assert!(state.drain_chat_stream(vec![SessionEvent::Agent {
+        session_id: "automation-session".into(),
+        event: AgentEvent::QuestionRequested {
+            request: question_request("next-question"),
+        },
+    }]));
+    assert_eq!(
+        state.queued_questions["automation-session"],
+        vec![question_request("next-question")]
+    );
+
+    // Another client resolves the permission and visible question. The
+    // complete projection retains only the later question.
+    let resolved = AutomationProjection {
+        questions: HashMap::from([(
+            "automation-session".into(),
+            question_request("next-question"),
+        )]),
+        question_queues: Some(HashMap::from([(
+            "automation-session".into(),
+            vec![question_request("next-question")],
+        )])),
+        ..Default::default()
+    };
+    assert!(
+        state.drain_chat_stream(vec![SessionEvent::AutomationChanged {
+            projection: resolved.clone(),
+        }])
+    );
+    assert!(!state.pending_permissions.contains_key("automation-session"));
+    assert_eq!(
+        state.pending_permissions["unrelated-session"].id,
+        "unrelated"
+    );
+    assert_eq!(
+        state.pending_questions["automation-session"].id,
+        "next-question"
+    );
+    assert!(!state.queued_questions.contains_key("automation-session"));
+    assert!(state.automations.permissions.is_empty());
+    assert_eq!(state.automations.questions, resolved.questions);
+    assert_eq!(state.client.automation, resolved);
+
+    assert!(
+        state.drain_chat_stream(vec![SessionEvent::AutomationChanged {
+            projection: AutomationProjection {
+                question_queues: Some(HashMap::new()),
+                ..Default::default()
+            },
+        }])
+    );
+    assert!(!state.pending_questions.contains_key("automation-session"));
+    assert!(!state.queued_questions.contains_key("automation-session"));
+    assert!(state.automations.questions.is_empty());
+}
+
+#[test]
+fn local_automation_projection_preserves_question_queue_order() {
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.active_session_id = Some("automation-session".into());
+    for id in ["first-question", "second-question"] {
+        assert!(state.drain_chat_stream(vec![SessionEvent::Agent {
+            session_id: "automation-session".into(),
+            event: AgentEvent::QuestionRequested {
+                request: question_request(id),
+            },
+        }]));
+    }
+    let projection = crate::automation::Projection {
+        questions: HashMap::from([(
+            "automation-session".into(),
+            question_request("second-question"),
+        )]),
+        question_queues: HashMap::from([(
+            "automation-session".into(),
+            vec![
+                question_request("first-question"),
+                question_request("second-question"),
+            ],
+        )]),
+        ..Default::default()
+    };
+    state.apply_automation_projection(projection.clone());
+    state.apply_automation_projection(projection);
+    assert_eq!(
+        state.pending_questions["automation-session"].id,
+        "first-question"
+    );
+    assert_eq!(
+        state.queued_questions["automation-session"],
+        vec![question_request("second-question")]
+    );
+
+    state.apply_automation_projection(crate::automation::Projection::default());
+    assert!(!state.pending_questions.contains_key("automation-session"));
+    assert!(!state.queued_questions.contains_key("automation-session"));
+}
+
+#[test]
+fn remote_automation_first_snapshot_reconciles_coalesced_agent_questions() {
+    use threadlane_protocol::automation::AutomationProjection;
+
+    for (agent_ids, projected_ids) in [
+        (vec!["first", "second"], vec!["second"]),
+        (vec!["second"], vec!["first", "second"]),
+    ] {
+        let mut state = AppState::load_from_registry(Vec::new());
+        state.daemon_remote = true;
+        state.active_session_id = Some("automation-session".into());
+        for id in agent_ids {
+            assert!(state.drain_chat_stream(vec![SessionEvent::Agent {
+                session_id: "automation-session".into(),
+                event: AgentEvent::QuestionRequested {
+                    request: question_request(id)
+                },
+            }]));
+        }
+        let requests: Vec<_> = projected_ids
+            .iter()
+            .map(|id| question_request(id))
+            .collect();
+        let projection = AutomationProjection {
+            questions: HashMap::from([(
+                "automation-session".into(),
+                requests.last().unwrap().clone(),
+            )]),
+            question_queues: Some(HashMap::from([(
+                "automation-session".into(),
+                requests.clone(),
+            )])),
+            ..Default::default()
+        };
+        assert!(state.drain_chat_stream(vec![SessionEvent::AutomationChanged { projection }]));
+        assert_eq!(state.pending_questions["automation-session"], requests[0]);
+        let queued = state
+            .queued_questions
+            .get("automation-session")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(queued, requests[1..]);
+    }
+}
+
+#[test]
+fn local_automation_watch_remains_authoritative_over_wire_events() {
+    let mut state = AppState::load_from_registry(Vec::new());
+    let mut projection = crate::automation::Projection {
+        permissions: HashMap::from([(
+            "automation-session".into(),
+            permission_request("permission"),
+        )]),
+        questions: HashMap::from([("automation-session".into(), question_request("question"))]),
+        question_queues: HashMap::from([(
+            "automation-session".into(),
+            vec![question_request("question")],
+        )]),
+        ..Default::default()
+    };
+    projection.snapshot.revision = 5;
+    state.apply_automation_projection(projection.clone());
+    let client_projection = state.client.automation.clone();
+
+    assert!(
+        !state.drain_chat_stream(vec![SessionEvent::AutomationChanged {
+            projection: Default::default(),
+        }])
+    );
+    assert_eq!(state.client.automation, client_projection);
+    assert_eq!(state.automations.snapshot, projection.snapshot);
+    assert_eq!(state.pending_permissions, projection.permissions);
+    assert_eq!(state.pending_questions, projection.questions);
+}
+
+#[test]
+fn remote_automation_does_not_subscribe_to_or_apply_local_projections() {
+    use threadlane_protocol::automation::AutomationProjection;
+
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.daemon_remote = true;
+    let projection = AutomationProjection {
+        questions: HashMap::from([(
+            "automation-session".into(),
+            question_request("remote-question"),
+        )]),
+        error: Some("Remote store warning".into()),
+        ..Default::default()
+    };
+    assert!(
+        state.drain_chat_stream(vec![SessionEvent::AutomationChanged {
+            projection: projection.clone(),
+        }])
+    );
+
+    assert!(state.start_automations().is_none());
+    assert!(state.automation_service.is_none());
+    state.apply_automation_projection(crate::automation::Projection::default());
+    assert_eq!(state.client.automation, projection);
+    assert_eq!(state.automations.questions, projection.questions);
+    assert_eq!(state.automations.error, projection.error);
+    assert_eq!(state.pending_questions, projection.questions);
+}
+
+#[test]
 fn fusion_project_model_overrides_old_fast_role() {
     let dir = tempfile::tempdir().unwrap();
     let mut settings = threadlane_project::subagent_settings::SubagentSettings::default();

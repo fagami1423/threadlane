@@ -230,13 +230,15 @@ impl DaemonCore {
 
     /// The service's process-local projection as it crosses the wire:
     /// `active_runtime` (an in-process handle) becomes the run's session id.
-    fn automation_projection_wire(
+    /// Also used by local UI hosts to share client-side request reconciliation.
+    pub fn automation_projection_wire(
         projection: &crate::automation::Projection,
     ) -> threadlane_protocol::automation::AutomationProjection {
         threadlane_protocol::automation::AutomationProjection {
             snapshot: projection.snapshot.clone(),
             permissions: projection.permissions.clone(),
             questions: projection.questions.clone(),
+            question_queues: Some(projection.question_queues.clone()),
             active_session_id: projection
                 .active_runtime
                 .as_ref()
