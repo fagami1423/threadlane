@@ -7,6 +7,7 @@ use threadlane_ui_workspace::{init as init_workspace, StartupView};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod diagnostics;
+mod image_http_client;
 mod process_environment;
 
 #[hotpath::main]
@@ -71,6 +72,13 @@ fn main() {
     }
 
     let app = gpui_platform::application().with_assets(Assets);
+    let app = match image_http_client::ImageHttpClient::new() {
+        Ok(client) => app.with_http_client(std::sync::Arc::new(client)),
+        Err(error) => {
+            tracing::error!(?error, "Threadlane could not initialize remote image loading");
+            app
+        }
+    };
 
     let shutdown_log = diagnostics.clone();
     app.run(move |cx| {
@@ -104,8 +112,13 @@ fn main() {
                 size(px(1440.0), px(900.0)),
                 cx,
             ))),
+            // Floor below which the shell cannot degrade gracefully: the
+            // workspace already auto-hides the sidebar under ~28rem of center
+            // content, but the 35rem command palette and the titlebar
+            // controls still need room, so never let the window go smaller.
+            window_min_size: Some(size(px(600.0), px(480.0))),
             titlebar: Some(TitlebarOptions {
-                title: Some("Threadlane (GPUI)".into()),
+                title: Some("Threadlane".into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(12.0), px(12.0))),
             }),

@@ -1,68 +1,13 @@
 use std::path::PathBuf;
 
 use gpui::*;
-use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputState, Textarea, TextareaState};
-use gpui_component::spinner::Spinner;
-use gpui_component::{h_flex, v_flex, ActiveTheme, Disableable, Sizable, WindowExt};
-use threadlane_git::GitStatus;
+use gpui_component::input::{InputState, TextareaState};
+use gpui_component::WindowExt;
+use threadlane_ui_kit::{ReviewDraftPrFields, ReviewDraftPrPhase};
 
-use super::types::{nonempty, Surface};
+use super::pr_generation::{current_diff, generation_prompt, PrField};
+use super::types::Surface;
 use super::RightPanelView;
-use super::pr_generation::{PrField, current_diff, generation_prompt};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DraftPrFields {
-    pub base: String,
-    pub title: String,
-    pub body: String,
-}
-
-impl DraftPrFields {
-    pub fn validate(&self) -> Result<(), &'static str> {
-        [
-            (&self.base, "Enter the base branch."),
-            (&self.title, "Enter a pull request title."),
-            (&self.body, "Enter a pull request description."),
-        ]
-        .into_iter()
-        .find(|(value, _)| value.trim().is_empty())
-        .map_or(Ok(()), |(_, error)| Err(error))
-    }
-}
-
-pub fn draft_pr_prefill(status: &GitStatus) -> DraftPrFields {
-    let branch = status
-        .branch
-        .as_deref()
-        .and_then(nonempty)
-        .unwrap_or("main");
-    let base = status
-        .default_branch
-        .as_deref()
-        .and_then(nonempty)
-        .or_else(|| {
-            status
-                .branch_details
-                .iter()
-                .find(|branch| branch.is_default)
-                .and_then(|branch| nonempty(&branch.name))
-        })
-        .unwrap_or("main")
-        .to_string();
-    let commit = status.recent_commits.first();
-    let summary = commit
-        .and_then(|commit| nonempty(&commit.summary))
-        .unwrap_or(branch);
-    let body = commit
-        .and_then(|commit| nonempty(&commit.body))
-        .unwrap_or(summary);
-    DraftPrFields {
-        base,
-        title: summary.into(),
-        body: body.into(),
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DraftPrContextKey {
@@ -75,7 +20,7 @@ pub struct DraftPrContextKey {
 pub struct DraftPrAttempt {
     pub id: u64,
     pub key: DraftPrContextKey,
-    pub fields: DraftPrFields,
+    pub fields: ReviewDraftPrFields,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -113,7 +58,7 @@ impl DraftPrAttemptState {
     pub fn begin(
         &mut self,
         key: DraftPrContextKey,
-        fields: DraftPrFields,
+        fields: ReviewDraftPrFields,
     ) -> Result<DraftPrAttempt, &'static str> {
         fields.validate()?;
         if !matches!(self.phase, DraftPrPhase::Idle) {
@@ -153,7 +98,7 @@ impl DraftPrAttemptState {
         &mut self,
         completed: &DraftPrAttempt,
         current_key: &DraftPrContextKey,
-        current_fields: &DraftPrFields,
+        current_fields: &ReviewDraftPrFields,
         result: DraftPrRemoteResult,
     ) -> DraftPrCompletion {
         let attempt = match &self.phase {
@@ -203,23 +148,23 @@ impl DraftPrDialogView {
     pub fn new(
         panel: WeakEntity<RightPanelView>,
         key: DraftPrContextKey,
-        fields: DraftPrFields,
+        fields: ReviewDraftPrFields,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let base_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Base branch")
+                .placeholder(threadlane_ui_kit::REVIEW_PR_BASE_PLACEHOLDER)
                 .default_value(fields.base)
         });
         let title_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Pull request title")
+                .placeholder(threadlane_ui_kit::REVIEW_PR_TITLE_PLACEHOLDER)
                 .default_value(fields.title)
         });
         let body_input = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder("Describe the change and how it was verified")
+                .placeholder(threadlane_ui_kit::REVIEW_PR_BODY_PLACEHOLDER)
                 .default_value(fields.body)
                 .auto_grow(4, 10)
                 .soft_wrap(true)
@@ -327,8 +272,8 @@ impl DraftPrDialogView {
         cx.notify();
     }
 
-    pub fn fields(&self, cx: &App) -> DraftPrFields {
-        DraftPrFields {
+    pub fn fields(&self, cx: &App) -> ReviewDraftPrFields {
+        ReviewDraftPrFields {
             base: self.base_input.read(cx).value().to_string(),
             title: self.title_input.read(cx).value().to_string(),
             body: self.body_input.read(cx).value().to_string(),
@@ -346,13 +291,12 @@ impl DraftPrDialogView {
         })
     }
 
-    pub fn start_request(
-        &mut self,
-        check: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.generating || self.created || self.attempts.is_busy() || (!check && self.attempts.is_uncertain()) {
+    pub fn start_request(&mut self, check: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.generating
+            || self.created
+            || self.attempts.is_busy()
+            || (!check && self.attempts.is_uncertain())
+        {
             return;
         }
         let Some(key) = self.current_key(!check, cx).filter(|key| key == &self.key) else {
@@ -528,132 +472,53 @@ impl DraftPrDialogView {
     }
 }
 
-fn draft_pr_field(label: &'static str, field: impl IntoElement) -> impl IntoElement {
-    v_flex()
-        .gap_1()
-        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(label))
-        .child(field)
-}
-
 impl Render for DraftPrDialogView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        let fields = self.fields(cx);
-        let busy = self.attempts.is_busy();
-        let uncertain = self.attempts.is_uncertain();
-        let checking = matches!(&self.attempts.phase, DraftPrPhase::Checking(_));
-        let created = self.created;
-        let context_matches = self.current_key(false, cx).as_ref() == Some(&self.key);
-        let creation_available = self.current_key(true, cx).as_ref() == Some(&self.key);
-        let can_submit = creation_available && fields.validate().is_ok() && !busy && !self.generating;
-        let base = if fields.base.trim().is_empty() {
-            "base branch".to_string()
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let phase = if self.created {
+            ReviewDraftPrPhase::Created
         } else {
-            fields.base.trim().to_string()
+            match &self.attempts.phase {
+                DraftPrPhase::Idle => ReviewDraftPrPhase::Idle,
+                DraftPrPhase::Posting(_) => ReviewDraftPrPhase::Creating,
+                DraftPrPhase::Unknown(_) => ReviewDraftPrPhase::Uncertain,
+                DraftPrPhase::Checking(_) => ReviewDraftPrPhase::Checking,
+            }
         };
-
-        v_flex()
-            .gap_3()
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(format!(
-                        "Creates a DRAFT pull request on GitHub from {} into {base}. No commits are pushed.",
-                        self.key.branch
-                    )),
-            )
-            .child(draft_pr_field(
-                "Base branch",
-                Input::new(&self.base_input)
-                    .aria_label("Base branch")
-                    .disabled(created),
-            ))
-            .child(draft_pr_field(
-                "Title",
-                Input::new(&self.title_input)
-                    .aria_label("Pull request title")
-                    .disabled(created),
-            ))
-            .child(draft_pr_field(
-                "Description",
-                Textarea::new(&self.body_input)
-                    .aria_label("Pull request description")
-                    .disabled(created),
-            ))
-            .child(h_flex().gap_2()
-                .child(Button::new("regenerate-pr-title").label("Regenerate title").small()
-                    .disabled(self.generating || busy || uncertain || created || !context_matches)
-                    .on_click(cx.listener(|this, _, window, cx| this.regenerate(PrField::Title, window, cx))))
-                .child(Button::new("regenerate-pr-description").label("Regenerate description").small()
-                    .disabled(self.generating || busy || uncertain || created || !context_matches)
-                    .on_click(cx.listener(|this, _, window, cx| this.regenerate(PrField::Description, window, cx)))))
-            .children(self.generating.then(|| div().text_sm().child("Generating…")))
-            .children((!context_matches).then(|| {
-                div()
-                    .text_sm()
-                    .text_color(theme.danger)
-                    .child("The active checkout or branch changed. Close this dialog and open it again.")
-            }))
-            .children(self.error.as_ref().map(|error| {
-                div()
-                    .text_sm()
-                    .text_color(if created {
-                        theme.success
-                    } else {
-                        theme.danger
-                    })
-                    .child(error.clone())
-            }))
-            .children(busy.then(|| {
-                h_flex()
-                    .gap_2()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(Spinner::new().small())
-                    .child(if checking {
-                        "Checking GitHub…"
-                    } else {
-                        "Creating draft on GitHub…"
-                    })
-            }))
-            .child(
-                h_flex()
-                    .justify_end()
-                    .gap_2()
-                    .pt_2()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .child(
-                        Button::new("cancel-draft-pr")
-                            .label(if created { "Done" } else { "Cancel" })
-                            .tooltip("Close dialog")
-                            .disabled(busy && context_matches)
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                    )
-                    .children((!uncertain && !created).then(|| {
-                        Button::new("submit-draft-pr")
-                            .label(if busy { "Creating…" } else { "Create draft" })
-                            .primary()
-                            .disabled(!can_submit)
-                            .tooltip(if context_matches {
-                                "Create a draft pull request on GitHub"
-                            } else {
-                                "The active checkout or branch changed"
-                            })
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.start_request(false, window, cx);
-                            }))
-                    }))
-                    .children((uncertain && !busy).then(|| {
-                        Button::new("check-draft-pr")
-                            .label("Check again")
-                            .outline()
-                            .tooltip("Re-check pull request status on GitHub")
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.start_request(true, window, cx);
-                            }))
-                    })),
-            )
+        threadlane_ui_kit::review_draft_pr_form(
+            &threadlane_ui_kit::ReviewDraftPrForm {
+                branch: &self.key.branch,
+                base: &self.base_input,
+                title: &self.title_input,
+                body: &self.body_input,
+                phase,
+                generating: self.generating,
+                context_matches: self.current_key(false, cx).as_ref() == Some(&self.key),
+                creation_available: self.current_key(true, cx).as_ref() == Some(&self.key),
+                error: self.error.as_deref(),
+            },
+            cx.listener(
+                |this, action: &threadlane_ui_kit::ReviewDraftPrAction, window, cx| {
+                    use threadlane_ui_kit::ReviewDraftPrAction;
+                    match action {
+                        ReviewDraftPrAction::Close => {
+                            if !this.attempts.is_busy()
+                                || this.current_key(false, cx).as_ref() != Some(&this.key)
+                            {
+                                window.close_dialog(cx);
+                            }
+                        }
+                        ReviewDraftPrAction::Create => this.start_request(false, window, cx),
+                        ReviewDraftPrAction::Check => this.start_request(true, window, cx),
+                        ReviewDraftPrAction::GenerateTitle => {
+                            this.regenerate(PrField::Title, window, cx)
+                        }
+                        ReviewDraftPrAction::GenerateDescription => {
+                            this.regenerate(PrField::Description, window, cx)
+                        }
+                    }
+                },
+            ),
+            cx,
+        )
     }
 }

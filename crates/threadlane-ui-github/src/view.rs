@@ -10,23 +10,16 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::checkbox::Checkbox;
-use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
-use gpui_component::link::Link;
-use gpui_component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_component::resizable::{h_resizable, resizable_panel, ResizableState};
-use gpui_component::scroll::{ScrollableElement, Scrollbar};
-use gpui_component::spinner::Spinner;
-use gpui_component::status_bar::StatusBar;
-use gpui_component::tab::{Tab, TabBar};
-use gpui_component::tag::Tag;
-use gpui_component::text::{TextView, TextViewState};
-use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable};
+use gpui_component::input::{InputEvent, InputState, TextareaState};
+use gpui_component::resizable::ResizableState;
+use gpui_component::scroll::Scrollbar;
+use gpui_component::text::TextViewState;
+use gpui_component::WindowExt;
 use threadlane_git::{
     GitHubIssueDetail, GitHubIssueRef, GitHubPrInfo, GitHubRepository, PrFileViewedStatus,
 };
 
+use threadlane_ui_kit::github as kit_github;
 use threadlane_ui_state::actions::AppAction;
 use threadlane_ui_state::controller;
 use threadlane_ui_state::{AppState, SessionInfo};
@@ -54,33 +47,9 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PrFileAction {
-    Previous,
-    Next,
-    Open,
-}
+use threadlane_ui_kit::github::{pr_file_action_ix, PrFileAction};
 
-fn pr_file_action_ix(current: Option<usize>, len: usize, action: PrFileAction) -> Option<usize> {
-    if len == 0 {
-        return None;
-    }
-    let current = current.unwrap_or_default().min(len - 1);
-    Some(match action {
-        PrFileAction::Previous => current.saturating_sub(1),
-        PrFileAction::Next => current.saturating_add(1).min(len - 1),
-        PrFileAction::Open => current,
-    })
-}
-
-fn pr_review_label(decision: &str) -> Option<&'static str> {
-    match decision {
-        "APPROVED" => Some("Approved"),
-        "CHANGES_REQUESTED" => Some("Changes requested"),
-        "REVIEW_REQUIRED" => Some("Review required"),
-        _ => None,
-    }
-}
+use threadlane_ui_kit::github::pr_review_label;
 
 fn github_server_query(query: &str) -> Option<&str> {
     let query = query.trim();
@@ -397,6 +366,7 @@ pub struct GitHubView {
     comment_list_state: ListState,
     pr_timeline_rows: Vec<PrTimelineRow>,
     pr_timeline_list_state: ListState,
+    pr_conversation_scroll: ScrollHandle,
     pr_file_list_state: ListState,
     pr_diff_body: Entity<TextViewState>,
     pr_selections: PrWorkspaceSelections,
@@ -594,6 +564,7 @@ impl GitHubView {
             comment_list_state: ListState::new(0, ListAlignment::Top, window.rem_size() * 6.0),
             pr_timeline_rows: Vec::new(),
             pr_timeline_list_state: ListState::new(0, ListAlignment::Top, window.rem_size() * 7.0),
+            pr_conversation_scroll: ScrollHandle::new(),
             pr_file_list_state: ListState::new(0, ListAlignment::Top, window.rem_size() * 3.25),
             pr_diff_body,
             pr_selections: PrWorkspaceSelections::default(),
@@ -1275,6 +1246,12 @@ impl GitHubView {
         };
         self.pr_drafts.select_reply_target(key, target);
         self.sync_pr_draft_inputs(window, cx);
+        kit_github::focus_github_reply(
+            &self.pr_reply_input,
+            &self.pr_conversation_scroll,
+            window,
+            cx,
+        );
         cx.notify();
     }
 
@@ -1800,6 +1777,9 @@ impl GitHubView {
         action: impl FnOnce(PathBuf) -> Result<String, threadlane_git::GitError> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
+        if self.issue_action_pending {
+            return;
+        }
         let Some(project) = self
             .selected_issue
             .as_ref()
@@ -1828,8 +1808,7 @@ impl GitHubView {
                         this.fetch_detail(cx);
                     }
                     Err(error) => {
-                        this.issue_action_status =
-                            Some(format!("{describe} failed: {error}"));
+                        this.issue_action_status = Some(format!("{describe} failed: {error}"));
                     }
                 }
                 cx.notify();
@@ -1859,37 +1838,64 @@ impl GitHubView {
         );
     }
 
-    fn delete_selected_issue(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn delete_selected_issue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.issue_action_pending {
+            return;
+        }
         let Some(key) = self.selected_issue.clone() else {
             return;
         };
-        let number = key.number;
+        let Some(row) = self
+            .issues
+            .iter()
+            .find(|row| row.project == key.project && row.summary.issue.number == key.number)
+        else {
+            return;
+        };
+        let identity = format!(
+            "{}/{} · #{} · {}",
+            row.summary.issue.owner, row.summary.issue.repo, key.number, row.project_name
+        );
+        let title = row.summary.title.clone();
         let view = cx.entity().downgrade();
-        cx.spawn(async move |_this, cx| {
-            let confirmed = rfd::AsyncMessageDialog::new()
-                .set_title("Delete issue?")
-                .set_description(format!(
-                    "Permanently delete issue #{number}? This cannot be undone."
-                ))
-                .set_buttons(rfd::MessageButtons::YesNo)
-                .show()
-                .await;
-            if !matches!(confirmed, rfd::MessageDialogResult::Yes) {
-                return;
-            }
-            let _ = view.update(cx, |this, cx| {
-                this.run_issue_mutation(
-                    number,
-                    "Deleting issue".to_string(),
-                    move |project| {
-                        threadlane_git::delete_github_issue(&project, number)?;
-                        Ok(format!("Deleted issue #{number}."))
-                    },
-                    cx,
-                );
-            });
-        })
-        .detach();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let key = key.clone();
+            kit_github::github_issue_delete_dialog(
+                alert,
+                identity.clone(),
+                title.clone(),
+                move |_, cx| {
+                    view.update(cx, |this, cx| {
+                        if this.issue_action_pending {
+                            this.issue_action_status = Some("Another issue action is still running. Wait for it to finish, then open the delete confirmation again.".into());
+                            cx.notify();
+                            return true;
+                        }
+                        if this.selected_issue.as_ref() != Some(&key) {
+                            this.issue_action_status = Some(
+                                "Issue selection changed. Open the delete confirmation again."
+                                    .into(),
+                            );
+                            cx.notify();
+                            return true;
+                        }
+                        let number = key.number;
+                        this.run_issue_mutation(
+                            number,
+                            "Deleting issue".into(),
+                            move |project| {
+                                threadlane_git::delete_github_issue(&project, number)?;
+                                Ok(format!("Deleted issue #{number}."))
+                            },
+                            cx,
+                        );
+                        true
+                    })
+                    .unwrap_or(true)
+                },
+            )
+        });
     }
 
     fn suggest_issue_labels(&mut self, cx: &mut Context<Self>) {
@@ -2029,239 +2035,129 @@ impl GitHubView {
         cx.notify();
     }
 
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
-        let close_model = self.model.clone();
-        div()
-            .flex_none()
-            .border_b_1()
-            .border_color(theme.title_bar_border)
-            .bg(theme.title_bar)
-            // Same top clearance as the sidebar/right-panel/settings
-            // headers so toolbar text sits on the shared line under the
-            // traffic lights instead of riding higher.
-            .pt(threadlane_ui_theme::WINDOW_CONTROLS_CLEARANCE)
-            .px_4()
-            .when_some(self.window_controls_inset, |this, inset| this.pl(inset))
-            .py_2()
-            .flex()
-            .items_center()
-            .gap_3()
-            .child(
-                Button::new("github-close")
-                    .accessibility_label("Back to chat")
-                    .icon(IconName::Close)
-                    .tooltip("Back to chat")
-                    .ghost()
-                    .small()
-                    .on_click(move |_, _, cx| {
-                        close_model.update(cx, |state, cx| {
-                            controller::dispatch(state, AppAction::CloseGitHub);
-                            cx.notify();
-                        });
-                    }),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .truncate()
-                    .child(self.tab.label()),
-            )
-            .into_any_element()
+    fn apply_list_action(
+        &mut self,
+        action: kit_github::GitHubListAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use kit_github::GitHubListAction as Action;
+        match action {
+            Action::State(state) => self.select_state(state, cx),
+            Action::Refresh => self.refresh(cx),
+            Action::LoadMore => self.load_more(cx),
+            Action::NewIssue => {
+                let targets = self.scope_targets(cx);
+                if targets.len() == 1 {
+                    open_issue_create_dialog(self.model.clone(), targets[0].1.clone(), window, cx);
+                }
+            }
+            Action::Settings => self.model.update(cx, |state, cx| {
+                controller::dispatch(state, AppAction::OpenSettings);
+                cx.notify();
+            }),
+            Action::AttachProject => {
+                let model = self.model.clone();
+                cx.spawn(async move |_, cx| {
+                    let Some(folder) = rfd::AsyncFileDialog::new().pick_folder().await else {
+                        return;
+                    };
+                    let _ = model.update(cx, |state, cx| {
+                        controller::dispatch(
+                            state,
+                            AppAction::AttachProject(folder.path().to_path_buf()),
+                        );
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+        }
+    }
+
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> Div {
+        let model = self.model.clone();
+        kit_github::github_toolbar(
+            self.tab.label(),
+            self.window_controls_inset,
+            move |_, _, cx| {
+                model.update(cx, |state, cx| {
+                    controller::dispatch(state, AppAction::CloseGitHub);
+                    cx.notify();
+                });
+            },
+            cx,
+        )
+        .when(
+            self.tab == GitHubTab::PullRequests && self.current_pr_tab() == PrDetailTab::Code,
+            |toolbar| {
+                toolbar.child(kit_github::github_back_to_pr_list().on_click(cx.listener(
+                    |view, _, window, cx| {
+                        view.select_pr_tab(PrDetailTab::Summary, cx);
+                        view.list_focus.focus(window, cx);
+                    },
+                )))
+            },
+        )
     }
 
     fn render_scope_row(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
         let projects = self.attached_projects(cx);
-        let current = self.scope.clone();
-        let scope_label = current.label(&projects);
-        let view = cx.entity();
-        let mut names_by_dir: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+        let mut counts = std::collections::HashMap::<String, usize>::new();
         for (name, _) in &projects {
-            *names_by_dir.entry(name.clone()).or_default() += 1;
+            *counts.entry(name.clone()).or_default() += 1;
         }
-        div()
-            .debug_selector(|| "github-scope-row".into())
-            .flex_none()
-            .border_b_1()
-            .border_color(theme.border)
-            .px_3()
-            .py_2()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(
-                Button::new("github-scope-picker")
-                    .debug_selector(|| "github-scope-all".into())
-                    .icon(IconName::Folder)
-                    .label(scope_label)
-                    .tooltip("Project scope for GitHub issues and pull requests")
-                    .ghost()
-                    .small()
-                    .dropdown_caret(true)
-                    .dropdown_menu(move |menu, _window, _cx| {
-                        let view_for_all = view.clone();
-                        let mut menu = menu.item(
-                            PopupMenuItem::new("All projects")
-                                .checked(current == GitHubScope::All)
-                                .on_click(move |_event, _window, cx| {
-                                    view_for_all.update(cx, |view, cx| {
-                                        view.select_scope(GitHubScope::All, cx);
-                                    });
-                                }),
-                        );
-                        for (name, work_dir) in projects.clone() {
-                            let scope = GitHubScope::Project(work_dir.clone());
-                            let checked = current == scope;
-                            let disambiguated =
-                                if names_by_dir.get(&name).is_some_and(|count| *count > 1) {
-                                    let parent = work_dir
-                                        .parent()
-                                        .and_then(|parent| parent.file_name())
-                                        .and_then(|parent| parent.to_str())
-                                        .unwrap_or("…");
-                                    format!("{name} · …/{parent}")
-                                } else {
-                                    name.clone()
-                                };
-                            let view_for_project = view.clone();
-                            menu = menu.item(
-                                PopupMenuItem::new(disambiguated).checked(checked).on_click(
-                                    move |_event, _window, cx| {
-                                        view_for_project.update(cx, |view, cx| {
-                                            view.select_scope(scope.clone(), cx);
-                                        });
-                                    },
-                                ),
-                            );
-                        }
-                        menu
-                    }),
-            )
-            .into_any_element()
+        let label = self.scope.label(&projects);
+        let selected = match &self.scope {
+            GitHubScope::All => None,
+            GitHubScope::Project(dir) => Some(dir.clone()),
+        };
+        let mut choices = vec![(None, "All projects".into())];
+        choices.extend(projects.into_iter().map(|(name, dir)| {
+            let label = if counts.get(&name).is_some_and(|count| *count > 1) {
+                let parent = dir
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("…");
+                format!("{name} · …/{parent}")
+            } else {
+                name
+            };
+            (Some(dir), label)
+        }));
+        let owner = cx.entity().downgrade();
+        kit_github::github_scope_row(
+            label,
+            choices,
+            selected,
+            move |id, _, cx| {
+                let scope = id.map(GitHubScope::Project).unwrap_or(GitHubScope::All);
+                let _ = owner.update(cx, |view, cx| view.select_scope(scope, cx));
+            },
+            cx,
+        )
+        .into_any_element()
     }
 
     fn render_filters(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
-        div()
-            .flex_none()
-            .border_b_1()
-            .border_color(theme.border)
-            .px_3()
-            .py_2()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .debug_selector(|| "github-search-field".into())
-                    .min_w_0()
-                    .w_full()
-                    .flex_none()
-                    .child(
-                        Input::new(&self.query_input)
-                            .aria_label("Search issues and pull requests")
-                            .small(),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("github-state-open")
-                            .label("Open")
-                            .ghost()
-                            .small()
-                            .selected(self.state_filter == GitHubStateFilter::Open)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.select_state(GitHubStateFilter::Open, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("github-state-closed")
-                            .label("Closed")
-                            .ghost()
-                            .small()
-                            .selected(self.state_filter == GitHubStateFilter::Closed)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.select_state(GitHubStateFilter::Closed, cx)
-                            })),
-                    )
-                    .children((self.tab == GitHubTab::PullRequests).then(|| {
-                        Button::new("github-state-merged")
-                            .label("Merged")
-                            .ghost()
-                            .small()
-                            .selected(self.state_filter == GitHubStateFilter::Merged)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.select_state(GitHubStateFilter::Merged, cx)
-                            }))
-                    }))
-                    .child(
-                        Button::new("github-refresh")
-                            .accessibility_label("Refresh GitHub")
-                            .icon(Icon::default().path("icons/refresh-cw.svg"))
-                            .tooltip("Refresh GitHub")
-                            .ghost()
-                            .small()
-                            .disabled(self.scope_targets(cx).is_empty() || self.list_loading)
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-                    )
-                    .children((self.tab == GitHubTab::Issues).then(|| {
-                        // New issues target exactly one project: enable only
-                        // when the scope resolves to a single work dir.
-                        let targets = self.scope_targets(cx);
-                        let single = targets.len() == 1;
-                        let work_dir = targets.into_iter().next().map(|(_, dir)| dir);
-                        let create_model = self.model.clone();
-                        Button::new("github-new-issue")
-                            .label("New issue")
-                            .accessibility_label(if single {
-                                "Create an issue in this project"
-                            } else {
-                                "Scope to one project to create an issue"
-                            })
-                            .ghost()
-                            .small()
-                            .disabled(!single)
-                            .tooltip(if single {
-                                "Create an issue in this project"
-                            } else {
-                                "Scope to one project to create an issue"
-                            })
-                            .on_click(cx.listener(move |_, _, window, cx| {
-                                if let Some(work_dir) = work_dir.clone() {
-                                    open_issue_create_dialog(
-                                        create_model.clone(),
-                                        work_dir,
-                                        window,
-                                        cx,
-                                    );
-                                }
-                            }))
-                    }))
-                    .children(self.list_loading.then(|| {
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(Spinner::new().xsmall())
-                            .child(if self.issues.is_empty() && self.pull_requests.is_empty() {
-                                "Loading…"
-                            } else {
-                                "Refreshing…"
-                            })
-                    })),
-            )
-            .into_any_element()
+        let targets = self.scope_targets(cx);
+        let controls = kit_github::GitHubListControls::new(self.state_filter)
+            .pull_requests(self.tab == GitHubTab::PullRequests)
+            .loading(self.list_loading)
+            .has_results(!self.issues.is_empty() || !self.pull_requests.is_empty())
+            .has_scope(!targets.is_empty())
+            .single_project(targets.len() == 1);
+        let owner = cx.entity().downgrade();
+        kit_github::github_filters(
+            &self.query_input,
+            &controls,
+            move |action, window, cx| {
+                let _ = owner.update(cx, |view, cx| view.apply_list_action(action, window, cx));
+            },
+            cx,
+        )
+        .into_any_element()
     }
 
     fn render_issue_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -2277,119 +2173,58 @@ impl GitHubView {
             .selected_issue
             .as_ref()
             .is_some_and(|key| key.project == row.project && key.number == number);
-        let linked_count = self.linked_sessions(&issue.issue, cx).len();
-        let theme = cx.theme().colors;
+        let linked = self.linked_sessions(&issue.issue, cx).len();
+        let mut metadata: Vec<_> = issue
+            .labels
+            .iter()
+            .take(2)
+            .map(|label| (label.name.clone(), false))
+            .collect();
+        if issue.labels.len() > 2 {
+            metadata.push((format!("+{}", issue.labels.len() - 2), false));
+        }
+        if linked > 0 {
+            metadata.push((
+                format!("{linked} linked task{}", if linked == 1 { "" } else { "s" }),
+                false,
+            ));
+        }
+        let kind = if issue.state.eq_ignore_ascii_case("closed") {
+            kit_github::GitHubRowKind::ClosedIssue
+        } else {
+            kit_github::GitHubRowKind::OpenIssue
+        };
         let context = scope_context_line(&issue.issue.owner, &issue.issue.repo, &row.project_name);
-        let label = format!("{context} #{number}: {}", issue.title);
-        Button::new(SharedString::from(format!(
-            "github-issue-{}-{number}",
-            row.project.display()
-        )))
-        .accessibility_label(label.clone())
-        .tooltip(label)
-        .ghost()
-        .h_auto()
-        .w_full()
-        .p_0()
-        .selected(selected)
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.list_focus.focus(window, cx);
-            if let Some(ix) = this
-                .issues
-                .iter()
-                .position(|item| item.project == row.project && item.summary.issue.number == number)
-            {
-                this.select_ix(ix, cx);
-            }
-        }))
-        .child(
-            div()
-                .w_full()
-                .min_w_0()
-                .whitespace_normal()
-                .px_3()
-                .py_3()
-                .border_b_1()
-                .border_color(theme.border)
-                .flex()
-                .items_start()
-                .gap_2()
-                .child(
-                    Icon::new(if issue.state.eq_ignore_ascii_case("closed") {
-                        IconName::CircleCheck
-                    } else {
-                        IconName::Asterisk
-                    })
-                    .small()
-                    .text_color(theme.muted_foreground),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(issue.title),
-                        )
-                        .child(
-                            div()
-                                .mt_1()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .truncate()
-                                .child(format!("{context} · #{number}")),
-                        )
-                        .child(
-                            div()
-                                .mt_1()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(div().flex_1().min_w_0().truncate().child(format!(
-                                    "@{} · {}",
-                                    issue.author,
-                                    format_github_time(&issue.updated_at, github_now_unix())
-                                )))
-                                .children((issue.comments_count > 0).then(|| {
-                                    div()
-                                        .flex_none()
-                                        .child(format!("{} comments", issue.comments_count))
-                                })),
-                        )
-                        .children((!issue.labels.is_empty() || linked_count > 0).then(|| {
-                            div()
-                                .mt_1()
-                                .flex()
-                                .flex_wrap()
-                                .gap_2()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .children(
-                                    issue
-                                        .labels
-                                        .iter()
-                                        .take(2)
-                                        .map(|label| div().child(label.name.clone())),
-                                )
-                                .children(
-                                    (issue.labels.len() > 2).then(|| {
-                                        div().child(format!("+{}", issue.labels.len() - 2))
-                                    }),
-                                )
-                                .children((linked_count > 0).then(|| {
-                                    div().child(format!(
-                                        "{linked_count} linked task{}",
-                                        if linked_count == 1 { "" } else { "s" }
-                                    ))
-                                }))
-                        })),
-                ),
+        let snapshot = kit_github::GitHubListRow::new(
+            format!("github-issue-{}-{number}", row.project.display()),
+            kind,
+            issue.title,
+            format!("{context} · #{number}"),
+            format!(
+                "@{} · {}",
+                issue.author,
+                format_github_time(&issue.updated_at, github_now_unix())
+            ),
         )
-        .into_any_element()
+        .selected(selected)
+        .metadata(metadata)
+        .suffix((issue.comments_count > 0).then(|| {
+            format!(
+                "{} comment{}",
+                issue.comments_count,
+                if issue.comments_count == 1 { "" } else { "s" }
+            )
+        }));
+        kit_github::github_list_row(snapshot, cx)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.list_focus.focus(window, cx);
+                if let Some(ix) = this.issues.iter().position(|item| {
+                    item.project == row.project && item.summary.issue.number == number
+                }) {
+                    this.select_ix(ix, cx);
+                }
+            }))
+            .into_any_element()
     }
 
     fn render_pr_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -2408,110 +2243,42 @@ impl GitHubView {
         let linked = self
             .linked_pr_task(&row.project, &pr.head_ref, cx)
             .is_some();
-        let theme = cx.theme().colors;
+        let checks = pr_check_label(&pr.checks);
+        let mut metadata = vec![(checks.to_string(), checks.contains("failing"))];
+        if let Some(label) = pr.review_decision.as_deref().and_then(pr_review_label) {
+            metadata.push((label.into(), false));
+        }
+        if linked {
+            metadata.push(("Linked task".into(), false));
+        }
         let context =
             scope_context_line(&pr.repository.owner, &pr.repository.repo, &row.project_name);
-        let label = format!("{context} #{number}: {}", pr.title);
-        let checks = pr_check_label(&pr.checks);
-        Button::new(SharedString::from(format!(
-            "github-pr-{}-{number}",
-            row.project.display()
-        )))
-        .accessibility_label(label.clone())
-        .tooltip(label)
-        .ghost()
-        .h_auto()
-        .w_full()
-        .p_0()
-        .selected(selected)
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.list_focus.focus(window, cx);
-            if let Some(ix) = this
-                .pull_requests
-                .iter()
-                .position(|item| item.project == row.project && item.summary.number == number)
-            {
-                this.select_ix(ix, cx);
-            }
-        }))
-        .child(
-            div()
-                .w_full()
-                .min_w_0()
-                .whitespace_normal()
-                .px_3()
-                .py_3()
-                .border_b_1()
-                .border_color(theme.border)
-                .flex()
-                .items_start()
-                .gap_2()
-                .child(
-                    Icon::new(IconName::Github)
-                        .small()
-                        .text_color(theme.muted_foreground),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(pr.title),
-                        )
-                        .child(
-                            div()
-                                .mt_1()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .truncate()
-                                .child(format!("{context} · #{number}")),
-                        )
-                        .child(
-                            div()
-                                .mt_1()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(div().flex_1().min_w_0().truncate().child(format!(
-                                    "@{} · {}",
-                                    pr.author,
-                                    format_github_time(&pr.updated_at, github_now_unix())
-                                )))
-                                .children(pr.is_draft.then(|| div().flex_none().child("Draft"))),
-                        )
-                        .child(
-                            div()
-                                .mt_1()
-                                .flex()
-                                .flex_wrap()
-                                .gap_2()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(
-                                    div()
-                                        .text_color(if checks.contains("failing") {
-                                            theme.danger
-                                        } else {
-                                            theme.muted_foreground
-                                        })
-                                        .child(checks),
-                                )
-                                .children(
-                                    pr.review_decision
-                                        .as_deref()
-                                        .and_then(pr_review_label)
-                                        .map(|label| div().child(label)),
-                                )
-                                .children(linked.then(|| div().child("Linked task"))),
-                        ),
-                ),
+        let snapshot = kit_github::GitHubListRow::new(
+            format!("github-pr-{}-{number}", row.project.display()),
+            kit_github::GitHubRowKind::PullRequest,
+            pr.title,
+            format!("{context} · #{number}"),
+            format!(
+                "@{} · {}",
+                pr.author,
+                format_github_time(&pr.updated_at, github_now_unix())
+            ),
         )
-        .into_any_element()
+        .selected(selected)
+        .metadata(metadata)
+        .suffix(pr.is_draft.then(|| "Draft".into()));
+        kit_github::github_list_row(snapshot, cx)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.list_focus.focus(window, cx);
+                if let Some(ix) = this
+                    .pull_requests
+                    .iter()
+                    .position(|item| item.project == row.project && item.summary.number == number)
+                {
+                    this.select_ix(ix, cx);
+                }
+            }))
+            .into_any_element()
     }
 
     fn render_load_more(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2521,22 +2288,13 @@ impl GitHubView {
             .items_center()
             .justify_center()
             .child(
-                Button::new("github-load-more")
-                    .label(if self.list_loading {
-                        "Loading…"
-                    } else {
-                        "Load more"
-                    })
-                    .ghost()
-                    .small()
-                    .disabled(self.list_loading)
+                kit_github::github_load_more(self.list_loading)
                     .on_click(cx.listener(|this, _, _, cx| this.load_more(cx))),
             )
             .into_any_element()
     }
 
     fn render_list(&mut self, _window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
         if self.scope_targets(cx).is_empty() {
             return self.render_no_project(cx);
         }
@@ -2562,16 +2320,8 @@ impl GitHubView {
             GitHubTab::PullRequests => self.pr_list_state.clone(),
         };
         let tab = self.tab;
-        let content = div()
-            .debug_selector(|| "github-result-list".into())
-            .id("github-result-list")
-            .role(Role::List)
-            .relative()
-            .size_full()
-            .min_h_0()
-            .border_1()
-            .border_color(theme.border)
-            .track_focus(&self.list_focus).focus(|style| style.border_color(theme.primary))
+        let content = kit_github::github_list_surface(cx)
+            .track_focus(&self.list_focus)
             .key_context(GITHUB_LIST_CONTEXT)
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::select_next))
@@ -2614,201 +2364,43 @@ impl GitHubView {
     }
 
     fn render_list_warning(&self, error: &str, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
-        let details = error.to_owned();
-        div()
-            .debug_selector(|| "github-list-warning".into())
-            .id("github-list-warning")
-            .tooltip({
-                let tip = format!("Some projects couldn’t load: {error}");
-                move |window, cx| {
-                    gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
-                }
-            })
-            .w_full()
-            .flex_none()
-            .px_3()
-            .py_1p5()
-            .flex()
-            .items_center()
-            .gap_2()
-            .bg(theme.warning.opacity(0.12))
-            .text_xs()
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .truncate()
-                    .text_color(theme.foreground)
-                    .child("Some projects unavailable"),
-            )
-            .child(
-                Button::new("github-list-warning-retry")
-                    .debug_selector(|| "github-list-warning-retry".into())
-                    .label("Retry")
-                    .ghost()
-                    .xsmall()
-                    .disabled(self.list_loading)
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-            )
-            .child(
-                Button::new("github-list-warning-copy")
-                    .debug_selector(|| "github-list-warning-copy".into())
-                    .label("Copy")
-                    .accessibility_label("Copy the complete GitHub error")
-                    .tooltip("Copy the complete GitHub error")
-                    .ghost()
-                    .xsmall()
-                    .on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(details.clone()));
-                    }),
-            )
-            .into_any_element()
+        kit_github::github_list_warning(
+            error.to_owned(),
+            self.list_loading,
+            cx.listener(|this, _, _, cx| this.refresh(cx)),
+            cx,
+        )
+        .into_any_element()
     }
 
     fn render_error(&self, id: &'static str, error: &str, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
-        let details = error.to_owned();
-        let model = self.model.clone();
-        div()
-            .debug_selector(move || format!("github-{id}-error"))
-            .w_full()
-            .flex_none()
-            .p_3()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .text_sm()
-            .child(
-                div()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme.danger)
-                    .child("GitHub request failed"),
-            )
-            .child(
-                div()
-                    .text_color(theme.foreground)
-                    .child(github_error_message(error)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new(format!("github-{id}-error-retry"))
-                            .debug_selector(move || format!("github-{id}-error-retry"))
-                            .label("Retry")
-                            .small()
-                            .disabled(self.list_loading)
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-                    )
-                    .child(
-                        Button::new(format!("github-{id}-error-copy"))
-                            .debug_selector(move || format!("github-{id}-error-copy"))
-                            .label("Copy details")
-                            .accessibility_label("Copy the complete GitHub error")
-                            .tooltip("Copy the complete GitHub error")
-                            .ghost()
-                            .small()
-                            .on_click(move |_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(details.clone()));
-                            }),
-                    )
-                    .child(
-                        Button::new(format!("github-{id}-settings"))
-                            .label("Open repository settings")
-                            .ghost()
-                            .small()
-                            .on_click(move |_, _, cx| {
-                                model.update(cx, |state, cx| {
-                                    controller::dispatch(state, AppAction::OpenSettings);
-                                    cx.notify();
-                                });
-                            }),
-                    ),
-            )
-            .into_any_element()
+        let owner = cx.entity().downgrade();
+        kit_github::github_error(
+            id,
+            github_error_message(error),
+            error.to_owned(),
+            self.list_loading,
+            move |action, window, cx| {
+                let _ = owner.update(cx, |view, cx| view.apply_list_action(action, window, cx));
+            },
+            cx,
+        )
+        .into_any_element()
     }
 
     fn render_empty(&self, message: &str, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .px_6()
-            .text_sm()
-            .text_color(theme.muted_foreground)
-            .children(self.list_loading.then(|| Spinner::new().small()))
-            .child(message.to_owned())
-            .into_any_element()
+        kit_github::github_empty(message.to_owned(), self.list_loading, cx).into_any_element()
     }
 
     fn render_no_project(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
-        let model = self.model.clone();
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_3()
-            .px_6()
-            .text_sm()
-            .text_color(theme.muted_foreground)
-            .child("No project or repository is attached")
-            .child(
-                div()
-                    .text_xs()
-                    .text_center()
-                    .child("Attach a project to load its GitHub issues and pull requests."),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        Button::new("github-attach-project")
-                            .label("Attach project")
-                            .small()
-                            .on_click(move |_, _, cx| {
-                                let model = model.clone();
-                                cx.spawn(async move |cx| {
-                                    let Some(folder) =
-                                        rfd::AsyncFileDialog::new().pick_folder().await
-                                    else {
-                                        return;
-                                    };
-                                    let _ = model.update(cx, |state, cx| {
-                                        controller::dispatch(
-                                            state,
-                                            AppAction::AttachProject(folder.path().to_path_buf()),
-                                        );
-                                        cx.notify();
-                                    });
-                                })
-                                .detach();
-                            }),
-                    )
-                    .child(
-                        Button::new("github-open-settings")
-                            .label("Configure GitHub")
-                            .ghost()
-                            .small()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.model.update(cx, |state, cx| {
-                                    controller::dispatch(state, AppAction::OpenSettings);
-                                    cx.notify();
-                                });
-                            })),
-                    ),
-            )
-            .into_any_element()
+        let owner = cx.entity().downgrade();
+        kit_github::github_no_project(
+            move |action, window, cx| {
+                let _ = owner.update(cx, |view, cx| view.apply_list_action(action, window, cx));
+            },
+            cx,
+        )
+        .into_any_element()
     }
 
     fn render_comment_row(
@@ -2820,39 +2412,31 @@ impl GitHubView {
         let Some((author, time, body)) = self.comment_rows.get(ix).cloned() else {
             return div().into_any_element();
         };
-        let theme = cx.theme().colors;
-        let body_element = if body.trim().is_empty() {
-            div()
-                .mt_2()
-                .text_sm()
-                .text_color(theme.muted_foreground)
-                .child("No comment body")
-                .into_any_element()
-        } else {
-            div()
-                .mt_2()
-                .text_sm()
-                .child(
-                    TextView::markdown(
-                        SharedString::from(format!("github-issue-comment-{ix}")),
-                        body,
-                    )
-                    .selectable(true),
-                )
-                .into_any_element()
-        };
-        div()
-            .p_3()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .text_xs()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(format!("{author} · {time}")),
-            )
-            .child(body_element)
-            .into_any_element()
+        let remote_id = self
+            .issue_detail
+            .as_ref()
+            .and_then(|detail| detail.comments.get(ix))
+            .map(|comment| comment.remote_id.clone())
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| {
+                // Older snapshots can omit remote IDs; keep their content identity stable on reorder.
+                let mut hash = DefaultHasher::new();
+                (&author, &time, &body).hash(&mut hash);
+                format!("legacy-{}", hash.finish())
+            });
+        let owner = self
+            .selected_issue
+            .as_ref()
+            .map(|key| format!("{}-{}", key.project.display(), key.number))
+            .unwrap_or_default();
+        kit_github::github_comment(
+            format!("github-issue-comment-{owner}-{remote_id}"),
+            author,
+            time,
+            body,
+            cx,
+        )
+        .into_any_element()
     }
 
     fn handoff_pr_reply(&self, head_ref: &str, prompt: String, cx: &mut Context<Self>) {
@@ -2924,7 +2508,6 @@ impl GitHubView {
         reply: bool,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let theme = cx.theme().colors;
         let draft = self
             .current_pr_key()
             .as_ref()
@@ -2951,72 +2534,54 @@ impl GitHubView {
             PrCommentPhase::Absent => Some("No matching new GitHub comment was found for the submitted draft. Draft retained."),
             PrCommentPhase::Unknown => Some("GitHub could not confirm whether the submitted draft was published. Draft retained."),
         };
-        let action = match control {
-            PrCommentControl::Post | PrCommentControl::Retry | PrCommentControl::PostNewDraft => {
-                Button::new(if reply {
-                    "github-pr-reply-publish"
-                } else {
-                    "github-pr-comment-publish"
-                })
-                .label(match control {
-                    PrCommentControl::Retry => "Retry",
-                    PrCommentControl::PostNewDraft if reply => "Post new reply",
-                    PrCommentControl::PostNewDraft => "Post new draft",
-                    _ if reply => "Reply",
-                    _ => "Post comment",
-                })
-                .small()
-                .disabled(publish.is_active() || body.trim().is_empty() || invalid_target.is_some())
-                .on_click(cx.listener(move |this, _, _, cx| {
+        let action_kind = match control {
+            PrCommentControl::Post => kit_github::GitHubDraftAction::Post,
+            PrCommentControl::Retry => kit_github::GitHubDraftAction::Retry,
+            PrCommentControl::PostNewDraft => kit_github::GitHubDraftAction::PostNewDraft,
+            PrCommentControl::CheckAgain => kit_github::GitHubDraftAction::CheckAgain,
+            PrCommentControl::ClearDraft => kit_github::GitHubDraftAction::ClearDraft,
+        };
+        let disabled =
+            matches!(
+                control,
+                PrCommentControl::Post | PrCommentControl::Retry | PrCommentControl::PostNewDraft
+            ) && (publish.is_active() || body.trim().is_empty() || invalid_target.is_some());
+        let action = kit_github::github_draft_action(
+            reply,
+            action_kind,
+            disabled,
+            cx.listener(move |this, _, window, cx| match control {
+                PrCommentControl::Post
+                | PrCommentControl::Retry
+                | PrCommentControl::PostNewDraft => {
                     if reply {
                         this.publish_pr_reply(cx)
                     } else {
                         this.publish_pr_comment(cx)
                     }
-                }))
-                .into_any_element()
-            }
-            PrCommentControl::CheckAgain => Button::new(if reply {
-                "github-pr-reply-check-again"
-            } else {
-                "github-pr-comment-check-again"
-            })
-            .label("Check again")
-            .small()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if reply {
-                    this.check_pr_reply_again(cx)
-                } else {
-                    this.check_pr_comment_again(cx)
                 }
-            }))
-            .into_any_element(),
-            PrCommentControl::ClearDraft => Button::new(if reply {
-                "github-pr-reply-clear"
-            } else {
-                "github-pr-comment-clear"
-            })
-            .label(if reply {
-                "Clear target and draft"
-            } else {
-                "Clear draft"
-            })
-            .ghost()
-            .small()
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if reply {
-                    this.clear_pr_reply(window, cx)
-                } else {
-                    this.clear_pr_draft(window, cx)
+                PrCommentControl::CheckAgain => {
+                    if reply {
+                        this.check_pr_reply_again(cx)
+                    } else {
+                        this.check_pr_comment_again(cx)
+                    }
                 }
-            }))
-            .into_any_element(),
-        };
+                PrCommentControl::ClearDraft => {
+                    if reply {
+                        this.clear_pr_reply(window, cx)
+                    } else {
+                        this.clear_pr_draft(window, cx)
+                    }
+                }
+            }),
+        )
+        .into_any_element();
         let mut controls_before_editor = publish
             .attempt
             .as_ref()
             .filter(|_| publish.phase == PrCommentPhase::Present)
-            .map(|attempt| pr_present_recovery_action(reply, attempt).into_any_element())
+            .map(|attempt| pr_present_recovery_action(reply, attempt, cx).into_any_element())
             .into_iter()
             .collect::<Vec<_>>();
         let mut controls_after_editor = Vec::new();
@@ -3028,108 +2593,44 @@ impl GitHubView {
         } else {
             controls_after_editor.push(action);
         }
-        let controls_row = |controls: Vec<AnyElement>| {
-            (!controls.is_empty()).then(|| {
-                div()
-                    .mt_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .children(controls)
-            })
-        };
-        Some(
-            div()
-                .tab_group()
-                .flex_none()
-                .p_3()
-                .border_b_1()
-                .border_color(theme.border)
-                .child(
-                    div()
-                        .text_xs()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child("Draft · Not published"),
-                )
-                .children(target.map(|target| {
-                    div()
-                        .mt_1()
-                        .text_xs()
-                        .whitespace_normal()
-                        .child(format!("Reply to {}", target.author))
-                        .children(target.path.as_ref().map(|path| {
-                            format!(
-                                " · {path}{}",
-                                target
-                                    .line
-                                    .map(|line| format!(":{line}"))
-                                    .unwrap_or_default()
-                            )
-                        }))
-                        .child(
-                            div()
-                                .mt_1()
-                                .text_color(theme.muted_foreground)
-                                .child(target.body),
-                        )
-                }))
-                .children(controls_row(controls_before_editor))
-                .child(div().mt_2().child(Textarea::new(if reply {
-                    &self.pr_reply_input
-                } else {
-                    &self.pr_comment_input
-                })
-                .aria_label(if reply {
-                    "Reply to review comment"
-                } else {
-                    "New review comment"
-                })))
-                .children(
-                    blocked
-                        .then_some(
-                            "Post or clear this reply draft before replying to another comment.",
-                        )
-                        .into_iter()
-                        .chain(invalid_target)
-                        .map(|message| {
-                            div()
-                                .mt_2()
-                                .text_xs()
-                                .text_color(theme.danger)
-                                .child(message)
-                        }),
-                )
-                .children(status.map(|status| {
-                    div()
-                        .mt_2()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_xs()
-                        .text_color(
-                            if matches!(
-                                publish.phase,
-                                PrCommentPhase::Absent | PrCommentPhase::Unknown
-                            ) {
-                                theme.danger
-                            } else {
-                                theme.muted_foreground
-                            },
-                        )
-                        .children(publish.is_active().then(|| Spinner::new().xsmall()))
-                        .child(status)
-                }))
-                .children(publish.error.map(|error| {
-                    div()
-                        .mt_2()
-                        .text_xs()
-                        .text_color(theme.danger)
-                        .whitespace_normal()
-                        .child(error)
-                }))
-                .children(controls_row(controls_after_editor))
-                .into_any_element(),
+        let validation = blocked
+            .then_some("Post or clear this reply draft before replying to another comment.")
+            .into_iter()
+            .chain(invalid_target)
+            .map(str::to_owned)
+            .collect();
+        let mut editor = kit_github::GitHubCommentEditor::new(
+            if reply {
+                self.pr_reply_input.clone()
+            } else {
+                self.pr_comment_input.clone()
+            },
+            reply,
         )
+        .controls(controls_before_editor, controls_after_editor)
+        .validation(validation)
+        .status(
+            status.map(str::to_owned),
+            publish.is_active(),
+            matches!(
+                publish.phase,
+                PrCommentPhase::Absent | PrCommentPhase::Unknown
+            ),
+        )
+        .error(publish.error);
+        if let Some(target) = target {
+            let location = target.path.map(|path| {
+                format!(
+                    "{path}{}",
+                    target
+                        .line
+                        .map(|line| format!(":{line}"))
+                        .unwrap_or_default()
+                )
+            });
+            editor = editor.target(target.author, target.body, location);
+        }
+        Some(editor.render(cx).into_any_element())
     }
 
     fn render_pr_timeline_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -3141,100 +2642,42 @@ impl GitHubView {
         };
         let prompt = draft_reply_prompt(&row);
         let head_ref = pr.head_ref.clone();
-        let location = row.location();
-        let reply_target = row.reply_target();
-        let theme = cx.theme().colors;
-        div()
-            .id(SharedString::from(format!(
-                "github-pr-timeline-{}-{}",
-                row.kind.label(),
-                row.remote_id
-            )))
-            .p_3()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .gap_2()
-                    .text_xs()
-                    .child(Tag::new().small().child(row.label()))
-                    .child(
-                        div()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(row.author.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme.muted_foreground)
-                            .child(format_github_time(&row.timestamp, github_now_unix())),
-                    )
-                    .children(location.map(|location| Tag::new().small().child(location)))
-                    .child(div().flex_1())
-                    .children(reply_target.map(|target| {
-                        Button::new(SharedString::from(format!(
-                            "reply-pr-review-{}",
-                            target.remote_id
-                        )))
-                        .label("Reply")
-                        .ghost()
-                        .xsmall()
-                        .tooltip(format!("Reply to {}", target.author))
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.select_pr_reply_target(target.clone(), window, cx)
-                            },
-                        ))
-                    }))
-                    .child(
-                        Button::new(SharedString::from(format!(
-                            "draft-pr-reply-{}-{}",
-                            row.kind.label(),
-                            row.remote_id
-                        )))
-                        .label("Ask agent to draft reply")
-                        .ghost()
-                        .xsmall()
-                        .tooltip("Ask the coding agent to draft a reply to this thread")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.handoff_pr_reply(&head_ref, prompt.clone(), cx);
-                        })),
-                    ),
-            )
-            .child(if row.body.trim().is_empty() {
-                div()
-                    .mt_2()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(if row.kind == PrTimelineKind::Review {
-                        "No review body"
-                    } else {
-                        "No comment body"
-                    })
-                    .into_any_element()
-            } else {
-                let body_id = if row.remote_id.is_empty() {
-                    SharedString::from(format!(
-                        "github-pr-timeline-body-{}-{}",
-                        row.kind.label(),
-                        ix
-                    ))
-                } else {
-                    SharedString::from(format!(
-                        "github-pr-timeline-body-{}-{}",
-                        row.kind.label(),
-                        row.remote_id
-                    ))
-                };
-                div()
-                    .mt_2()
-                    .text_sm()
-                    .child(TextView::markdown(body_id, row.body).selectable(true))
-                    .into_any_element()
-            })
-            .into_any_element()
+        let target = row.reply_target();
+        let identity = if row.remote_id.is_empty() {
+            let mut hash = DefaultHasher::new();
+            (&row.author, &row.timestamp, &row.body, &row.path, row.line).hash(&mut hash);
+            format!("{:x}", hash.finish())
+        } else {
+            row.remote_id.clone()
+        };
+        let entry = kit_github::GitHubConversationEntry::new(
+            format!("{}-{}-{identity}", pr.url, row.kind.label()),
+            row.label(),
+            row.author.clone(),
+            format_github_time(&row.timestamp, github_now_unix()),
+            row.body.clone(),
+        )
+        .location(row.location())
+        .review(row.kind == PrTimelineKind::Review)
+        .reply_author(target.as_ref().map(|target| target.author.clone()));
+        let owner = cx.entity().downgrade();
+        kit_github::github_conversation_row(
+            entry,
+            move |action, window, cx| {
+                let _ = owner.update(cx, |this, cx| match action {
+                    kit_github::GitHubConversationAction::Reply => {
+                        if let Some(target) = &target {
+                            this.select_pr_reply_target(target.clone(), window, cx);
+                        }
+                    }
+                    kit_github::GitHubConversationAction::AskAgent => {
+                        this.handoff_pr_reply(&head_ref, prompt.clone(), cx)
+                    }
+                });
+            },
+            cx,
+        )
+        .into_any_element()
     }
 
     fn render_pr_file_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -3242,9 +2685,8 @@ impl GitHubView {
             .pr_detail
             .as_ref()
             .and_then(|detail| detail.files.get(ix))
-            .cloned()
         else {
-            return div().into_any_element();
+            return Empty.into_any_element();
         };
         let selected = self.current_pr_file() == Some(file.path.as_str());
         let marker = self
@@ -3252,246 +2694,40 @@ impl GitHubView {
             .and_then(|key| self.pr_viewed.get(&key))
             .and_then(|state| state.marker_label(&file.path));
         let path = file.path.clone();
-        let theme = cx.theme().colors;
-        div()
-            .id(SharedString::from(format!("github-pr-file-{}", file.path)))
-            .role(Role::ListItem)
-            .aria_label(format!(
-                "{}: +{} −{}{}",
-                file.path,
-                file.additions,
-                file.deletions,
-                marker.map(|text| format!(" · {text}")).unwrap_or_default()
-            ))
-            .aria_selected(selected)
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(theme.border)
-            .bg(if selected {
-                theme.list_active
-            } else {
-                theme.background
-            })
-            .hover(|style| style.bg(theme.list_hover))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.pr_file_focus.focus(window, cx);
-                this.select_pr_file(path.clone(), cx);
-            }))
-            .child(
-                div()
-                    .text_sm()
-                    .truncate()
-                    .id(SharedString::from(format!("pr-file-path-{}", file.path)))
-                    .tooltip({
-                        let tip = file.path.clone();
-                        move |window, cx| {
-                            gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
-                        }
-                    })
-                    .child(file.path),
-            )
-            .child(
-                div()
-                    .mt_1()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!(
-                        "+{} −{} · {}{}",
-                        file.additions,
-                        file.deletions,
-                        file.change_type,
-                        marker.map(|text| format!(" · {text}")).unwrap_or_default()
-                    )),
-            )
-            .into_any_element()
+        let owner = cx.entity().downgrade();
+        kit_github::github_pr_file_row(
+            file,
+            selected,
+            marker,
+            move |_, window, cx| {
+                let _ = owner.update(cx, |this, cx| {
+                    this.pr_file_focus.focus(window, cx);
+                    this.select_pr_file(path.clone(), cx);
+                });
+            },
+            cx,
+        )
+        .into_any_element()
     }
 
     fn render_pr_summary(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let selected = self.selected_pr.clone();
         let Some(detail) = self.pr_detail.as_ref().filter(|detail| {
-            selected
+            self.selected_pr
                 .as_ref()
                 .is_some_and(|selected| selected.number == detail.number)
         }) else {
             return self.render_empty("Loading details…", cx);
         };
-        let detail = detail.clone();
-        let theme = cx.theme().colors;
-        div()
-            .size_full()
-            .overflow_y_scrollbar()
-            .child(
-                div()
-                    .w_full()
-                    .max_w(rems(52.))
-                    .mx_auto()
-                    .px_5()
-                    .py_4()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .children(detail.is_draft.then(|| Tag::new().small().child("Draft")))
-                            .child(Tag::new().small().child(detail.state.clone()))
-                            .children(
-                                detail
-                                    .review_decision
-                                    .clone()
-                                    .as_deref()
-                                    .and_then(pr_review_label)
-                                    .map(|decision| Tag::new().small().child(decision)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .mt_5()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Description"),
-                    )
-                    .child(
-                        div()
-                            .mt_2()
-                            .text_sm()
-                            .child(if detail.body.trim().is_empty() {
-                                div()
-                                    .text_color(theme.muted_foreground)
-                                    .child("No description provided.")
-                                    .into_any_element()
-                            } else {
-                                TextView::new(&self.detail_body)
-                                    .selectable(true)
-                                    .into_any_element()
-                            }),
-                    )
-                    .child(
-                        div()
-                            .mt_3()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Checks"),
-                    )
-                    .child(
-                        div()
-                            .mt_2()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child(if detail.total_checks == 0 {
-                                "No checks reported".to_owned()
-                            } else {
-                                format!(
-                                    "{} passing · {} pending · {} failing",
-                                    detail.passing_checks,
-                                    detail.pending_checks,
-                                    detail.failing_checks
-                                )
-                            }),
-                    )
-                    .children(detail.checks.iter().map(|check| {
-                        div()
-                            .debug_selector({
-                                let name = check.name.clone();
-                                move || format!("github-pr-check-{name}")
-                            })
-                            .mt_2()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .text_sm()
-                            .child(div().min_w_0().flex_1().child(check.name.clone()))
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .debug_selector({
-                                        let name = check.name.clone();
-                                        move || format!("github-pr-check-status-{name}")
-                                    })
-                                    .text_color(theme.muted_foreground)
-                                    .child(pr_check_status_label(check)),
-                            )
-                            .child(
-                                div().w_20().flex_none().children(
-                                    check
-                                        .details_url
-                                        .as_deref()
-                                        .map(str::trim)
-                                        .filter(|url| {
-                                            url.starts_with("https://")
-                                                || url.starts_with("http://")
-                                        })
-                                        .map(|url| {
-                                            gpui_kit::base::Link::new(SharedString::from(format!(
-                                                "github-pr-check-log-{}-{}-{url}",
-                                                detail.number, check.name
-                                            )))
-                                            .href(url.to_owned())
-                                            .open_with(|url, _, _, cx| cx.open_url(url))
-                                            .accessibility_label(format!(
-                                                "View logs for {}",
-                                                check.name
-                                            ))
-                                            .flex_none()
-                                            .text_color(theme.link)
-                                            .underline()
-                                            .cursor_pointer()
-                                            .border_1()
-                                            .border_color(cx.theme().transparent)
-                                            .rounded(cx.theme().radius)
-                                            .px_1()
-                                            .py_1()
-                                            .hover(|style| style.bg(theme.list_hover))
-                                            .focus_visible(|style| {
-                                                style.border_color(theme.primary)
-                                            })
-                                            .debug_selector({
-                                                let name = check.name.clone();
-                                                move || format!("github-pr-check-log-{name}")
-                                            })
-                                            .child("View logs")
-                                        }),
-                                ),
-                            )
-                    })),
-            )
-            .into_any_element()
+        kit_github::github_pr_summary(detail, &self.detail_body, cx).into_any_element()
     }
 
     fn render_pr_conversation(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
         let comments = (0..self.pr_timeline_rows.len())
             .map(|ix| self.render_pr_timeline_row(ix, cx))
-            .collect::<Vec<_>>();
-        div()
-            .size_full()
-            .overflow_y_scrollbar()
-            .child(
-                div()
-                    .w_full()
-                    .max_w(rems(52.))
-                    .mx_auto()
-                    .px_5()
-                    .py_4()
-                    .child(
-                        div()
-                            .debug_selector(|| "github-pr-conversation-comments".into())
-                            .mt_4()
-                            .children(self.pr_timeline_rows.is_empty().then(|| {
-                                div()
-                                    .py_6()
-                                    .w_full()
-                                    .flex()
-                                    .justify_center()
-                                    .text_sm()
-                                    .text_color(theme.muted_foreground)
-                                    .child("No comments yet.")
-                            }))
-                            .children(comments),
-                    )
-                    .child(self.render_pr_comment_editor(cx))
-                    .children(self.render_pr_reply_editor(cx)),
-            )
+            .collect();
+        let editor = self.render_pr_comment_editor(cx);
+        let reply = self.render_pr_reply_editor(cx);
+        kit_github::github_pr_conversation(comments, editor, reply, &self.pr_conversation_scroll, cx)
             .into_any_element()
     }
 
@@ -3505,100 +2741,42 @@ impl GitHubView {
             .pr_detail
             .as_ref()
             .and_then(|detail| detail.commits.get(ix))
-            .cloned()
         else {
             return div().into_any_element();
         };
-        let theme = cx.theme().colors;
-        div()
-            .w_full()
-            .px_5()
-            .py_3()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(Tag::new().small().child("Commit"))
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(commit.message),
-                    ),
-            )
-            .child(
-                div()
-                    .mt_1()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!(
-                        "{}  ·  {}  ·  {}",
-                        &commit.oid[..commit.oid.len().min(7)],
-                        commit.author,
-                        commit.committed_at
-                    )),
-            )
-            .into_any_element()
+        kit_github::github_pr_commit_row(commit, cx).into_any_element()
     }
 
     fn render_pr_timeline(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
-        let commit_count = self
+        let count = self
             .pr_detail
             .as_ref()
             .map(|detail| detail.commits.len())
             .unwrap_or_default();
-        div()
-            .size_full()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .px_5()
-                    .py_3()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("{} commits", commit_count)),
-            )
-            .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h_0()
-                    .children((commit_count == 0).then(|| {
-                        div()
-                            .size_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child("No commits reported.")
-                    }))
-                    .children((commit_count > 0).then(|| {
-                        list(
-                            self.pr_timeline_list_state.clone(),
-                            cx.processor(Self::render_pr_commit_row),
-                        )
-                        .size_full()
-                        .with_sizing_behavior(ListSizingBehavior::Infer)
-                    }))
-                    .children((commit_count > 0).then(|| {
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .child(Scrollbar::vertical(&self.pr_timeline_list_state))
-                    })),
-            )
-            .into_any_element()
+        let list = (count > 0).then(|| {
+            div()
+                .relative()
+                .size_full()
+                .child(
+                    list(
+                        self.pr_timeline_list_state.clone(),
+                        cx.processor(Self::render_pr_commit_row),
+                    )
+                    .size_full()
+                    .with_sizing_behavior(ListSizingBehavior::Infer),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .child(Scrollbar::vertical(&self.pr_timeline_list_state)),
+                )
+                .into_any_element()
+        });
+        kit_github::github_pr_commits(count, list, cx).into_any_element()
     }
 
     fn render_pr_code(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
         let file_count = self
             .pr_detail
             .as_ref()
@@ -3626,8 +2804,7 @@ impl GitHubView {
         };
         let snapshot = viewed_state.and_then(|state| state.snapshot.as_ref());
         let loading = viewed_state.is_some_and(|state| state.loading);
-        let (viewed_count, listed_count, all_viewed) =
-            pr_viewed_progress(snapshot, listed_files);
+        let (viewed_count, listed_count, all_viewed) = pr_viewed_progress(snapshot, listed_files);
         let progress_label = if (loading && snapshot.is_none()) || !detail_matches {
             "Loading viewed status…".to_owned()
         } else if all_viewed {
@@ -3646,7 +2823,7 @@ impl GitHubView {
             .as_ref()
             .and_then(|key| self.pr_selections.selected_file(key))
             .map(str::to_owned);
-        let viewed_checkbox = selected_path.clone().map(|path| {
+        let viewed_control = selected_path.clone().map(|path| {
             let pending = viewed_state
                 .and_then(|state| state.pending_write.as_ref())
                 .filter(|write| write.path == path);
@@ -3671,143 +2848,66 @@ impl GitHubView {
             } else {
                 format!("{path}: viewed status unavailable — refresh to retry").into()
             };
-            let click_path = path.clone();
-            Checkbox::new("github-pr-viewed")
-                .accessibility_label(help.clone())
-                .label("Viewed")
-                .checked(checked)
-                .disabled(!enabled)
-                .small()
-                .tooltip(help)
-                .on_click(cx.listener(move |this, checked, _window, cx| {
-                    this.set_pr_file_viewed(click_path.clone(), *checked, cx);
-                }))
+            (checked, enabled, help)
         });
         let next_target = next_unviewed_file(snapshot, listed_files, selected_path.as_deref());
-        let next_help: SharedString = if next_target.is_some() {
-            "Select the next file without a viewed marker".into()
-        } else {
-            "No other unviewed files".into()
-        };
-        let toolbar = div()
-            .w_full()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_x_3()
-            .gap_y_1()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(theme.border)
+        let next_help = next_target.map(|_| "Select the next file without a viewed marker".into());
+        let mut controls = kit_github::GitHubPrFilesControls::new(progress_label, next_help)
+            .error(viewed_state.and_then(|state| state.error.clone()));
+        if let Some((checked, enabled, help)) = viewed_control {
+            controls = controls.viewed(checked, enabled, help);
+        }
+        let owner = cx.entity().downgrade();
+        let toolbar = controls.render(
+            move |action, _, cx| {
+                let _ = owner.update(cx, |this, cx| match action {
+                    kit_github::GitHubFileReviewAction::SetViewed(checked) => {
+                        if let Some(path) = &selected_path {
+                            this.set_pr_file_viewed(path.clone(), checked, cx);
+                        }
+                    }
+                    kit_github::GitHubFileReviewAction::NextUnviewed => {
+                        this.select_next_unviewed(cx)
+                    }
+                });
+            },
+            cx,
+        );
+        let files = kit_github::github_pr_file_list(&self.pr_file_focus, cx)
+            .key_context(GITHUB_PR_FILE_LIST_CONTEXT)
+            .on_action(cx.listener(Self::select_previous_pr_file))
+            .on_action(cx.listener(Self::select_next_pr_file))
+            .on_action(cx.listener(Self::open_selected_pr_file))
+            .child(
+                list(
+                    self.pr_file_list_state.clone(),
+                    cx.processor(|this, ix, _, cx| this.render_pr_file_row(ix, cx)),
+                )
+                .size_full()
+                .with_sizing_behavior(ListSizingBehavior::Infer),
+            )
             .child(
                 div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(progress_label),
-            )
-            .children(viewed_checkbox)
-            .child(div().flex_1())
-            .child(
-                Button::new("github-pr-next-unviewed")
-                    .ghost()
-                    .small()
-                    .label("Next unviewed")
-                    .disabled(next_target.is_none())
-                    .accessibility_label(next_help.clone())
-                    .tooltip(next_help)
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.select_next_unviewed(cx);
-                    })),
-            )
-            .children(
-                viewed_state
-                    .and_then(|state| state.error.clone())
-                    .map(|error| {
-                        div()
-                            .w_full()
-                            .text_xs()
-                            .text_color(theme.danger)
-                            .child(error)
-                    }),
+                    .absolute()
+                    .inset_0()
+                    .child(Scrollbar::vertical(&self.pr_file_list_state)),
             );
-        let diff_status = if self.diff_loading {
-            Some(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(Spinner::new().xsmall())
-                    .child("Loading diff…")
-                    .into_any_element(),
-            )
-        } else {
-            self.diff_error.as_ref().map(|error| {
-                div()
-                    .text_sm()
-                    .text_color(theme.danger)
-                    .child(error.clone())
-                    .into_any_element()
-            })
-        };
-        div()
-            .size_full()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .child(toolbar)
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .child(
-                        div()
-                            .id("github-pr-file-list")
-                    .role(Role::List)
-                    .relative()
-                    .w_64()
-                    .min_h_0()
-                    .border_1()
-                    .border_color(theme.border)
-                    .track_focus(&self.pr_file_focus).focus(|style| style.border_color(theme.primary))
-                    .key_context(GITHUB_PR_FILE_LIST_CONTEXT)
-                    .on_action(cx.listener(Self::select_previous_pr_file))
-                    .on_action(cx.listener(Self::select_next_pr_file))
-                    .on_action(cx.listener(Self::open_selected_pr_file))
-                    .child(
-                        list(
-                            self.pr_file_list_state.clone(),
-                            cx.processor(|this, ix, _window, cx| this.render_pr_file_row(ix, cx)),
-                        )
-                        .size_full()
-                        .with_sizing_behavior(ListSizingBehavior::Infer),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .child(Scrollbar::vertical(&self.pr_file_list_state)),
-                    ),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .min_h_0()
-                    .flex_1()
-                    .children(diff_status)
-                    .children(self.diff_error.is_none().then(|| {
-                        TextView::new(&self.pr_diff_body)
-                            .selectable(true)
-                            .scrollable(true)
-                            .size_full()
-                            .p_4()
-                    })),
-            ),
-            )
-            .into_any_element()
+        let owner = cx.entity().downgrade();
+        let diff = kit_github::github_pr_diff(
+            &self.pr_diff_body,
+            self.diff_loading,
+            self.diff_error.clone(),
+            move |_, _, cx| {
+                let _ = owner.update(cx, |this, cx| this.load_selected_diff(cx));
+            },
+            cx,
+        );
+        kit_github::github_pr_files(
+            toolbar.into_any_element(),
+            files.into_any_element(),
+            diff.into_any_element(),
+        )
+        .into_any_element()
     }
 
     fn render_pr_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -3818,7 +2918,6 @@ impl GitHubView {
                 }
             });
         }
-        let theme = cx.theme().colors;
         let (number, title, url, state, author, head_ref, base_ref, updated_at) = {
             let Some(detail) = self.pr_detail.as_ref().filter(|detail| {
                 self.selected_pr
@@ -3862,126 +2961,69 @@ impl GitHubView {
                 && !threadlane_git::collect_actionable_pr_feedback(pr).is_empty()
         });
         let tab = self.current_pr_tab();
-        let tabs_focus = self.pr_tabs_focus.clone();
-        let tabs = TabBar::new("github-pr-detail-tabs")
-            .underline()
-            .small()
-            .selected_index(tab.ix())
-            .children(
-                PrDetailTab::ALL
-                    .into_iter()
-                    .map(|candidate| Tab::new().label(candidate.label())),
-            )
-            .on_click(cx.listener(move |this, ix, window, cx| {
-                tabs_focus.focus(window, cx);
-                if let Some(candidate) = PrDetailTab::ALL.get(*ix).copied() {
-                    this.select_pr_tab(candidate, cx);
-                }
-            }));
-        div()
-            .size_full()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .flex_none()
-                    .px_5()
-                    .pt_4()
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .mt_1()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(format!(
-                                "{} · #{} · {} · @{} · {}",
-                                repository_label,
-                                number,
+        let owner = cx.entity().downgrade();
+        let model = self.model.clone();
+        let linked_title = linked.as_ref().map(|session| session.title.clone());
+        let actions = kit_github::github_pr_actions(
+            url,
+            linked_title,
+            has_actionable_reviews,
+            move |action, _, cx| match action {
+                kit_github::GitHubDetailAction::OpenTask => {
+                    if let Some(session) = &linked {
+                        model.update(cx, |state, cx| {
+                            controller::dispatch(
                                 state,
-                                author,
-                                format_github_time(&updated_at, github_now_unix())
-                            )),
-                    )
-                    .child(
-                        div()
-                            .mt_1()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(format!("{head_ref} → {base_ref}")),
-                    )
-                    .child(
-                        div()
-                            .mt_3()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .flex_wrap()
-                            .child(
-                                Link::new("github-open-pr-browser")
-                                    .href(url)
-                                    .child("Open on GitHub"),
-                            )
-                            .children(linked.map(|session| {
-                                let model = self.model.clone();
-                                Button::new("github-open-linked-pr-task")
-                                    .label("Open task")
-                                    .tooltip(session.title)
-                                    .small()
-                                    .on_click(move |_, _, cx| {
-                                        model.update(cx, |state, cx| {
-                                            controller::dispatch(
-                                                state,
-                                                AppAction::SelectSession {
-                                                    work_dir: session.work_dir.clone(),
-                                                    session_id: session.id.clone(),
-                                                },
-                                            );
-                                            controller::dispatch(state, AppAction::CloseGitHub);
-                                            cx.notify();
-                                        });
-                                    })
-                            }))
-                            .children(has_actionable_reviews.then(|| {
-                                Button::new("github-address-pr-reviews")
-                                    .label("Address reviews")
-                                    .ghost()
-                                    .xsmall()
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.address_all_pr_reviews(cx);
-                                    }))
-                            })),
-                    )
-                    .child(
-                        div()
-                            .mt_3()
-                            .w_full()
-                            .id("github-pr-detail-tabs-focus")
-                            .role(Role::TabList)
-                            .track_focus(&self.pr_tabs_focus)
-                            .key_context(GITHUB_PR_TABS_CONTEXT)
-                            .on_action(cx.listener(Self::select_previous_pr_tab))
-                            .on_action(cx.listener(Self::select_next_pr_tab))
-                            .child(tabs),
-                    )
-                    .child(div().mt_3().border_b_1().border_color(theme.border)),
-            )
-            .child(div().flex_1().min_h_0().child(match tab {
-                PrDetailTab::Summary => self.render_pr_summary(cx),
-                PrDetailTab::Conversation => self.render_pr_conversation(cx),
-                PrDetailTab::Timeline => self.render_pr_timeline(cx),
-                PrDetailTab::Code => self.render_pr_code(cx),
-            }))
-            .into_any_element()
+                                AppAction::SelectSession {
+                                    work_dir: session.work_dir.clone(),
+                                    session_id: session.id.clone(),
+                                },
+                            );
+                            controller::dispatch(state, AppAction::CloseGitHub);
+                            cx.notify();
+                        });
+                    }
+                }
+                kit_github::GitHubDetailAction::AddressReviews => {
+                    let _ = owner.update(cx, |view, cx| view.address_all_pr_reviews(cx));
+                }
+                _ => {}
+            },
+        );
+        let owner = cx.entity().downgrade();
+        let tabs_focus = self.pr_tabs_focus.clone();
+        let tabs = div()
+            .id("github-pr-detail-tabs-focus")
+            .role(Role::TabList)
+            .track_focus(&self.pr_tabs_focus)
+            .key_context(GITHUB_PR_TABS_CONTEXT)
+            .on_action(cx.listener(Self::select_previous_pr_tab))
+            .on_action(cx.listener(Self::select_next_pr_tab))
+            .child(kit_github::github_pr_tabs(tab, move |tab, window, cx| {
+                tabs_focus.focus(window, cx);
+                let _ = owner.update(cx, |view, cx| view.select_pr_tab(tab, cx));
+            }));
+        let header = kit_github::GitHubDetailHeader::new(
+            title,
+            format!(
+                "{repository_label} · #{number} · {state} · @{author} · {}",
+                format_github_time(&updated_at, github_now_unix())
+            ),
+            actions.into_any_element(),
+        )
+        .branch(format!("{head_ref} → {base_ref}"))
+        .tabs(tabs.into_any_element())
+        .render(cx);
+        let body = match tab {
+            PrDetailTab::Summary => self.render_pr_summary(cx),
+            PrDetailTab::Conversation => self.render_pr_conversation(cx),
+            PrDetailTab::Timeline => self.render_pr_timeline(cx),
+            PrDetailTab::Code => self.render_pr_code(cx),
+        };
+        kit_github::github_detail_surface(header, body).into_any_element()
     }
 
     fn render_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
         if self.selected_ix().is_none() {
             return self.render_empty("Select an item to see details.", cx);
         }
@@ -3991,380 +3033,139 @@ impl GitHubView {
         if self.tab == GitHubTab::PullRequests {
             return self.render_pr_detail(window, cx);
         }
-
-        let (title, metadata, url, issue) = match self.tab {
-            GitHubTab::Issues => {
-                let Some(detail) = self.issue_detail.as_ref().filter(|detail| {
-                    self.selected_issue
-                        .as_ref()
-                        .is_some_and(|selected| selected.number == detail.summary.issue.number)
-                }) else {
-                    return self.render_empty("Loading details…", cx);
-                };
-                (
-                    detail.summary.title.clone(),
-                    format!(
-                        "{}/{} · #{} · {} · @{} · {}",
-                        detail.summary.issue.owner,
-                        detail.summary.issue.repo,
-                        detail.summary.issue.number,
-                        detail.summary.state,
-                        detail.summary.author,
-                        format_github_time(&detail.summary.updated_at, github_now_unix())
-                    ),
-                    detail.summary.issue.url.clone(),
-                    Some(detail.summary.issue.clone()),
-                )
-            }
-            GitHubTab::PullRequests => {
-                let Some(detail) = self.pr_detail.as_ref().filter(|detail| {
-                    self.selected_pr
-                        .as_ref()
-                        .is_some_and(|selected| selected.number == detail.number)
-                }) else {
-                    return self.render_empty("Loading details…", cx);
-                };
-                (
-                    detail.title.clone(),
-                    format!(
-                        "#{} · {} · {} · {} → {}",
-                        detail.number,
-                        detail.state,
-                        detail.author,
-                        detail.head_ref,
-                        detail.base_ref
-                    ),
-                    detail.url.clone(),
-                    None,
-                )
-            }
+        let Some(detail) = self.issue_detail.as_ref().filter(|detail| {
+            self.selected_issue
+                .as_ref()
+                .is_some_and(|selected| selected.number == detail.summary.issue.number)
+        }) else {
+            return self.render_empty("Loading details…", cx);
         };
-        let linked_sessions = issue
-            .as_ref()
-            .map(|issue| self.linked_sessions(issue, cx))
-            .unwrap_or_default();
-        let start_model = self.model.clone();
-        let start_work_dir = self
+        let issue = detail.summary.issue.clone();
+        let title = detail.summary.title.clone();
+        let linked = self.linked_sessions(&issue, cx);
+        let has_linked = !linked.is_empty();
+        let work_dir = self
             .selected_issue
-            .clone()
-            .map(|key| key.project)
+            .as_ref()
+            .map(|key| key.project.clone())
             .or_else(|| self.project_work_dir.clone());
-        let start_issue = issue.clone();
+        let model = self.model.clone();
+        let owner = cx.entity().downgrade();
+        let controls = kit_github::GitHubIssueActions::new(issue.url.clone())
+            .linked_task(has_linked)
+            .closed(detail.summary.state.eq_ignore_ascii_case("closed"))
+            .pending(self.issue_action_pending);
         let start_title = title.clone();
-        let start_has_linked_task = !linked_sessions.is_empty();
-
-        let header = div()
-            .debug_selector(|| "github-issue-detail-header".into())
-            .flex_none()
-            .px_5()
-            .py_4()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(title),
-            )
-            .child(
-                div()
-                    .mt_1()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(metadata),
-            )
-            .child(
-                div()
-                    .mt_3()
-                    .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .gap_3()
-                    .child(
-                        Link::new("github-open-browser").href(url).child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .child(Icon::new(IconName::ExternalLink).small())
-                                .child("Open on GitHub"),
-                        ),
-                    )
-                    .children(start_issue.map(|issue| {
-                        Button::new("github-start-agent-task")
-                            .icon(IconName::Play)
-                            .label(if start_has_linked_task {
-                                "Start another…"
-                            } else {
-                                "Start task…"
-                            })
-                            .small()
-                            .on_click(move |_, window, cx| {
-                                let Some(work_dir) = start_work_dir.clone() else {
-                                    return;
-                                };
-                                open_issue_start_dialog(
-                                    start_model.clone(),
-                                    work_dir,
-                                    issue.clone(),
-                                    start_title.clone(),
-                                    start_has_linked_task,
-                                    window,
-                                    cx,
-                                );
-                            })
-                    }))
-                    .children((self.tab == GitHubTab::Issues).then(|| {
-                        let is_closed = self
-                            .issue_detail
-                            .as_ref()
-                            .filter(|detail| {
-                                self.selected_issue.as_ref().is_some_and(|selected| {
-                                    selected.number == detail.summary.issue.number
-                                })
-                            })
-                            .is_some_and(|detail| {
-                                detail.summary.state.eq_ignore_ascii_case("closed")
-                            });
-                        let pending = self.issue_action_pending;
-                        div()
-                            .flex()
-                            .items_center()
-                            .flex_wrap()
-                            .gap_2()
-                            .child(
-                                Button::new("github-issue-close-reopen")
-                                    .label(if is_closed { "Reopen" } else { "Close" })
-                                    .accessibility_label(if is_closed {
-                                        "Reopen this issue"
-                                    } else {
-                                        "Close this issue"
-                                    })
-                                    .ghost()
-                                    .small()
-                                    .disabled(pending)
-                                    .tooltip(if is_closed {
-                                        "Reopen this issue"
-                                    } else {
-                                        "Close this issue"
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.close_or_reopen_selected_issue(!is_closed, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("github-issue-suggest-labels")
-                                    .label("Suggest labels")
-                                    .accessibility_label("Ask the model to pick repository labels (no session)")
-                                    .ghost()
-                                    .small()
-                                    .disabled(pending)
-                                    .tooltip("Ask the model to pick repository labels (no session)")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.suggest_issue_labels(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("github-issue-delete")
-                                    .label("Delete")
-                                    .accessibility_label("Permanently delete this issue")
-                                    .ghost()
-                                    .small()
-                                    .disabled(pending)
-                                    .tooltip("Permanently delete this issue")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.delete_selected_issue(window, cx);
-                                    })),
-                            )
-                    }))
-                    .children(self.issue_action_status.as_ref().map(|status| {
-                        div()
-                            .mt_2()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(status.clone())
-                    })),
-            );
-        div()
-            .size_full()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .child(header)
-            .child(
-                div().flex_1().min_h_0().overflow_y_scrollbar().child(
-                    div()
-                        .w_full()
-                        .max_w(rems(52.))
-                        .mx_auto()
-                        .px_5()
-                        .pb_5()
-                        .children(
-                            self.issue_detail
-                                .as_ref()
-                                .filter(|detail| {
-                                    !detail.summary.labels.is_empty()
-                                        || !detail.summary.assignees.is_empty()
-                                })
-                                .map(|detail| {
-                                    div()
-                                        .mt_4()
-                                        .flex()
-                                        .flex_wrap()
-                                        .gap_2()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .children(detail.summary.labels.iter().map(|label| {
-                                            Tag::new().small().child(label.name.clone())
-                                        }))
-                                        .children((!detail.summary.assignees.is_empty()).then(
-                                            || {
-                                                div().child(format!(
-                                                    "Assigned to @{}",
-                                                    detail.summary.assignees.join(" @")
-                                                ))
-                                            },
-                                        ))
-                                }),
-                        )
-                        .child(
-                            div().mt_5().text_sm().child(
-                                if self
-                                    .issue_detail
-                                    .as_ref()
-                                    .is_some_and(|detail| detail.body.trim().is_empty())
-                                {
-                                    div()
-                                        .text_color(theme.muted_foreground)
-                                        .child("No description provided.")
-                                        .into_any_element()
-                                } else {
-                                    TextView::new(&self.detail_body)
-                                        .selectable(true)
-                                        .into_any_element()
+        let actions =
+            kit_github::github_issue_actions(controls, move |action, window, cx| match action {
+                kit_github::GitHubDetailAction::StartTask => {
+                    if let Some(work_dir) = work_dir.clone() {
+                        open_issue_start_dialog(
+                            model.clone(),
+                            work_dir,
+                            issue.clone(),
+                            start_title.clone(),
+                            has_linked,
+                            window,
+                            cx,
+                        );
+                    }
+                }
+                kit_github::GitHubDetailAction::SetIssueClosed(close) => {
+                    let _ = owner.update(cx, |view, cx| {
+                        view.close_or_reopen_selected_issue(close, cx)
+                    });
+                }
+                kit_github::GitHubDetailAction::SuggestLabels => {
+                    let _ = owner.update(cx, |view, cx| view.suggest_issue_labels(cx));
+                }
+                kit_github::GitHubDetailAction::DeleteIssue => {
+                    let _ = owner.update(cx, |view, cx| view.delete_selected_issue(window, cx));
+                }
+                _ => {}
+            });
+        let summary = &detail.summary;
+        let header = kit_github::GitHubDetailHeader::new(
+            title,
+            format!(
+                "{}/{} · #{} · {} · @{} · {}",
+                summary.issue.owner,
+                summary.issue.repo,
+                summary.issue.number,
+                summary.state,
+                summary.author,
+                format_github_time(&summary.updated_at, github_now_unix())
+            ),
+            actions.into_any_element(),
+        )
+        .status(self.issue_action_status.clone())
+        .render(cx);
+        let tasks = linked
+            .into_iter()
+            .map(|linked| {
+                let model = self.model.clone();
+                let session = linked.session;
+                let task = kit_github::GitHubLinkedTask::new(
+                    format!("open-linked-task-{}", session.id),
+                    session.title.clone(),
+                    linked.project_name,
+                    linked.status.into(),
+                )
+                .worktree(session.is_worktree)
+                .branch(linked.branch)
+                .pr_number(linked.pr_number);
+                kit_github::github_linked_task(
+                    task,
+                    move |_, _, cx| {
+                        model.update(cx, |state, cx| {
+                            controller::dispatch(
+                                state,
+                                AppAction::SelectSession {
+                                    work_dir: session.work_dir.clone(),
+                                    session_id: session.id.clone(),
                                 },
-                            ),
+                            );
+                            controller::dispatch(state, AppAction::CloseGitHub);
+                            cx.notify();
+                        });
+                    },
+                    cx,
+                )
+                .into_any_element()
+            })
+            .collect();
+        let comments = (!self.comment_rows.is_empty()).then(|| {
+            (
+                self.comment_rows.len(),
+                div()
+                    .size_full()
+                    .relative()
+                    .child(
+                        list(
+                            self.comment_list_state.clone(),
+                            cx.processor(Self::render_comment_row),
                         )
-                        .children((!linked_sessions.is_empty()).then(|| {
-                            div()
-                                .mt_5()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child("Linked tasks"),
-                                )
-                                .children(linked_sessions.into_iter().map(|linked| {
-                                    let open_model = self.model.clone();
-                                    let open_work_dir = linked.session.work_dir.clone();
-                                    let open_session_id = linked.session.id.clone();
-                                    div()
-                                        .mt_2()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .text_sm()
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .flex_1()
-                                                .truncate()
-                                                .child(linked.session.title),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(theme.muted_foreground)
-                                                .child(linked.project_name),
-                                        )
-                                        .child(Tag::new().small().child(linked.status))
-                                        .children(
-                                            linked
-                                                .session
-                                                .is_worktree
-                                                .then(|| Tag::new().small().child("Worktree")),
-                                        )
-                                        .children(
-                                            linked
-                                                .branch
-                                                .map(|branch| Tag::new().small().child(branch)),
-                                        )
-                                        .children(linked.pr_number.map(|number| {
-                                            Tag::new().small().child(format!("PR #{number}"))
-                                        }))
-                                        .child(
-                                            Button::new(SharedString::from(format!(
-                                                "open-linked-task-{}",
-                                                open_session_id
-                                            )))
-                                            .label("Open task")
-                                            .ghost()
-                                            .xsmall()
-                                            .on_click(move |_, _, cx| {
-                                                open_model.update(cx, |state, cx| {
-                                                    controller::dispatch(
-                                                        state,
-                                                        AppAction::SelectSession {
-                                                            work_dir: open_work_dir.clone(),
-                                                            session_id: open_session_id.clone(),
-                                                        },
-                                                    );
-                                                    controller::dispatch(
-                                                        state,
-                                                        AppAction::CloseGitHub,
-                                                    );
-                                                    cx.notify();
-                                                });
-                                            }),
-                                        )
-                                        .into_any_element()
-                                }))
-                        }))
-                        .children((!self.comment_rows.is_empty()).then(|| {
-                            div()
-                                .mt_5()
-                                .child(
-                                    div().text_sm().font_weight(FontWeight::SEMIBOLD).child(
-                                        format!("Conversation ({})", self.comment_rows.len()),
-                                    ),
-                                )
-                                .child(
-                                    div()
-                                        .relative()
-                                        .mt_2()
-                                        .h_64()
-                                        .border_1()
-                                        .border_color(theme.border)
-                                        .rounded(cx.theme().radius)
-                                        .child(
-                                            list(
-                                                self.comment_list_state.clone(),
-                                                cx.processor(Self::render_comment_row),
-                                            )
-                                            .size_full()
-                                            .with_sizing_behavior(ListSizingBehavior::Infer),
-                                        )
-                                        .child(
-                                            div().absolute().inset_0().child(Scrollbar::vertical(
-                                                &self.comment_list_state,
-                                            )),
-                                        ),
-                                )
-                        }))
-                        .children(self.detail_loading.then(|| {
-                            div()
-                                .mt_3()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(Spinner::new().xsmall())
-                                .child("Refreshing details…")
-                        })),
-                ),
+                        .size_full()
+                        .with_sizing_behavior(ListSizingBehavior::Infer),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .child(Scrollbar::vertical(&self.comment_list_state)),
+                    )
+                    .into_any_element(),
             )
-            .into_any_element()
+        });
+        let body = kit_github::github_issue_body(
+            detail,
+            &self.detail_body,
+            tasks,
+            comments,
+            self.detail_loading,
+            cx,
+        );
+        kit_github::github_detail_surface(header, body.into_any_element()).into_any_element()
     }
 
     fn render_status_bar(&self, cx: &App) -> impl IntoElement {
@@ -4377,57 +3178,30 @@ impl GitHubView {
             GitHubTab::PullRequests => !self.pr_review_draft.is_empty(),
         };
         let projects = self.attached_projects(cx);
-        StatusBar::new().left(format!(
-            "{} {} · {} · {}{}",
-            count,
-            self.tab.label().to_lowercase(),
-            self.scope.label(&projects).to_lowercase(),
-            self.state_filter.value(),
-            if has_draft { " · Unsaved draft" } else { "" }
-        ))
+        kit_github::github_status(count, self.tab.label(), self.scope.label(&projects), self.state_filter, has_draft)
     }
 }
 
 impl Render for GitHubView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let narrow = window.bounds().size.width < window.rem_size() * 56.25;
-        let master = div()
-            .size_full()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .child(self.render_scope_row(cx))
-            .child(self.render_filters(cx))
-            .child(div().flex_1().min_h_0().child(self.render_list(window, cx)));
         let detail = self.render_detail(window, cx);
-        let content = if narrow {
-            div()
-                .size_full()
-                .min_h_0()
-                .flex()
-                .flex_col()
-                .child(div().flex_1().min_h_0().child(master))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .border_t_1()
-                        .border_color(cx.theme().border)
-                        .child(detail),
+        let content =
+            if self.tab == GitHubTab::PullRequests && self.current_pr_tab() == PrDetailTab::Code {
+                detail
+            } else {
+                let master = kit_github::github_master(
+                    self.render_scope_row(cx),
+                    self.render_filters(cx),
+                    self.render_list(window, cx),
+                );
+                kit_github::github_master_detail(
+                    master.into_any_element(),
+                    detail,
+                    &self.detail_split_state,
+                    window,
+                    cx,
                 )
-                .into_any_element()
-        } else {
-            h_resizable("github-master-detail")
-                .with_state(&self.detail_split_state)
-                .child(
-                    resizable_panel()
-                        .size(window.rem_size() * 24.)
-                        .size_range((window.rem_size() * 19.)..(window.rem_size() * 34.))
-                        .child(master),
-                )
-                .child(resizable_panel().child(detail))
-                .into_any_element()
-        };
+            };
 
         div()
             .size_full()
@@ -4469,6 +3243,71 @@ mod tests {
         GitHubPrViewedState, GitHubPullRequestSummary, PrCheckStatus, PrConversationComment,
         PrFileViewedStatus, PrReview, PrReviewComment,
     };
+
+    #[gpui::test]
+    fn issue_delete_confirmation_rejects_same_number_in_another_project(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui_component::WindowExt;
+        cx.update(gpui_component::init);
+        let mut captured = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let model = cx.new(|_| {
+                let mut state = AppState::default();
+                state.projects.clear();
+                state.active_work_dir = None;
+                state
+            });
+            let view = cx.new(|cx| GitHubView::new(model, window, cx));
+            captured = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let view = captured.unwrap();
+        cx.run_until_parked();
+        let original = GitHubItemKey {
+            project: PathBuf::from("/projects/original"),
+            number: 42,
+        };
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.issues = vec![ScopedIssue {
+                    project: original.project.clone(),
+                    project_name: "Original project".into(),
+                    summary: issue(42),
+                }];
+                view.selected_issue = Some(original.clone());
+                view.issue_list_state.reset(1);
+                view.delete_selected_issue(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("github-issue-delete-identity").is_some());
+        cx.simulate_keystrokes("enter");
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "bare Enter never deletes"
+        );
+        view.update(cx, |view, _| {
+            view.selected_issue = Some(GitHubItemKey {
+                project: PathBuf::from("/projects/other"),
+                number: 42,
+            })
+        });
+        let confirm = cx.debug_bounds("confirm-delete-issue").unwrap();
+        cx.simulate_click(confirm.center(), gpui::Modifiers::default());
+        view.read_with(cx, |view, _| {
+            assert!(!view.issue_action_pending, "no mutation was dispatched");
+            assert_eq!(
+                view.issue_action_status.as_deref(),
+                Some("Issue selection changed. Open the delete confirmation again.")
+            );
+        });
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+    }
 
     fn issue(number: u64) -> GitHubIssueSummary {
         GitHubIssueSummary {
@@ -4631,6 +3470,18 @@ mod tests {
         });
         let view = github.unwrap();
         let model = view.read_with(cx, |view, _| view.model.clone());
+
+        for tab in [GitHubTab::Issues, GitHubTab::PullRequests] {
+            model.update(cx, |state, cx| {
+                controller::dispatch(state, AppAction::OpenGitHubTab(tab));
+                cx.notify();
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| { window.refresh(); window.draw(cx).clear(cx); });
+            let heading = cx.debug_bounds("github-page-heading").expect("named page heading");
+            assert!(heading.top() >= threadlane_ui_theme::WINDOW_CONTROLS_CLEARANCE,
+                "{tab:?} header must retain the shared window-controls clearance: {heading:?}");
+        }
 
         model.update(cx, |state, cx| {
             controller::dispatch(state, AppAction::OpenGitHubTab(GitHubTab::PullRequests));

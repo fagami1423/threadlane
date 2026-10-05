@@ -1,0 +1,23 @@
+{
+  "session": null,
+  "messages": [
+    {
+      "id": "sample-user",
+      "role": "User",
+      "content": "Make our desktop and web preview use the same components.",
+      "tool_activities": [],
+      "streaming": false,
+      "reasoning_content": null,
+      "reasoning_expanded": false
+    },
+    {
+      "id": "sample-assistant",
+      "role": "Assistant",
+      "content": "The sidebar, workspace layout, chat header and composer now come from **threadlane-ui-kit**.\n\nOpen a saved session snapshot to refine the components with real content.",
+      "tool_activities": [],
+      "streaming": false,
+      "reasoning_content": null,
+      "reasoning_expanded": false
+    }
+  ]
+}

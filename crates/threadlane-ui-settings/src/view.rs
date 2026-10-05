@@ -1,14 +1,7 @@
-use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::alert::{Alert, AlertVariant};
-use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_component::scroll::ScrollableElement;
-use gpui_component::switch::Switch;
-use gpui_component::tag::{Tag, TagVariant};
-use gpui_component::text::TextView;
-use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable};
+use gpui_component::input::{InputEvent, InputState};
+
+use threadlane_ui_kit::settings::{self as kit_settings, SettingsAction, SettingsGeneral, SettingsPage, SettingsUpdate};
 
 use threadlane_acp::{AcpAgentRecord, AcpScope};
 use threadlane_skills::SkillMetadata;
@@ -19,6 +12,12 @@ use threadlane_ui_state::AppState;
 use threadlane_ui_state::{actions::AppAction, controller};
 use threadlane_updater::{current_version, UpdateStatus};
 use threadlane_wasi::packages::{ExtensionRecord, ExtensionScope};
+
+// A project overlay and the global extension can share an ID. Key UI controls
+// by the full durable inventory identity used by the settings service.
+fn extension_row_id(record: &ExtensionRecord) -> String {
+    format!("{:?}:{}:{:?}", record.scope(), record.id(), record.module_path())
+}
 
 fn update_controls(status: &UpdateStatus) -> (&'static str, &'static str, bool) {
     match status {
@@ -31,45 +30,6 @@ fn update_controls(status: &UpdateStatus) -> (&'static str, &'static str, bool) 
         UpdateStatus::Installing => ("Installing update…", "Installing…", true),
         UpdateStatus::Error(_) => ("Update failed", "Retry update check", false),
     }
-}
-
-/// Fixed palette for the Appearance page's miniature theme previews. These
-/// depict the dark/light themes as static illustrations (audited exception to
-/// the token rule: the preview must show its own theme, not the active one),
-/// so they are defined once here instead of repeated at each swatch.
-fn preview_dark_surface() -> Hsla {
-    hsla(0.65, 0.10, 0.08, 1.0)
-}
-fn preview_dark_well() -> Hsla {
-    hsla(0.65, 0.12, 0.14, 1.0)
-}
-fn preview_light_surface() -> Hsla {
-    hsla(0.0, 0.0, 0.98, 1.0)
-}
-fn preview_light_well() -> Hsla {
-    hsla(0.0, 0.0, 0.88, 1.0)
-}
-fn preview_dot_close() -> Hsla {
-    hsla(0.0, 0.7, 0.6, 1.0)
-}
-fn preview_dot_minimize() -> Hsla {
-    hsla(0.12, 0.7, 0.6, 1.0)
-}
-fn preview_dot_zoom() -> Hsla {
-    hsla(0.35, 0.7, 0.6, 1.0)
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum SettingsPage {
-    #[default]
-    General,
-    Appearance,
-    Keybindings,
-    Providers,
-    Subagents,
-    Skills,
-    Extensions,
-    AcpAgents,
 }
 
 /// Provider auth state shown on the Providers page. Reading it hits disk
@@ -347,17 +307,8 @@ impl SettingsView {
 
     /// Open the existing settings page for a static command-palette destination.
     pub fn open_search_destination(&mut self, id: &str, cx: &mut Context<Self>) {
-        self.page = match id {
-            "general" => SettingsPage::General,
-            "appearance" => SettingsPage::Appearance,
-            "keybindings" => SettingsPage::Keybindings,
-            "providers" => SettingsPage::Providers,
-            "fusion" | "subagents" => SettingsPage::Subagents,
-            "skills" => SettingsPage::Skills,
-            "extensions" => SettingsPage::Extensions,
-            "acp-agents" => SettingsPage::AcpAgents,
-            _ => return,
-        };
+        let Some(page) = threadlane_ui_kit::settings_search_page(id) else { return; };
+        self.page = page;
         match self.page {
             SettingsPage::Providers => self.refresh_providers_snapshot(),
             SettingsPage::Skills => { self.capability_status = None; self.refresh_skills(cx); }
@@ -423,2734 +374,507 @@ impl SettingsView {
         .detach();
     }
 
-    /// Renders the muted "no items" placeholder shared by the extension,
-    /// skill, and ACP agent lists. Compact margins so narrow panes keep
-    /// content width instead of huge side gutters.
-    fn empty_state(message: &str, colors: gpui_component::ThemeColor) -> AnyElement {
-        div()
-            .p_4()
-            .mx_2()
-            .rounded_lg()
-            .border_1()
-            .border_color(colors.border)
-            .bg(colors.muted.opacity(0.3))
-            .text_center()
-            .text_sm()
-            .text_color(colors.muted_foreground)
-            .child(message.to_string())
-            .into_any_element()
+    fn render_navigation(&self, cx: &mut Context<Self>) -> Div {
+        let owner = cx.entity().downgrade();
+        kit_settings::settings_navigation(self.page, &SettingsPage::ALL, move |action, _, cx| {
+            let _ = owner.update(cx, |this, cx| {
+                match action {
+                    SettingsAction::Page(page) => {
+                        this.page = page;
+                        match page {
+                            SettingsPage::Providers => this.refresh_providers_snapshot(),
+                            SettingsPage::Subagents => this.capability_status = None,
+                            SettingsPage::Skills => { this.capability_status = None; this.refresh_skills(cx); }
+                            SettingsPage::Extensions => { this.capability_status = None; this.refresh_extensions(cx); }
+                            SettingsPage::AcpAgents => { this.capability_status = None; this.refresh_acp(cx); }
+                            _ => {}
+                        }
+                    }
+                    SettingsAction::Back => this.model.update(cx, |state, cx| { controller::dispatch(state, AppAction::CloseSettings); cx.notify(); }),
+                    _ => {}
+                }
+                cx.notify();
+            });
+        }, cx)
     }
 
-    fn render_navigation(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        let model = self.model.clone();
-        // Keep icon and label alignment independent of Button's centered content wrapper.
-        let nav_content = |icon: Icon, label: &'static str| {
-            div()
-                .w_full()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(icon.small().flex_none())
-                .child(label)
-        };
-
-        div()
-            .w(rems(15.0))
-            .h_full()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .border_r_1()
-            .border_color(theme.border)
-            .bg(theme.title_bar)
-            .child(
-                div()
-                    .h(threadlane_ui_theme::WINDOW_CONTROLS_CLEARANCE)
-                    .flex_none(),
-            )
-            .child(
-                div()
-                    .pl(rems(1.25))
-                    .pr_3()
-                    .pb_2()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.muted_foreground)
-                    .child("SETTINGS"),
-            )
-            .child(
-                div()
-                    .px_3()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        Button::new("settings-general")
-                            .child(nav_content(Icon::new(IconName::Settings), "General"))
-                            .ghost()
-                            .selected(self.page == SettingsPage::General)
-                            .w_full()
-                            .justify_start()
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.page = SettingsPage::General;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("settings-appearance")
-                            .child(nav_content(Icon::new(IconName::Palette), "Appearance"))
-                            .ghost()
-                            .selected(self.page == SettingsPage::Appearance)
-                            .w_full()
-                            .justify_start()
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.page = SettingsPage::Appearance;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("settings-keybindings")
-                            .child(nav_content(
-                                Icon::new(IconName::SquareTerminal),
-                                "Keybindings",
-                            ))
-                            .ghost()
-                            .selected(self.page == SettingsPage::Keybindings)
-                            .w_full()
-                            .justify_start()
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.page = SettingsPage::Keybindings;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("settings-providers")
-                            .child(nav_content(Icon::new(IconName::Bot), "Providers"))
-                            .ghost()
-                            .selected(self.page == SettingsPage::Providers)
-                            .w_full()
-                            .justify_start()
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.page = SettingsPage::Providers;
-                                this.refresh_providers_snapshot();
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("settings-subagents")
-                            .child(nav_content(Icon::new(IconName::Bot), "Agent & Fusion"))
-                            .ghost()
-                            .selected(self.page == SettingsPage::Subagents)
-                            .w_full()
-                            .justify_start()
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.page = SettingsPage::Subagents;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("settings-skills")
-                            .child(nav_content(Icon::new(IconName::BookOpen), "Skills"))
-                            .ghost()
-                            .selected(self.page == SettingsPage::Skills)
-                            .w_full()
-                            .justify_start()
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.page = SettingsPage::Skills;
-                                this.capability_status = None;
-                                this.refresh_skills(cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("settings-extensions")
-                            .child(nav_content(
-                                Icon::new(IconName::HardDrive),
-                                "WASI Extensions",
-                            ))
-                            .ghost()
-                            .selected(self.page == SettingsPage::Extensions)
-                            .w_full()
-                            .justify_start()
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.page = SettingsPage::Extensions;
-                                this.capability_status = None;
-                                this.refresh_extensions(cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("settings-acp")
-                            .child(nav_content(Icon::new(IconName::Network), "ACP Agents"))
-                            .ghost()
-                            .selected(self.page == SettingsPage::AcpAgents)
-                            .w_full()
-                            .justify_start()
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.page = SettingsPage::AcpAgents;
-                                this.capability_status = None;
-                                this.refresh_acp(cx);
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(div().flex_1())
-            .child(
-                div().flex_none().px_3().py_2().child(
-                    Button::new("settings-back")
-                        .child(nav_content(Icon::new(IconName::ArrowLeft), "Back"))
-                        .ghost()
-                        .w_full()
-                        .justify_start()
-                        .text_color(theme.muted_foreground)
-                        .on_click(move |_event, _window, cx| {
-                            model.update(cx, |state, cx| {
-                                controller::dispatch(state, AppAction::CloseSettings);
-                                cx.notify();
-                            });
-                        }),
-                ),
-            )
-    }
-
-    fn render_subagents(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
-        let state = self.model.read(cx);
-        let Some(project) = state.active_work_dir.clone() else {
-            return Self::empty_state(
-                "Attach a project to configure Agent and Fusion modes.",
-                theme,
-            );
+    fn render_subagents(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(project) = self.model.read(cx).active_work_dir.clone() else {
+            return kit_settings::settings_agent(None, |_, _, _| {}, window, cx);
         };
         let preferences = threadlane_project::subagent_settings::load(&project);
         let available = threadlane_daemon::catalog::available_models_for_project(Some(&project));
-        let available_for_fast = available.clone();
-        let selected_fast_model = preferences.fast_model.clone();
-        let fast_model_label = selected_fast_model
-            .as_deref()
-            .map(|id| threadlane_daemon::catalog::selection_label(id, &available))
-            .unwrap_or_else(|| "Same as parent".into());
-        let fast_model_entity = self.model.clone();
-        let project_for_fast = project.clone();
-        let fast_model_picker = Button::new("fast-model-picker")
-            .label(fast_model_label)
-            .dropdown_caret(true)
-            .dropdown_menu(move |menu, _, _| {
-                let menu = menu.check_side(gpui_component::Side::Right);
-                let model_entity_for_parent = fast_model_entity.clone();
-                let project_for_parent = project_for_fast.clone();
-                let parent_label = if selected_fast_model.is_none() {
-                    "Same as parent · Current"
-                } else {
-                    "Same as parent"
-                };
-                available_for_fast.iter().cloned().fold(
-                    menu.scrollable(true).item(
-                        PopupMenuItem::new(parent_label)
-                            .checked(selected_fast_model.is_none())
-                            .on_click(move |_, _, cx| {
-                                let mut settings = threadlane_project::subagent_settings::load(
-                                    &project_for_parent,
-                                );
-                                settings.fast_model = None;
-                                if threadlane_project::subagent_settings::save(
-                                    &project_for_parent,
-                                    &settings,
-                                )
-                                .is_ok()
-                                {
-                                    model_entity_for_parent.update(cx, |state, cx| {
-                                        state.invalidate_capability_runtimes();
-                                        cx.notify();
-                                    });
-                                }
-                            }),
-                    ),
-                    |menu, option| {
-                        let model_entity = fast_model_entity.clone();
-                        let project = project_for_fast.clone();
-                        let is_current = selected_fast_model.as_deref() == Some(option.id.as_str());
-                        let label = if is_current {
-                            format!("{} · Current", option.label)
-                        } else {
-                            option.label
-                        };
-                        menu.item(
-                            PopupMenuItem::new(label)
-                                .icon(Icon::default().path(option.provider.icon_path()))
-                                .checked(is_current)
-                                .on_click(move |_, _, cx| {
-                                    let mut settings =
-                                        threadlane_project::subagent_settings::load(&project);
-                                    settings.fast_model = Some(option.id.clone());
-                                    if threadlane_project::subagent_settings::save(
-                                        &project, &settings,
-                                    )
-                                    .is_ok()
-                                    {
-                                        model_entity.update(cx, |state, cx| {
-                                            state.invalidate_capability_runtimes();
-                                            cx.notify();
-                                        });
-                                    }
-                                }),
-                        )
-                    },
-                )
-            });
-        let selected_fast_reasoning = preferences.fast_reasoning_effort.map(|effort| {
-            threadlane_provider::model_registry::effective_effort(
-                preferences.fast_model.as_deref().unwrap_or_default(),
-                effort,
-                Some(&project),
-            )
-        });
-        let fast_reasoning_label = selected_fast_reasoning
-            .map(|effort| effort.label())
-            .unwrap_or("Same as parent");
-        let fast_reasoning_entity = self.model.clone();
-        let project_for_fast_reasoning = project.clone();
-        let fast_for_model = preferences.fast_model.clone().unwrap_or_default();
-        let show_fast_reasoning =
-            threadlane_daemon::catalog::supports_reasoning(&fast_for_model, Some(&project));
-        let fast_reasoning_picker = Button::new("fast-reasoning-picker")
-            .label(fast_reasoning_label)
-            .dropdown_caret(true)
-            .dropdown_menu(move |menu, _, _| {
-                let entity = fast_reasoning_entity.clone();
-                let project = project_for_fast_reasoning.clone();
-                let mut options: Vec<Option<threadlane_protocol::ReasoningEffort>> = vec![None];
-                options.extend(
-                    threadlane_daemon::catalog::efforts_for_model(&fast_for_model, Some(&project))
-                        .into_iter()
-                        .map(Some),
-                );
-                options.into_iter().fold(menu, |menu, effort| {
-                    let entity = entity.clone();
-                    let project = project.clone();
-                    menu.item(
-                        PopupMenuItem::new(
-                            effort
-                                .map(|value| value.label())
-                                .unwrap_or("Same as parent"),
-                        )
-                        .checked(selected_fast_reasoning == effort)
-                        .on_click(move |_, _, cx| {
-                            let mut settings =
-                                threadlane_project::subagent_settings::load(&project);
-                            settings.fast_reasoning_effort = effort;
-                            if threadlane_project::subagent_settings::save(&project, &settings)
-                                .is_ok()
-                            {
-                                entity.update(cx, |state, cx| {
-                                    state.invalidate_capability_runtimes();
-                                    cx.notify();
-                                });
-                            }
-                        }),
-                    )
-                })
-            });
-        let selected_orchestrator_mode = preferences.orchestrator_mode;
-        let orchestrator_label = selected_orchestrator_mode.label();
-        let orchestrator_entity = self.model.clone();
-        let orchestrator_picker = Button::new("orchestrator-picker")
-            .label(orchestrator_label)
-            .dropdown_caret(true)
-            .dropdown_menu(move |menu, _, _| {
-                let entity = orchestrator_entity.clone();
-                [
-                    threadlane_protocol::OrchestratorMode::Normal,
-                    threadlane_protocol::OrchestratorMode::Fusion,
-                ]
-                .into_iter()
-                .fold(menu, |menu, mode| {
-                    let entity = entity.clone();
-                    // Route through the canonical setter so a mode change
-                    // gets the no-op guard, the in-flight-turn deferral
-                    // message, and the targeted runtime rebuild — the same
-                    // path as the composer Mode dropdown.
-                    menu.item(PopupMenuItem::new(mode.label()).on_click(move |_, _, cx| {
-                        entity.update(cx, |state, cx| {
-                            controller::dispatch(state, AppAction::SelectOrchestratorMode(mode));
-                            cx.notify();
-                        });
-                    }))
-                })
-            });
-        let row = |title: &'static str, description: &'static str, control: AnyElement| {
-            div()
-                .rounded_xl()
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.title_bar)
-                .p_4()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_4()
-                .child(
-                    div()
-                        .flex_1()
-                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
-                        .child(
-                            div()
-                                .mt_1()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(description),
-                        ),
-                )
-                .child(control)
+        let model_id = preferences.fast_model.as_deref().unwrap_or_default();
+        let presentation = kit_settings::SettingsAgent {
+            model_label: preferences.fast_model.as_deref()
+                .map(|id| threadlane_daemon::catalog::selection_label(id, &available))
+                .unwrap_or_else(|| "Same as parent".into()),
+            models: available.into_iter().map(|model| kit_settings::SettingsAgentModel {
+                id: model.id,
+                label: model.label,
+                icon_path: Some(model.provider.icon_path().into()),
+            }).collect(),
+            effort: preferences.fast_reasoning_effort.map(|effort| {
+                threadlane_provider::model_registry::effective_effort(model_id, effort, Some(&project))
+            }),
+            efforts: threadlane_daemon::catalog::supports_reasoning(model_id, Some(&project))
+                .then(|| threadlane_daemon::catalog::efforts_for_model(model_id, Some(&project))),
+            model: preferences.fast_model.clone(),
+            mode: preferences.orchestrator_mode,
+            error: self.capability_status.clone(),
         };
-        div()
-            .mt_5()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(row(
-                "Fusion model",
-                "Model used for delegated work in Fusion mode.",
-                fast_model_picker.into_any_element(),
-            ))
-            .children(show_fast_reasoning.then(|| {
-                row(
-                    "Fusion reasoning effort",
-                    "Reasoning effort for delegated work in Fusion mode.",
-                    fast_reasoning_picker.into_any_element(),
-                )
-            }))
-            .child(row(
-                "Session mode",
-                "Agent runs on the selected model; Fusion delegates work to the configured Fusion model. Also switchable from the composer Mode dropdown.",
-                orchestrator_picker.into_any_element(),
-            ))
-            .into_any_element()
+        let owner = cx.entity().downgrade();
+        kit_settings::settings_agent(Some(&presentation), move |action, _, cx| {
+            let _ = owner.update(cx, |this, cx| {
+                if let kit_settings::SettingsAgentAction::Mode(mode) = action {
+                    // Keep the composer's canonical no-op and in-flight-turn guards.
+                    this.model.update(cx, |state, cx| {
+                        controller::dispatch(state, AppAction::SelectOrchestratorMode(mode));
+                        cx.notify();
+                    });
+                } else {
+                    let mut settings = threadlane_project::subagent_settings::load(&project);
+                    match action {
+                        kit_settings::SettingsAgentAction::Model(model) => settings.fast_model = model,
+                        kit_settings::SettingsAgentAction::Effort(effort) => settings.fast_reasoning_effort = effort,
+                        kit_settings::SettingsAgentAction::Mode(_) => unreachable!(),
+                    }
+                    match threadlane_project::subagent_settings::save(&project, &settings) {
+                        Ok(()) => {
+                            this.capability_status = None;
+                            this.model.update(cx, |state, cx| {
+                                state.invalidate_capability_runtimes();
+                                cx.notify();
+                            });
+                        }
+                        Err(error) => this.capability_status = Some(format!("Couldn't save Agent & Fusion settings: {error}")),
+                    }
+                }
+                cx.notify();
+            });
+        }, window, cx)
     }
 
     fn render_general(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
         let state = self.model.read(cx);
-        let active_project = state
-            .active_work_dir
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "No active project".to_string());
-        let project_count = state.projects.len();
-        let auto_address_pr_reviews_enabled = state.auto_address_pr_reviews_enabled;
-        let toggle_view_auto_address = cx.entity().downgrade();
-        let (update_status_label, update_action_label, update_busy) =
-            update_controls(&state.update_status);
-
-        div()
-            .mt_5()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(
-                div()
-                    .rounded_xl()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.title_bar)
-                    .p_4()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .size_9()
-                                            .rounded_lg()
-                                            .bg(theme.muted)
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .text_color(theme.foreground)
-                                            .child(IconName::Settings),
-                                    )
-                                    .child(
-                                        div()
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(theme.foreground)
-                                                    .child("Application details"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(theme.muted_foreground)
-                                                    .child("Threadlane GPUI Desktop Native Engine"),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                Tag::new()
-                                    .child(format!("v{}", current_version()))
-                                    .with_variant(TagVariant::Primary)
-                                    .small(),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .grid()
-                            .grid_cols(2)
-                            .gap_3()
-                            .pt_2()
-                            .border_t_1()
-                            .border_color(theme.border)
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child("Active workspace")
-                                    .child(
-                                        div()
-                                            .mt_1()
-                                            .text_sm()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(theme.foreground)
-                                            .child(active_project),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child("Attached projects")
-                                    .child(
-                                        div()
-                                            .mt_1()
-                                            .text_sm()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(theme.foreground)
-                                            .child(format!("{project_count} projects")),
-                                    ),
-                            ),
-                    ),
-            )
-            // Update installation only supports a packaged macOS .app bundle;
-            // on Linux and Windows the controls can only fail, so hide them.
-            .when(cfg!(target_os = "macos"), |element| {
-                element.child(
-                    div()
-                        .rounded_xl()
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.title_bar)
-                        .p_4()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(theme.foreground)
-                                                .child("Application updates"),
-                                        )
-                                        .child(
-                                            Tag::new()
-                                                .child(update_status_label)
-                                                .with_variant(TagVariant::Secondary)
-                                                .small(),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .mt_1()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child("Signed native desktop application release channel."),
-                                ),
-                        )
-                        .child(
-                            Button::new("settings-update")
-                                .label(update_action_label)
-                                .accessibility_label(update_action_label)
-                                .tooltip(update_action_label)
-                                .outline()
-                                .small()
-                                .flex_none()
-                                .loading(update_busy)
-                                .disabled(update_busy)
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(crate::ActivateUpdate), cx);
-                                }),
-                        ),
-                )
-            })
-            .child(
-                div()
-                    .rounded_xl()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.title_bar)
-                    .p_4()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(theme.foreground)
-                                            .child("Auto-Address PR Reviews"),
-                                    )
-                                    .child(
-                                        Tag::new()
-                                            .child(if auto_address_pr_reviews_enabled { "Enabled" } else { "Disabled" })
-                                            .with_variant(if auto_address_pr_reviews_enabled {
-                                                TagVariant::Success
-                                            } else {
-                                                TagVariant::Secondary
-                                            })
-                                            .small(),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .mt_1()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child("Automatically trigger the agent to address new code review feedback on open pull requests."),
-                            ),
-                    )
-                    .child(
-                        Switch::new("general-auto-address-pr-reviews-switch")
-                            .accessibility_label("Automatically address PR reviews")
-                            .checked(auto_address_pr_reviews_enabled)
-                            .tooltip(if auto_address_pr_reviews_enabled {
-                                "Disable automatic PR review addressing"
-                            } else {
-                                "Enable automatic PR review addressing"
-                            })
-                            .on_click(move |checked, _window, cx| {
-                                let _ = toggle_view_auto_address.update(cx, |this, cx| {
-                                    let result = this.model.update(cx, |state, _cx| {
-                                        state.set_auto_address_pr_reviews_enabled(*checked)
-                                    });
-                                    if let Err(error) = result {
-                                        this.capability_status = Some(error);
-                                    }
-                                    cx.notify();
-                                });
-                            }),
-                    ),
-            )
-            .into_any_element()
+        let (status, action, busy) = update_controls(&state.update_status);
+        let general = SettingsGeneral {
+            version: current_version().to_string(),
+            active_project: state.active_work_dir.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "No active project".into()),
+            project_count: state.projects.len(),
+            auto_address_reviews: state.auto_address_pr_reviews_enabled,
+            update: cfg!(target_os = "macos").then(|| SettingsUpdate { status: status.into(), action: action.into(), busy }),
+        };
+        let owner = cx.entity().downgrade();
+        kit_settings::settings_general(&general, move |action, window, cx| match action {
+            SettingsAction::Update => window.dispatch_action(Box::new(crate::ActivateUpdate), cx),
+            SettingsAction::AutoAddressReviews(enabled) => {
+                let _ = owner.update(cx, |this, cx| {
+                    let result = this.model.update(cx, |state, _| state.set_auto_address_pr_reviews_enabled(enabled));
+                    if let Err(error) = result { this.capability_status = Some(error); }
+                    cx.notify();
+                });
+            }
+            _ => {}
+        }, cx)
     }
 
-    fn render_appearance(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
-        let active_theme = threadlane_ui_theme::active_theme_name(cx);
-        let is_dark = active_theme == "Threadlane Dark";
-        let is_light = active_theme == "Threadlane Light";
-
-        div()
-            .mt_5()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(
-                div()
-                    .grid()
-                    .grid_cols(2)
-                    .gap_4()
-                    .child(
-                        Button::new("theme-card-dark")
-                            .accessibility_label("Threadlane Dark")
-                            .tooltip("Use Threadlane Dark")
-                            .outline()
-                            .selected(is_dark)
-                            .h_auto()
-                            .items_stretch()
-                            .text_left()
-                            .p_4()
-                            .rounded_xl()
-                            .border_2()
-                            .border_color(if is_dark { theme.primary } else { theme.border })
-                            .bg(theme.title_bar)
-                            .on_click(|_event, _window, cx| {
-                                threadlane_ui_theme::apply_theme("Threadlane Dark", cx);
-                            })
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .child(div().w_full().flex().flex_col().gap_3()
-                            .child(
-                                div()
-                                    .h_20()
-                                    .rounded_lg()
-                                    .border_1()
-                                    .border_color(theme.border)
-                                    .bg(preview_dark_surface())
-                                    .p_3()
-                                    .flex()
-                                    .flex_col()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .gap_1_5()
-                                            .child(
-                                                div()
-                                                    .size_2()
-                                                    .rounded_full()
-                                                    .bg(preview_dot_close()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .size_2()
-                                                    .rounded_full()
-                                                    .bg(preview_dot_minimize()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .size_2()
-                                                    .rounded_full()
-                                                    .bg(preview_dot_zoom()),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .h_4()
-                                            .w_3_4()
-                                            .rounded_md()
-                                            .bg(preview_dark_well()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(theme.foreground)
-                                                    .child("Threadlane Dark"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(theme.muted_foreground)
-                                                    .child("High-contrast deep black interface"),
-                                            ),
-                                    )
-                                    .children(is_dark.then(|| {
-                                        Tag::new()
-                                            .child("Active")
-                                            .with_variant(TagVariant::Success)
-                                            .small()
-                                    })),
-                            )),
-                    )
-                    .child(
-                        Button::new("theme-card-light")
-                            .accessibility_label("Threadlane Light")
-                            .tooltip("Use Threadlane Light")
-                            .outline()
-                            .selected(is_light)
-                            .h_auto()
-                            .items_stretch()
-                            .text_left()
-                            .p_4()
-                            .rounded_xl()
-                            .border_2()
-                            .border_color(if is_light {
-                                theme.primary
-                            } else {
-                                theme.border
-                            })
-                            .bg(theme.title_bar)
-                            .on_click(|_event, _window, cx| {
-                                threadlane_ui_theme::apply_theme("Threadlane Light", cx);
-                            })
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .child(div().w_full().flex().flex_col().gap_3()
-                            .child(
-                                div()
-                                    .h_20()
-                                    .rounded_lg()
-                                    .border_1()
-                                    .border_color(theme.border)
-                                    .bg(preview_light_surface())
-                                    .p_3()
-                                    .flex()
-                                    .flex_col()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .gap_1_5()
-                                            .child(
-                                                div()
-                                                    .size_2()
-                                                    .rounded_full()
-                                                    .bg(preview_dot_close()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .size_2()
-                                                    .rounded_full()
-                                                    .bg(preview_dot_minimize()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .size_2()
-                                                    .rounded_full()
-                                                    .bg(preview_dot_zoom()),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .h_4()
-                                            .w_3_4()
-                                            .rounded_md()
-                                            .bg(preview_light_well()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(theme.foreground)
-                                                    .child("Threadlane Light"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(theme.muted_foreground)
-                                                    .child("Clean and crisp light aesthetic"),
-                                            ),
-                                    )
-                                    .children(is_light.then(|| {
-                                        Tag::new()
-                                            .child("Active")
-                                            .with_variant(TagVariant::Success)
-                                            .small()
-                                    })),
-                            )),
-                    ),
-            )
-            .into_any_element()
+    fn render_appearance(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        kit_settings::settings_appearance(&threadlane_ui_theme::active_theme_name(cx), |action, _, cx| {
+            if let SettingsAction::Theme(name) = action { threadlane_ui_theme::apply_theme(name, cx); }
+        }, window, cx)
     }
 
     fn render_keybindings(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
+        kit_settings::settings_shortcuts(cx)
+    }
 
-        let shortcuts = [
-            (
-                "Global",
-                vec![
-                    ("⌘ K", "Open Command Palette"),
-                    ("⌘ ,", "Open Settings"),
-                    ("⌘ B", "Toggle Left Sidebar"),
-                    ("⌘ R", "Toggle Right Panel"),
-                    ("⌘ J", "Toggle Terminal Panel"),
-                    ("⌘ N", "New task"),
-                    ("⌘ L", "Focus composer"),
-                    ("⌘ 1 / 2 / 3", "Chat / Trajectory / Editor tab"),
-                    ("Escape", "Cancel active agent turn"),
-                ],
-            ),
-            (
-                "Composer & Chat",
-                vec![
-                    ("⌘ F / Ctrl F", "Find in conversation (Chat or composer focused)"),
-                    ("Enter / ⇧ Enter", "Next / previous matching message (find focused)"),
-                    ("Escape", "Close conversation find before cancelling a turn"),
-                    ("Enter", "Submit prompt to agent"),
-                    ("⇧ Enter", "Insert newline in composer"),
-                    ("/ (in empty composer)", "Open Slash Commands palette"),
-                    ("@ (in composer)", "Insert a workspace file path (Git worktrees)"),
-                ],
-            ),
-            (
-                "Editor & Diff",
-                vec![
-                    ("⌘ S", "Save active file"),
-                    ("⌘ Z", "Undo edit"),
-                    ("⌘ ⇧ Z", "Redo edit"),
-                    ("⌘ F", "Find in active editor buffer"),
-                ],
-            ),
-            (
-                "Terminal",
-                vec![
-                    ("⌘ F / Ctrl ⇧ F", "Find in terminal output (terminal focused)"),
-                    ("Enter / ⇧ Enter", "Next / previous matching line (find focused)"),
-                    ("Escape", "Close terminal find (find focused)"),
-                    ("⇧ Page Up / Page Down", "Scroll retained output"),
-                ],
-            ),
-        ];
-
-        let mut list = div().mt_5().flex().flex_col().gap_6();
-
-        for (section_title, items) in shortcuts {
-            let mut section_div = div()
-                .rounded_xl()
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.title_bar)
-                .p_4()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(
-                    div()
-                        .pb_2()
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.muted_foreground)
-                        .child(section_title.to_uppercase()),
-                );
-
-            for (keys, description) in items {
-                section_div = section_div.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .py_1()
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(theme.foreground)
-                                .child(description),
-                        )
-                        .child(
-                            Tag::new()
-                                .child(keys)
-                                .with_variant(TagVariant::Secondary)
-                                .small(),
-                        ),
-                );
+    fn apply_provider(&mut self, action: kit_settings::SettingsProviderAction, cx: &mut Context<Self>) {
+        use kit_settings::{SettingsProvider as Provider, SettingsProviderAction as Action};
+        let activating_account = matches!(&action, Action::SetActiveAccount(_));
+        match action {
+            Action::Connect(provider) => {
+                let result = match provider {
+                    Provider::ChatGPT => provider_auth::start_chatgpt_login(self.auth_tx.clone()),
+                    Provider::Antigravity => provider_auth::start_antigravity_login(self.auth_tx.clone()),
+                    Provider::GitHub => provider_auth::connect_github_cli(self.auth_tx.clone()),
+                    _ => return,
+                };
+                self.auth_message = Some(match result {
+                    Ok(()) => AuthStatusMessage::new(match provider {
+                        Provider::ChatGPT => "Starting ChatGPT sign-in…",
+                        Provider::Antigravity => "Opening Google Antigravity sign-in…",
+                        _ => "Connecting via GitHub CLI…",
+                    }, AuthStatusKind::Info),
+                    Err(error) => AuthStatusMessage::new(error, AuthStatusKind::Error),
+                });
+                self.refresh_providers_snapshot();
             }
-
-            list = list.child(section_div);
-        }
-
-        list.into_any_element()
-    }
-
-    fn render_provider_connection(
-        &self,
-        title: &'static str,
-        description: &'static str,
-        connected: bool,
-        antigravity: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        let view = cx.entity().downgrade();
-        let model = self.model.clone();
-        let button_label = if connected {
-            "Disconnect"
-        } else if antigravity {
-            "Sign in with Google"
-        } else {
-            "Sign in with ChatGPT"
-        };
-
-        div()
-            .py_4()
-            .border_b_1()
-            .border_color(theme.border)
-            .flex()
-            .items_center()
-            .gap_4()
-            .child(
-                div()
-                    .w_9()
-                    .h_9()
-                    .flex_none()
-                    .rounded_lg()
-                    .bg(theme.muted)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(if connected {
-                        theme.success
-                    } else {
-                        theme.muted_foreground
-                    })
-                    .child(IconName::Bot),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.foreground)
-                                    .child(title),
-                            )
-                            .child(
-                                Tag::new()
-                                    .child(if connected { "Connected" } else { "Not connected" })
-                                    .with_variant(if connected {
-                                        TagVariant::Success
-                                    } else {
-                                        TagVariant::Secondary
-                                    })
-                                    .small(),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .mt_1()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(description),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .children(connected.then(|| {
-                        let auth_tx = self.auth_tx.clone();
-                        Button::new(if antigravity {
-                            "test-antigravity-connection-btn"
-                        } else {
-                            "test-chatgpt-connection-btn"
-                        })
-                        .icon(IconName::Play)
-                        .label("Test")
-                        .outline()
-                        .on_click(move |_event, _window, _cx| {
-                            if antigravity {
-                                let _ = provider_auth::test_antigravity_connection(auth_tx.clone());
-                            } else {
-                                let _ = provider_auth::test_openai_connection(None, auth_tx.clone());
-                            }
-                        })
-                    }))
-                    .child(
-                        Button::new(if antigravity {
-                            "antigravity-auth-button"
-                        } else {
-                            "chatgpt-auth-button"
-                        })
-                        .label(button_label)
-                        .when(!connected, |button| button.primary())
-                        .when(connected, |button| button.ghost())
-                        .on_click(move |_event, _window, cx| {
-                            let _ = view.update(cx, |this, cx| {
-                                if connected {
-                                    let result = if antigravity {
-                                        threadlane_auth::antigravity_auth::clear_antigravity_credentials()
-                                    } else {
-                                        threadlane_auth::openai_auth::remove_credentials()
-                                    };
-                                    let disconnected = result.is_ok();
-                                    this.auth_message = Some(match result {
-                                        Ok(()) if antigravity => AuthStatusMessage::new(
-                                            "Disconnected Google Antigravity.",
-                                            AuthStatusKind::Success,
-                                        ),
-                                        Ok(()) => AuthStatusMessage::new(
-                                            "Disconnected ChatGPT.",
-                                            AuthStatusKind::Success,
-                                        ),
-                                        Err(error) => AuthStatusMessage::new(
-                                            format!("Failed to disconnect: {error}"),
-                                            AuthStatusKind::Error,
-                                        ),
-                                    });
-                                    if disconnected {
-                                        model.update(cx, |state, cx| {
-                                            state.reconcile_selected_model();
-                                            cx.notify();
-                                        });
-                                    }
-                                } else {
-                                    let result = if antigravity {
-                                        provider_auth::start_antigravity_login(this.auth_tx.clone())
-                                    } else {
-                                        provider_auth::start_chatgpt_login(this.auth_tx.clone())
-                                    };
-                                    this.auth_message = Some(match result {
-                                        Ok(()) if antigravity => AuthStatusMessage::new(
-                                            "Opening Google Antigravity sign-in...",
-                                            AuthStatusKind::Info,
-                                        ),
-                                        Ok(()) => AuthStatusMessage::new(
-                                            "Starting ChatGPT sign-in...",
-                                            AuthStatusKind::Info,
-                                        ),
-                                        Err(error) => {
-                                            AuthStatusMessage::new(error, AuthStatusKind::Error)
-                                        }
-                                    });
-                                }
-                                cx.notify();
-                            });
-                        }),
-                    ),
-            )
-    }
-
-    fn render_github_connection(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        let view = cx.entity().downgrade();
-        let github_status = self
-            .providers_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.github_status.clone())
-            .unwrap_or_else(threadlane_auth::github_auth::get_github_auth_status);
-        let connected = github_status.is_some();
-        let status_label = github_status.unwrap_or_else(|| "Not connected".to_string());
-        let auth_tx = self.auth_tx.clone();
-
-        div()
-            .py_4()
-            .border_b_1()
-            .border_color(theme.border)
-            .flex()
-            .items_center()
-            .gap_4()
-            .child(
-                div()
-                    .w_9()
-                    .h_9()
-                    .flex_none()
-                    .rounded_lg()
-                    .bg(theme.muted)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(if connected {
-                        theme.success
-                    } else {
-                        theme.muted_foreground
-                    })
-                    .child(IconName::Globe),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.foreground)
-                                    .child("GitHub"),
-                            )
-                            .child(
-                                Tag::new()
-                                    .child(if connected {
-                                        status_label
-                                    } else {
-                                        "Not connected".to_string()
-                                    })
-                                    .with_variant(if connected {
-                                        TagVariant::Success
-                                    } else {
-                                        TagVariant::Secondary
-                                    })
-                                    .small(),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .mt_1()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(
-                            "Connect GitHub to inspect pr:// and issue:// virtual file references.",
-                        ),
-                    ),
-            )
-            .child(
-                Button::new("github-auth-button")
-                    .label(if connected {
-                        "Disconnect"
-                    } else {
-                        "Connect via gh CLI"
-                    })
-                    .when(!connected, |button| button.primary())
-                    .when(connected, |button| button.ghost())
-                    .on_click(move |_event, _window, cx| {
-                        let tx = auth_tx.clone();
-                        let _ = view.update(cx, |this, cx| {
-                            if connected {
-                                let result = provider_auth::disconnect_github();
-                                this.auth_message = Some(match result {
-                                    Ok(()) => AuthStatusMessage::new(
-                                        "Disconnected GitHub.",
-                                        AuthStatusKind::Success,
-                                    ),
-                                    Err(err) => AuthStatusMessage::new(
-                                        format!("Failed to disconnect GitHub: {err}"),
-                                        AuthStatusKind::Error,
-                                    ),
-                                });
-                            } else {
-                                let result = provider_auth::connect_github_cli(tx);
-                                if let Err(err) = result {
-                                    this.auth_message = Some(AuthStatusMessage::new(
-                                        format!("GitHub CLI connection: {err}"),
-                                        AuthStatusKind::Error,
-                                    ));
-                                }
-                            }
-                            this.refresh_providers_snapshot();
-                            cx.notify();
-                        });
-                    }),
-            )
-    }
-
-    fn render_github_pat_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        let view = cx.entity().downgrade();
-        let input = self.github_input.clone();
-        let auth_tx = self.auth_tx.clone();
-
-        div()
-            .py_4()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme.foreground)
-                    .child("GitHub Personal Access Token (PAT)"),
-            )
-            .child(
-                div()
-                    .mt_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div().flex_1().child(
-                            Input::new(&input)
-                                .mask_toggle()
-                                .aria_label("GitHub Personal Access Token"),
-                        ),
-                    )
-                    .child(
-                        Button::new("save-github-token")
-                            .label("Save")
-                            .primary()
-                            .on_click(move |_event, _window, cx| {
-                                let val = input.read(cx).value().to_string();
-                                let tx = auth_tx.clone();
-                                let _ = view.update(cx, |this, cx| {
-                                    if val.trim().is_empty() {
-                                        let _ = provider_auth::disconnect_github();
-                                        this.auth_message = Some(AuthStatusMessage::new(
-                                            "Cleared GitHub token.",
-                                            AuthStatusKind::Success,
-                                        ));
-                                    } else {
-                                        let _ = provider_auth::save_github_pat(&val, tx);
-                                    }
-                                    this.refresh_providers_snapshot();
-                                    cx.notify();
-                                });
-                            }),
-                    ),
-            )
-    }
-
-    fn render_gitlab_connection(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        let view = cx.entity().downgrade();
-        let gitlab_status = self
-            .providers_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.gitlab_status.clone())
-            .unwrap_or_else(threadlane_auth::github_auth::get_gitlab_auth_status);
-        let connected = gitlab_status.is_some();
-        let status_label = gitlab_status.unwrap_or_else(|| "Not connected".to_string());
-
-        div()
-            .py_4()
-            .border_b_1()
-            .border_color(theme.border)
-            .flex()
-            .items_center()
-            .gap_4()
-            .child(
-                div()
-                    .w_9()
-                    .h_9()
-                    .flex_none()
-                    .rounded_lg()
-                    .bg(theme.muted)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(if connected {
-                        theme.success
-                    } else {
-                        theme.muted_foreground
-                    })
-                    .child(IconName::Globe),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.foreground)
-                                    .child("GitLab"),
-                            )
-                            .child(
-                                Tag::new()
-                                    .child(if connected {
-                                        status_label
-                                    } else {
-                                        "Not connected".to_string()
-                                    })
-                                    .with_variant(if connected {
-                                        TagVariant::Success
-                                    } else {
-                                        TagVariant::Secondary
-                                    })
-                                    .small(),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .mt_1()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(
-                            "Connect GitLab to inspect mr:// and GitLab issue virtual references.",
-                        ),
-                    ),
-            )
-            .child(
-                Button::new("gitlab-auth-button")
-                    .label("Disconnect")
-                    .disabled(!connected)
-                    .ghost()
-                    .on_click(move |_event, _window, cx| {
-                        let _ = view.update(cx, |this, cx| {
-                            if connected {
-                                let result = provider_auth::disconnect_gitlab();
-                                this.auth_message = Some(match result {
-                                    Ok(()) => AuthStatusMessage::new(
-                                        "Disconnected GitLab.",
-                                        AuthStatusKind::Success,
-                                    ),
-                                    Err(err) => AuthStatusMessage::new(
-                                        format!("Failed to disconnect GitLab: {err}"),
-                                        AuthStatusKind::Error,
-                                    ),
-                                });
-                                this.refresh_providers_snapshot();
-                            }
-                            cx.notify();
-                        });
-                    }),
-            )
-    }
-
-    fn render_chatgpt_connections(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        let view = cx.entity().downgrade();
-        let model = self.model.clone();
-        let (own_accounts, active_account_id) = match self.providers_snapshot.as_ref() {
-            Some(snapshot) => (
-                snapshot.codex_accounts.clone(),
-                snapshot.active_codex_account_id.clone(),
-            ),
-            None => {
-                let accounts = threadlane_auth::openai_auth::load_all_codex_accounts()
-                    .into_iter()
-                    .filter(|a| threadlane_auth::openai_auth::is_own_source(&a.source))
-                    .map(|a| (a.id, a.label))
-                    .collect::<Vec<_>>();
-                (
-                    accounts,
-                    threadlane_auth::openai_auth::get_active_codex_account().map(|a| a.id),
-                )
-            }
-        };
-
-        if own_accounts.is_empty() {
-            return self
-                .render_provider_connection(
-                    "OpenAI / ChatGPT",
-                    "GPT and Codex models via ChatGPT device login or an API key.",
-                    false,
-                    false,
-                    cx,
-                )
-                .into_any_element();
-        }
-
-        let auth_tx = self.auth_tx.clone();
-        let count = own_accounts.len();
-
-        div()
-            .py_4()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_4()
-                            .child(
-                                div()
-                                    .w_9()
-                                    .h_9()
-                                    .flex_none()
-                                    .rounded_lg()
-                                    .bg(theme.muted)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_color(theme.success)
-                                    .child(IconName::Bot),
-                            )
-                            .child(
-                                div()
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(theme.foreground)
-                                                    .child("OpenAI / ChatGPT"),
-                                            )
-                                            .child(
-                                                Tag::new()
-                                                    .child(if count == 1 {
-                                                        "1 Account".to_string()
-                                                    } else {
-                                                        format!("{count} Accounts Connected")
-                                                    })
-                                                    .with_variant(TagVariant::Success)
-                                                    .small(),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .mt_1()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(
-                                                "Manage connected accounts with automatic rate-limit and quota failover.",
-                                            ),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child({
-                                let auth_tx = auth_tx.clone();
-                                Button::new("test-chatgpt-accounts-btn")
-                                    .icon(IconName::Play)
-                                    .label("Test")
-                                    .outline()
-                                    .on_click(move |_event, _window, _cx| {
-                                        let _ = provider_auth::test_openai_connection(None, auth_tx.clone());
-                                    })
-                            })
-                            .child(
-                                Button::new("add-chatgpt-account-btn")
-                                    .icon(IconName::Plus)
-                                    .label("Add account")
-                                    .outline()
-                                    .on_click({
-                                        let view = view.clone();
-                                        let auth_tx = auth_tx.clone();
-                                        move |_event, _window, cx| {
-                                            let _ = view.update(cx, |this, cx| {
-                                                let result =
-                                                    provider_auth::start_chatgpt_login(auth_tx.clone());
-                                                this.auth_message = Some(match result {
-                                                    Ok(()) => AuthStatusMessage::new(
-                                                        "Starting sign-in for additional account...",
-                                                        AuthStatusKind::Info,
-                                                    ),
-                                                    Err(error) => AuthStatusMessage::new(
-                                                        error,
-                                                        AuthStatusKind::Error,
-                                                    ),
-                                                });
-                                                cx.notify();
-                                            });
-                                        }
-                                    }),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .mt_3()
-                    .pl(rems(3.25))
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .children(own_accounts.into_iter().enumerate().map(|(idx, (acc_id, acc_label))| {
-                        let is_active = active_account_id.as_deref() == Some(&acc_id)
-                            || (active_account_id.is_none() && idx == 0);
-                        let acc_id_make_active = acc_id.clone();
-                        let acc_id_remove = acc_id.clone();
-                        let model_active = model.clone();
-                        let model_remove = model.clone();
-                        let view_active = view.clone();
-                        let view_remove = view.clone();
-
-                        let initial = acc_label
-                            .chars()
-                            .next()
-                            .map(|c| c.to_uppercase().to_string())
-                            .unwrap_or_else(|| "U".to_string());
-
-                        div()
-                            .p_3()
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.muted)
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .w_7()
-                                            .h_7()
-                                            .rounded_full()
-                                            .bg(theme.title_bar)
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .text_xs()
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(if is_active {
-                                                theme.success
-                                            } else {
-                                                theme.muted_foreground
-                                            })
-                                            .child(initial),
-                                    )
-                                    .child(
-                                        div()
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap_2()
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .font_weight(FontWeight::MEDIUM)
-                                                            .text_color(theme.foreground)
-                                                            .child(acc_label.clone()),
-                                                    )
-                                                    .child(
-                                                        Tag::new()
-                                                            .child(if is_active {
-                                                                "Active"
-                                                            } else {
-                                                                "Backup"
-                                                            })
-                                                            .with_variant(if is_active {
-                                                                TagVariant::Success
-                                                            } else {
-                                                                TagVariant::Secondary
-                                                            })
-                                                            .small(),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .mt_1()
-                                                    .text_xs()
-                                                    .text_color(theme.muted_foreground)
-                                                    .child(if is_active {
-                                                        "Primary account for coding and prompt turns"
-                                                    } else {
-                                                        "Standby account — auto-failover on rate limits"
-                                                    }),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                     .children((!is_active).then(|| {
-                                        Button::new(format!("make-active-{}", acc_id))
-                                            .icon(IconName::Check)
-                                            .label("Set active")
-                                            .outline()
-                                             .on_click(move |_event, _window, cx| {
-                                                 let acc_id = acc_id_make_active.clone();
-                                                 let _ = model_active.update(cx, |state, cx| {
-                                                     controller::dispatch(
-                                                         state,
-                                                         AppAction::SetActiveCodexAccount(acc_id),
-                                                     );
-                                                     cx.notify();
-                                                 });
-                                                 let _ = view_active.update(cx, |this, cx| {
-                                                     this.refresh_providers_snapshot();
-                                                     cx.notify();
-                                                 });
-                                                 let model = model_active.clone();
-                                                 cx.spawn(async move |cx| {
-                                                     crate::refresh_openai_models_and_update(model, cx).await;
-                                                 }).detach();
-                                             })
-                                    }))
-                                    .child(
-                                        Button::new(format!("remove-acc-{}", acc_id))
-                                            .icon(IconName::Delete)
-                                            .label("Disconnect")
-                                            .ghost()
-                                             .on_click(move |_event, _window, cx| {
-                                                 let acc_id = acc_id_remove.clone();
-                                                 let _ = model_remove.update(cx, |state, cx| {
-                                                     controller::dispatch(
-                                                         state,
-                                                         AppAction::RemoveCodexAccount(acc_id),
-                                                     );
-                                                     cx.notify();
-                                                 });
-                                                 let _ = view_remove.update(cx, |this, cx| {
-                                                     this.refresh_providers_snapshot();
-                                                     cx.notify();
-                                                 });
-                                                 let model = model_remove.clone();
-                                                 cx.spawn(async move |cx| {
-                                                     crate::refresh_openai_models_and_update(model, cx).await;
-                                                 }).detach();
-                                             }),
-                                    ),
-                            )
-                    })),
-            )
-            .when(count > 1, |el| {
-                el.child(
-                    div()
-                        .mt_3()
-                        .pl(rems(3.25))
-                        .child(
-                            div()
-                                .p_2()
-                                .rounded_md()
-                                .bg(theme.muted)
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child(
-                                            "⚡ Automatic Failover Active: If your active account hits rate limits or 5-hour quota (HTTP 429), requests seamlessly failover to your backup account.",
-                                        ),
-                                ),
-                        ),
-                )
-            })
-            .into_any_element()
-    }
-
-    fn render_key_row(
-        &self,
-        label: &'static str,
-        input: &Entity<InputState>,
-        button_id: &'static str,
-        action: fn(String) -> AppAction,
-        is_openai: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = cx.theme().colors;
-        let model = self.model.clone();
-        let input = input.clone();
-        let auth_tx = self.auth_tx.clone();
-
-        div()
-            .py_4()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme.foreground)
-                    .child(label),
-            )
-            .child(
-                div()
-                    .mt_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(Input::new(&input).mask_toggle().aria_label(label)),
-                    )
-                    .child({
-                        let input = input.clone();
-                        let auth_tx = auth_tx.clone();
-                        Button::new(format!("test-{button_id}"))
-                            .icon(IconName::Play)
-                            .label("Test")
-                            .outline()
-                            .on_click(move |_event, _window, cx| {
-                                let key = input.read(cx).value().to_string();
-                                if is_openai {
-                                    let _ = provider_auth::test_openai_connection(
-                                        Some(key),
-                                        auth_tx.clone(),
-                                    );
-                                } else {
-                                    let _ = provider_auth::test_opencode_connection(
-                                        &key,
-                                        auth_tx.clone(),
-                                    );
-                                }
-                            })
-                    })
-                    .child(Button::new(button_id).label("Save").primary().on_click(
-                        move |_event, _window, cx| {
-                            let value = input.read(cx).value().to_string();
-                            model.update(cx, |state, cx| {
-                                controller::dispatch(state, action(value));
-                                cx.notify();
-                            });
-                        },
-                    )),
-            )
-    }
-
-    fn render_providers(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
-        let state_status = self
-            .model
-            .read(cx)
-            .auth_status_msg
-            .clone()
-            .map(AuthStatusMessage::from_legacy);
-        let status = self.auth_message.clone().or(state_status);
-        let antigravity_connected = self
-            .providers_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.antigravity_connected)
-            .unwrap_or_else(|| {
-                threadlane_auth::antigravity_auth::load_antigravity_credentials().is_some()
-            });
-
-        div()
-            .mt_5()
-            .rounded_xl()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.title_bar)
-            .px_4()
-            .children(status.map(|status| {
-                let (bg, border, fg) = match status.kind {
-                    AuthStatusKind::Success => (
-                        theme.success.opacity(0.12),
-                        theme.success.opacity(0.4),
-                        theme.success,
-                    ),
-                    AuthStatusKind::Error => (
-                        theme.danger.opacity(0.12),
-                        theme.danger.opacity(0.4),
-                        theme.danger,
-                    ),
-                    AuthStatusKind::Info => (theme.muted, theme.border, theme.foreground),
+            Action::Disconnect(provider) => {
+                let result = match provider {
+                    Provider::ChatGPT => threadlane_auth::openai_auth::remove_credentials(),
+                    Provider::Antigravity => threadlane_auth::antigravity_auth::clear_antigravity_credentials(),
+                    Provider::GitHub => provider_auth::disconnect_github(),
+                    Provider::GitLab => provider_auth::disconnect_gitlab(),
+                    _ => return,
                 };
-                div()
-                    .mt_4()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(border)
-                    .bg(bg)
-                    .p_3()
-                    .text_xs()
-                    .text_color(fg)
-                    .child(TextView::markdown("provider-auth-status", status.text).selectable(true))
-            }))
-            .child(self.render_chatgpt_connections(cx))
-            .child(self.render_provider_connection(
-                "Google Antigravity",
-                "Gemini and other models via Google OAuth PKCE.",
-                antigravity_connected,
-                true,
-                cx,
-            ))
-            .child(self.render_github_connection(cx))
-            .child(self.render_github_pat_row(cx))
-            .child(self.render_gitlab_connection(cx))
-            .child(self.render_key_row(
-                "OpenAI API key",
-                &self.openai_input,
-                "save-openai-key",
-                AppAction::SaveOpenAiKey,
-                true,
-                cx,
-            ))
-            .child(self.render_key_row(
-                "OpenCode API key",
-                &self.opencode_input,
-                "save-opencode-key",
-                AppAction::SaveOpenCodeKey,
-                false,
-                cx,
-            ))
-            .into_any_element()
-    }
-
-    fn render_scope_picker(&self, prefix: &'static str, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .flex()
-            .gap_1()
-            .child(
-                Button::new(SharedString::from(format!("{prefix}-project")))
-                    .icon(IconName::Folder)
-                    .label("Project")
-                    .ghost()
-                    .selected(!self.install_globally)
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.install_globally = false;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Button::new(SharedString::from(format!("{prefix}-global")))
-                    .icon(IconName::Globe)
-                    .label("Global")
-                    .ghost()
-                    .selected(self.install_globally)
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.install_globally = true;
-                        cx.notify();
-                    })),
-            )
-            .into_any_element()
-    }
-
-    fn render_capability_status(&self, _cx: &mut Context<Self>) -> Option<AnyElement> {
-        self.capability_status.clone().map(|status| {
-            Alert::new("capability-status-alert", status)
-                .title("Notice")
-                .with_variant(AlertVariant::Info)
-                .into_any_element()
-        })
-    }
-
-    fn render_extensions(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
-        let view = cx.entity().downgrade();
-        let rows = self.extension_rows.clone();
-        let project_available = self.active_project(cx).is_some();
-        div()
-            .mt_5()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .children(self.render_capability_status(cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(self.render_scope_picker("extension-scope", cx))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                Button::new("extension-refresh")
-                                    .icon(IconName::Redo)
-                                    .label("Refresh")
-                                    .outline()
-                                    .on_click(cx.listener(|this, _event, _window, cx| {
-                                        this.refresh_extensions(cx);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("extension-install")
-                                    .icon(IconName::Plus)
-                                    .label("Install .wasm")
-                                    .primary()
-                                    .disabled(!self.install_globally && !project_available)
-                                    .tooltip(if !self.install_globally && !project_available {
-                                        "Select install scope or attach a project first"
-                                    } else {
-                                        "Install a compiled WASI extension"
-                                    })
-                                    .on_click(move |_event, _window, cx| {
-                                        let Some(path) = rfd::FileDialog::new()
-                                            .set_title("Install a compiled WASI extension")
-                                            .add_filter("WebAssembly", &["wasm"])
-                                            .pick_file()
-                                        else {
-                                            return;
-                                        };
-                                        let _ = view.update(cx, |this, cx| {
-                                            let scope = if this.install_globally {
-                                                ExtensionScope::Global
-                                            } else {
-                                                ExtensionScope::Project
-                                            };
-                                            let project = this.active_project(cx);
-                                            this.capability_status = Some(
-                                                threadlane_wasi::settings::install_extension(
-                                                    project, &path, scope,
-                                                )
-                                                .unwrap_or_else(|error| error),
-                                            );
-                                            this.refresh_extensions(cx);
-                                            this.model.update(cx, |state, cx| {
-                                                state.invalidate_capability_runtimes();
-                                                cx.notify();
-                                            });
-                                            cx.notify();
-                                        });
-                                    }),
-                            ),
-                    ),
-            )
-            .children(rows.into_iter().map(|record| {
-                let toggle_record = record.clone();
-                let remove_record = record.clone();
-                let toggle_view = cx.entity().downgrade();
-                let remove_view = cx.entity().downgrade();
-                let enabled = record.is_enabled();
-                let scope = match record.scope() {
-                    ExtensionScope::Global => "Global",
-                    ExtensionScope::Project => "Project",
-                };
-                let (status, status_variant) = if !enabled {
-                    ("Disabled", TagVariant::Secondary)
-                } else if record.is_effective() {
-                    ("Active", TagVariant::Success)
-                } else {
-                    ("Overridden", TagVariant::Warning)
-                };
-                div()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.title_bar)
-                    .px_4()
-                    .py_3()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .size_8()
-                            .flex_none()
-                            .rounded_md()
-                            .bg(theme.muted)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_color(theme.muted_foreground)
-                            .child(IconName::HardDrive),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(format!("{} · v{}", record.name(), record.version())),
-                            )
-                            .child(
-                                div()
-                                    .mt_1()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        Tag::new()
-                                            .child(scope)
-                                            .with_variant(TagVariant::Secondary)
-                                            .small(),
-                                    )
-                                    .child(
-                                        Tag::new()
-                                            .child(status)
-                                            .with_variant(status_variant)
-                                            .small(),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .mt_1()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .truncate()
-                                    .child(record.module_path().display().to_string()),
-                            ),
-                    )
-                    .child(
-                        Switch::new(SharedString::from(format!(
-                            "extension-toggle-{}",
-                            record.id()
-                        )))
-                        .accessibility_label(format!("Enable extension {}", record.id()))
-                        .checked(enabled)
-                        .tooltip(if enabled {
-                            "Disable extension"
-                        } else {
-                            "Enable extension"
-                        })
-                        .on_click(move |checked, _window, cx| {
-                            let checked = *checked;
-                            let _ = toggle_view.update(cx, |this, cx| {
-                                let result = threadlane_wasi::settings::set_extension_enabled(
-                                    this.active_project(cx),
-                                    &toggle_record,
-                                    checked,
-                                );
-                                this.capability_status = result.err();
-                                this.refresh_extensions(cx);
-                                this.model.update(cx, |state, cx| {
-                                    state.invalidate_capability_runtimes();
-                                    cx.notify();
-                                });
-                                cx.notify();
-                            });
-                        }),
-                    )
-                    .child(
-                        Button::new(SharedString::from(format!(
-                            "extension-remove-{}",
-                            record.id()
-                        )))
-                        .accessibility_label(format!("Remove extension {}", record.id()))
-                        .icon(IconName::Delete)
-                        .tooltip("Remove extension")
-                        .ghost()
-                        .w_8()
-                        .h_8()
-                        .on_click(move |_event, _window, cx| {
-                            let _ = remove_view.update(cx, |this, cx| {
-                                let result = threadlane_wasi::settings::remove_extension(
-                                    this.active_project(cx),
-                                    &remove_record,
-                                );
-                                this.capability_status = result.err();
-                                this.refresh_extensions(cx);
-                                this.model.update(cx, |state, cx| {
-                                    state.invalidate_capability_runtimes();
-                                    cx.notify();
-                                });
-                                cx.notify();
-                            });
-                        }),
-                    )
-            }))
-            .when(self.extension_rows.is_empty(), |view| {
-                view.child(Self::empty_state(
-                    "No WASI extensions found. Install one below.",
-                    theme,
-                ))
-            })
-            .into_any_element()
-    }
-
-    fn render_skills(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
-        let rows = self.skill_rows.clone();
-        let skill_ids: Vec<String> = rows.iter().map(|skill| skill.id.clone()).collect();
-        let has_enabled_skills = rows.iter().any(|skill| skill.enabled);
-        let has_project = self.active_project(cx).is_some();
-        div()
-            .mt_5()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .children(self.render_capability_status(cx))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .justify_end()
-                    .child(
-                        Button::new("skills-disable-all")
-                            .label("Disable all")
-                            .outline()
-                            .disabled(!has_project || !has_enabled_skills)
-                            .tooltip(if !has_project {
-                                "Attach a project to manage skills"
-                            } else {
-                                "Disable all project skills"
-                            })
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                let Some(project) = this.active_project(cx) else {
-                                    this.capability_status =
-                                        Some("Attach a project to manage skills.".into());
-                                    cx.notify();
-                                    return;
-                                };
-                                this.capability_status =
-                                    threadlane_skills::settings::disable_all_skills(
-                                        &project,
-                                        skill_ids.clone(),
-                                    )
-                                    .err();
-                                this.refresh_skills(cx);
-                                this.model.update(cx, |state, cx| {
-                                    state.invalidate_capability_runtimes();
-                                    cx.notify();
-                                });
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("skills-refresh")
-                            .icon(IconName::Redo)
-                            .label("Refresh")
-                            .outline()
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.refresh_skills(cx);
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .children(rows.into_iter().map(|skill| {
-                let view = cx.entity().downgrade();
-                let skill_id = skill.id.clone();
-                let enabled = skill.enabled;
-                div()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.title_bar)
-                    .px_4()
-                    .py_3()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .size_8()
-                            .flex_none()
-                            .rounded_md()
-                            .bg(theme.muted)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_color(theme.muted_foreground)
-                            .child(IconName::BookOpen),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(skill.name),
-                            )
-                            .child(
-                                div()
-                                    .mt_1()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(skill.description),
-                            )
-                            .child({
-                                let status_label = if !skill.is_valid {
-                                    "Invalid"
-                                } else if enabled {
-                                    "Enabled"
-                                } else {
-                                    "Disabled"
-                                };
-                                let status_variant = if !skill.is_valid {
-                                    TagVariant::Danger
-                                } else if enabled {
-                                    TagVariant::Success
-                                } else {
-                                    TagVariant::Secondary
-                                };
-                                div()
-                                    .mt_1()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        Tag::new()
-                                            .child(skill.scope.display_name().to_string())
-                                            .with_variant(TagVariant::Secondary)
-                                            .small(),
-                                    )
-                                    .child(
-                                        Tag::new()
-                                            .child(status_label)
-                                            .with_variant(status_variant)
-                                            .small(),
-                                    )
-                            }),
-                    )
-                    .child(
-                        Switch::new(SharedString::from(format!("skill-toggle-{skill_id}")))
-                            .accessibility_label(format!("Enable skill {skill_id}"))
-                            .checked(enabled)
-                            .disabled(!has_project || !skill.is_valid)
-                            .tooltip(if enabled {
-                                "Disable skill"
-                            } else {
-                                "Enable skill"
-                            })
-                            .on_click(move |checked, _window, cx| {
-                                let checked = *checked;
-                                let _ = view.update(cx, |this, cx| {
-                                    let Some(project) = this.active_project(cx) else {
-                                        this.capability_status =
-                                            Some("Attach a project to manage skills.".into());
-                                        cx.notify();
-                                        return;
-                                    };
-                                    this.capability_status =
-                                        threadlane_skills::settings::set_skill_enabled(
-                                            &project, &skill_id, checked,
-                                        )
-                                        .err();
-                                    this.refresh_skills(cx);
-                                    this.model.update(cx, |state, cx| {
-                                        state.invalidate_capability_runtimes();
-                                        cx.notify();
-                                    });
-                                    cx.notify();
-                                });
-                            }),
-                    )
-            }))
-            .when(self.skill_rows.is_empty(), |view| {
-                view.child(Self::empty_state(
-                    "No skills found. Attach a project to discover skills.",
-                    theme,
-                ))
-            })
-            .into_any_element()
-    }
-
-    fn render_acp_agents(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
-        let rows = self.acp_rows.clone();
-        let has_project = self.active_project(cx).is_some();
-        let selected_scope = if self.install_globally {
-            AcpScope::Global
-        } else {
-            AcpScope::Project
-        };
-        let add_view = cx.entity().downgrade();
-        let name_input = self.acp_name_input.clone();
-        let command_input = self.acp_command_input.clone();
-        div()
-            .mt_5()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .children(self.render_capability_status(cx))
-            .child(self.render_scope_picker("acp-scope", cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Quick setup"),
-                    )
-                    .children(threadlane_acp_engine::ACP_PRESETS.iter().map(|preset| {
-                        let preset_view = cx.entity().downgrade();
-                        let configured = rows.iter().find(|record| {
-                            preset.matches_agent(&record.config)
-                                && record.config.scope == selected_scope
-                        });
-                        let enabled = configured.is_some_and(|record| record.config.enabled);
-                        let status = configured
-                            .map(|record| record.status.display_status())
-                            .unwrap_or_else(|| "Not configured".to_string());
-                        let preset_id = preset.id;
-                        div()
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.title_bar)
-                            .px_4()
-                            .py_3()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .size_8()
-                                    .flex_none()
-                                    .rounded_md()
-                                    .bg(theme.muted)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_color(theme.muted_foreground)
-                                    .child(Icon::default().path("icons/providers/acp.svg")),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .child(preset.name),
-                                    )
-                                    .child(
-                                        div()
-                                            .mt_1()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(preset.description),
-                                    )
-                                    .child(
-                                        div()
-                                            .mt_1()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(status),
-                                    ),
-                            )
-                            .child(
-                                Switch::new(SharedString::from(format!(
-                                    "acp-preset-{preset_id}-{:?}",
-                                    selected_scope
-                                )))
-                                .accessibility_label(format!("Enable {}", preset.name))
-                                .checked(enabled)
-                                .disabled(selected_scope == AcpScope::Project && !has_project)
-                                .tooltip(if enabled {
-                                    "Disable ACP agent"
-                                } else {
-                                    "Enable ACP agent"
-                                })
-                                .on_click(
-                                    move |checked, _window, cx| {
-                                        let checked = *checked;
-                                        let _ = preset_view.update(cx, |this, cx| {
-                                            let project = this.active_project(cx);
-                                            this.capability_status =
-                                                threadlane_acp_engine::set_acp_preset_enabled(
-                                                    project.as_deref(),
-                                                    selected_scope,
-                                                    preset,
-                                                    checked,
-                                                )
-                                                .err();
-                                            this.refresh_acp(cx);
-                                            cx.notify();
-                                        });
-                                    },
-                                ),
-                            )
-                    })),
-            )
-            .child(
-                div()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.title_bar)
-                    .p_4()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Custom agent"),
-                    )
-                    .child(Input::new(&self.acp_name_input).aria_label("Custom agent name"))
-                    .child(Input::new(&self.acp_command_input).aria_label("Custom agent command"))
-                    .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                Button::new("acp-refresh")
-                                    .icon(IconName::Redo)
-                                    .label("Refresh")
-                                    .outline()
-                                    .on_click(cx.listener(|this, _event, _window, cx| {
-                                        this.load_acp(true, cx);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("acp-add")
-                                    .icon(IconName::Plus)
-                                    .label("Add agent")
-                                    .primary()
-                                    .disabled(!self.install_globally && !has_project)
-                                    .on_click(move |_event, _window, cx| {
-                                        let name = name_input.read(cx).value().to_string();
-                                        let command = command_input.read(cx).value().to_string();
-                                        let _ = add_view.update(cx, |this, cx| {
-                                            let scope = if this.install_globally {
-                                                AcpScope::Global
-                                            } else {
-                                                AcpScope::Project
-                                            };
-                                            let project = this.active_project(cx);
-                                            this.capability_status =
-                                                threadlane_acp_engine::add_acp_agent(
-                                                    project.as_deref(),
-                                                    scope,
-                                                    &name,
-                                                    &command,
-                                                )
-                                                .err();
-                                            this.refresh_acp(cx);
-                                            cx.notify();
-                                        });
-                                    }),
-                            ),
-                    ),
-            )
-            .children(rows.into_iter().filter_map(|record| {
-                if threadlane_acp_engine::ACP_PRESETS
-                    .iter()
-                    .any(|preset| preset.matches_agent(&record.config))
-                {
-                    return None;
+                let disconnected = result.is_ok();
+                self.auth_message = Some(match result {
+                    Ok(()) => AuthStatusMessage::new(match provider {
+                        Provider::ChatGPT => "Disconnected ChatGPT.",
+                        Provider::Antigravity => "Disconnected Google Antigravity.",
+                        Provider::GitHub => "Disconnected GitHub.",
+                        _ => "Disconnected GitLab.",
+                    }, AuthStatusKind::Success),
+                    Err(error) => AuthStatusMessage::new(format!("Failed to disconnect: {error}"), AuthStatusKind::Error),
+                });
+                if disconnected && matches!(provider, Provider::ChatGPT | Provider::Antigravity) {
+                    self.model.update(cx, |state, cx| { state.reconcile_selected_model(); cx.notify(); });
                 }
-                let toggle_view = cx.entity().downgrade();
-                let remove_view = cx.entity().downgrade();
-                let config = record.config;
-                let toggle_id = config.id.clone();
-                let remove_id = config.id.clone();
-                let enabled = config.enabled;
-                let scope = config.scope;
-                let command_line = config.command_line();
-                div()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.title_bar)
-                    .px_4()
-                    .py_3()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .size_8()
-                            .flex_none()
-                            .rounded_md()
-                            .bg(theme.muted)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_color(theme.muted_foreground)
-                            .child(Icon::default().path("icons/providers/acp.svg")),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(config.name),
-                            )
-                            .child({
-                                let scope_label = match scope {
-                                    AcpScope::Global => "Global",
-                                    AcpScope::Project => "Project",
-                                };
-                                let status_label = record.status.display_status();
-                                let status_variant = if status_label.contains("Ready")
-                                    || status_label.contains("Available")
-                                {
-                                    TagVariant::Success
-                                } else if status_label.contains("Failed")
-                                    || status_label.contains("Error")
-                                {
-                                    TagVariant::Danger
-                                } else {
-                                    TagVariant::Info
-                                };
-                                div()
-                                    .mt_1()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        Tag::new()
-                                            .child(scope_label)
-                                            .with_variant(TagVariant::Secondary)
-                                            .small(),
-                                    )
-                                    .child(
-                                        Tag::new()
-                                            .child(status_label)
-                                            .with_variant(status_variant)
-                                            .small(),
-                                    )
-                            })
-                            .child(
-                                div()
-                                    .mt_1()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(command_line),
-                            ),
-                    )
-                    .child(
-                        Switch::new(SharedString::from(format!("acp-toggle-{toggle_id}")))
-                            .accessibility_label(format!("Enable ACP agent {toggle_id}"))
-                            .checked(enabled)
-                            .tooltip(if enabled {
-                                "Disable ACP agent"
-                            } else {
-                                "Enable ACP agent"
-                            })
-                            .on_click(move |checked, _window, cx| {
-                                let checked = *checked;
-                                let _ = toggle_view.update(cx, |this, cx| {
-                                    let project = this.active_project(cx);
-                                    this.capability_status =
-                                        threadlane_acp_engine::set_acp_enabled(
-                                            project.as_deref(),
-                                            scope,
-                                            &toggle_id,
-                                            checked,
-                                        )
-                                        .err();
-                                    this.refresh_acp(cx);
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new(SharedString::from(format!("acp-remove-{remove_id}")))
-                            .accessibility_label(format!("Remove ACP agent {remove_id}"))
-                            .icon(IconName::Delete)
-                            .tooltip("Remove ACP agent")
-                            .ghost()
-                            .w_8()
-                            .h_8()
-                            .on_click(move |_event, _window, cx| {
-                                let _ = remove_view.update(cx, |this, cx| {
-                                    let project = this.active_project(cx);
-                                    this.capability_status =
-                                        threadlane_acp_engine::remove_acp_agent(
-                                            project.as_deref(),
-                                            scope,
-                                            &remove_id,
-                                        )
-                                        .err();
-                                    this.refresh_acp(cx);
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .into()
-            }))
-            .into_any_element()
+                self.refresh_providers_snapshot();
+            }
+            Action::TestConnection(provider) => match provider {
+                Provider::ChatGPT => { let _ = provider_auth::test_openai_connection(None, self.auth_tx.clone()); }
+                Provider::Antigravity => { let _ = provider_auth::test_antigravity_connection(self.auth_tx.clone()); }
+                _ => return,
+            },
+            Action::SaveKey(provider) => match provider {
+                Provider::GitHub => {
+                    let value = self.github_input.read(cx).value().to_string();
+                    if value.trim().is_empty() {
+                        self.auth_message = Some(match provider_auth::disconnect_github() {
+                            Ok(()) => AuthStatusMessage::new("Cleared GitHub token.", AuthStatusKind::Success),
+                            Err(error) => AuthStatusMessage::new(format!("Failed to clear GitHub token: {error}"), AuthStatusKind::Error),
+                        });
+                    } else {
+                        let _ = provider_auth::save_github_pat(&value, self.auth_tx.clone());
+                    }
+                    self.refresh_providers_snapshot();
+                }
+                Provider::OpenAI | Provider::OpenCode => {
+                    let action = if provider == Provider::OpenAI {
+                        AppAction::SaveOpenAiKey(self.openai_input.read(cx).value().to_string())
+                    } else { AppAction::SaveOpenCodeKey(self.opencode_input.read(cx).value().to_string()) };
+                    self.model.update(cx, |state, cx| { controller::dispatch(state, action); cx.notify(); });
+                }
+                _ => return,
+            },
+            Action::TestKey(provider) => match provider {
+                Provider::OpenAI => { let _ = provider_auth::test_openai_connection(Some(self.openai_input.read(cx).value().to_string()), self.auth_tx.clone()); }
+                Provider::OpenCode => { let _ = provider_auth::test_opencode_connection(&self.opencode_input.read(cx).value(), self.auth_tx.clone()); }
+                _ => return,
+            },
+            Action::SetActiveAccount(id) | Action::RemoveAccount(id) => {
+                // Both commands refresh the same inventory and live model catalog.
+                let command = if activating_account {
+                    AppAction::SetActiveCodexAccount(id)
+                } else { AppAction::RemoveCodexAccount(id) };
+                self.model.update(cx, |state, cx| { controller::dispatch(state, command); cx.notify(); });
+                self.refresh_providers_snapshot();
+                let model = self.model.clone();
+                cx.spawn(async move |_, cx| { crate::refresh_openai_models_and_update(model, cx).await; }).detach();
+            }
+        }
+        cx.notify();
     }
+
+    fn render_providers(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        use kit_settings::{SettingsProviderAccount, SettingsProviders, SettingsProviderStatus, SettingsProviderStatusKind};
+        let snapshot = self.providers_snapshot.as_ref();
+        let active_id = snapshot.and_then(|snapshot| snapshot.active_codex_account_id.as_deref());
+        let accounts = snapshot.map(|snapshot| snapshot.codex_accounts.iter().enumerate().map(|(ix, (id, label))| SettingsProviderAccount {
+            id: id.clone(), label: label.clone(), active: active_id == Some(id.as_str()) || (active_id.is_none() && ix == 0),
+        }).collect()).unwrap_or_default();
+        let status = self.auth_message.clone().or_else(|| self.model.read(cx).auth_status_msg.clone().map(AuthStatusMessage::from_legacy))
+            .map(|status| SettingsProviderStatus { text: status.text, kind: match status.kind {
+                AuthStatusKind::Info => SettingsProviderStatusKind::Info,
+                AuthStatusKind::Success => SettingsProviderStatusKind::Success,
+                AuthStatusKind::Error => SettingsProviderStatusKind::Error,
+            }});
+        let providers = SettingsProviders { accounts, status,
+            antigravity_connected: snapshot.is_some_and(|snapshot| snapshot.antigravity_connected),
+            github_status: snapshot.and_then(|snapshot| snapshot.github_status.clone()),
+            gitlab_status: snapshot.and_then(|snapshot| snapshot.gitlab_status.clone()),
+        };
+        let owner = cx.entity().downgrade();
+        kit_settings::settings_providers(&providers, &self.github_input, &self.openai_input, &self.opencode_input,
+            move |action, _, cx| { let _ = owner.update(cx, |this, cx| this.apply_provider(action, cx)); }, window, cx)
+    }
+
+    fn render_extensions(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        self.render_catalog(kit_settings::SettingsCatalogKind::Extensions, window, cx)
+    }
+
+    fn render_skills(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        self.render_catalog(kit_settings::SettingsCatalogKind::Skills, window, cx)
+    }
+
+    fn render_catalog(
+        &self,
+        kind: kit_settings::SettingsCatalogKind,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use kit_settings::{SettingsCatalogKind as Kind, SettingsCatalogStatus as Status};
+        let has_project = self.active_project(cx).is_some();
+        let rows = match kind {
+            Kind::Skills => self
+                .skill_rows
+                .iter()
+                .map(|skill| kit_settings::SettingsCatalogRow {
+                    id: skill.id.clone(),
+                    title: skill.name.clone(),
+                    description: skill.description.clone(),
+                    scope: skill.scope.display_name().into(),
+                    enabled: skill.enabled,
+                    status: if !skill.is_valid {
+                        Status::Invalid
+                    } else if skill.enabled {
+                        Status::Enabled
+                    } else {
+                        Status::Disabled
+                    },
+                    disabled_reason: if !has_project {
+                        Some("Attach a project to manage skills".into())
+                    } else if !skill.is_valid {
+                        Some("This skill is invalid".into())
+                    } else {
+                        None
+                    },
+                })
+                .collect(),
+            Kind::Extensions => self
+                .extension_rows
+                .iter()
+                .map(|record| kit_settings::SettingsCatalogRow {
+                    id: extension_row_id(record),
+                    title: format!("{} · v{}", record.name(), record.version()),
+                    description: record.module_path().display().to_string(),
+                    scope: match record.scope() {
+                        ExtensionScope::Global => "Global",
+                        ExtensionScope::Project => "Project",
+                    }
+                    .into(),
+                    enabled: record.is_enabled(),
+                    status: if !record.is_enabled() {
+                        Status::Disabled
+                    } else if record.is_effective() {
+                        Status::Active
+                    } else {
+                        Status::Overridden
+                    },
+                    disabled_reason: None,
+                })
+                .collect(),
+        };
+        let presentation = kit_settings::SettingsCatalog {
+            kind,
+            rows,
+            has_project,
+            install_globally: self.install_globally,
+            status: self.capability_status.clone(),
+        };
+        let owner = cx.entity().downgrade();
+        kit_settings::settings_catalog(
+            &presentation,
+            move |action, _, cx| {
+                // File selection stays outside the entity update, as in the native host.
+                let source = if action == kit_settings::SettingsCatalogAction::Install {
+                    let Some(path) = rfd::FileDialog::new()
+                        .set_title("Install a compiled WASI extension")
+                        .add_filter("WebAssembly", &["wasm"])
+                        .pick_file()
+                    else {
+                        return;
+                    };
+                    Some(path)
+                } else {
+                    None
+                };
+                let _ = owner.update(cx, |this, cx| this.apply_catalog(kind, action, source, cx));
+            },
+            window,
+            cx,
+        )
+    }
+
+    fn apply_catalog(
+        &mut self,
+        kind: kit_settings::SettingsCatalogKind,
+        action: kit_settings::SettingsCatalogAction,
+        source: Option<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        use kit_settings::{SettingsCatalogAction as Action, SettingsCatalogKind as Kind};
+        let mut changed = false;
+        match action {
+            Action::Scope(global) => {
+                self.install_globally = global;
+                cx.notify();
+                return;
+            }
+            Action::Refresh => {}
+            Action::Install if kind == Kind::Extensions => {
+                let Some(source) = source else {
+                    return;
+                };
+                let scope = if self.install_globally {
+                    ExtensionScope::Global
+                } else {
+                    ExtensionScope::Project
+                };
+                self.capability_status = Some(
+                    threadlane_wasi::settings::install_extension(
+                        self.active_project(cx),
+                        &source,
+                        scope,
+                    )
+                    .unwrap_or_else(|error| error),
+                );
+                changed = true;
+            }
+            Action::DisableAll if kind == Kind::Skills => {
+                let Some(project) = self.active_project(cx) else {
+                    self.capability_status = Some("Attach a project to manage skills.".into());
+                    cx.notify();
+                    return;
+                };
+                self.capability_status = threadlane_skills::settings::disable_all_skills(
+                    &project,
+                    self.skill_rows.iter().map(|skill| skill.id.clone()),
+                )
+                .err();
+                changed = true;
+            }
+            Action::Toggle { id, enabled } if kind == Kind::Skills => {
+                let Some(project) = self.active_project(cx) else {
+                    self.capability_status = Some("Attach a project to manage skills.".into());
+                    cx.notify();
+                    return;
+                };
+                if !self
+                    .skill_rows
+                    .iter()
+                    .any(|skill| skill.id == id && skill.is_valid)
+                {
+                    return;
+                }
+                self.capability_status =
+                    threadlane_skills::settings::set_skill_enabled(&project, &id, enabled).err();
+                changed = true;
+            }
+            Action::Toggle { id, enabled } => {
+                if let Some(record) = self
+                    .extension_rows
+                    .iter()
+                    .find(|record| extension_row_id(record) == id)
+                {
+                    self.capability_status = threadlane_wasi::settings::set_extension_enabled(
+                        self.active_project(cx),
+                        record,
+                        enabled,
+                    )
+                    .err();
+                    changed = true;
+                }
+            }
+            Action::Remove { id } if kind == Kind::Extensions => {
+                if let Some(record) = self
+                    .extension_rows
+                    .iter()
+                    .find(|record| extension_row_id(record) == id)
+                {
+                    self.capability_status = threadlane_wasi::settings::remove_extension(
+                        self.active_project(cx),
+                        record,
+                    )
+                    .err();
+                    changed = true;
+                }
+            }
+            _ => return,
+        }
+        match kind {
+            Kind::Skills => self.refresh_skills(cx),
+            Kind::Extensions => self.refresh_extensions(cx),
+        }
+        if changed {
+            self.model.update(cx, |state, cx| {
+                state.invalidate_capability_runtimes();
+                cx.notify();
+            });
+        }
+        cx.notify();
+    }
+
+    fn apply_external_agent(&mut self, action: kit_settings::SettingsExternalAgentAction, cx: &mut Context<Self>) {
+        use kit_settings::SettingsExternalAgentAction as Action;
+        let project = self.active_project(cx);
+        let scope = |global| if global { AcpScope::Global } else { AcpScope::Project };
+        let result = match action {
+            Action::Scope(global) => { self.install_globally = global; cx.notify(); return; }
+            Action::Refresh => { self.load_acp(true, cx); cx.notify(); return; }
+            Action::Add { name, command } => threadlane_acp_engine::add_acp_agent(
+                project.as_deref(), scope(self.install_globally), &name, &command),
+            Action::Toggle { id, global, preset, enabled } => {
+                if preset {
+                    let Some(preset) = threadlane_acp_engine::ACP_PRESETS.iter().find(|preset| preset.id == id) else { return; };
+                    threadlane_acp_engine::set_acp_preset_enabled(project.as_deref(), scope(global), preset, enabled)
+                } else {
+                    threadlane_acp_engine::set_acp_enabled(project.as_deref(), scope(global), &id, enabled)
+                }
+            }
+            Action::Remove { id, global } => threadlane_acp_engine::remove_acp_agent(project.as_deref(), scope(global), &id),
+        };
+        self.capability_status = result.err();
+        self.refresh_acp(cx);
+        cx.notify();
+    }
+
+    fn render_acp_agents(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        use kit_settings::{SettingsExternalAgentRow, SettingsExternalAgents};
+        let selected_scope = if self.install_globally { AcpScope::Global } else { AcpScope::Project };
+        let mut rows: Vec<_> = threadlane_acp_engine::ACP_PRESETS.iter().map(|preset| {
+            let configured = self.acp_rows.iter().find(|record| preset.matches_agent(&record.config) && record.config.scope == selected_scope);
+            SettingsExternalAgentRow {
+                id: preset.id.into(), name: preset.name.into(), description: preset.description.into(),
+                status: configured.map(|record| record.status.display_status()).unwrap_or_else(|| "Not configured".into()),
+                enabled: configured.is_some_and(|record| record.config.enabled),
+                global: self.install_globally, preset: true,
+                error: configured.is_some_and(|record| matches!(record.status, threadlane_acp::AcpAgentStatus::Error(_))),
+            }
+        }).collect();
+        rows.extend(self.acp_rows.iter().filter(|record| !threadlane_acp_engine::ACP_PRESETS.iter().any(|preset| preset.matches_agent(&record.config))).map(|record| SettingsExternalAgentRow {
+            id: record.config.id.clone(), name: record.config.name.clone(), description: record.config.command_line(),
+            status: record.status.display_status(), enabled: record.config.enabled,
+            global: record.config.scope == AcpScope::Global, preset: false,
+            error: matches!(record.status, threadlane_acp::AcpAgentStatus::Error(_)),
+        }));
+        let agents = SettingsExternalAgents { rows, global: self.install_globally,
+            has_project: self.active_project(cx).is_some(), status: self.capability_status.clone() };
+        let owner = cx.entity().downgrade();
+        kit_settings::settings_external_agents(&agents, &self.acp_name_input, &self.acp_command_input,
+            move |action, _, cx| { let _ = owner.update(cx, |this, cx| this.apply_external_agent(action, cx)); }, window, cx)
+    }
+
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors;
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.page == SettingsPage::Providers && self.providers_snapshot.is_none() {
             self.refresh_providers_snapshot();
         }
-        let (title, description, content) = match self.page {
-            SettingsPage::General => (
-                "General",
-                "Application details, release channels, and runtime options.",
-                self.render_general(cx),
-            ),
-            SettingsPage::Appearance => (
-                "Appearance & Themes",
-                "Customize the editor theme and visual aesthetic.",
-                self.render_appearance(cx),
-            ),
-            SettingsPage::Keybindings => (
-                "Keybindings",
-                "Keyboard shortcuts reference and operational controls.",
-                self.render_keybindings(cx),
-            ),
-            SettingsPage::Providers => (
-                "Models & Providers",
-                "Configure model providers, cloud authentication, and API credentials.",
-                self.render_providers(cx),
-            ),
-            SettingsPage::Subagents => (
-                "Agent & Fusion",
-                "Choose the Fusion model, reasoning effort, and the session mode.",
-                self.render_subagents(cx),
-            ),
-            SettingsPage::Skills => (
-                "Skills Catalog",
-                "Contextual instructions and automation skills enabled for your active workspace.",
-                self.render_skills(cx),
-            ),
-            SettingsPage::Extensions => (
-                "WASI Extensions",
-                "Install and manage compiled WebAssembly extensions (.wasm) for tools and language servers.",
-                self.render_extensions(cx),
-            ),
-            SettingsPage::AcpAgents => (
-                "ACP Agents",
-                "Configure external coding agents communicating over stdio (e.g. Claude Code, Copilot).",
-                self.render_acp_agents(cx),
-            ),
+        let content = match self.page {
+            SettingsPage::General => self.render_general(cx),
+            SettingsPage::Appearance => self.render_appearance(window, cx),
+            SettingsPage::Keybindings => self.render_keybindings(cx),
+            SettingsPage::Providers => self.render_providers(window, cx),
+            SettingsPage::Subagents => self.render_subagents(window, cx),
+            SettingsPage::Skills => self.render_skills(window, cx),
+            SettingsPage::Extensions => self.render_extensions(window, cx),
+            SettingsPage::AcpAgents => self.render_acp_agents(window, cx),
         };
-
-        div()
-            .flex_1()
-            .h_full()
-            .min_w_0()
-            .flex()
-            .bg(theme.background)
-            .child(self.render_navigation(cx))
-            .child(
-                div()
-                    .flex_1()
-                    .h_full()
-                    .min_w_0()
-                    .overflow_y_scrollbar()
-                    .px_8()
-                    .pb_8()
-                    .child(
-                        div()
-                            .w_full()
-                            .max_w(rems(48.0))
-                            .child(
-                                div()
-                                    .h(threadlane_ui_theme::WINDOW_CONTROLS_CLEARANCE)
-                                    .flex_none(),
-                            )
-                            .child(
-                                div()
-                                    .text_xl()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.foreground)
-                                    .child(title),
-                            )
-                            .child(
-                                div()
-                                    .mt_1()
-                                    .text_sm()
-                                    .text_color(theme.muted_foreground)
-                                    .child(description),
-                            )
-                            .child(content),
-                    ),
-            )
+        kit_settings::settings_screen(self.page, self.render_navigation(cx), content, cx)
     }
 }
 

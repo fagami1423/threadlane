@@ -1,14 +1,9 @@
 use super::*;
 
-actions!(
-    threadlane_chat_find,
-    [
-        FindInConversation,
-        CloseConversationFind,
-        NextConversationMatch,
-        PreviousConversationMatch
-    ]
-);
+pub use threadlane_ui_kit::{
+    init_conversation_find, CloseConversationFind, FindInConversation,
+    NextConversationMatch, PreviousConversationMatch,
+};
 
 /// One-shot handoff from project conversation search: select this session,
 /// then seed the find strip with `query` once the destination transcript has
@@ -22,31 +17,6 @@ pub struct ConversationFindHandoff {
     pub query: String,
 }
 
-pub(super) fn init_conversation_find(cx: &mut App) {
-    let shortcut = if cfg!(target_os = "macos") {
-        "cmd-f"
-    } else {
-        "ctrl-f"
-    };
-    cx.bind_keys([
-        KeyBinding::new(shortcut, FindInConversation, Some("Conversation")),
-        KeyBinding::new(
-            "escape",
-            CloseConversationFind,
-            Some("ConversationFindActive"),
-        ),
-        KeyBinding::new(
-            "enter",
-            NextConversationMatch,
-            Some("ConversationFind > Input"),
-        ),
-        KeyBinding::new(
-            "shift-enter",
-            PreviousConversationMatch,
-            Some("ConversationFind > Input"),
-        ),
-    ]);
-}
 
 impl ChatListView {
     pub(super) fn open_conversation_find(
@@ -395,22 +365,9 @@ impl ChatListView {
             .filter(|status| status.starts_with("Could not load session:"))
         {
             error.clone()
-        } else if self.find_query.trim().is_empty() {
-            "Type to find a message".to_owned()
-        } else if self.find_pending && self.find_results.is_empty() {
-            "Searching…".to_owned()
-        } else if self.find_results.is_empty() {
-            "No matching messages".to_owned()
-        } else if let Some(index) = selected {
-            format!(
-                "{} of {} matching messages",
-                index + 1,
-                self.find_results.len()
-            )
         } else {
-            format!(
-                "{} matching messages · Choose Previous or Next",
-                self.find_results.len()
+            threadlane_ui_kit::conversation_find_status(
+                &self.find_query, self.find_pending, self.find_results.len(), selected,
             )
         }
     }
@@ -421,86 +378,19 @@ impl ChatListView {
             .find_results
             .iter()
             .position(|hit| Some(&hit.message_id) == self.find_selected.as_ref());
-        let disabled = !self.find_ready(cx);
-        div()
-            .key_context("ConversationFind")
-            .flex()
-            .flex_col()
-            .gap_2()
-            .px_4()
-            .pl(self.header_left_padding)
-            .py_2()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div().flex_1().min_w(rems(10.)).child(
-                            Input::new(&self.find_input)
-                                .small()
-                                .aria_label("Find in conversation"),
-                        ),
-                    )
-                    .child(
-                        Button::new("conversation-find-previous")
-                            .debug_selector(|| "conversation-find-previous".into())
-                            .label("Previous")
-                            .small()
-                            .ghost()
-                            .accessibility_label("Previous matching message (Shift+Enter)")
-                            .tooltip("Previous matching message (Shift+Enter)")
-                            .disabled(disabled)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.navigate_conversation_find(true, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("conversation-find-next")
-                            .debug_selector(|| "conversation-find-next".into())
-                            .label("Next")
-                            .small()
-                            .ghost()
-                            .accessibility_label("Next matching message (Enter)")
-                            .tooltip("Next matching message (Enter)")
-                            .disabled(disabled)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.navigate_conversation_find(false, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("conversation-find-close")
-                            .debug_selector(|| "conversation-find-close".into())
-                            .label("Close")
-                            .small()
-                            .ghost()
-                            .accessibility_label("Close find in conversation (Escape)")
-                            .tooltip("Close find (Escape)")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.close_conversation_find(&CloseConversationFind, window, cx)
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .id("conversation-find-status")
-                    .role(Role::Status)
-                    .aria_label(status.clone())
-                    .text_sm()
-                    .child(status),
-            )
-            .children(selected.map(|index| {
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!(
-                        "Selected message: {}",
-                        self.find_results[index].excerpt
-                    ))
-            }))
-            .into_any_element()
+        threadlane_ui_kit::ConversationFindStrip::new(
+            &self.find_input, status, self.find_ready(cx),
+        )
+        .leading_inset(self.header_left_padding)
+        .excerpt(selected.map(|index| self.find_results[index].excerpt.clone().into()))
+        .render(cx.listener(|this, action, window, cx| {
+            use threadlane_ui_kit::ConversationFindAction;
+            match action {
+                ConversationFindAction::Previous => this.navigate_conversation_find(true, cx),
+                ConversationFindAction::Next => this.navigate_conversation_find(false, cx),
+                ConversationFindAction::Close => this.close_conversation_find(&CloseConversationFind, window, cx),
+            }
+        }), cx)
+        .into_any_element()
     }
 }

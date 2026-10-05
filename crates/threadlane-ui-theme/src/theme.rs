@@ -1,3 +1,4 @@
+#[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -5,6 +6,7 @@ use gpui::{px, App, Hsla, Pixels, SharedString};
 use gpui_component::{ActiveTheme, Theme, ThemeConfig, ThemeMode, ThemeRegistry};
 use serde::{Deserialize, Serialize};
 
+#[cfg(not(target_family = "wasm"))]
 use threadlane_project::global_threadlane_dir;
 
 const DEFAULT_THEME_NAME: &str = "Threadlane Dark";
@@ -15,6 +17,10 @@ const BUNDLED_THEMES: &str = include_str!("../themes/threadlane.json");
 /// coincident header content forms one continuous line. This is a physical
 /// platform-window boundary, hence fixed pixels rather than `rem`.
 pub const WINDOW_CONTROLS_CLEARANCE: Pixels = px(48.0);
+
+/// Leading header space, in rem, for window controls and the sidebar toggle
+/// when the sidebar is hidden. Shared by chat and compact inspector headers.
+pub const WINDOW_CONTROLS_CONTENT_INSET: f32 = 6.875;
 
 /// Shared reading width for user messages, relative to the interface font size.
 pub const USER_BUBBLE_MAX_WIDTH: f32 = 40.0;
@@ -42,22 +48,25 @@ struct ThemePreferences {
 pub fn init(cx: &mut App) {
     init_bundled(cx);
 
-    let themes_dir = global_threadlane_dir().join("themes");
-    if let Err(error) = std::fs::create_dir_all(&themes_dir) {
-        tracing::warn!(
-            "failed to create theme directory {}: {error}",
-            themes_dir.display()
-        );
-        return;
-    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let themes_dir = global_threadlane_dir().join("themes");
+        if let Err(error) = std::fs::create_dir_all(&themes_dir) {
+            tracing::warn!(
+                "failed to create theme directory {}: {error}",
+                themes_dir.display()
+            );
+            return;
+        }
 
-    if let Err(error) = ThemeRegistry::watch_dir(themes_dir, cx, |cx| {
-        // Registry reloads rebuild its map, so restore themes embedded in the binary.
-        register_bundled_themes(cx);
-        apply_saved_or_default_theme(cx);
-        cx.refresh_windows();
-    }) {
-        tracing::warn!("failed to watch Threadlane themes: {error}");
+        if let Err(error) = ThemeRegistry::watch_dir(themes_dir, cx, |cx| {
+            // Registry reloads rebuild its map, so restore themes embedded in the binary.
+            register_bundled_themes(cx);
+            apply_saved_or_default_theme(cx);
+            cx.refresh_windows();
+        }) {
+            tracing::warn!("failed to watch Threadlane themes: {error}");
+        }
     }
 }
 
@@ -65,6 +74,27 @@ pub fn init(cx: &mut App) {
 /// the `~/.threadlane/themes` directory watch — for platforms where that
 /// directory is unavailable or unwatchable (the iOS client).
 pub fn init_bundled(cx: &mut App) {
+    // Every host uses the same licensed font data, including GPUI Web, which
+    // has no access to native system fonts. Load every UI weight and its italic
+    // face so hierarchy does not depend on synthetic styles or system fallback.
+    // Custom theme typography can override it.
+    if let Err(error) = cx.text_system().add_fonts(vec![
+        std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf")),
+        std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-Medium.ttf")),
+        std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-SemiBold.ttf")),
+        std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-Bold.ttf")),
+        std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-Italic.ttf")),
+        std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-MediumItalic.ttf")),
+        std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-SemiBoldItalic.ttf")),
+        std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexSans-BoldItalic.ttf")),
+        std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf")),
+    ]) {
+        tracing::error!(?error, "failed to register bundled Threadlane fonts");
+    }
+    Theme::update(cx, |theme| {
+        theme.font_family = "IBM Plex Sans".into();
+        theme.mono_font_family = "JetBrains Mono".into();
+    });
     register_bundled_themes(cx);
     apply_saved_or_default_theme(cx);
 }
@@ -74,16 +104,25 @@ pub fn active_theme_name(cx: &App) -> SharedString {
 }
 
 pub fn apply_theme(theme_name: &str, cx: &mut App) -> bool {
-    let Some(theme) = find_theme(theme_name, cx) else {
+    if !preview_theme(theme_name, cx) {
         return false;
-    };
-
-    apply_theme_config(theme, cx);
+    }
+    #[cfg(not(target_family = "wasm"))]
     if let Err(error) = save_preferences(&ThemePreferences {
         selected_theme: Some(theme_name.to_string()),
     }) {
         tracing::warn!("failed to save selected theme: {error}");
     }
+    true
+}
+
+/// Apply a theme to this app instance without writing the user's preference.
+pub fn preview_theme(theme_name: &str, cx: &mut App) -> bool {
+    let Some(theme) = find_theme(theme_name, cx) else {
+        return false;
+    };
+
+    apply_theme_config(theme, cx);
     cx.refresh_windows();
     true
 }
@@ -129,17 +168,25 @@ fn apply_theme_config(theme: Rc<ThemeConfig>, cx: &mut App) {
     Theme::change(mode, None, cx);
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn preferences_path() -> PathBuf {
     global_threadlane_dir().join("gui").join("preferences.json")
 }
 
 fn load_preferences() -> ThemePreferences {
+    #[cfg(target_family = "wasm")]
+    {
+        // Browser previews use the bundled default and never access host preferences.
+        ThemePreferences::default()
+    }
+    #[cfg(not(target_family = "wasm"))]
     std::fs::read(preferences_path())
         .ok()
         .and_then(|contents| serde_json::from_slice(&contents).ok())
         .unwrap_or_default()
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn save_preferences(preferences: &ThemePreferences) -> Result<(), String> {
     let path = preferences_path();
     let parent = path
@@ -167,5 +214,24 @@ mod tests {
             .themes
             .iter()
             .any(|theme| theme.name == "Threadlane Light"));
+    }
+
+    #[test]
+    fn bundled_theme_switches_restore_shared_typography() {
+        let themes: ThemeSet = serde_json::from_str(BUNDLED_THEMES).unwrap();
+        let mut theme = gpui_component::Theme::default();
+        for config in themes.themes {
+            // A prior custom theme must not leak platform fonts or sizing into
+            // either bundled theme, including after a registry reload.
+            theme.font_family = ".SystemUIFont".into();
+            theme.mono_font_family = "monospace".into();
+            theme.font_size = gpui::px(20.);
+            theme.mono_font_size = gpui::px(18.);
+            theme.apply_config(&std::rc::Rc::new(config));
+            assert_eq!(theme.font_family, "IBM Plex Sans");
+            assert_eq!(theme.mono_font_family, "JetBrains Mono");
+            assert_eq!(theme.font_size, gpui::px(16.));
+            assert_eq!(theme.mono_font_size, gpui::px(13.));
+        }
     }
 }

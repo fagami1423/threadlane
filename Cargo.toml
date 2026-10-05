@@ -2,8 +2,10 @@
 members = [
     "crates/*",
     "extensions/*",
+    "crates/threadlane-ui-kit/examples/preview",
 ]
 resolver = "2"
+exclude = ["vendor/vt100"]
 
 [workspace.package]
 version = "0.1.40"
@@ -48,7 +50,7 @@ threadlane-ui-pairing = { version = "0.1.0", path = "crates/threadlane-ui-pairin
 threadlane-ui-right-panel = { version = "0.1.0", path = "crates/threadlane-ui-right-panel" }
 threadlane-ui-settings = { version = "0.1.0", path = "crates/threadlane-ui-settings" }
 threadlane-ui-sidebar = { version = "0.1.0", path = "crates/threadlane-ui-sidebar" }
-threadlane-ui-session = { version = "0.1.0", path = "crates/threadlane-ui-session" }
+threadlane-ui-kit = { version = "0.1.0", path = "crates/threadlane-ui-kit" }
 threadlane-ui-state = { version = "0.1.0", path = "crates/threadlane-ui-state" }
 threadlane-ui-terminal = { version = "0.1.0", path = "crates/threadlane-ui-terminal" }
 threadlane-ui-theme = { version = "0.1.0", path = "crates/threadlane-ui-theme" }
@@ -98,6 +100,8 @@ wasmi = "2.0"
 # Pinned to c22243e: window composition (longbridge/gpui-fast#30), which lets
 # the embedded browser's WKWebView sit under GPUI's overlay layer.
 [patch.crates-io]
+# Preserve terminal rows when Find or pane resizing changes its height.
+vt100 = { path = "vendor/vt100" }
 gpui-pre = { git = "https://github.com/longbridge/gpui-fast", rev = "c22243e1ddc97ac4ea81ddb18408e0074a78d820" }
 gpui-pre-platform = { git = "https://github.com/longbridge/gpui-fast", rev = "c22243e1ddc97ac4ea81ddb18408e0074a78d820" }
 gpui-pre-macros = { git = "https://github.com/longbridge/gpui-fast", rev = "c22243e1ddc97ac4ea81ddb18408e0074a78d820" }

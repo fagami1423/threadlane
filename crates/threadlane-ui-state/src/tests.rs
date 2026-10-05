@@ -4246,7 +4246,7 @@ fn inactive_session_stream_events_replay_after_switching_back() {
 async fn stream_drain_preserves_events_beyond_one_frame_budget() {
     use threadlane_daemon::next_event_batch_capped;
 
-    let mut state = AppState::load_from_registry(Vec::new());
+    let mut state = AppState::for_tests();
     state.messages_mut().clear();
     state.active_work_dir = Some(std::env::temp_dir().join("threadlane-stream-budget"));
     state.active_session_id = Some("session".into());
@@ -5134,7 +5134,7 @@ fn worktree_setup_failure_and_cancellation_are_scoped_to_the_session() {
     let project = root.path().to_path_buf();
     let id = "session_setup".to_string();
     let file = project.join(".threadlane/sessions/session_setup.jsonl");
-    let mut state = AppState::load_from_registry(Vec::new());
+    let mut state = AppState::for_tests();
     let setup = WorktreeSetup {
         project: project.clone(),
         session_id: id.clone(),

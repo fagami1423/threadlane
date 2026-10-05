@@ -201,17 +201,5 @@ pub fn pr_check_label(checks: &[PrCheckStatus]) -> String {
     }
 }
 
-pub fn pr_check_status_label(check: &PrCheckStatus) -> String {
-    let status = check
-        .conclusion
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(&check.status)
-        .replace('_', " ")
-        .to_ascii_lowercase();
-    let mut chars = status.trim().chars();
-    match chars.next() {
-        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
-        None => "Unknown".into(),
-    }
-}
+#[cfg(test)]
+pub use threadlane_ui_kit::github::pr_check_status_label;

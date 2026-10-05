@@ -2388,6 +2388,19 @@ dependencies = [
  "smallvec",
  "smol",
  "tracing",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "tree-sitter-css",
+ "tree-sitter-diff",
+ "tree-sitter-html",
+ "tree-sitter-javascript",
+ "tree-sitter-json",
+ "tree-sitter-md",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-toml-ng",
+ "tree-sitter-typescript",
+ "tree-sitter-yaml",
  "uuid",
  "windows 0.58.0",
 ]
@@ -2410,6 +2423,7 @@ source = "git+https://github.com/longbridge/gpui-kit?rev=201b55a431fb1b82a6047e9
 dependencies = [
  "gpui-base",
  "gpui-component",
+ "gpui-kit-assets",
  "gpui-pre",
  "gpui-pre-platform",
  "gpui-pre-web",
@@ -6539,6 +6553,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d08889ec5408683408db66ad89e0e1f93dff55c73a4ccc71c427d5b277ee47e6"
 
 [[package]]
+name = "streaming-iterator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b2231b7c3057d5e4ad0156fb3dc807d900806020c5ffa3ee6ff2c8c76fb8520"
+
+[[package]]
 name = "strict-num"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6956,7 +6976,7 @@ dependencies = [
  "objc2 0.6.4",
  "threadlane-client",
  "threadlane-protocol",
- "threadlane-ui-session",
+ "threadlane-ui-kit",
  "threadlane-ui-theme",
  "tokio",
  "url",
@@ -6986,14 +7006,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "threadlane-ui-session"
+name = "threadlane-ui-kit"
 version = "0.1.0"
 dependencies = [
  "gpui-component",
+ "gpui-kit",
  "gpui-kit-assets",
  "gpui-pre",
+ "serde_json",
+ "threadlane-automation",
  "threadlane-protocol",
  "threadlane-ui-theme",
+ "vt100",
 ]
 
 [[package]]
@@ -7345,6 +7369,146 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter"
+version = "0.26.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17ebdd3a5a7e28a1890b876fdbd0c3c0fe0a6336cffaa104f11b9f720c9daa29"
+dependencies = [
+ "cc",
+ "regex",
+ "regex-syntax",
+ "serde_json",
+ "streaming-iterator",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-bash"
+version = "0.23.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "329a4d48623ac337d42b1df84e81a1c9dbb2946907c102ca72db158c1964a52e"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-css"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ad6489794d41350d12a7fbe520e5199f688618f43aace5443980d1ddcf1b29e"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-diff"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfe1e5ca280a65dfe5ba4205c1bcc84edf486464fed315db53dee6da9a335889"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-html"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "261b708e5d92061ede329babaaa427b819329a9d427a1d710abb0f67bbef63ee"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-javascript"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf40bf599e0416c16c125c3cec10ee5ddc7d1bb8b0c60fa5c4de249ad34dc1b1"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-json"
+version = "0.24.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d727acca406c0020cffc6cf35516764f36c8e3dc4408e5ebe2cb35a947ec471"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-language"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
+
+[[package]]
+name = "tree-sitter-md"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2efd398be546456c814598ee56c0f51769a77241511b4a58077815d120afa882"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-python"
+version = "0.23.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d065aaa27f3aaceaf60c1f0e0ac09e1cb9eb8ed28e7bcdaa52129cffc7f4b04"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-rust"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "439e577dbe07423ec2582ac62c7531120dbfccfa6e5f92406f93dd271a120e45"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-toml-ng"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9adc2c898ae49730e857d75be403da3f92bb81d8e37a2f918a08dd10de5ebb1"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-typescript"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c5f76ed8d947a75cc446d5fccd8b602ebf0cde64ccf2ffa434d873d7a575eff"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-yaml"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53c223db85f05e34794f065454843b0668ebc15d240ada63e2b5939f43ce7c97"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "triomphe"
 version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7661,6 +7825,27 @@ checksum = "fb067e4cbd1ff067d1df46c9194b5de0e98efd2810bbc95c5d5e5f25a3231150"
 dependencies = [
  "cc",
  "libc",
+]
+
+[[package]]
+name = "vt100"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
+dependencies = [
+ "itoa",
+ "unicode-width",
+ "vte",
+]
+
+[[package]]
+name = "vte"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
+dependencies = [
+ "arrayvec",
+ "memchr",
 ]
 
 [[package]]

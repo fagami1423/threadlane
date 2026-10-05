@@ -146,12 +146,35 @@ pub fn tool_activity_summary(name: &str, arguments: &str) -> String {
 
 pub fn tool_activity_display_summary(summary: &str) -> String {
     let first_line = summary.lines().next().unwrap_or(summary).trim();
+    let first_line = [
+        ("run command: ", "Run"),
+        ("read file: ", "Read"),
+        ("list dir: ", "List"),
+        ("grep search: ", "Search"),
+        ("edit file hashline: ", "Edit"),
+    ]
+    .into_iter()
+    .find_map(|(prefix, label)| first_line.strip_prefix(prefix).map(|detail| format!("{label} · {detail}")))
+    .unwrap_or_else(|| first_line.to_string());
     if summary.lines().nth(1).is_some()
         && !first_line.ends_with('…')
         && !first_line.ends_with("...")
     {
         format!("{first_line} …")
     } else {
-        first_line.to_string()
+        first_line
+    }
+}
+
+#[cfg(test)]
+mod activity_display_tests {
+    #[test]
+    fn compact_activity_labels_preserve_details_and_unknown_tools() {
+        use super::tool_activity_display_summary as display;
+        assert_eq!(display("read file: src/main.rs"), "Read · src/main.rs");
+        assert_eq!(display("run command: cargo check\nmore output"), "Run · cargo check …");
+        assert_eq!(display("grep search: user_id"), "Search · user_id");
+        assert_eq!(display("custom tool: exact_value"), "custom tool: exact_value");
+        assert_eq!(display("Read · src/main.rs"), "Read · src/main.rs");
     }
 }

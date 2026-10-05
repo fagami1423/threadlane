@@ -5,7 +5,7 @@ edition = "2021"
 description = "Project/session sidebar for the Threadlane desktop app, including the shared BeginNewTask action"
 
 [dependencies]
-threadlane-ui-session.workspace = true
+threadlane-ui-kit.workspace = true
 gpui.workspace = true
 gpui-component.workspace = true
 rfd.workspace = true

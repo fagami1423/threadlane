@@ -8,16 +8,17 @@ mod search;
 mod links;
 #[cfg(test)]
 mod links_tests;
+#[cfg(test)]
+mod resize_tests;
 
-use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
+use gpui_component::input::{InputEvent, InputState};
+use gpui_component::menu::{ContextMenuExt, PopupMenu};
 use links::{visible_links, TerminalLink};
 pub use links::is_web_url;
-use gpui_component::ThemeMode;
-use gpui_component::{ActiveTheme, Disableable, ElementExt, Icon, IconName, Sizable, WindowExt};
+use gpui_component::WindowExt;
+use threadlane_ui_kit::{self as kit, TerminalFindAction, TerminalFindStatus};
+pub use threadlane_ui_kit::{CloseTerminalFind, FindInTerminalOutput, NextTerminalMatch, PreviousTerminalMatch, TerminalLinkDestination as LinkDestination};
 
 use search::{
     cue_row, next_find_match, reveal_offset, scan_retained_output, TerminalSearchHit,
@@ -40,49 +41,10 @@ const TERMINAL_FIND_DEBOUNCE: Duration = Duration::from_millis(120);
 /// keeps arriving; scans never run when find is closed.
 const TERMINAL_FIND_RESCAN_INTERVAL: Duration = Duration::from_millis(250);
 
-actions!(
-    threadlane_terminal,
-    [
-        FindInTerminalOutput,
-        CloseTerminalFind,
-        NextTerminalMatch,
-        PreviousTerminalMatch
-    ]
-);
-
-/// Registers the terminal's focus-scoped keybindings: Cmd+F (macOS) or
-/// Ctrl+Shift+F opens find from the focused terminal, Escape closes it, and
-/// Enter/Shift+Enter navigate while the find input is focused.
+/// Register shared terminal search shortcuts; the host retains worker lifecycle.
 pub fn init(cx: &mut App) {
-    let find_shortcut = if cfg!(target_os = "macos") {
-        "cmd-f"
-    } else {
-        // Ctrl+F stays with the shell: readline and TUI programs own it.
-        "ctrl-shift-f"
-    };
-    cx.bind_keys([
-        KeyBinding::new(find_shortcut, FindInTerminalOutput, Some("Terminal")),
-        KeyBinding::new("escape", CloseTerminalFind, Some("TerminalFind")),
-        KeyBinding::new("enter", NextTerminalMatch, Some("TerminalFind > Input")),
-        KeyBinding::new(
-            "shift-enter",
-            PreviousTerminalMatch,
-            Some("TerminalFind > Input"),
-        ),
-    ]);
+    kit::init_terminal_find(cx);
 }
-
-/// Terminal text metrics. The painted glyph size, row height, hit-testing,
-/// and resize math must all agree; they share these constants so a font
-/// change cannot drift click-to-select away from what is painted.
-/// Row height = selected font size × selected line height.
-/// The screen container uses `p_3`, so the content inset is 12px per side.
-const TERMINAL_FONT_SIZE: f32 = 13.0;
-const TERMINAL_LINE_HEIGHT: f32 = 1.35;
-const TERMINAL_COMPACT_LINE_HEIGHT: f32 = 1.15;
-const TERMINAL_CONTENT_INSET: f32 = 12.0;
-/// Fallback advance width until the text system measures `.ZedMono`.
-const TERMINAL_CELL_WIDTH_FALLBACK: f32 = 7.8;
 
 fn terminal_frame_policy(saturated: bool) -> (Duration, usize) {
     if saturated {
@@ -672,48 +634,12 @@ fn terminal_host_queries(tail: &mut Vec<u8>, bytes: &[u8]) -> Vec<(usize, HostQu
     queries
 }
 
-fn selection_bounds(
-    anchor: (u16, u16),
-    head: (u16, u16),
-    cols: u16,
-) -> Option<((u16, u16), (u16, u16))> {
-    if anchor == head {
-        return None;
-    }
-    if head < anchor {
-        Some((
-            head,
-            (
-                anchor.0,
-                anchor.1.saturating_add(1).min(cols.saturating_sub(1)),
-            ),
-        ))
-    } else {
-        Some((anchor, head))
-    }
-}
-
-fn selection_present(
-    anchor: Option<(u16, u16)>,
-    head: Option<(u16, u16)>,
-    cols: u16,
-) -> bool {
-    match (anchor, head) {
-        (Some(anchor), Some(head)) => selection_bounds(anchor, head, cols).is_some(),
-        _ => false,
-    }
-}
-
-fn selected_excerpt(
-    screen: &vt100::Screen,
-    anchor: Option<(u16, u16)>,
-    head: Option<(u16, u16)>,
-    cols: u16,
-) -> Option<String> {
-    let (anchor, head) = (anchor?, head?);
-    let (start, end) = selection_bounds(anchor, head, cols)?;
-    Some(screen.contents_between(start.0, start.1, end.0, end.1))
-}
+use threadlane_ui_kit::{
+    terminal_selection_bounds as selection_bounds,
+    terminal_selection_present as selection_present,
+    terminal_selected_excerpt as selected_excerpt,
+    TERMINAL_FONT_SIZE, TERMINAL_CELL_WIDTH_FALLBACK,
+};
 
 fn should_paint_cursor(is_focused: bool, terminal_hides_cursor: bool, blink_visible: bool) -> bool {
     is_focused && !terminal_hides_cursor && blink_visible
@@ -768,12 +694,6 @@ pub struct SelectionStatus {
     pub excerpt_len: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LinkDestination {
-    Threadlane,
-    DefaultBrowser,
-}
-
 #[derive(Clone, Debug)]
 pub struct OpenTerminalLink {
     pub url: String,
@@ -812,6 +732,7 @@ pub struct TerminalView {
     selection_anchor: Option<(u16, u16)>,
     selection_head: Option<(u16, u16)>,
     cell_width: f32,
+    content_inset: f32,
     font_size: f32,
     compact: bool,
     translucent_background: bool,
@@ -914,6 +835,7 @@ impl TerminalView {
             selection_anchor: None,
             selection_head: None,
             cell_width: TERMINAL_CELL_WIDTH_FALLBACK,
+            content_inset: 12.0, // Default p_3 until the first resolved window frame.
             font_size: TERMINAL_FONT_SIZE,
             compact: false,
             translucent_background: false,
@@ -1373,17 +1295,7 @@ impl TerminalView {
     }
 
     fn link_at(&self, position: Point<Pixels>) -> Option<&TerminalLink> {
-        let bounds = self.screen_bounds?;
-        let x = (position.x - bounds.left()).as_f32() - TERMINAL_CONTENT_INSET;
-        let y = (position.y - bounds.top()).as_f32() - TERMINAL_CONTENT_INSET;
-        // Unlike selection drags, links must not clamp padding to a nearby cell.
-        if !bounds.contains(&position) || x < 0.0 || y < 0.0
-            || x >= f32::from(self.cols) * self.cell_width
-            || y >= f32::from(self.rows) * self.row_height()
-        {
-            return None;
-        }
-        let cell = self.cell_at(position)?;
+        let cell = self.grid_geometry()?.link_cell_at(position)?;
         self.links.iter().find(|link| link.cells.contains(&cell))
     }
 
@@ -1405,41 +1317,17 @@ impl TerminalView {
         terminal: WeakEntity<Self>,
         epoch: u64,
     ) -> PopupMenu {
-        let mut menu = menu;
-        if cfg!(target_os = "macos") {
-            let url = url.clone();
-            let terminal = terminal.clone();
-            menu = menu.item(
-                PopupMenuItem::new(format!("Open in Threadlane browser — {url}")).on_click(
-                    move |_, _, cx| {
-                        let _ = terminal.update(cx, |terminal, cx| {
-                            terminal.activate_link(
-                                url.clone(),
-                                LinkDestination::Threadlane,
-                                epoch,
-                                cx,
-                            );
-                        });
-                    },
-                ),
-            );
-        }
-        menu.item(
-            PopupMenuItem::new(format!("Open in default browser — {url}")).on_click(
-                move |_, _, cx| {
-                    let _ = terminal.update(cx, |terminal, cx| {
-                        terminal.activate_link(
-                            url.clone(),
-                            LinkDestination::DefaultBrowser,
-                            epoch,
-                            cx,
-                        );
-                    });
-                },
-            ),
+        kit::terminal_link_commands(
+            menu,
+            url,
+            cfg!(target_os = "macos"),
+            move |url, destination, _, cx| {
+                let _ = terminal.update(cx, |terminal, cx| {
+                    terminal.activate_link(url, destination, epoch, cx)
+                });
+            },
         )
     }
-
     pub fn retry_link(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
         self.retry_url = Some(url);
         self.open_links(window, cx);
@@ -1450,37 +1338,19 @@ impl TerminalView {
         self.focus_handle.focus(window, cx);
         let terminal = cx.weak_entity();
         let epoch = self.link_epoch;
+        let picker = kit::TerminalLinkPicker::new(self.links.iter().map(|link| link.url.clone()))
+            .retry_url(self.retry_url.clone())
+            .in_app_browser(cfg!(target_os = "macos"))
+            .full_screen(self.alt_screen);
         let menu = PopupMenu::build(window, cx, |menu, _, _| {
-            let mut menu = menu
-                .label("Links in visible output")
-                .action_context(self.focus_handle.clone())
-                .scrollable(true);
-            if self.alt_screen {
-                return menu.label("Links unavailable in full-screen terminal applications");
-            }
-            if cfg!(not(any(
-                target_os = "macos",
-                target_os = "linux",
-                target_os = "windows"
-            ))) {
-                menu = menu.label("Threadlane browser is not available on this platform");
-            }
-            if let Some(url) = &self.retry_url {
-                menu = menu.label("Navigation could not start — retry or open externally");
-                menu = Self::link_commands(menu, url.clone(), terminal.clone(), epoch).separator();
-            }
-            if self.links.is_empty() && self.retry_url.is_none() {
-                return menu
-                    .label("No web links in visible output")
-                    .label("Scroll older output into view to find links");
-            }
-            let mut seen = std::collections::HashSet::new();
-            for link in &self.links {
-                if seen.insert(&link.url) {
-                    menu = Self::link_commands(menu, link.url.clone(), terminal.clone(), epoch);
-                }
-            }
-            menu
+            picker.render(
+                menu.action_context(self.focus_handle.clone()),
+                move |url, destination, _, cx| {
+                    let _ = terminal.update(cx, |terminal, cx| {
+                        terminal.activate_link(url, destination, epoch, cx)
+                    });
+                },
+            )
         });
         self.link_menu_subscription = Some(cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
             this.link_menu_focus = None;
@@ -1492,7 +1362,6 @@ impl TerminalView {
         self.link_menu = Some(menu);
         cx.notify();
     }
-
     fn screen_text(&self) -> String {
         let mut text = self.screen.contents();
         if let Some(status) = &self.status {
@@ -1504,30 +1373,19 @@ impl TerminalView {
         text
     }
 
-    fn line_height(&self) -> f32 {
-        if self.compact {
-            TERMINAL_COMPACT_LINE_HEIGHT
-        } else {
-            TERMINAL_LINE_HEIGHT
-        }
+    fn row_height(&self) -> f32 {
+        self.font_size * kit::terminal_line_height(self.compact)
     }
 
-    fn row_height(&self) -> f32 {
-        self.font_size * self.line_height()
+    fn grid_geometry(&self) -> Option<kit::TerminalGridGeometry> {
+        Some(kit::TerminalGridGeometry::new(
+            self.screen_bounds?, (self.rows, self.cols), self.cell_width,
+            self.row_height(), self.content_inset,
+        ))
     }
 
     fn cell_at(&self, position: Point<Pixels>) -> Option<(u16, u16)> {
-        let bounds = self.screen_bounds?;
-        let x = ((position.x - bounds.left()).as_f32() - TERMINAL_CONTENT_INSET) / self.cell_width;
-        let y = ((position.y - bounds.top()).as_f32() - TERMINAL_CONTENT_INSET) / self.row_height();
-        Some((
-            y.floor()
-                .max(0.0)
-                .min(f32::from(self.rows.saturating_sub(1))) as u16,
-            x.floor()
-                .max(0.0)
-                .min(f32::from(self.cols.saturating_sub(1))) as u16,
-        ))
+        self.grid_geometry()?.cell_at(position)
     }
 
     fn selected_text(&self) -> Option<String> {
@@ -1668,20 +1526,9 @@ impl TerminalView {
         self.selection_head = self.cell_at(event.position).or(self.selection_head);
         cx.notify();
     }
-    fn is_cell_selected(&self, row: u16, col: u16) -> bool {
-        let (Some(anchor), Some(head)) = (self.selection_anchor, self.selection_head) else {
-            return false;
-        };
-        let Some((start, end)) = selection_bounds(anchor, head, self.cols) else {
-            return false;
-        };
-        let pos = (row, col);
-        pos >= start && pos <= end
-    }
-
     fn select_all(&mut self, cx: &mut Context<Self>) {
         self.selection_anchor = Some((0, 0));
-        self.selection_head = Some((self.rows.saturating_sub(1), self.cols.saturating_sub(1)));
+        self.selection_head = Some((self.rows.saturating_sub(1), self.cols));
         cx.notify();
     }
 
@@ -1894,27 +1741,20 @@ impl TerminalView {
         cx.stop_propagation();
     }
 
-    fn find_status_text(&self) -> String {
+    fn find_status(&self) -> TerminalFindStatus {
         let Some(find) = &self.find else {
-            return String::new();
+            return TerminalFindStatus::Empty;
         };
         if self.alt_screen {
-            "Find unavailable in full-screen terminal applications".to_owned()
+            TerminalFindStatus::Unavailable
         } else if find.failed {
-            "Couldn't search terminal output".to_owned()
+            TerminalFindStatus::Failed
         } else if find.query.is_empty() {
-            "Type to find output".to_owned()
+            TerminalFindStatus::Empty
         } else if find.pending {
-            "Searching…".to_owned()
-        } else if find.hits.is_empty() {
-            "No matching lines in retained output".to_owned()
-        } else if let Some(index) = find.selected {
-            // `hits` holds the newest descriptors when truncated, so a
-            // visible index maps to a global match position.
-            let position = find.total - find.hits.len() + index + 1;
-            format!("{position} of {} matching lines", find.total)
+            TerminalFindStatus::Searching
         } else {
-            format!("{} matching lines · Choose Previous or Next", find.total)
+            TerminalFindStatus::results(find.total, find.hits.len(), find.selected)
         }
     }
 
@@ -1922,213 +1762,31 @@ impl TerminalView {
         let Some(find) = &self.find else {
             return div().into_any_element();
         };
-        let theme = cx.theme();
-        let status = self.find_status_text();
-        let nav_disabled =
-            find.pending || find.failed || find.hits.is_empty() || self.alt_screen;
-        div()
-            .key_context("TerminalFind")
-            .flex()
-            .flex_col()
-            .gap_1p5()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div().flex_1().min_w(rems(10.)).child(
-                            Input::new(&find.input)
-                                .small()
-                                .aria_label("Find in terminal output"),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .px_2()
-                            .py_0p5()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(theme.border)
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child("Match case"),
-                    )
-                    .child(
-                        Button::new("terminal-find-previous")
-                            .debug_selector(|| "terminal-find-previous".into())
-                            .label("Previous")
-                            .small()
-                            .ghost()
-                            .accessibility_label("Previous matching line (Shift+Enter)")
-                            .tooltip("Previous matching line (Shift+Enter)")
-                            .disabled(nav_disabled)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.navigate_find(true, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("terminal-find-next")
-                            .debug_selector(|| "terminal-find-next".into())
-                            .label("Next")
-                            .small()
-                            .ghost()
-                            .accessibility_label("Next matching line (Enter)")
-                            .tooltip("Next matching line (Enter)")
-                            .disabled(nav_disabled)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.navigate_find(false, cx)
-                            })),
-                    )
-                    .children(find.failed.then(|| {
-                        Button::new("terminal-find-retry")
-                            .label("Retry")
-                            .small()
-                            .ghost()
-                            .accessibility_label("Retry terminal output search")
-                            .tooltip("Retry terminal output search")
-                            .on_click(cx.listener(|this, _, _, cx| this.retry_find(cx)))
-                    }))
-                    .children((self.scrollback_offset > 0).then(|| {
-                        Button::new("terminal-find-jump-to-live")
-                            .label("Jump to live output")
-                            .small()
-                            .ghost()
-                            .accessibility_label("Jump to live output")
-                            .tooltip("Jump to live output")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.scroll_to_bottom(cx)
-                            }))
-                    }))
-                    .child(
-                        Button::new("terminal-find-close")
-                            .debug_selector(|| "terminal-find-close".into())
-                            .label("Close")
-                            .small()
-                            .ghost()
-                            .accessibility_label("Close find in terminal output (Escape)")
-                            .tooltip("Close find (Escape)")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.close_find(&CloseTerminalFind, window, cx)
-                            })),
-                    ),
+        let owner = cx.weak_entity();
+        kit::TerminalFindStrip::new(&find.input, self.find_status())
+            .scrolled(self.scrollback_offset > 0)
+            .excerpt(
+                find.selected
+                    .and_then(|index| find.hits.get(index))
+                    .map(|hit| hit.excerpt.clone().into()),
             )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .id("terminal-find-status")
-                            .role(Role::Status)
-                            .aria_label(status.clone())
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(status),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child("Retained output · current terminal"),
-                    ),
+            .render(
+                move |action, window, cx| {
+                    let _ = owner.update(cx, |host, cx| match action {
+                        TerminalFindAction::Previous => host.navigate_find(true, cx),
+                        TerminalFindAction::Next => host.navigate_find(false, cx),
+                        TerminalFindAction::Retry => host.retry_find(cx),
+                        TerminalFindAction::JumpToLive => host.scroll_to_bottom(cx),
+                        TerminalFindAction::Close => {
+                            host.close_find(&CloseTerminalFind, window, cx)
+                        }
+                    });
+                },
+                cx,
             )
-            .children(find.selected.and_then(|index| {
-                find.hits.get(index).map(|hit| {
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(format!("Match: {}", hit.excerpt))
-                })
-            }))
             .into_any_element()
     }
-}
 
-fn rgb_to_hsla(r: u8, g: u8, b: u8) -> Hsla {
-    let r = r as f32 / 255.0;
-    let g = g as f32 / 255.0;
-    let b = b as f32 / 255.0;
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let l = (max + min) / 2.0;
-    if (max - min).abs() < 1e-4 {
-        return hsla(0.0, 0.0, l, 1.0);
-    }
-    let d = max - min;
-    let s = if l > 0.5 {
-        d / (2.0 - max - min)
-    } else {
-        d / (max + min)
-    };
-    let h = if (max - r).abs() < 1e-4 {
-        ((g - b) / d + if g < b { 6.0 } else { 0.0 }) / 6.0
-    } else if (max - g).abs() < 1e-4 {
-        ((b - r) / d + 2.0) / 6.0
-    } else {
-        ((r - g) / d + 4.0) / 6.0
-    };
-    hsla(h, s, l, 1.0)
-}
-
-fn ansi_index_to_hsla(idx: u8, is_light_theme: bool) -> Hsla {
-    // The base palette is tuned for dark backgrounds. On light themes the
-    // achromatic entries are inverted and bright chromatic colors are darkened
-    // so they stay legible against a light terminal background.
-    let adjust = |color: Hsla| -> Hsla {
-        if is_light_theme {
-            hsla(color.h, color.s, (color.l - 0.18).max(0.0), color.a)
-        } else {
-            color
-        }
-    };
-    match idx {
-        // Standard 16 ANSI colors
-        0 => hsla(0.0, 0.0, if is_light_theme { 0.95 } else { 0.15 }, 1.0), // Black
-        1 => adjust(hsla(0.0, 0.75, 0.60, 1.0)),                            // Red
-        2 => adjust(hsla(0.35, 0.65, 0.55, 1.0)),                           // Green
-        3 => adjust(hsla(0.12, 0.80, 0.60, 1.0)),                           // Yellow
-        4 => adjust(hsla(0.60, 0.75, 0.65, 1.0)),                           // Blue
-        5 => adjust(hsla(0.82, 0.65, 0.65, 1.0)),                           // Magenta
-        6 => adjust(hsla(0.50, 0.75, 0.60, 1.0)),                           // Cyan
-        7 => hsla(0.0, 0.0, if is_light_theme { 0.25 } else { 0.85 }, 1.0), // White (Dim)
-        8 => hsla(0.0, 0.0, if is_light_theme { 0.55 } else { 0.45 }, 1.0), // Bright Black (Gray)
-        9 => adjust(hsla(0.0, 0.85, 0.70, 1.0)),                            // Bright Red
-        10 => adjust(hsla(0.35, 0.75, 0.65, 1.0)),                          // Bright Green
-        11 => adjust(hsla(0.12, 0.90, 0.70, 1.0)),                          // Bright Yellow
-        12 => adjust(hsla(0.60, 0.85, 0.75, 1.0)),                          // Bright Blue
-        13 => adjust(hsla(0.82, 0.75, 0.75, 1.0)),                          // Bright Magenta
-        14 => adjust(hsla(0.50, 0.85, 0.70, 1.0)),                          // Bright Cyan
-        15 => hsla(0.0, 0.0, if is_light_theme { 0.05 } else { 0.98 }, 1.0), // Bright White
-        // 216 Color cube: 16..=231
-        16..=231 => {
-            let n = idx - 16;
-            let levels = [0, 95, 135, 175, 215, 255];
-            let b = levels[(n % 6) as usize];
-            let g = levels[((n / 6) % 6) as usize];
-            let r = levels[(n / 36) as usize];
-            rgb_to_hsla(r, g, b)
-        }
-        // 24 Grayscale ramp: 232..=255
-        232..=255 => {
-            let gray = (idx - 232) as f32 / 23.0 * 0.9 + 0.05;
-            hsla(0.0, 0.0, gray, 1.0)
-        }
-    }
-}
-
-fn ansi_to_hsla(color: vt100::Color, default_fg: Hsla, is_light_theme: bool) -> Option<Hsla> {
-    match color {
-        vt100::Color::Default => Some(default_fg),
-        vt100::Color::Idx(idx) => Some(ansi_index_to_hsla(idx, is_light_theme)),
-        vt100::Color::Rgb(r, g, b) => Some(rgb_to_hsla(r, g, b)),
-    }
 }
 
 impl Focusable for TerminalView {
@@ -2144,27 +1802,13 @@ impl Render for TerminalView {
                 self.focus_handle.focus(window, cx);
             }
         }
-        let theme = cx.theme().colors;
-        let is_light_theme = cx.theme().mode == ThemeMode::Light;
         let terminal_resize = cx.entity().clone();
         let terminal_actions = cx.entity().clone();
         let is_focused = self.focus_handle.is_focused(window);
-        let font_id = window.text_system().resolve_font(&font(".ZedMono"));
-        let measured_cell_width = window
-            .text_system()
-            .layout_width(font_id, px(self.font_size), '0')
-            .as_f32();
-        if measured_cell_width > 0.0 {
-            self.cell_width = measured_cell_width;
-        }
-        let cell_width = self.cell_width;
-        let font_size = self.font_size;
-        let line_height = self.line_height();
-        let row_height = self.row_height();
-
-        let screen = &self.screen;
-        let (cursor_row, cursor_col) = screen.cursor_position();
-        let hide_cursor = screen.hide_cursor();
+        let metrics = kit::TerminalTextMetrics::measure(self.font_size, self.compact, window, cx);
+        self.cell_width = metrics.cell_width();
+        self.content_inset = metrics.inset(window);
+        let row_height = metrics.row_height();
 
         // The selected find hit paints as a row-level background cue: it
         // sits behind the per-cell ANSI colors and is never part of copied
@@ -2174,299 +1818,75 @@ impl Render for TerminalView {
             cue_row(hit, self.scrollback_len, self.scrollback_offset, self.rows)
         });
 
-        let mut screen_lines = Vec::with_capacity(self.rows as usize);
-        let link_cells: std::collections::HashMap<_, _> = self
-            .links
-            .iter()
-            .enumerate()
-            .flat_map(|(index, link)| link.cells.iter().map(move |cell| (*cell, index)))
-            .collect();
-        for row in 0..self.rows {
-            let mut row_spans = Vec::new();
-            let mut current_span_text = String::new();
-            let mut current_style: Option<(Option<Hsla>, Option<Hsla>, bool, bool, Option<usize>)> =
-                None;
-
-            // Find the rightmost non-empty column or cursor column
-            let mut max_col = 0;
-            for col in (0..self.cols).rev() {
-                if let Some(cell) = screen.cell(row, col) {
-                    let contents = cell.contents();
-                    if (!contents.is_empty() && contents != " ")
-                        || (row == cursor_row && col == cursor_col)
-                    {
-                        max_col = col + 1;
-                        break;
-                    }
+        let screen_grid = kit::TerminalGrid::new(
+            ("pty-terminal-screen", self.link_epoch as usize),
+            &self.screen,
+            metrics.clone(),
+        )
+        .selection(self.selection_anchor, self.selection_head)
+        .cursor(should_paint_cursor(
+            is_focused,
+            self.screen.hide_cursor(),
+            self.cursor_visible,
+        ))
+        .find_cue(find_cue_row)
+        .links(
+            self.links
+                .iter()
+                .map(|link| (link.url.as_str(), link.cells.as_slice())),
+        )
+        .on_layout(move |bounds, window, cx| {
+            let (rows, cols) = metrics.grid_size(bounds.size, window);
+            let inset = metrics.inset(window);
+            terminal_resize.update(cx, |terminal, cx| {
+                if terminal.screen_bounds != Some(bounds) {
+                    terminal.link_press = None;
                 }
-            }
-
-            for col in 0..max_col {
-                let is_cursor = should_paint_cursor(is_focused, hide_cursor, self.cursor_visible)
-                    && row == cursor_row
-                    && col == cursor_col;
-                let is_selected = self.is_cell_selected(row, col);
-
-                if let Some(cell) = screen.cell(row, col) {
-                    if cell.is_wide_continuation() {
-                        continue;
-                    }
-                    let cell_content = cell.contents();
-                    let char_str = if cell_content.is_empty() {
-                        " "
-                    } else {
-                        cell_content
-                    };
-
-                    let fg = if is_selected {
-                        Some(theme.accent_foreground)
-                    } else if is_cursor {
-                        Some(theme.background)
-                    } else {
-                        ansi_to_hsla(cell.fgcolor(), theme.foreground, is_light_theme)
-                    };
-
-                    let bg = if is_selected {
-                        Some(theme.accent)
-                    } else if is_cursor {
-                        Some(theme.primary)
-                    } else {
-                        match cell.bgcolor() {
-                            vt100::Color::Default => None,
-                            other => ansi_to_hsla(other, theme.background, is_light_theme),
-                        }
-                    };
-
-                    let link = link_cells.get(&(row, col)).copied();
-                    let style = (fg, bg, cell.bold(), is_cursor, link);
-
-                    if current_style == Some(style) {
-                        current_span_text.push_str(char_str);
-                    } else {
-                        if let Some((cfg, cbg, bold, _cur, link)) = current_style {
-                            if !current_span_text.is_empty() {
-                                let mut span = div().child(current_span_text.clone());
-                                if let Some(c) = cfg {
-                                    span = span.text_color(c);
-                                }
-                                if let Some(c) = cbg {
-                                    span = span.bg(c);
-                                }
-                                if bold {
-                                    span = span.font_weight(FontWeight::BOLD);
-                                }
-                                if let Some(index) = link {
-                                    let gesture = if cfg!(target_os = "macos") {
-                                        "Cmd-click to open in Threadlane browser"
-                                    } else {
-                                        "Ctrl-click to open in default browser"
-                                    };
-                                    let tooltip = format!("{} — {gesture}", self.links[index].url);
-                                    span = span.underline().cursor_pointer();
-                                    row_spans.push(
-                                        span.id((
-                                            "terminal-link",
-                                            row as usize * self.cols as usize + col as usize,
-                                        ))
-                                        .tooltip(move |window, cx| {
-                                            gpui_component::tooltip::Tooltip::new(tooltip.clone())
-                                                .build(window, cx)
-                                        })
-                                        .into_any_element(),
-                                    );
-                                } else {
-                                    row_spans.push(span.into_any_element());
-                                }
-                            }
-                        }
-                        current_span_text.clear();
-                        current_span_text.push_str(char_str);
-                        current_style = Some(style);
-                    }
-                }
-            }
-
-            if let Some((cfg, cbg, bold, _cur, link)) = current_style {
-                if !current_span_text.is_empty() {
-                    let mut span = div().child(current_span_text);
-                    if let Some(c) = cfg {
-                        span = span.text_color(c);
-                    }
-                    if let Some(c) = cbg {
-                        span = span.bg(c);
-                    }
-                    if bold {
-                        span = span.font_weight(FontWeight::BOLD);
-                    }
-                    if let Some(index) = link {
-                        let gesture = if cfg!(target_os = "macos") {
-                            "Cmd-click to open in Threadlane browser"
-                        } else {
-                            "Ctrl-click to open in default browser"
-                        };
-                        let tooltip = format!("{} — {gesture}", self.links[index].url);
-                        span = span.underline().cursor_pointer();
-                        row_spans.push(
-                            span.id(("terminal-link-end", row as usize))
-                                .tooltip(move |window, cx| {
-                                    gpui_component::tooltip::Tooltip::new(tooltip.clone())
-                                        .build(window, cx)
-                                })
-                                .into_any_element(),
-                        );
-                    } else {
-                        row_spans.push(span.into_any_element());
-                    }
-                }
-            }
-
-            if row_spans.is_empty() {
-                row_spans.push(div().child(" ").into_any_element());
-            }
-
-            let find_cue = find_cue_row == Some(row);
-            screen_lines.push(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .h(px(row_height))
-                    .when(find_cue, |row| row.bg(theme.accent.opacity(0.18)))
-                    .children(row_spans),
-            );
-        }
+                terminal.screen_bounds = Some(bounds);
+                terminal.content_inset = inset;
+                terminal.resize(rows, cols, cx);
+            });
+        })
+        .render(cx);
 
         let status_banner = self.status.as_ref().map(|status_text| {
-            let restart_handle = terminal_actions.clone();
+            let restart = terminal_actions.clone();
             let is_error = status_text.starts_with("Terminal read failed")
                 || status_text.starts_with("Unable to start terminal");
-            let status_color = if is_error {
-                theme.danger
-            } else {
-                theme.warning
-            };
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .px_3()
-                .py_2()
-                .bg(status_color.opacity(0.1))
-                .border_1()
-                .border_color(status_color.opacity(0.3))
-                .rounded_md()
-                .mt_2()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            Icon::new(if is_error {
-                                IconName::CircleX
-                            } else {
-                                IconName::Info
-                            })
-                            .xsmall()
-                            .text_color(status_color),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.foreground)
-                                .child(status_text.clone()),
-                        ),
-                )
-                .child(
-                    Button::new("terminal-restart-banner-btn")
-                        .label("Restart shell")
-                        .icon(IconName::Redo)
-                        .ghost()
-                        .xsmall()
-                        .on_click(move |_event, _window, cx| {
-                            restart_handle.update(cx, |t, cx| t.restart(cx));
-                        }),
-                )
-        });
-
-        let autoscroll_pill = if self.scrollback_offset > 0 {
-            let scroll_to_bottom_handle = terminal_actions.clone();
-            Some(
-                // Lifted clear of the last output lines with a scrimmed,
-                // outlined pill so it never covers PTY text nor mis-taps
-                // during selection.
-                div()
-                    .absolute()
-                    .bottom_7()
-                    .right_3()
-                    .rounded_full()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.title_bar)
-                    .shadow_md()
-                    .child(
-                        Button::new("terminal-autoscroll-pill")
-                            .label(format!(
-                                "↓ Scroll to Bottom ({} lines up)",
-                                self.scrollback_offset
-                            ))
-                            .icon(IconName::ChevronDown)
-                            .tooltip("Jump to live output")
-                            .xsmall()
-                            .ghost()
-                            .on_click(move |_event, _window, cx| {
-                                scroll_to_bottom_handle.update(cx, |t, cx| t.scroll_to_bottom(cx));
-                            }),
-                    ),
+            kit::terminal_status(
+                status_text.clone(),
+                is_error,
+                move |_, cx| {
+                    restart.update(cx, |view, cx| view.restart(cx));
+                },
+                cx,
             )
-        } else {
-            None
-        };
+        });
+        let autoscroll_pill = (self.scrollback_offset > 0).then(|| {
+            let terminal = terminal_actions.clone();
+            kit::terminal_live_output(
+                self.scrollback_offset,
+                move |_, cx| {
+                    terminal.update(cx, |view, cx| view.scroll_to_bottom(cx));
+                },
+                cx,
+            )
+        });
 
         let find_strip = self.find.as_ref().map(|_| self.render_find_strip(cx));
 
-        div()
-            .id("pty-terminal-root")
+        kit::terminal_output_surface("pty-terminal-root", self.translucent_background, cx)
             .key_context("Terminal")
-            .size_full()
-            .min_h_0()
-            .flex()
-            .flex_col()
             .on_action(cx.listener(Self::open_find))
             .on_action(cx.listener(Self::close_find))
             .on_action(cx.listener(Self::next_terminal_match))
             .on_action(cx.listener(Self::previous_terminal_match))
-            .bg(theme.background.opacity(if self.translucent_background {
-                0.92
-            } else {
-                1.0
-            }))
-            .rounded_md()
-            .border_1()
-            .border_color(gpui::transparent_black())
-            .focus(|style| style.border_color(theme.ring))
             .track_focus(&self.focus_handle)
-            .role(Role::Terminal)
             .on_key_down(cx.listener(Self::key_down))
             .children(find_strip)
-            .children(
-                self.link_menu
-                    .as_ref()
-                    .map(|menu| deferred(anchored().child(menu.clone())).with_priority(1)),
-            )
+            .children(self.link_menu.as_ref().map(kit::terminal_link_overlay))
             .child(
-                div()
-                    .id(("pty-terminal-screen", self.link_epoch as usize))
-                    .relative()
-                    .flex_1()
-                    .min_h_0()
-                    .p_3()
-                    .font_family(".ZedMono")
-                    // Raster-bound: glyph size must match row_height
-                    // and the measured cell width; not a type-scale step.
-                    .text_size(px(font_size))
-                    .line_height(relative(line_height))
-                    .cursor_text()
+                screen_grid
                     .on_scroll_wheel(cx.listener(
                         move |this, event: &ScrollWheelEvent, _window, cx| {
                             let delta = match event.delta {
@@ -2478,21 +1898,6 @@ impl Render for TerminalView {
                             }
                         },
                     ))
-                    .on_prepaint(move |bounds, _, cx| {
-                        let rows = ((bounds.size.height.as_f32() - TERMINAL_CONTENT_INSET * 2.0)
-                            / row_height)
-                            .floor() as u16;
-                        let cols = ((bounds.size.width.as_f32() - TERMINAL_CONTENT_INSET * 2.0)
-                            / cell_width)
-                            .floor() as u16;
-                        terminal_resize.update(cx, |terminal, cx| {
-                            if terminal.screen_bounds != Some(bounds) {
-                                terminal.link_press = None;
-                            }
-                            terminal.screen_bounds = Some(bounds);
-                            terminal.resize(rows, cols, cx);
-                        });
-                    })
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(|this, event: &MouseDownEvent, _, _| {
@@ -2504,125 +1909,73 @@ impl Render for TerminalView {
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_selection))
                     .on_mouse_move(cx.listener(Self::extend_selection))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::end_selection))
-                    .children(screen_lines)
-                    .children(status_banner)
                     .children(autoscroll_pill)
                     .context_menu({
                         let terminal = terminal_actions.clone();
-                        move |menu, _window, cx| {
-                            let (output, selection) = {
-                                let terminal = terminal.read(cx);
-                                (terminal.screen_text(), terminal.selected_text())
-                            };
+                        move |menu, window, cx| {
+                            let view = terminal.read(cx);
+                            let output = view.screen_text();
+                            let selection = view.selected_text();
+                            let presentation = kit::TerminalOutputMenu::new(view.font_size)
+                                .compact(view.compact)
+                                .blend(view.translucent_background)
+                                .selection(selection.is_some());
                             let mut menu = menu;
-                            if let Some((url, epoch)) = terminal.read(cx).context_link.clone() {
+                            if let Some((url, epoch)) = view.context_link.clone() {
                                 menu = Self::link_commands(menu, url, terminal.downgrade(), epoch)
                                     .separator();
                             }
-                            if let Some(selection) = &selection {
-                                let selection = selection.clone();
-                                menu = menu.item(PopupMenuItem::new("Copy Selection").on_click(
-                                    move |_event, _window, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            selection.clone(),
-                                        ));
-                                    },
-                                ));
-                            }
-                            let t_paste = terminal.clone();
-                            let t_select = terminal.clone();
-                            let t_clear = terminal.clone();
-                            let t_restart = terminal.clone();
-                            let (font_size, compact, translucent_background) = {
-                                let view = terminal.read(cx);
-                                (view.font_size, view.compact, view.translucent_background)
-                            };
-                            for (label, size) in
-                                [("Small", 11.0), ("Medium", 13.0), ("Large", 16.0)]
-                            {
-                                let target = terminal.clone();
-                                menu = menu.item(
-                                    PopupMenuItem::new(format!("Font size: {label}"))
-                                        .checked(font_size == size)
-                                        .on_click(move |_, _, cx| {
-                                            target.update(cx, |view, cx| {
+                            let terminal = terminal.clone();
+                            presentation.render(
+                                menu,
+                                move |action, window, cx| {
+                                    terminal.update(cx, |view, cx| {
+                                        use kit::TerminalOutputAction as Action;
+                                        match action {
+                                            Action::CopySelection => {
+                                                if let Some(text) = &selection {
+                                                    cx.write_to_clipboard(
+                                                        ClipboardItem::new_string(text.clone()),
+                                                    );
+                                                }
+                                            }
+                                            Action::CopyOutput => cx.write_to_clipboard(
+                                                ClipboardItem::new_string(output.clone()),
+                                            ),
+                                            Action::FontSize(size) => {
                                                 view.invalidate_links();
-                                                view.sync_link_frame();
                                                 view.font_size = size;
+                                                view.sync_link_frame();
                                                 cx.notify();
-                                            });
-                                        }),
-                                );
-                            }
-                            let compact_target = terminal.clone();
-                            menu = menu.item(
-                                PopupMenuItem::new("Compact lines")
-                                    .checked(compact)
-                                    .on_click(move |_, _, cx| {
-                                        compact_target.update(cx, |view, cx| {
-                                            view.invalidate_links();
-                                            view.sync_link_frame();
-                                            view.compact = !view.compact;
-                                            cx.notify();
-                                        });
-                                    }),
-                            );
-                            let background_target = terminal.clone();
-                            menu = menu.item(
-                                PopupMenuItem::new("Blend background")
-                                    .checked(translucent_background)
-                                    .on_click(move |_, _, cx| {
-                                        background_target.update(cx, |view, cx| {
-                                            view.translucent_background =
-                                                !view.translucent_background;
-                                            cx.notify();
-                                        });
-                                    }),
-                            );
-                            let t_find = terminal.clone();
-                            menu = menu.item(
-                                PopupMenuItem::new("Find in Terminal Output…").on_click(
-                                    move |_event, window, cx| {
-                                        t_find.update(cx, |terminal, cx| {
-                                            terminal.open_find(&FindInTerminalOutput, window, cx)
-                                        });
-                                    },
-                                ),
-                            );
-                            menu.item(PopupMenuItem::new("Copy Terminal Output").on_click(
-                                move |_event, _window, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        output.clone(),
-                                    ));
-                                },
-                            ))
-                            .item(PopupMenuItem::new("Paste").on_click(
-                                move |_event, _window, cx| {
-                                    t_paste.update(cx, |terminal, cx| {
-                                        terminal.paste_from_clipboard(cx)
+                                            }
+                                            Action::ToggleCompact => {
+                                                view.invalidate_links();
+                                                view.compact = !view.compact;
+                                                view.sync_link_frame();
+                                                cx.notify();
+                                            }
+                                            Action::ToggleBackground => {
+                                                view.translucent_background =
+                                                    !view.translucent_background;
+                                                cx.notify();
+                                            }
+                                            Action::Find => {
+                                                view.open_find(&FindInTerminalOutput, window, cx)
+                                            }
+                                            Action::Paste => view.paste_from_clipboard(cx),
+                                            Action::SelectAll => view.select_all(cx),
+                                            Action::Clear => view.clear(cx),
+                                            Action::Restart => view.restart(cx),
+                                        }
                                     });
                                 },
-                            ))
-                            .item(PopupMenuItem::new("Select All").on_click(
-                                move |_event, _window, cx| {
-                                    t_select.update(cx, |terminal, cx| terminal.select_all(cx));
-                                },
-                            ))
-                            .item(PopupMenuItem::new("Clear Terminal").on_click(
-                                move |_event, _window, cx| {
-                                    t_clear.update(cx, |terminal, cx| terminal.clear(cx));
-                                },
-                            ))
-                            .item(
-                                PopupMenuItem::new("Restart Terminal").on_click(
-                                    move |_event, _window, cx| {
-                                        t_restart.update(cx, |terminal, cx| terminal.restart(cx));
-                                    },
-                                ),
+                                window,
+                                cx,
                             )
                         }
                     }),
             )
+            .children(status_banner)
     }
 }
 
@@ -2752,7 +2105,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ansi_index_to_hsla, next_terminal_wake, rgb_to_hsla, selected_excerpt, selection_bounds,
+        next_terminal_wake, selected_excerpt, selection_bounds,
         selection_present, should_paint_cursor, start_parser_worker, terminal_frame_policy,
         terminal_parse_budget_exhausted, ParserCommand, PtyEvent, TerminalWake,
         TERMINAL_FIND_RESCAN_INTERVAL, TERMINAL_PARSE_BUDGET_PER_FRAME,
@@ -3189,6 +2542,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parser_worker_retains_output_when_find_resizes_the_grid() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (output_tx, command_tx) = start_parser_worker(6, 40, event_tx).unwrap();
+        output_tx
+            .send(b"needle first\r\nneedle second\r\nneedle third\r\nprompt> ".to_vec())
+            .unwrap();
+        next_frame(&mut event_rx).await;
+        command_tx
+            .send(ParserCommand::Find {
+                generation: 7,
+                query: Some("needle".to_string()),
+            })
+            .unwrap();
+        let _ = next_search_results(&mut event_rx).await;
+
+        for rows in [2, 6] {
+            command_tx.send(ParserCommand::Resize(rows, 40)).unwrap();
+            let PtyEvent::SearchResults { total, .. } = next_search_results(&mut event_rx).await else {
+                panic!("expected search results after resize");
+            };
+            assert_eq!(
+                total, 3,
+                "Find must retain all output after resizing to {rows} rows"
+            );
+        }
+    }
+
+    #[test]
+    fn parser_resize_preserves_ansi_and_an_incomplete_escape_sequence() {
+        let mut parser = vt100::Parser::new(6, 40, 20);
+        parser.process(b"\x1b[36mfirst\x1b[0m\r\nsecond\r\nthird\r\n\x1b[");
+        parser.screen_mut().set_size(2, 40);
+        parser.process(b"31mred");
+        assert_eq!(parser.screen().contents(), "third\nred");
+        assert_eq!(
+            parser.screen().cell(1, 0).unwrap().fgcolor(),
+            vt100::Color::Idx(1)
+        );
+
+        parser.screen_mut().set_size(6, 40);
+        assert_eq!(parser.screen().contents(), "first\nsecond\nthird\nred");
+        assert_eq!(parser.screen().cursor_position(), (3, 3));
+        assert_eq!(
+            parser.screen().cell(0, 0).unwrap().fgcolor(),
+            vt100::Color::Idx(6)
+        );
+        parser.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(parser.screen().scrollback(), 0);
+    }
+
+    #[tokio::test]
     async fn parser_worker_invalidates_results_on_clear_and_resize() {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let (output_tx, command_tx) = start_parser_worker(4, 16, event_tx).unwrap();
@@ -3271,11 +2675,6 @@ mod tests {
         assert!(!produced_results);
     }
 
-    #[test]
-    fn xterm_color_cube_uses_standard_channel_levels() {
-        assert_eq!(ansi_index_to_hsla(17, false), rgb_to_hsla(0, 0, 95));
-        assert_eq!(ansi_index_to_hsla(67, false), rgb_to_hsla(95, 135, 175));
-    }
 
     #[test]
     fn backward_selection_includes_its_anchor_cell() {

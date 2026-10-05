@@ -290,7 +290,6 @@ impl ChatListView {
         &mut self,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = cx.theme().colors;
         let entries = self.recallable_prompts(cx);
         let position = self
             .prompt_recall
@@ -301,72 +300,21 @@ impl ChatListView {
                     .position(|entry| entry.message_id == recall.landmark_id)
             })
             .unwrap_or(0);
-        let at_oldest = position == 0;
-        div()
-            .id("prompt-recall-strip")
-            .debug_selector(|| "prompt-recall-strip".into())
-            .w_full()
-            .mb_2()
-            .px_3()
-            .py_1p5()
-            .rounded_lg()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.title_bar)
-            .flex()
-            .items_center()
-            .gap_2()
-            .role(Role::Status)
-            .aria_label(
-                "Earlier prompt recalled into the composer; text only, attachments are not restored",
-            )
-            .child(
-                Icon::new(IconName::Undo2)
-                    .xsmall()
-                    .text_color(theme.muted_foreground),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!(
-                        "Earlier prompt · text only · {} of {}",
-                        position + 1,
-                        entries.len()
-                    )),
-            )
-            .child(
-                Button::new("prompt-recall-older")
-                    .debug_selector(|| "prompt-recall-older".into())
-                    .label("Older")
-                    .ghost()
-                    .xsmall()
-                    .disabled(at_oldest)
-                    .tooltip(if at_oldest {
-                        "This is the oldest prompt"
-                    } else {
-                        "Recall an older prompt (Up)"
-                    })
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.step_prompt_recall(true, window, cx);
-                        this.focus_composer(window, cx);
-                    })),
-            )
-            .child(
-                Button::new("prompt-recall-newer")
-                    .debug_selector(|| "prompt-recall-newer".into())
-                    .label("Newer")
-                    .ghost()
-                    .xsmall()
-                    .tooltip("Recall a newer prompt (Down); clears past the newest")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.step_prompt_recall(false, window, cx);
-                        this.focus_composer(window, cx);
-                    })),
-            )
-            .into_any_element()
+        threadlane_ui_kit::prompt_recall_strip(
+            position,
+            entries.len(),
+            threadlane_ui_kit::recall_older_button(position == 0)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.step_prompt_recall(true, window, cx);
+                    this.focus_composer(window, cx);
+                })),
+            threadlane_ui_kit::recall_newer_button()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.step_prompt_recall(false, window, cx);
+                    this.focus_composer(window, cx);
+                })),
+            cx,
+        ).into_any_element()
     }
 
     // ---- Prompt navigation rail -----------------------------------------
@@ -392,42 +340,14 @@ impl ChatListView {
                 self.prompt_rail_active_id = Some(id.clone());
             }
         }
-        div()
-            .id("prompt-navigation-rail")
-            .debug_selector(|| "prompt-navigation-rail".into())
-            .w_8()
-            .h_full()
-            .flex_shrink_0()
-            .py_3()
-            .flex()
-            .flex_col()
-            .justify_center()
-            .items_center()
-            .child(
-                list(
-                    self.prompt_rail_list_state.clone(),
-                    cx.processor(Self::render_prompt_rail_tick),
-                )
-                .w_8()
-                .h(rems((entries.len() as f32 * 1.5).min(12.0)))
-                .max_h_full()
-                .min_h_0(),
-            )
-            .child(self.render_outline_popover(cx))
-            .into_any_element()
+        threadlane_ui_kit::prompt_navigation_rail(
+            list(self.prompt_rail_list_state.clone(), cx.processor(Self::render_prompt_rail_tick)),
+            self.render_outline_popover(cx), entries.len(),
+        ).into_any_element()
     }
 
     fn active_prompt_rail_index(&self, entries: &[PromptLandmark]) -> Option<usize> {
-        let top = self.transcript.list.logical_scroll_top().item_ix;
-        if self.transcript.list.is_following_tail() {
-            entries.len().checked_sub(1)
-        } else {
-            Some(
-                entries
-                    .partition_point(|entry| entry.row_index <= top)
-                    .saturating_sub(1),
-            )
-        }
+        threadlane_ui_kit::active_prompt_landmark(entries, &self.transcript.list)
     }
 
     fn render_prompt_rail_tick(
@@ -442,40 +362,8 @@ impl ChatListView {
         };
         let active = self.active_prompt_rail_index(&entries);
         let selected = active == Some(index);
-        let theme = cx.theme().colors;
         let id = landmark.message_id.clone();
-        let label = format!(
-            "Prompt {} · {}",
-            landmark.ordinal,
-            if landmark.excerpt.is_empty() {
-                "No text"
-            } else {
-                &landmark.excerpt
-            }
-        );
-        Button::new(SharedString::from(format!("prompt-rail-{id}")))
-            .debug_selector({
-                let id = id.clone();
-                move || format!("prompt-rail-{id}")
-            })
-            .ghost()
-            .small()
-            .w_8()
-            .h_6()
-            .accessibility_label(if selected {
-                format!("{label} · Current prompt")
-            } else {
-                label.clone()
-            })
-            .tooltip(label)
-            .tooltip_placement(gpui_component::Placement::Right)
-            .child(
-                div()
-                    .h_0p5()
-                    .rounded_full()
-                    .when(selected, |el| el.w_4().bg(theme.foreground))
-                    .when(!selected, |el| el.w_2().bg(theme.muted_foreground)),
-            )
+        threadlane_ui_kit::prompt_rail_tick(landmark, selected, cx)
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.clear_conversation_find();
                 this.outline_focus_id = Some(id.clone());
@@ -684,65 +572,13 @@ impl ChatListView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = cx.theme().colors;
         let Some(landmark) = self.outline_landmarks.get(index).cloned() else {
             return div().into_any_element();
         };
         let focused = self.outline_focus_id.as_ref() == Some(&landmark.message_id);
         let selected = self.outline_selected_id.as_ref() == Some(&landmark.message_id);
-        let label = if landmark.excerpt.is_empty() {
-            format!("Prompt {} · No text", landmark.ordinal)
-        } else {
-            format!("Prompt {} · {}", landmark.ordinal, landmark.excerpt)
-        };
         let message_id = landmark.message_id.clone();
-        div()
-            .id(("conversation-outline-row", index))
-            .flex()
-            .flex_row()
-            .w_full()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_1p5()
-            .cursor_pointer()
-            .role(Role::ListBoxOption)
-            .aria_label(label.clone())
-            .when(focused, |el| el.bg(theme.secondary))
-            .when(!focused, |el| {
-                el.hover(|style| style.bg(theme.list_hover))
-            })
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .flex_shrink_0()
-                    .child(format!("Prompt {}", landmark.ordinal)),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_sm()
-                    .text_color(if landmark.excerpt.is_empty() {
-                        theme.muted_foreground
-                    } else {
-                        theme.foreground
-                    })
-                    .child(if landmark.excerpt.is_empty() {
-                        SharedString::from("No text")
-                    } else {
-                        SharedString::from(landmark.excerpt.clone())
-                    }),
-            )
-            .when(selected, |el| {
-                el.child(
-                    Icon::new(IconName::Check)
-                        .xsmall()
-                        .text_color(theme.primary),
-                )
-            })
+        threadlane_ui_kit::conversation_outline_row(&landmark, focused, selected, cx)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
@@ -765,11 +601,7 @@ impl ChatListView {
         // Enter/Space Confirm binding it registers under its "Popover"
         // context; `on_open_change` is the single driver of view state so
         // no click handler can double-toggle it.
-        Popover::new("conversation-outline")
-            .anchor(Anchor::TopLeft)
-            .appearance(false)
-            .open(self.outline_open)
-            .track_focus(&self.outline_focus)
+        threadlane_ui_kit::conversation_outline_popover(self.outline_open, &self.outline_focus)
             .on_open_change(move |open, window, cx| {
                 outline_chat.update(cx, |this, cx| {
                     if *open {
@@ -779,15 +611,6 @@ impl ChatListView {
                     }
                 });
             })
-            .trigger(
-                Button::new("conversation-outline-open")
-                    .debug_selector(|| "conversation-outline-open".into())
-                    .label("…")
-                    .ghost()
-                    .small()
-                    .accessibility_label("Conversation outline")
-                    .tooltip("Conversation outline — jump to an earlier prompt"),
-            )
             .content(move |_, _window, cx| {
                 outline_chat_content.update(cx, |this, cx| this.render_outline_content(cx))
             })
@@ -796,7 +619,6 @@ impl ChatListView {
     /// The popover body: header, status line for loading/error/empty,
     /// and the virtualized landmark list.
     fn render_outline_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().colors;
         let (loading, load_error) = {
             let state = self.model.read(cx);
             let error = state
@@ -811,90 +633,16 @@ impl ChatListView {
             .or_else(|| (loading && count == 0).then(|| SharedString::from("Loading conversation…")))
             .or_else(|| (count == 0).then(|| SharedString::from("No prompts yet")));
 
-        div()
-            .id("conversation-outline-content")
-            .flex()
-            .flex_col()
-            .role(Role::ListBox)
-            .aria_label("Conversation outline prompts")
-            .track_focus(&self.outline_focus)
-            .key_context("ConversationOutline")
-            .on_key_down(cx.listener(Self::handle_outline_key_down))
-            // The kit Popover binds Enter/Space to Confirm under its "Popover"
-            // context and toggles closed on that action. Intercept it here —
-            // deeper on the dispatch path — so activation jumps instead.
-            .on_action(cx.listener(
-                |this: &mut Self, _: &gpui_component::dialog::Confirm, window, cx| {
-                    this.activate_outline_prompt(window, cx);
-                    cx.stop_propagation();
-                },
-            ))
-            .w_80()
-            .h(rems(18.75))
-            .rounded_lg()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.popover)
-            .shadow_lg()
-            .occlude()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.muted_foreground)
-                            .child("Prompts in this conversation"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(format!("{count}")),
-                    ),
-            )
-            .child(
-                div().flex_1().min_h_0().child(match status_message {
-                    Some(message) => div()
-                        .w_full()
-                        .h_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .px_3()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(message)
-                        .into_any_element(),
-                    None => list(
-                        self.outline_list_state.clone(),
-                        cx.processor(Self::render_outline_row),
-                    )
-                    .w_full()
-                    .h_full()
-                    .into_any_element(),
-                }),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .px_3()
-                    .py_1p5()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("Enter to jump · Esc to close"),
-            )
-            .into_any_element()
+        threadlane_ui_kit::conversation_outline_content(
+            &self.outline_focus, count, status_message,
+            list(self.outline_list_state.clone(), cx.processor(Self::render_outline_row)).w_full().h_full(), cx,
+        )
+        .on_key_down(cx.listener(Self::handle_outline_key_down))
+        // Handle activation before the Popover's own Enter/Space Confirm action.
+        .on_action(cx.listener(|this: &mut Self, _: &gpui_component::dialog::Confirm, window, cx| {
+            this.activate_outline_prompt(window, cx);
+            cx.stop_propagation();
+        }))
+        .into_any_element()
     }
 }

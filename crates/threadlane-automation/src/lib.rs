@@ -194,7 +194,13 @@ impl Definition {
         if self.prompt.trim().is_empty() || self.prompt.len() > 64_000 {
             return Err("Enter a prompt of at most 64,000 bytes".into());
         }
-        if !self.project.is_absolute() {
+        // Browser snapshots use rooted POSIX paths. Rust's unknown WASM target
+        // has no filesystem prefix, so `is_absolute` rejects even `/project`.
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let absolute_project = self.project.has_root();
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let absolute_project = self.project.is_absolute();
+        if !absolute_project {
             return Err("Choose an attached project".into());
         }
         if self.model.trim().is_empty() || self.model.starts_with("acp/") {
@@ -640,6 +646,15 @@ mod tests {
             next_at: None,
             failures: 0,
             paused_reason: None,
+        }
+    }
+    #[test]
+    fn definition_requires_an_absolute_project() {
+        let mut definition = definition();
+        assert!(definition.validate().is_ok());
+        for path in ["", "project", "../project"] {
+            definition.project = path.into();
+            assert_eq!(definition.validate().unwrap_err(), "Choose an attached project");
         }
     }
     fn ts(s: &str) -> i64 {

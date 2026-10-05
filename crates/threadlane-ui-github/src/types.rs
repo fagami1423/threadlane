@@ -3,8 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::*;
-use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::Sizable;
+use gpui_kit::base::Link;
 use threadlane_git::{
     GitHubIssueDetail, GitHubIssueSummary, GitHubPrFile, GitHubPrInfo, GitHubPrViewedState,
     GitHubPullRequestSummary, PrFileViewedStatus,
@@ -18,22 +17,7 @@ pub const GITHUB_PR_TABS_CONTEXT: &str = "GitHubPullRequestTabs";
 pub const GITHUB_PR_FILE_LIST_CONTEXT: &str = "GitHubPullRequestFiles";
 pub const PAGE_SIZE: usize = 50;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GitHubStateFilter {
-    Open,
-    Closed,
-    Merged,
-}
-
-impl GitHubStateFilter {
-    pub fn value(self) -> &'static str {
-        match self {
-            Self::Open => "open",
-            Self::Closed => "closed",
-            Self::Merged => "merged",
-        }
-    }
-}
+pub use threadlane_ui_kit::github::GitHubStateFilter;
 
 pub fn github_state_for_tab(state: GitHubStateFilter, tab: GitHubTab) -> GitHubStateFilter {
     if tab == GitHubTab::Issues && state == GitHubStateFilter::Merged {
@@ -197,43 +181,7 @@ pub fn detail_result_matches_list(
         && detail.item == selected
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PrDetailTab {
-    #[default]
-    Summary,
-    Conversation,
-    Timeline,
-    Code,
-}
-
-impl PrDetailTab {
-    pub const ALL: [Self; 4] = [Self::Summary, Self::Conversation, Self::Timeline, Self::Code];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Summary => "Overview",
-            Self::Conversation => "Conversation",
-            Self::Timeline => "Commits",
-            Self::Code => "Files changed",
-        }
-    }
-
-    pub fn ix(self) -> usize {
-        match self {
-            Self::Summary => 0,
-            Self::Conversation => 1,
-            Self::Timeline => 2,
-            Self::Code => 3,
-        }
-    }
-
-    pub fn adjacent(self, delta: isize) -> Self {
-        Self::ALL[self
-            .ix()
-            .saturating_add_signed(delta)
-            .min(Self::ALL.len() - 1)]
-    }
-}
+pub use threadlane_ui_kit::github::PrDetailTab;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PrWorkspaceKey {
@@ -1013,13 +961,10 @@ pub fn pr_present_action_id(reply: bool, attempt: &PrCommentAttempt) -> SharedSt
     .into()
 }
 
-pub fn pr_present_recovery_action(reply: bool, attempt: &PrCommentAttempt) -> Button {
-    let url = attempt.pr_url.clone();
-    Button::new(pr_present_action_id(reply, attempt))
-        .link()
-        .small()
-        .label("Open on GitHub")
-        .on_click(move |_, _, cx| cx.open_url(&url))
+pub fn pr_present_recovery_action(reply: bool, attempt: &PrCommentAttempt, cx: &gpui::App) -> Link {
+    threadlane_ui_kit::github::github_draft_recovery(
+        pr_present_action_id(reply, attempt), attempt.pr_url.clone(), cx,
+    )
 }
 
 pub enum GitHubListResult {

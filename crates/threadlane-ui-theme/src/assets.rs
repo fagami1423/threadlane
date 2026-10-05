@@ -2,7 +2,10 @@ use std::borrow::Cow;
 
 use gpui::{AssetSource, Result, SharedString};
 use gpui_component::Icon;
+#[cfg(not(target_family = "wasm"))]
 use gpui_kit_assets::Assets as ComponentAssets;
+#[cfg(target_family = "wasm")]
+use crate::web_assets::ComponentAssets;
 
 /// Vendored Threadlane icon bytes by path — the same set [`Assets::load`]
 /// serves before falling back to the kit bundle.

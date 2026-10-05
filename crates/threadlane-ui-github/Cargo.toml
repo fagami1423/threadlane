@@ -18,6 +18,7 @@ threadlane-provider.workspace = true
 threadlane-daemon.workspace = true
 threadlane-ui-state.workspace = true
 threadlane-ui-theme.workspace = true
+threadlane-ui-kit.workspace = true
 tokio = { workspace = true, features = ["full"] }
 
 [dev-dependencies]

@@ -1,0 +1,45 @@
+[package]
+name = "threadlane-ui-kit-preview"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "threadlane-ui-kit-preview"
+path = "main.rs"
+
+[dependencies]
+vt100.workspace = true
+threadlane-automation.workspace = true
+# Only Frame/RgbaImage buffers are used; do not bundle desktop codecs into WASM.
+image = { version = "0.25", default-features = false }
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui-component.workspace = true
+threadlane-ui-kit.workspace = true
+threadlane-ui-theme.workspace = true
+threadlane-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+threadlane-daemon.workspace = true
+# Import canonical sidebar return-time choices without bundling host services in WASM.
+threadlane-ui-state.workspace = true
+# Archive imports use the same read-only store/title projector as discovery.
+threadlane-runtime.workspace = true
+threadlane-git.workspace = true
+threadlane-project.workspace = true
+threadlane-skills.workspace = true
+threadlane-acp-engine.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The development gallery compiles Metal shaders at launch, avoiding an extra
+# Xcode MetalToolchain download just to iterate on components.
+gpui_platform = { workspace = true, features = ["runtime_shaders"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+gpui_platform = { workspace = true, features = ["wayland", "x11"] }
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

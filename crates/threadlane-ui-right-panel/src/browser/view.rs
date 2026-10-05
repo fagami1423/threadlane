@@ -7,9 +7,8 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::{ActiveTheme, Icon, IconName, Selectable, Sizable, WindowExt};
+use gpui_component::input::{InputEvent, InputState};
+use gpui_component::WindowExt;
 use threadlane_ui_state::{AppState, RequestedComposerInsert};
 
 use super::address::{resolve_address, search_url, AddressTarget};
@@ -702,7 +701,7 @@ impl BrowserView {
     /// Toggles the annotate overlay. While active, the in-page picker selects
     /// elements and collects an optional comment; attaching hands the
     /// description plus an element-cropped snapshot to the chat composer.
-    pub fn toggle_annotate(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn toggle_annotate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.annotating {
             self.stop_annotate(cx);
             cx.notify();
@@ -715,6 +714,7 @@ impl BrowserView {
                 return;
             }
         };
+        self.focus_handle.focus(window, cx);
         self.annotating = true;
         cx.notify();
         self.annotate_task = Some(cx.spawn(async move |this, cx| {
@@ -904,19 +904,8 @@ impl Focusable for BrowserView {
     }
 }
 
-fn tab_title(url: &str) -> String {
-    let bare = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-    let host = bare.split('/').next().unwrap_or(bare);
-    let short: String = host.chars().take(24).collect();
-    if short.len() < host.len() {
-        format!("{short}…")
-    } else {
-        short
-    }
-}
+#[cfg(test)]
+use threadlane_ui_kit::browser_tab_title as tab_title;
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -929,273 +918,31 @@ impl Render for BrowserView {
             self.revealed_tab = selection;
         }
         let tabs = self.tabs(cx);
-        let annotating = self.annotating;
-        div()
-            .id("browser-panel")
-            .role(Role::Application)
-            .track_focus(&self.focus_handle)
-            .tab_group()
-            .size_full()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_2()
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_1()
-                    .py_0p5()
-                    .rounded_md()
-                    .when(annotating, |bar| {
-                        bar.bg(cx.theme().warning.opacity(0.08))
-                            .border_1()
-                            .border_color(cx.theme().warning.opacity(0.25))
-                    })
-                    .child(
-                        Button::new("browser-back")
-                            .icon(IconName::ArrowLeft)
-                            .accessibility_label("Go back")
-                            .tooltip("Go back")
-                            .ghost()
-                            .xsmall()
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.go_back(cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("browser-forward")
-                            .icon(IconName::ArrowRight)
-                            .accessibility_label("Go forward")
-                            .tooltip("Go forward")
-                            .ghost()
-                            .xsmall()
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.go_forward(cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("browser-reload")
-                            .icon(Icon::default().path("icons/refresh-cw.svg"))
-                            .accessibility_label("Reload page")
-                            .tooltip("Reload page")
-                            .ghost()
-                            .xsmall()
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.reload(cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("browser-annotate")
-                            .icon(Icon::default().path("icons/crosshair.svg"))
-                            .accessibility_label(if annotating {
-                                "Stop annotating"
-                            } else {
-                                "Annotate page elements"
-                            })
-                            .tooltip(if annotating {
-                                "Annotating — click elements, then attach (Esc cancels)"
-                            } else {
-                                "Annotate: pick page elements into the composer"
-                            })
-                            .ghost()
-                            .xsmall()
-                            .selected(annotating)
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.toggle_annotate(window, cx);
-                            })),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .debug_selector(|| "browser-address-field".into())
-                            .when(
-                                self.current_url(cx)
-                                    .as_deref()
-                                    .is_some_and(|u| u.starts_with("https://")),
-                                |row| {
-                                    row.child(
-                                        div()
-                                            .flex_none()
-                                            .text_color(cx.theme().success)
-                                            .child(Icon::default().path("icons/lock.svg").xsmall()),
-                                    )
-                                },
-                            )
-                            .child(div().flex_1().min_w_0().child(
-                                Input::new(&self.address_input).aria_label("Browser address"),
-                            )),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .id("browser-tab-strip")
-                            .debug_selector(|| "browser-tab-strip".into())
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .overflow_x_scroll()
-                            .track_scroll(&self.tab_scroll)
-                            .children(tabs.into_iter().map(|(id, url)| {
-                                let selected = Some(id) == active_id;
-                                let title = tab_title(&url);
-                                div()
-                                    .id(SharedString::from(format!("browser-tab-{id}")))
-                                    .group(SharedString::from(format!("browser-tab-group-{id}")))
-                                    .flex_shrink_0()
-                                    .flex()
-                                    .items_center()
-                                    .rounded_md()
-                                    .bg(if selected {
-                                        cx.theme().list_active
-                                    } else {
-                                        gpui::transparent_black()
-                                    })
-                                    .child(
-                                        Button::new(SharedString::from(format!(
-                                            "browser-tab-{id}"
-                                        )))
-                                        .label(title.clone())
-                                        .accessibility_label(format!("Show browser tab {title}"))
-                                        .tooltip(url.clone())
-                                        .ghost()
-                                        .xsmall()
-                                        .selected(selected)
-                                        .on_click(
-                                            cx.listener(move |this, _event, window, cx| {
-                                                this.switch_tab(id, window, cx);
-                                            }),
-                                        ),
-                                    )
-                                    .child({
-                                        let is_active_tab = selected;
-                                        let group_name =
-                                            SharedString::from(format!("browser-tab-group-{id}"));
-                                        div()
-                                            .when(!is_active_tab, |el| {
-                                                el.invisible()
-                                                    .group_hover(group_name, |el| el.visible())
-                                            })
-                                            .child(
-                                                Button::new(SharedString::from(format!(
-                                                    "browser-tab-close-{id}"
-                                                )))
-                                                .icon(IconName::Close)
-                                                .accessibility_label(format!("Close tab {title}"))
-                                                .ghost()
-                                                .xsmall()
-                                                .on_click(cx.listener(
-                                                    move |this, _event, window, cx| {
-                                                        this.close_tab(id, window, cx);
-                                                    },
-                                                )),
-                                            )
-                                    })
-                            })),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(|| "browser-new-tab-control".into())
-                            .flex_shrink_0()
-                            .child(
-                                Button::new("browser-new-tab")
-                                    .icon(IconName::Plus)
-                                    .accessibility_label("New browser tab")
-                                    .tooltip("New tab")
-                                    .flex_shrink_0()
-                                    .ghost()
-                                    .xsmall()
-                                    .on_click(cx.listener(|this, _event, window, cx| {
-                                        this.open_tab(DEFAULT_URL, window, cx);
-                                    })),
-                            ),
-                    ),
-            )
-            .when(annotating, |panel| {
-                panel.child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .px_1()
-                        .py_0p5()
-                        .rounded_md()
-                        .bg(cx.theme().warning.opacity(0.08))
-                        .child(
-                            div()
-                                .size_4()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_color(cx.theme().warning)
-                                .child(Icon::default().path("icons/crosshair.svg").xsmall()),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(cx.theme().warning)
-                                .child("Click elements, Enter attaches \u{2014} Esc cancels"),
-                        ),
-                )
-            })
-            .when(self.tabs.is_empty(), |panel| {
-                panel.child(
-                    div().flex_1().flex().items_center().justify_center().child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(IconName::Globe),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("No tabs open"),
-                            )
-                            .child(
-                                Button::new("open-first-tab")
-                                    .label("New Tab")
-                                    .small()
-                                    .on_click(cx.listener(|this, _event, window, cx| {
-                                        this.open_tab(DEFAULT_URL, window, cx);
-                                    })),
-                            ),
-                    ),
-                )
-            })
-            .when(!self.tabs.is_empty(), |panel| {
-                panel.child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .rounded_md()
-                        .overflow_hidden()
-                        .children(webview),
-                )
-            })
+        threadlane_ui_kit::browser_chrome(
+            &self.address_input,
+            &tabs,
+            active_id,
+            &self.tab_scroll,
+            self.annotating,
+            self.current_url(cx).as_deref().is_some_and(|url| url.starts_with("https://")),
+            cx.listener(|this, action: &threadlane_ui_kit::BrowserAction, window, cx| {
+                use threadlane_ui_kit::BrowserAction;
+                match *action {
+                    BrowserAction::Back => this.go_back(cx),
+                    BrowserAction::Forward => this.go_forward(cx),
+                    BrowserAction::Reload => this.reload(cx),
+                    BrowserAction::ToggleAnnotate => this.toggle_annotate(window, cx),
+                    BrowserAction::SelectTab(id) => this.switch_tab(id, window, cx),
+                    BrowserAction::CloseTab(id) => this.close_tab(id, window, cx),
+                    BrowserAction::NewTab => this.open_tab(DEFAULT_URL, window, cx),
+                }
+            }),
+            cx,
+        )
+        .track_focus(&self.focus_handle)
+        .when(!self.tabs.is_empty(), |panel| {
+            panel.child(threadlane_ui_kit::browser_viewport(cx).children(webview))
+        })
     }
 }
 
