@@ -90,6 +90,9 @@ pub struct AppState {
     stashed_prompts: HashMap<String, String>,
     pub pending_hydrations: Vec<SessionHydrationRequest>,
     in_flight_hydrations: HashMap<SessionProjectionKey, usize>,
+    /// Live lifecycle status seen since remote selection, scoped to the
+    /// connection epoch so reconnect snapshots can restore missed changes.
+    remote_live_status: Option<(SessionProjectionKey, u64)>,
     pub git_statuses: HashMap<PathBuf, threadlane_git::GitStatus>,
     pub git_prs: HashMap<(PathBuf, String), Option<threadlane_git::GitHubPrInfo>>,
     pub auto_address_pr_reviews_enabled: bool,
@@ -1082,6 +1085,7 @@ impl AppState {
             automation_runs_restored: false,
             pending_hydrations: Vec::new(),
             in_flight_hydrations: HashMap::new(),
+            remote_live_status: None,
             git_statuses: HashMap::new(),
             git_prs: HashMap::new(),
             auto_address_pr_reviews_enabled: threadlane_git::load_auto_address_pr_reviews_enabled(),
@@ -1259,7 +1263,15 @@ impl AppState {
             .cloned()
     }
 
-    pub fn start_automations(&mut self) -> tokio::sync::watch::Receiver<crate::automation::Projection> {
+    /// Subscribe to the local service only when this desktop owns the embedded daemon.
+    pub fn start_automations(
+        &mut self,
+    ) -> Option<tokio::sync::watch::Receiver<crate::automation::Projection>> {
+        if self.daemon_remote {
+            // Remote projections arrive through the daemon event stream;
+            // a local watch would overwrite them with this host's store.
+            return None;
+        }
         let service = crate::automation::AutomationService::shared();
         // The daemon core's automation bridge forwards the service's agent
         // events into the same broadcast `daemon_client.subscribe()` feeds
@@ -1267,19 +1279,13 @@ impl AppState {
         let updates = service.projection.clone();
         self.automation_service = Some(service);
         self.apply_automation_projection(updates.borrow().clone());
-        updates
+        Some(updates)
     }
 
+    /// Apply a local service snapshot while retaining runtime registration and discovery behavior.
     pub fn apply_automation_projection(&mut self, projection: crate::automation::Projection) {
-        for (session, old) in &self.automations.permissions {
-            if !projection.permissions.contains_key(session) && self.client.pending_permissions.get(session).is_some_and(|p| p.id == old.id) {
-                self.client.pending_permissions.remove(session);
-            }
-        }
-        for (session, old) in &self.automations.questions {
-            if !projection.questions.contains_key(session) && self.client.pending_questions.get(session).is_some_and(|q| q.id == old.id) {
-                self.client.pending_questions.remove(session);
-            }
+        if self.daemon_remote {
+            return;
         }
         if let Some(runtime) = &projection.active_runtime {
             let path = runtime.session_file().to_path_buf();
@@ -1321,15 +1327,93 @@ impl AppState {
         for (project, session_id) in to_register {
             self.register_session_seen(&project, &session_id);
         }
-        self.client.pending_permissions.extend(projection.permissions.clone());
-        self.client.pending_questions.extend(projection.questions.clone());
+        self.client.apply_event(SessionEvent::AutomationChanged {
+            projection: threadlane_daemon::core::DaemonCore::automation_projection_wire(&projection),
+        });
         self.automations = projection;
     }
 
+    /// Open a run using its owning daemon identity, without probing remote paths on this host.
     pub fn open_automation_run(&mut self, id: &str) -> Result<(), String> {
-        let run = self.automations.snapshot.runs.iter().find(|r| r.id == id).cloned().ok_or("Run no longer exists")?;
-        if run.session_file.as_ref().is_none_or(|path| !path.exists()) { return Err("This run has no chat yet".into()); }
-        let project = self.client.projects.iter_mut().find(|p| p.work_dir == run.definition.project).ok_or("Attach this run's project to open its chat")?;
+        let run = self
+            .automations
+            .snapshot
+            .runs
+            .iter()
+            .find(|r| r.id == id)
+            .cloned()
+            .ok_or("Run no longer exists")?;
+        if self.daemon_remote {
+            let session_file = run.session_file.clone().ok_or("This run has no chat yet")?;
+            // The run projection supplies daemon-owned identities. Seed a
+            // lightweight row until hydration returns the full SessionInfo;
+            // neither the project nor the transcript need exist on this host.
+            let project = match self
+                .client
+                .projects
+                .iter()
+                .position(|p| p.work_dir == run.definition.project)
+            {
+                Some(index) => &mut self.client.projects[index],
+                None => {
+                    self.client.projects.push(ProjectInfo {
+                        name: run
+                            .definition
+                            .project
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned(),
+                        work_dir: run.definition.project.clone(),
+                        sessions: Vec::new(),
+                        is_expanded: true,
+                    });
+                    self.client.projects.last_mut().unwrap()
+                }
+            };
+            if !project
+                .sessions
+                .iter()
+                .any(|session| session.id == run.session_id && session.session_file == session_file)
+            {
+                project
+                    .sessions
+                    .retain(|session| session.id != run.session_id);
+                project.sessions.push(SessionInfo {
+                    id: run.session_id.clone(),
+                    title: format!("{} · automation", run.definition.name),
+                    work_dir: run.definition.project.clone(),
+                    runtime_work_dir: session_file
+                        .ancestors()
+                        .nth(3)
+                        .unwrap_or(&run.definition.project)
+                        .to_path_buf(),
+                    session_file,
+                    health: if run.status.active() {
+                        SessionHealth::Working
+                    } else {
+                        SessionHealth::Healthy
+                    },
+                    is_worktree: run.definition.worktree,
+                    worktree_available: true,
+                    ..Default::default()
+                });
+            }
+            self.selected_model = run.definition.model.clone();
+            self.reasoning_effort =
+                ReasoningEffort::from_label(&run.definition.effort).unwrap_or_default();
+            self.select_session(run.definition.project, run.session_id);
+            return Ok(());
+        }
+        if run.session_file.as_ref().is_none_or(|path| !path.exists()) {
+            return Err("This run has no chat yet".into());
+        }
+        let project = self
+            .client
+            .projects
+            .iter_mut()
+            .find(|p| p.work_dir == run.definition.project)
+            .ok_or("Attach this run's project to open its chat")?;
         project.sessions = discover_session_stubs_in_project(&project.work_dir);
         self.select_session(run.definition.project, run.session_id);
         self.workspace_page = WorkspacePage::Chat;
@@ -1676,20 +1760,28 @@ impl AppState {
         self.auth_status_msg = None;
     }
 
+    /// Refresh session metadata on the owning host, never the remote client's disk.
     fn request_session_refresh(&self, work_dir: &Path) {
+        if self.daemon_remote {
+            self.dispatch_command(SessionCommand::GetProjectState {
+                work_dir: work_dir.to_path_buf(),
+            });
+            return;
+        }
         let _ = self.session_refresh_tx.send((
             self.session_refresh_generation,
             work_dir.to_path_buf(),
         ));
     }
 
+    /// Apply a current local discovery result; remote metadata arrives through ProjectChanged.
     pub fn apply_session_refresh(
         &mut self,
         work_dir: PathBuf,
         sessions: Vec<SessionInfo>,
         generation: u64,
     ) -> bool {
-        if generation != self.session_refresh_generation {
+        if self.daemon_remote || generation != self.session_refresh_generation {
             return false;
         }
         // Sessions first confirmed by this discovery pass inherit their
@@ -1990,6 +2082,7 @@ impl AppState {
         self.select_session_with_persistence(work_dir, session_id, true)
     }
 
+    /// Select and hydrate a session; remote sessions never use local settings or runtime recovery.
     fn select_session_with_persistence(
         &mut self,
         work_dir: PathBuf,
@@ -1997,6 +2090,40 @@ impl AppState {
         persist_selection: bool,
     ) {
         self.workspace_page = WorkspacePage::Chat;
+        if self.daemon_remote {
+            let session = self
+                .client
+                .projects
+                .iter()
+                .find(|project| project.work_dir == work_dir)
+                .and_then(|project| {
+                    project
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == session_id)
+                })
+                .cloned();
+            let Some(session) = session else {
+                self.client.session_status = Some("Remote session metadata is unavailable".into());
+                return;
+            };
+            self.client.select_session(&session);
+            self.remote_live_status = None;
+            self.client.session_status = Some("Loading session…".into());
+            self.is_new_task = false;
+            self.pending_hydrations.retain(|pending| {
+                pending.session_id != session.id || pending.session_file != session.session_file
+            });
+            self.pending_hydrations.push(SessionHydrationRequest {
+                session_id: session.id,
+                session_file: session.session_file,
+                reload_messages: true,
+                // Opening a transcript must not rebuild an automation's
+                // live runtime with settings from the client machine.
+                runtime_options: None,
+            });
+            return;
+        }
         let session = self.client.projects
             .iter()
             .find(|project| project.work_dir == work_dir)
@@ -3795,6 +3922,7 @@ pub fn merge_live_subagents(
 }
 
 impl AppState {
+    /// Apply identity-matched projections, preserving live activity that arrived after the snapshot.
     pub fn apply_session_hydration(
         &mut self,
         session_id: &str,
@@ -3812,10 +3940,13 @@ impl AppState {
         // replay on session switch already consumed its queue into these maps.
         // While the runtime is still generating, a wholesale replace would
         // drop that live activity, so merge it back over the fresh snapshot.
-        let generating = self
-            .daemon_core
-            .runtime_for_file(session_file)
-            .is_some_and(|runtime| runtime.is_generating());
+        let generating = if self.daemon_remote {
+            self.client.is_generating
+        } else {
+            self.daemon_core
+                .runtime_for_file(session_file)
+                .is_some_and(|runtime| runtime.is_generating())
+        };
         if generating {
             let live_trajectory = self.trajectory_by_session.remove(&key).unwrap_or_default();
             self.trajectory_by_session.insert(
@@ -3862,15 +3993,67 @@ impl AppState {
         snapshot: threadlane_protocol::daemon::SessionSnapshot,
     ) -> bool {
         let session_file = snapshot.session.session_file.clone();
-        self.finish_session_hydration(session_id, &session_file);
-        if !self.active_session_matches(session_id, &session_file) {
+        if snapshot.session.id != session_id
+            || (self.daemon_remote
+                && !self.client.projects.iter().any(|project| {
+                    project.work_dir == snapshot.session.work_dir
+                        && project.sessions.iter().any(|session| {
+                            session.id == session_id && session.session_file == session_file
+                        })
+                }))
+        {
             return false;
         }
-        // The "new result" watermark is local bookkeeping; a remote daemon's
-        // transcript may not exist on this filesystem at all.
-        let presented_completion = compute_latest_run_completion(&session_file)
-            .ok()
-            .flatten();
+        self.finish_session_hydration(session_id, &session_file);
+        if !self.active_session_matches(session_id, &session_file)
+            || (self.daemon_remote
+                && self.client.active_work_dir.as_ref() != Some(&snapshot.session.work_dir))
+        {
+            return false;
+        }
+        let presented_completion = if self.daemon_remote {
+            // Replace a run-projection stub with the daemon's full metadata.
+            // Remote completion watermarks must not scan/write this host's
+            // filesystem using a daemon-owned transcript path.
+            let keep_live_status = self
+                .remote_live_status
+                .as_ref()
+                .is_some_and(|(key, epoch)| {
+                    key == &Self::projection_key(session_id, &session_file)
+                        && *epoch == self.daemon_client.file_search_connection_epoch()
+                });
+            let mut session_info = snapshot.session.clone();
+            if keep_live_status {
+                if self.client.is_generating {
+                    session_info.health = SessionHealth::Working;
+                } else if matches!(session_info.health, SessionHealth::Working) {
+                    session_info.health = SessionHealth::Healthy;
+                }
+            } else {
+                self.client.is_generating = matches!(session_info.health, SessionHealth::Working);
+            }
+            if !keep_live_status
+                || matches!(
+                    self.client.session_status.as_deref(),
+                    Some("Loading session…" | "Reconciling session…")
+                )
+            {
+                self.client.session_status = None;
+            }
+            if let Some(session) = self
+                .client
+                .projects
+                .iter_mut()
+                .filter(|project| project.work_dir == snapshot.session.work_dir)
+                .flat_map(|project| project.sessions.iter_mut())
+                .find(|session| session.id == session_id && session.session_file == session_file)
+            {
+                *session = session_info;
+            }
+            None
+        } else {
+            compute_latest_run_completion(&session_file).ok().flatten()
+        };
         self.apply_session_messages(
             session_id,
             &session_file,
@@ -4730,7 +4913,34 @@ impl AppState {
             .into_iter();
         let mut changed = seen_changed | snooze_changed;
 
-        for event in deferred.chain(events) {
+        for (is_new, event) in deferred
+            .map(|event| (false, event))
+            .chain(events.into_iter().map(|event| (true, event)))
+        {
+            // Deferred events predate this selection and cannot make a
+            // subsequently requested hydration snapshot look stale.
+            if self.daemon_remote && is_new {
+                let lifecycle = match &event {
+                    SessionEvent::Agent {
+                        session_id,
+                        event: AgentEvent::AgentStart | AgentEvent::AgentEnd { .. } | AgentEvent::AgentError { .. },
+                    } => Some((session_id, None)),
+                    SessionEvent::Finished { session_id, session_file }
+                    | SessionEvent::Scheduled { session_id, session_file, .. } => {
+                        Some((session_id, Some(session_file)))
+                    }
+                    _ => None,
+                };
+                if let Some((session_id, file)) = lifecycle {
+                    if let Some(key) = self.active_session_projection_key().filter(|key| {
+                        key.session_id == *session_id
+                            && file.is_none_or(|file| *file == key.session_file)
+                    }) {
+                        self.remote_live_status =
+                            Some((key, self.daemon_client.file_search_connection_epoch()));
+                    }
+                }
+            }
             match event {
                 SessionEvent::WorktreeBases { project, result } => {
                     if self.is_new_task && self.client.active_work_dir.as_ref() == Some(&project) {
@@ -4773,6 +4983,20 @@ impl AppState {
                 SessionEvent::Agent { session_id, event }
                     if self.client.active_session_id.as_deref() == Some(&session_id) =>
                 {
+                    if self.daemon_remote {
+                        match &event {
+                            AgentEvent::AgentStart => {
+                                self.client.is_generating = true;
+                                self.client.session_status = None;
+                                changed = true;
+                            }
+                            AgentEvent::AgentEnd { .. } => {
+                                self.client.is_generating = false;
+                                changed = true;
+                            }
+                            _ => {}
+                        }
+                    }
                     if matches!(&event, AgentEvent::AgentStart) {
                         if let Some(key) = self.active_session_projection_key() {
                             self.pending_hydrations.push(SessionHydrationRequest {
@@ -5113,11 +5337,38 @@ impl AppState {
                         changed |= self.remove_queued_echo(&session_id, &entry_id);
                     }
                 }
-                SessionEvent::ProjectChanged { .. } => {}
-                SessionEvent::AutomationChanged { .. } => {
-                    // `apply_automation_projection` already applies the
-                    // service's watch channel directly — the journaled copy
-                    // exists for transport clients.
+                SessionEvent::ProjectChanged { mut project } => {
+                    if self.daemon_remote {
+                        // A project snapshot can predate the run we just
+                        // opened. Keep its exact in-flight identity until
+                        // the matching session hydration supplies metadata.
+                        if self.active_session_is_loading() {
+                            if let Some(active) = self.active_session_info().filter(|session| session.work_dir == project.work_dir) {
+                                if !project.sessions.iter().any(|session| session.id == active.id && session.session_file == active.session_file) {
+                                    project.sessions.retain(|session| session.id != active.id);
+                                    project.sessions.push(active.clone());
+                                }
+                            }
+                        }
+                        self.client.apply_event(SessionEvent::ProjectChanged { project });
+                        changed = true;
+                    }
+                }
+                SessionEvent::AutomationChanged { projection } => {
+                    // Local mode uses the service watch, including its
+                    // runtime handle. Remote mode has only the wire event.
+                    if self.daemon_remote {
+                        self.automations = crate::automation::Projection {
+                            snapshot: projection.snapshot.clone(),
+                            permissions: projection.permissions.clone(),
+                            questions: projection.questions.clone(),
+                            question_queues: projection.question_queues.clone().unwrap_or_default(),
+                            error: projection.error.clone(),
+                            ..Default::default()
+                        };
+                        self.client.apply_event(SessionEvent::AutomationChanged { projection });
+                        changed = true;
+                    }
                 }
                 SessionEvent::WorkspaceChanged { .. } => {
                     // Files/git surfaces hold their own daemon

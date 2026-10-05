@@ -21,6 +21,12 @@ fn run_git(work_dir: &Path, args: &[&str]) {
         args,
         String::from_utf8_lossy(&output.stderr)
     );
+    if args.first() == Some(&"init") {
+        // Library commands also use this repository; keep host hooks out of fixtures.
+        let hooks = work_dir.canonicalize().unwrap().join(".git/empty-hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        run_git(work_dir, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+    }
 }
 
 #[test]
@@ -62,6 +68,61 @@ fn inspect_counts_untracked_files_inside_new_directories() {
         status.files.iter().map(|file| file.deletions).sum::<u32>(),
         0
     );
+}
+
+#[test]
+fn file_inspection_preserves_review_changes_with_two_git_commands() {
+    let dir = tempdir().unwrap();
+    run_git(dir.path(), &["init", "-q"]);
+    run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+    run_git(dir.path(), &["config", "user.name", "Threadlane"]);
+    run_git(dir.path(), &["config", "status.renames", "true"]);
+    for (path, content) in [
+        (".gitignore", "ignored/\n"),
+        ("tracked.txt", "initial\n"),
+        ("original.txt", "rename me\n"),
+        ("deleted.txt", "delete me\n"),
+    ] {
+        fs::write(dir.path().join(path), content).unwrap();
+    }
+    run_git(dir.path(), &["add", "."]);
+    run_git(dir.path(), &["commit", "-qm", "initial"]);
+    fs::write(dir.path().join("tracked.txt"), "staged\n").unwrap();
+    run_git(dir.path(), &["add", "tracked.txt"]);
+    fs::write(dir.path().join("tracked.txt"), "staged\nunstaged\n").unwrap();
+    run_git(dir.path(), &["mv", "original.txt", "renamed.txt"]);
+    fs::remove_file(dir.path().join("deleted.txt")).unwrap();
+    for folder in ["new/nested", "ignored"] {
+        fs::create_dir_all(dir.path().join(folder)).unwrap();
+        fs::write(dir.path().join(folder).join("file.txt"), "one\ntwo\n").unwrap();
+    }
+
+    COMMAND_SPAWNS.set(0);
+    let review = inspect(dir.path()).unwrap();
+    let review_commands = COMMAND_SPAWNS.get();
+    COMMAND_SPAWNS.set(0);
+    let files = inspect_files(dir.path()).unwrap();
+    let file_commands = COMMAND_SPAWNS.get();
+
+    assert_eq!(files, review.files);
+    assert_eq!(files.len(), 4);
+    assert!(files.iter().any(|file| file.path == "tracked.txt"
+        && file.index_status == 'M'
+        && file.worktree_status == 'M'));
+    assert!(files.iter().any(
+        |file| file.path == "renamed.txt" && file.orig_path.as_deref() == Some("original.txt")
+    ));
+    assert!(
+        files
+            .iter()
+            .any(|file| file.path == "deleted.txt" && file.worktree_status == 'D')
+    );
+    assert!(files.iter().any(|file| file.path == "new/nested/file.txt"
+        && file.is_untracked()
+        && file.additions == 2));
+    assert_eq!(file_commands, 2);
+    assert!(review_commands > file_commands);
+    println!("Git commands: full review {review_commands}, files {file_commands}");
 }
 
 #[test]
@@ -1013,7 +1074,6 @@ fn safe_branch_deletion_preserves_unmerged_and_checked_out_branches() {
     run_git(dir.path(), &["init", "-b", "main"]);
     run_git(dir.path(), &["config", "user.email", "test@example.com"]);
     run_git(dir.path(), &["config", "user.name", "Test"]);
-    run_git(dir.path(), &["config", "core.hooksPath", "/dev/null"]);
     fs::write(dir.path().join("base.txt"), "base\n").unwrap();
     run_git(dir.path(), &["add", "."]);
     run_git(dir.path(), &["commit", "-qm", "initial"]);

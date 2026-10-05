@@ -577,7 +577,7 @@ pub fn remove_worktree_cargo_target_dir(workspace_root: &Path) {
 /// Strips one layer of matching outer shell quotes (`'...'` or `"..."`) so
 /// `dyn <tool> '{"a": 1}'` works like `dyn <tool> {"a": 1}`. Returns `None`
 /// when the input is not quoted.
-fn strip_matching_outer_quotes(input: &str) -> Option<&str> {
+pub fn strip_matching_outer_quotes(input: &str) -> Option<&str> {
     let bytes = input.as_bytes();
     if bytes.len() >= 2 {
         let (first, last) = (bytes[0], bytes[bytes.len() - 1]);

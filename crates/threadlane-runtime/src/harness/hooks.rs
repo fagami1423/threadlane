@@ -22,6 +22,8 @@ pub struct HookContext {
     /// Set for AfterTool hooks.
     pub tool_result_content: Option<String>,
     pub tool_result_is_error: Option<bool>,
+    /// Host proof for an after-tool hook belonging to the original execution.
+    pub tool_execution_identity: Option<threadlane_protocol::ToolExecutionIdentity>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -483,20 +483,18 @@ const AGED_TOOL_INLINE_LIMIT: usize = 2_000;
 const AGED_TOOL_PRUNE_HEAD_CHARS: usize = 1_000;
 const AGED_TOOL_PRUNE_TAIL_CHARS: usize = 400;
 
-fn aged_tool_output_preview(content: &str) -> String {
-    let total_chars = content.chars().count();
-    if total_chars <= AGED_TOOL_PRUNE_HEAD_CHARS + AGED_TOOL_PRUNE_TAIL_CHARS {
-        return content.to_string();
-    }
-    let head: String = content.chars().take(AGED_TOOL_PRUNE_HEAD_CHARS).collect();
-    let tail: String = content
-        .chars()
+fn aged_tool_output_preview(content: &str, total_chars: usize) -> String {
+    let head_end = content
+        .char_indices()
+        .nth(AGED_TOOL_PRUNE_HEAD_CHARS)
+        .map_or(content.len(), |(index, _)| index);
+    let tail_start = content
+        .char_indices()
         .rev()
-        .take(AGED_TOOL_PRUNE_TAIL_CHARS)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+        .nth(AGED_TOOL_PRUNE_TAIL_CHARS - 1)
+        .map_or(0, |(index, _)| index);
+    let head = &content[..head_end];
+    let tail = &content[tail_start..];
     let hidden = total_chars.saturating_sub(AGED_TOOL_PRUNE_HEAD_CHARS + AGED_TOOL_PRUNE_TAIL_CHARS);
     format!(
         "{head}\n\n[... {hidden} characters pruned from the middle of this tool output ...]\n\n{tail}"
@@ -559,6 +557,7 @@ pub fn prune_historical_tool_outputs_preserving(
 
     for (i, msg) in messages.iter().enumerate() {
         match msg {
+            AgentMessage::Tool { .. } if keep_full[i] => result.push(msg.clone()),
             AgentMessage::Tool {
                 tool_call_id,
                 name,
@@ -569,14 +568,13 @@ pub fn prune_historical_tool_outputs_preserving(
             } => {
                 let image_bytes: usize = images.iter().map(|image| image.data_url.len()).sum();
                 let content_chars = content.chars().count();
-                if keep_full[i]
-                    || (content_chars <= AGED_TOOL_INLINE_LIMIT
-                        && image_bytes <= AGED_TOOL_INLINE_LIMIT)
+                if content_chars <= AGED_TOOL_INLINE_LIMIT
+                    && image_bytes <= AGED_TOOL_INLINE_LIMIT
                 {
                     result.push(msg.clone());
                 } else {
                     let pruned_content = if content_chars > AGED_TOOL_INLINE_LIMIT {
-                        aged_tool_output_preview(content)
+                        aged_tool_output_preview(content, content_chars)
                     } else {
                         content.clone()
                     };
@@ -660,14 +658,18 @@ fn build_checkpoint_from_entries<'a>(
     let dropped: Vec<(&AgentMessage, bool)> = entries.collect();
     let task_state = checkpoint_task_state(&dropped, config.max_checkpoint_chars / 2);
     let mut used_chars = task_state.chars().count();
-    let findings = build_findings(&dropped);
+    let findings = build_findings(
+        &dropped,
+        config.max_checkpoint_chars.saturating_sub(used_chars),
+    );
     used_chars += findings.chars().count();
 
     for (message, output_omitted) in dropped.iter().rev() {
         let Some(excerpt) = message_excerpt(message, *output_omitted) else {
             continue;
         };
-        let excerpt_chars = excerpt.chars().count();
+        let separator_chars = if excerpts.is_empty() { 0 } else { 2 };
+        let excerpt_chars = excerpt.chars().count() + separator_chars;
         if used_chars + excerpt_chars > config.max_checkpoint_chars {
             // An oversized recent message must not hide all older evidence.
             continue;
@@ -770,7 +772,7 @@ fn checkpoint_task_state(dropped: &[(&AgentMessage, bool)], budget: usize) -> St
 /// Condensed episodic memory for the dropped range: failed tool calls
 /// (deduplicated, with counts) and loop-guard trip notices. Raw outputs age
 /// out; what was tried and what failed must not.
-fn build_findings(dropped: &[(&AgentMessage, bool)]) -> String {
+fn build_findings(dropped: &[(&AgentMessage, bool)], budget: usize) -> String {
     const MAX_FINDINGS: usize = 6;
     const MAX_FINDING_CHARS: usize = 200;
     const MAX_FINDINGS_CHARS: usize = 1_200;
@@ -833,8 +835,8 @@ fn build_findings(dropped: &[(&AgentMessage, bool)]) -> String {
         "Tried and failed (do not retry verbatim):\n{}\n\n",
         lines.join("\n")
     );
-    if findings.len() > MAX_FINDINGS_CHARS {
-        findings.truncate(MAX_FINDINGS_CHARS);
+    if let Some((end, _)) = findings.char_indices().nth(budget.min(MAX_FINDINGS_CHARS)) {
+        findings.truncate(end);
     }
     findings
 }
@@ -1586,6 +1588,39 @@ mod tests {
         );
         assert!(checkpoint.contains("`read_file` failed 2x"));
         assert!(checkpoint.contains("Stopped:"));
+    }
+
+    #[test]
+    fn checkpoint_body_respects_small_budgets_with_unicode_failures() {
+        let messages: Vec<_> = (0..8)
+            .map(|index| AgentMessage::Tool {
+                tool_call_id: format!("call-{index}"),
+                name: "read_file".into(),
+                content: format!("{index}: {}", "🦀".repeat(200)),
+                is_error: true,
+                terminate: false,
+                images: vec![],
+            })
+            .collect();
+        for budget in [0, 64, 512, 1_200, 2_000] {
+            let config = CompactionParams {
+                max_checkpoint_chars: budget,
+                ..CompactionParams::default()
+            };
+            let checkpoint = build_checkpoint(&messages, &config);
+            let body = checkpoint.split_once("\n\n").unwrap().1;
+            assert!(body.chars().count() <= budget, "budget {budget}");
+        }
+        // Tiny excerpts also pay for their separators.
+        let messages: Vec<_> = (0..100)
+            .map(|_| AgentMessage::user("x", vec![]))
+            .collect();
+        let config = CompactionParams {
+            max_checkpoint_chars: 512,
+            ..CompactionParams::default()
+        };
+        let checkpoint = build_checkpoint(&messages, &config);
+        assert!(checkpoint.split_once("\n\n").unwrap().1.chars().count() <= 512);
     }
 
     #[test]

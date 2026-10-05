@@ -18,7 +18,11 @@ use threadlane_mcp::McpManager;
 use threadlane_permission::{PermissionHandle, PermissionManager};
 use threadlane_plan::{SessionPlanStore, UpdatePlanToolExecutor};
 use threadlane_protocol::browser::BrowserBridge;
-use threadlane_protocol::{AgentEvent, AgentToolCall, AgentToolDefinition, ToolExecutor};
+use threadlane_protocol::RecoveredToolReply;
+use threadlane_protocol::{
+    AgentEvent, AgentToolCall, AgentToolDefinition, ToolExecutionError, ToolExecutionIdentity,
+    ToolExecutor, ToolOutput,
+};
 use threadlane_question::{AskQuestionToolExecutor, QuestionHandle};
 use threadlane_runtime::Capability;
 use threadlane_runtime::ToolPolicy;
@@ -529,6 +533,52 @@ mod subagent_definition_tests {
         );
     }
 
+    #[tokio::test]
+    async fn subagent_runner_receives_call_identity_in_foreground_and_background() {
+        for wait in [true, false] {
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            let runner: AgentRunner = Arc::new(move |tasks, parallel, call_id| {
+                let sender = sender.clone();
+                Box::pin(async move {
+                    assert_eq!(tasks.len(), 1);
+                    assert_eq!(tasks[0].agent, "test");
+                    assert!(!parallel);
+                    sender.send(call_id).unwrap();
+                    Ok(serde_json::json!({"message":"completed"}))
+                })
+            });
+            let executor = SubagentToolExecutor::new(runner);
+            let call = AgentToolCall {
+                id: format!("durable-call-{wait}"),
+                name: SUBAGENT_TOOL_NAME.into(),
+                arguments: serde_json::json!({
+                    "tasks":[{"agent":"test", "task":"fixture"}],
+                    "wait":wait,
+                })
+                .to_string(),
+            };
+            let output = executor
+                .execute_tool_with_call(&call, &call.arguments, None, None)
+                .await
+                .unwrap()
+                .unwrap();
+            let received = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                receiver.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(received, Some(call.id));
+            assert!(output.images.is_empty());
+            if wait {
+                assert_eq!(output.content, "completed");
+            } else {
+                assert!(output.content.contains("background subagent"));
+            }
+        }
+    }
+
     #[test]
     fn worktree_tool_rejects_non_subagent_branches() {
         let executor = WorktreeToolExecutor {
@@ -714,9 +764,16 @@ impl ToolExecutor for SubagentToolExecutor {
         &self,
         call: &AgentToolCall,
         args: &str,
-    ) -> Option<Result<String, String>> {
+        _work_dir: Option<&Path>,
+        _identity: Option<&ToolExecutionIdentity>,
+    ) -> Option<Result<ToolOutput, ToolExecutionError>> {
         self.execute_tool_impl(&call.name, args, Some(call.id.clone()))
             .await
+            .map(|result| {
+                result
+                    .map(ToolOutput::from)
+                    .map_err(ToolExecutionError::Failed)
+            })
     }
 }
 
@@ -745,13 +802,18 @@ pub(crate) fn render_agent_catalog(work_dir: &Path) -> String {
 }
 
 pub(crate) fn restored_tool_policy(extensions: &WasiExtensionManager) -> ToolPolicy {
-    match extensions
-        .host_state("tools.policy")
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .as_deref()
-    {
-        Some("read_only") => ToolPolicy::ReadOnly,
-        _ => ToolPolicy::FullAccess,
+    match extensions.host_state("tools.policy") {
+        Ok(None) => ToolPolicy::FullAccess,
+        Ok(Some(Value::String(policy))) if policy == "full" => ToolPolicy::FullAccess,
+        Ok(Some(Value::String(policy))) if policy == "read_only" => ToolPolicy::ReadOnly,
+        Ok(Some(_)) => {
+            warn!("Invalid persisted tools.policy; using read-only access until the policy is repaired");
+            ToolPolicy::ReadOnly
+        }
+        Err(error) => {
+            warn!("Cannot restore tools.policy: {error}; using read-only access until the policy is repaired");
+            ToolPolicy::ReadOnly
+        }
     }
 }
 
@@ -817,11 +879,13 @@ pub(crate) async fn dispatch_hook_requests(
     extensions: &WasiExtensionManager,
     requests: Vec<HostBrokerRequest>,
 ) -> Result<(), BrokerError> {
-    for request in requests {
-        let dispatch = dispatcher.dispatch_envelopes(vec![request]).await?;
-        extensions.enqueue_broker_results(dispatch.operation_results);
-    }
-    Ok(())
+    let dispatch = dispatcher.dispatch_envelopes(requests).await?;
+    extensions
+        .enqueue_broker_results(dispatch.operation_results)
+        .map_err(|message| BrokerError {
+            code: "state_persistence_failed".into(),
+            message,
+        })
 }
 
 async fn dispatch_hook_requests_isolated(
@@ -830,10 +894,8 @@ async fn dispatch_hook_requests_isolated(
     requests: Vec<HostBrokerRequest>,
     label: &str,
 ) {
-    for request in requests {
-        if let Err(error) = dispatch_hook_requests(dispatcher, extensions, vec![request]).await {
-            warn!("{label}: {}", error.message);
-        }
+    if let Err(error) = dispatch_hook_requests(dispatcher, extensions, requests).await {
+        warn!("{label}: {}", error.message);
     }
 }
 
@@ -893,10 +955,10 @@ pub(crate) fn extension_before_tool_hook_handler(
                 "tool_name": tool_name,
                 "tool_arguments": context.tool_arguments.as_deref().unwrap_or(""),
             });
-            let hook_responses = extensions
-                .execute_hook_with_broker_requests("before_tool_call", &arguments.to_string());
-            for resp in hook_responses {
-                let res = match resp {
+            for operation in extensions.begin_hook_operations("before_tool_call") {
+                let mut operation = operation
+                    .map_err(|error| format!("Extension hook error: {error}"))?;
+                let res = match operation.invoke(&arguments.to_string()) {
                     Ok(res) => res,
                     Err(error) => {
                         return Err(format!("Extension hook error: {error}"));
@@ -989,17 +1051,30 @@ pub(crate) fn create_after_tool_hook_handler(
                     }
                 }
             }
-            for response in extensions
-                .execute_hook_with_broker_requests("after_tool_call", &arguments.to_string())
-            {
-                match response {
+            for operation in extensions.begin_hook_operations("after_tool_call") {
+                let mut operation = match operation {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        warn!("WASI after-tool hook error: {error}");
+                        continue;
+                    }
+                };
+                let invocation = match context.tool_execution_identity.as_ref() {
+                    Some(identity) => operation.invoke_after_tool(&arguments.to_string(), identity),
+                    None => operation.invoke(&arguments.to_string()),
+                };
+                match invocation {
                     Ok(response) => {
                         match broker_dispatcher
                             .dispatch_envelopes(response.host_broker_requests)
                             .await
                         {
                             Ok(dispatch) => {
-                                extensions.enqueue_broker_results(dispatch.operation_results);
+                                if let Err(error) =
+                                    extensions.enqueue_broker_results(dispatch.operation_results)
+                                {
+                                    warn!("WASI after-tool hook outcome commit failed: {error}");
+                                }
                             }
                             Err(error) => {
                                 warn!("WASI after-tool hook broker error: {}", error.message)
@@ -1015,44 +1090,17 @@ pub(crate) fn create_after_tool_hook_handler(
 }
 
 async fn run_lsp_diagnostics_after_write(
-    extensions: &WasiExtensionManager,
+    extensions: &Arc<WasiExtensionManager>,
     broker_dispatcher: &Arc<CapabilityDispatcher>,
     path: &str,
 ) -> Option<Result<String, String>> {
     let args = serde_json::json!({ "path": path }).to_string();
-    let mut continuation_rounds = 0;
-    loop {
-        let invocation = extensions.execute_tool_with_broker_requests("lsp_diagnostics", &args)?;
-        let invocation = match invocation {
-            Ok(invocation) => invocation,
-            Err(error) => return Some(Err(error)),
-        };
-        if let Some(error) = invocation.response.error {
-            return Some(Err(error));
-        }
-        let continue_after_broker = invocation.response.continue_after_broker;
-        let message = invocation.response.message.unwrap_or_default();
-        if invocation.host_broker_requests.is_empty() {
-            return Some(Ok(message));
-        }
-        if continuation_rounds >= MAX_BROKER_CONTINUATION_ROUNDS {
-            return Some(Err(
-                "lsp_diagnostics exceeded broker continuation limit".into()
-            ));
-        }
-        let dispatch = match broker_dispatcher
-            .dispatch_envelopes(invocation.host_broker_requests)
-            .await
-        {
-            Ok(dispatch) => dispatch,
-            Err(error) => return Some(Err(error.message)),
-        };
-        extensions.enqueue_broker_results(dispatch.operation_results);
-        if !continue_after_broker {
-            return Some(Ok(message));
-        }
-        continuation_rounds += 1;
+    BrokerAwareWasiToolExecutor {
+        extensions: extensions.clone(),
+        broker_dispatcher: broker_dispatcher.clone(),
     }
+    .execute_tool("lsp_diagnostics", &args)
+    .await
 }
 
 pub struct BrokerAwareWasiToolExecutor {
@@ -1071,41 +1119,145 @@ impl ToolExecutor for BrokerAwareWasiToolExecutor {
     }
 
     async fn execute_tool(&self, name: &str, args: &str) -> Option<Result<String, String>> {
+        self.execute_tool_impl(name, args, None)
+            .await
+            .map(|result| result.map_err(|error| error.to_string()))
+    }
+
+    async fn execute_tool_with_call(
+        &self,
+        call: &AgentToolCall,
+        args: &str,
+        _: Option<&Path>,
+        identity: Option<&ToolExecutionIdentity>,
+    ) -> Option<Result<ToolOutput, ToolExecutionError>> {
+        self.execute_tool_impl(&call.name, args, identity)
+            .await
+            .map(|result| result.map(ToolOutput::from))
+    }
+
+    async fn recover_tool_reply(
+        &self,
+        call: &AgentToolCall,
+        args: &str,
+        _: Option<&Path>,
+        identity: &ToolExecutionIdentity,
+    ) -> Option<Result<RecoveredToolReply, ToolExecutionError>> {
+        match self
+            .extensions
+            .recover_tool_reply(identity, &call.name, args)
+        {
+            Ok(Some(reply)) => match self.extensions.recovered_canonical_reply(identity) {
+                Ok(Some(result)) => Some(Ok(RecoveredToolReply::Canonical(result))),
+                Ok(None) => Some(
+                    reply
+                        .map(ToolOutput::from)
+                        .map(RecoveredToolReply::Extension)
+                        .map_err(ToolExecutionError::Failed),
+                ),
+                Err(error) => Some(Err(ToolExecutionError::RecoveryRequired(error))),
+            },
+            Ok(None) => None,
+            Err(error) => Some(Err(ToolExecutionError::RecoveryRequired(error))),
+        }
+    }
+
+    async fn acknowledge_tool_reply(&self, identity: &ToolExecutionIdentity) -> Result<(), String> {
+        self.extensions.acknowledge_tool_reply(identity)
+    }
+
+    async fn prepare_tool_reply(
+        &self,
+        identity: &ToolExecutionIdentity,
+        result: &threadlane_protocol::AgentToolResult,
+    ) -> Result<(), ToolExecutionError> {
+        self.extensions
+            .prepare_tool_reply(identity, result)
+            .map_err(ToolExecutionError::RecoveryRequired)
+    }
+}
+
+impl BrokerAwareWasiToolExecutor {
+    async fn execute_tool_impl(
+        &self,
+        name: &str,
+        args: &str,
+        identity: Option<&ToolExecutionIdentity>,
+    ) -> Option<Result<String, ToolExecutionError>> {
+        let persistence_error = |error| {
+            if identity.is_some() {
+                ToolExecutionError::RecoveryRequired(error)
+            } else {
+                ToolExecutionError::Failed(error)
+            }
+        };
+        if let Some(identity) = identity {
+            match self.extensions.recover_tool_reply(identity, name, args) {
+                Ok(Some(reply)) => return Some(reply.map_err(ToolExecutionError::Failed)),
+                Ok(None) => {}
+                Err(error) => return Some(Err(persistence_error(error))),
+            }
+        }
+
+        let mut operation = match self.extensions.begin_tool_operation(name)? {
+            Ok(operation) => operation,
+            Err(error) => return Some(Err(persistence_error(error))),
+        };
         let mut continuation_rounds = 0;
         loop {
-            let invocation = match self
-                .extensions
-                .execute_tool_with_broker_requests(name, args)?
-            {
+            let invocation = match match identity {
+                Some(identity) => operation.invoke_for_execution(args, identity),
+                None => operation.invoke(args),
+            } {
                 Ok(invocation) => invocation,
-                Err(error) => return Some(Err(error)),
+                Err(error) => return Some(Err(persistence_error(error))),
             };
             if let Some(error) = invocation.response.error {
-                return Some(Err(error));
+                return Some(Err(ToolExecutionError::Failed(error)));
             }
             let continue_after_broker = invocation.response.continue_after_broker;
             let immediate_message = invocation.response.message.unwrap_or_default();
             let requests = invocation.host_broker_requests;
             if requests.is_empty() {
+                if continue_after_broker {
+                    return Some(Err(ToolExecutionError::Failed(format!(
+                        "WASI tool `{name}` requested a broker continuation without any requests; \
+                         check capability grants and clear `continue_after_broker` when finished"
+                    ))));
+                }
                 return Some(Ok(immediate_message));
             }
             if continue_after_broker && continuation_rounds >= MAX_BROKER_CONTINUATION_ROUNDS {
-                return Some(Err(format!(
+                let message = format!(
                     "WASI tool `{name}` exceeded the broker continuation limit of \
                      {MAX_BROKER_CONTINUATION_ROUNDS} rounds; clear `continue_after_broker` after \
                      processing `broker_response` events"
-                )));
+                );
+                let outcomes = requests.into_iter().map(|request| request.not_dispatched(BrokerError {
+                    code: "continuation_limit".into(),
+                    message: "Host continuation budget exhausted before dispatch".into(),
+                })).collect();
+                let persisted = match identity {
+                    Some(identity) => {
+                        operation.finish_with_error(args, identity, outcomes, message.clone())
+                    }
+                    None => self.extensions.enqueue_broker_results(outcomes),
+                };
+                if let Err(error) = persisted {
+                    return Some(Err(persistence_error(error)));
+                }
+                return Some(Err(ToolExecutionError::Failed(message)));
             }
 
             let dispatch = match self.broker_dispatcher.dispatch_envelopes(requests).await {
                 Ok(dispatch) => dispatch,
-                Err(error) => return Some(Err(error.message)),
+                Err(error) => return Some(Err(persistence_error(error.message))),
             };
             let operation_results = dispatch.operation_results;
-            self.extensions
-                .enqueue_broker_results(operation_results.clone());
-
             if continue_after_broker {
+                if let Err(error) = self.extensions.enqueue_broker_results(operation_results) {
+                    return Some(Err(persistence_error(error)));
+                }
                 continuation_rounds += 1;
                 continue;
             }
@@ -1114,7 +1266,11 @@ impl ToolExecutor for BrokerAwareWasiToolExecutor {
                 .iter()
                 .find_map(|result| result.error.as_ref())
             {
-                return Some(Err(error.message.clone()));
+                let message = error.message.clone();
+                if let Err(error) = self.extensions.enqueue_broker_results(operation_results) {
+                    return Some(Err(persistence_error(format!("{message}; {error}"))));
+                }
+                return Some(Err(ToolExecutionError::Failed(message)));
             }
 
             let broker_message = operation_results
@@ -1131,7 +1287,420 @@ impl ToolExecutor for BrokerAwareWasiToolExecutor {
                         .or_else(|| result.value.get("output").and_then(Value::as_str))
                         .map(str::to_owned)
                 });
+            if let Err(error) = self.extensions.enqueue_broker_results(operation_results) {
+                return Some(Err(persistence_error(error)));
+            }
             return Some(Ok(broker_message.unwrap_or(immediate_message)));
+        }
+    }
+}
+
+#[cfg(test)]
+mod broker_continuation_tests {
+    use super::{
+        run_lsp_diagnostics_after_write, BrokerAwareWasiToolExecutor, CapabilityDispatcher,
+        MAX_BROKER_CONTINUATION_ROUNDS,
+    };
+    use async_trait::async_trait;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use threadlane_protocol::ToolExecutor;
+    use threadlane_wasi::{
+        broker::{BrokerError, BrokerRequest, CapabilityHandler},
+        WasiExtensionManager,
+    };
+
+    struct RoundCounter {
+        manager: Arc<WasiExtensionManager>,
+        rounds: AtomicUsize,
+    }
+
+    struct FailingOutcomeStorage {
+        checkpoint: std::path::PathBuf,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CapabilityHandler for FailingOutcomeStorage {
+        fn handle(&self, _: &BrokerRequest) -> Result<serde_json::Value, BrokerError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                std::fs::rename(&self.checkpoint, self.checkpoint.with_extension("backup"))
+                    .unwrap();
+                std::fs::create_dir(&self.checkpoint).unwrap();
+            }
+            Ok(serde_json::json!("executed once"))
+        }
+    }
+
+    async fn hook_batch_retains_all_outcomes(isolated: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        crate::runtime::broker_repair_tests::install_fixture(directory.path());
+        let manager = WasiExtensionManager::for_project_session(directory.path(), "batch");
+        manager
+            .reload_from_roots(None, Some(directory.path()))
+            .unwrap();
+        let requests = {
+            let mut hook = manager
+                .begin_hook_operations("before_tool_call")
+                .next()
+                .unwrap()
+                .unwrap();
+            hook.invoke("{}").unwrap().host_broker_requests
+        };
+        assert_eq!(requests.len(), 2);
+        let handler = Arc::new(FailingOutcomeStorage {
+            checkpoint: WasiExtensionManager::session_state_path(
+                directory.path(),
+                "batch",
+                "receipt_probe",
+            ),
+            calls: AtomicUsize::new(0),
+        });
+        let mut dispatcher = CapabilityDispatcher::new();
+        dispatcher.register("tools", handler.clone());
+        let dispatcher = Arc::new(dispatcher);
+        if isolated {
+            super::dispatch_hook_requests_isolated(&dispatcher, &manager, requests, "test").await;
+        } else {
+            let error = super::dispatch_hook_requests(&dispatcher, &manager, requests)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "state_persistence_failed");
+        }
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 2);
+        std::fs::remove_dir(&handler.checkpoint).unwrap();
+        std::fs::rename(
+            handler.checkpoint.with_extension("backup"),
+            &handler.checkpoint,
+        )
+        .unwrap();
+        {
+            let mut hook = manager
+                .begin_hook_operations("before_tool_call")
+                .next()
+                .unwrap()
+                .unwrap();
+            let result = hook.invoke("{}").unwrap();
+            assert!(result.host_broker_requests.is_empty());
+        }
+        assert_eq!(
+            manager.extension_state("receipt_probe"),
+            Some(serde_json::json!({"phase":"ready"}))
+        );
+        manager
+            .reload_from_roots(None, Some(directory.path()))
+            .unwrap();
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 2);
+        drop(manager);
+        let recovered = WasiExtensionManager::for_project_session(directory.path(), "batch");
+        recovered
+            .reload_from_roots(None, Some(directory.path()))
+            .unwrap();
+        assert_eq!(
+            recovered.extension_state("receipt_probe"),
+            Some(serde_json::json!({"phase":"ready"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_batch_preserves_suffix_when_outcome_storage_fails() {
+        hook_batch_retains_all_outcomes(false).await;
+    }
+
+    #[tokio::test]
+    async fn isolated_hook_batch_preserves_suffix_when_outcome_storage_fails() {
+        hook_batch_retains_all_outcomes(true).await;
+    }
+
+    #[async_trait]
+    impl CapabilityHandler for RoundCounter {
+        fn handle(&self, _: &BrokerRequest) -> Result<serde_json::Value, BrokerError> {
+            let round = self.rounds.fetch_add(1, Ordering::SeqCst) + 1;
+            self.manager
+                .set_extension_state("rounds", serde_json::json!(round))
+                .unwrap();
+            Ok(serde_json::Value::Null)
+        }
+    }
+
+    fn fixture(finite: bool, emit_request: bool) -> (tempfile::TempDir, Arc<WasiExtensionManager>) {
+        // Exercise the production WASM invocation, queued broker outcomes,
+        // and executor loop. The finite fixture settles after six dispatches.
+        let manifest = serde_json::json!({"api_version":2,"name":"rounds","version":"1","description":"test","capabilities":["tools"],"tools":[{"name":"rounds","description":"test","parameters":{}},{"name":"lsp_diagnostics","description":"test","parameters":{}}]}).to_string();
+        let pending = r#"{"message":"waiting","continue_after_broker":true}"#;
+        let done = r#"{"message":"done","state":{}}"#;
+        let request =
+            r#"{"api_version":2,"capability":"tools","operation":"get_policy","arguments":{}}"#;
+        let escape = |text: &str| text.replace('\\', "\\\\").replace('"', "\\\"");
+        let finish = if finite {
+            r#"(local.set $end (i32.sub (i32.add (local.get $ptr) (local.get $len)) (i32.const 9)))
+                (block $scanned (loop $scan
+                  (br_if $scanned (i32.gt_u (local.get $ptr) (local.get $end)))
+                  (if (i64.eq (i64.load align=1 (local.get $ptr)) (i64.const 0x3a22657461747322))
+                    (then (if (i32.eq (i32.load8_u offset=8 (local.get $ptr)) (i32.const 54))
+                      (then (return (i64.const DONE))))))
+                  (local.set $ptr (i32.add (local.get $ptr) (i32.const 1)))
+                  (br $scan)))"#
+                .replace("DONE", &(((2048u64) << 32) | done.len() as u64).to_string())
+        } else {
+            String::new()
+        };
+        let request_call = if emit_request {
+            format!("(drop (call $request (i32.const 3072) (i32.const {}) (i32.const 8192) (i32.const 1024)))", request.len())
+        } else {
+            String::new()
+        };
+        let module = format!(
+            r#"(module
+          (import "threadlane_host" "request" (func $request (param i32 i32 i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 8) "{manifest}")
+          (data (i32.const 1024) "{pending}")
+          (data (i32.const 2048) "{done}")
+          (data (i32.const 3072) "{request}")
+          (func (export "extension_info") (result i64) (i64.const {manifest_result}))
+          (func (export "alloc") (param i32) (result i32) (i32.const 4096))
+          (func (export "execute_tool") (param $ptr i32) (param $len i32) (result i64)
+            (local $end i32)
+            {finish}
+            {request_call}
+            (i64.const {pending_result})))"#,
+            manifest = escape(&manifest),
+            pending = escape(pending),
+            done = escape(done),
+            request = escape(request),
+            manifest_result = (8u64 << 32) | manifest.len() as u64,
+            pending_result = (1024u64 << 32) | pending.len() as u64,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".threadlane/extensions/rounds.wasm");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, module).unwrap();
+        let manager = Arc::new(WasiExtensionManager::new());
+        assert_eq!(
+            manager
+                .reload_from_roots(None, Some(directory.path()))
+                .unwrap(),
+            1
+        );
+        (directory, manager)
+    }
+
+    async fn run_fixture(finite: bool, emit_request: bool) -> (Result<String, String>, usize) {
+        let (_directory, manager) = fixture(finite, emit_request);
+        let counter = Arc::new(RoundCounter {
+            manager: manager.clone(),
+            rounds: AtomicUsize::new(0),
+        });
+        let mut dispatcher = CapabilityDispatcher::new();
+        dispatcher.register("tools", counter.clone());
+        let executor = BrokerAwareWasiToolExecutor {
+            extensions: manager,
+            broker_dispatcher: Arc::new(dispatcher),
+        };
+        let result = executor.execute_tool("rounds", "{}").await.unwrap();
+        let rounds = counter.rounds.load(Ordering::SeqCst);
+        if finite && emit_request {
+            counter.rounds.store(0, Ordering::SeqCst);
+            counter
+                .manager
+                .set_extension_state("rounds", serde_json::json!({}))
+                .unwrap();
+            let diagnostics = run_lsp_diagnostics_after_write(
+                &executor.extensions,
+                &executor.broker_dispatcher,
+                "src/lib.rs",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(diagnostics, "done");
+            assert_eq!(counter.rounds.load(Ordering::SeqCst), 6);
+        }
+        (result, rounds)
+    }
+
+    struct PausedBroker {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CapabilityHandler for PausedBroker {
+        fn handle(&self, _: &BrokerRequest) -> Result<serde_json::Value, BrokerError> {
+            panic!("the production dispatcher must use the async handler")
+        }
+
+        async fn handle_for_extension_async(
+            &self,
+            _: &BrokerRequest,
+            _: &str,
+        ) -> Result<serde_json::Value, BrokerError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(serde_json::Value::Null)
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_owns_the_call_across_broker_awaits_and_releases_on_cancellation() {
+        let (directory, _) = fixture(true, true);
+        let manager = Arc::new(WasiExtensionManager::for_project_session(
+            directory.path(), "cancelled",
+        ));
+        manager.reload_from_roots(None, Some(directory.path())).unwrap();
+        let handler = Arc::new(PausedBroker {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            calls: AtomicUsize::new(0),
+        });
+        let mut dispatcher = CapabilityDispatcher::new();
+        dispatcher.register("tools", handler.clone());
+        let executor = Arc::new(BrokerAwareWasiToolExecutor {
+            extensions: manager.clone(),
+            broker_dispatcher: Arc::new(dispatcher),
+        });
+        let running = executor.clone();
+        let task = tokio::spawn(async move { running.execute_tool("rounds", "{}").await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), handler.entered.notified())
+            .await
+            .unwrap();
+        let error = executor.execute_tool("lsp_diagnostics", "{}").await
+            .unwrap().unwrap_err();
+        assert!(error.contains("active call"), "{error}");
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        // The RAII claim disappears, but cancellation cannot declare the
+        // dispatched operation safe to repeat or discard its durable receipt.
+        let mut recovery = manager.begin_tool_operation("rounds").unwrap().unwrap();
+        let error = recovery.invoke("{}").unwrap_err();
+        assert!(error.contains("may already have executed"), "{error}");
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+        drop(recovery);
+        drop(executor);
+        drop(manager);
+        let recovered = WasiExtensionManager::for_project_session(directory.path(), "cancelled");
+        recovered.reload_from_roots(None, Some(directory.path())).unwrap();
+        let error = recovered.execute_tool_with_broker_requests("rounds", "{}")
+            .unwrap().unwrap_err();
+        assert!(error.contains("may already have executed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn broker_continuations_allow_normal_protocol_setup_and_bound_runaways() {
+        assert_eq!(
+            serde_json::to_value(threadlane_runtime::CodingAgentConfig::default()).unwrap()
+                ["max_broker_continuation_rounds"],
+            MAX_BROKER_CONTINUATION_ROUNDS,
+        );
+        let (result, rounds) = run_fixture(true, true).await;
+        assert_eq!(result.unwrap(), "done");
+        assert_eq!(rounds, 6);
+        let (result, rounds) = run_fixture(false, true).await;
+        assert!(result.unwrap_err().contains("continuation limit"));
+        assert_eq!(rounds, MAX_BROKER_CONTINUATION_ROUNDS);
+        let (result, rounds) = run_fixture(false, false).await;
+        assert!(result.unwrap_err().contains("without any requests"));
+        assert_eq!(rounds, 0);
+    }
+
+    #[tokio::test]
+    async fn durable_broker_protocol_failures_save_terminal_replies_without_replaying_rounds() {
+        use threadlane_protocol::{AgentToolCall, ToolExecutionIdentity};
+        for emit_request in [false, true] {
+            let (directory, old) = fixture(false, emit_request);
+            drop(old);
+            let manager = Arc::new(WasiExtensionManager::for_project_session(
+                directory.path(),
+                "durable",
+            ));
+            manager
+                .reload_from_roots(None, Some(directory.path()))
+                .unwrap();
+            let counter = Arc::new(RoundCounter {
+                manager: manager.clone(),
+                rounds: AtomicUsize::new(0),
+            });
+            let mut dispatcher = CapabilityDispatcher::new();
+            dispatcher.register("tools", counter.clone());
+            let executor = BrokerAwareWasiToolExecutor {
+                extensions: manager.clone(),
+                broker_dispatcher: Arc::new(dispatcher),
+            };
+            let identity = ToolExecutionIdentity {
+                session_id: "durable".into(),
+                lane: "main".into(),
+                run_id: "run".into(),
+                assistant_entry_id: "assistant".into(),
+                tool_call_id: "call".into(),
+                tool_name: "rounds".into(),
+                result_entry_id: "result".into(),
+            };
+            let call = AgentToolCall {
+                id: "call".into(),
+                name: "rounds".into(),
+                arguments: "{}".into(),
+            };
+            let error = executor
+                .execute_tool_with_call(&call, "{}", None, Some(&identity))
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(if emit_request {
+                    "continuation limit"
+                } else {
+                    "without any requests"
+                }),
+                "{error}"
+            );
+            assert_eq!(
+                counter.rounds.load(Ordering::SeqCst),
+                if emit_request {
+                    MAX_BROKER_CONTINUATION_ROUNDS
+                } else {
+                    0
+                }
+            );
+            assert_eq!(
+                manager
+                    .recover_tool_reply(&identity, "rounds", "{}")
+                    .unwrap(),
+                Some(Err(error.clone()))
+            );
+            // Even another execution entry cannot repeat the completed broker loop.
+            assert_eq!(
+                executor
+                    .execute_tool_with_call(&call, "{}", None, Some(&identity))
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string(),
+                error
+            );
+            assert_eq!(
+                counter.rounds.load(Ordering::SeqCst),
+                if emit_request {
+                    MAX_BROKER_CONTINUATION_ROUNDS
+                } else {
+                    0
+                }
+            );
+            let result = threadlane_protocol::AgentToolResult::external(
+                "call",
+                "rounds",
+                format!("Tool executor error: {error}"),
+                true,
+            );
+            manager.prepare_tool_reply(&identity, &result).unwrap();
+            manager.acknowledge_tool_reply(&identity).unwrap();
+            assert!(manager.pending_tool_reply_identities().unwrap().is_empty());
         }
     }
 }
@@ -1212,7 +1781,52 @@ mod github_tests {
 
 #[cfg(test)]
 mod read_only_policy_tests {
-    use super::{memory_tool_mutates, read_only_policy_block_message};
+    use super::{
+        memory_tool_mutates, read_only_policy_block_message, restored_tool_policy,
+        ToolPolicy, WasiExtensionManager,
+    };
+
+    #[test]
+    fn persisted_policy_does_not_grant_access_on_invalid_storage() {
+        let project = tempfile::tempdir().unwrap();
+        let manager = WasiExtensionManager::for_project_session(project.path(), "policy");
+        assert_eq!(restored_tool_policy(&manager), ToolPolicy::FullAccess);
+        manager
+            .set_host_state("tools.policy", serde_json::json!("read_only"))
+            .unwrap();
+        drop(manager);
+        assert_eq!(
+            restored_tool_policy(&WasiExtensionManager::for_project_session(project.path(), "policy")),
+            ToolPolicy::ReadOnly,
+        );
+        let directory = WasiExtensionManager::session_state_path(project.path(), "policy", "unused")
+            .parent()
+            .unwrap()
+            .to_owned();
+        let path = directory.join(".host.tools.policy.json");
+        for bytes in [
+            b"{incomplete".as_slice(), b"{}".as_slice(), b"\"unknown_policy\"".as_slice(),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            let reloaded = WasiExtensionManager::for_project_session(project.path(), "policy");
+            assert_eq!(restored_tool_policy(&reloaded), ToolPolicy::ReadOnly);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        let manager = WasiExtensionManager::for_project_session(project.path(), "policy");
+        manager
+            .set_host_state("tools.policy", serde_json::json!("full"))
+            .unwrap();
+        // A second live manager cannot load a full policy from an owned cache scope.
+        assert_eq!(
+            restored_tool_policy(&WasiExtensionManager::for_project_session(project.path(), "policy")),
+            ToolPolicy::ReadOnly,
+        );
+        drop(manager);
+        assert_eq!(
+            restored_tool_policy(&WasiExtensionManager::for_project_session(project.path(), "policy")),
+            ToolPolicy::FullAccess,
+        );
+    }
 
     #[test]
     fn read_only_memory_actions_are_allowed_and_mutations_are_blocked() {

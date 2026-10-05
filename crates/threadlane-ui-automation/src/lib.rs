@@ -1,9 +1,10 @@
-//! Automation navigation, editor, and paged run history. Execution stays in UI state.
+//! Automation navigation, editor, and paged run history. Execution stays in the owning daemon.
 mod editor;
 use gpui::*;
 use std::path::PathBuf;
 use threadlane_automation::Definition;
-use threadlane_ui_state::{automation::Command, AppState};
+use threadlane_protocol::automation::AutomationCommand as Command;
+use threadlane_ui_state::{automation_io, AppState};
 
 pub use threadlane_ui_kit::automation_form::SaveAutomation;
 pub fn init(cx: &mut App) { threadlane_ui_kit::automation_form::init(cx); }
@@ -20,6 +21,12 @@ pub struct AutomationsView {
     busy: bool,
     _subscription: Subscription,
 }
+
+/// A completed delete may reset navigation only while its definition remains selected.
+fn deleted_selection_is_current(deleted_id: Option<&str>, selected: Option<&str>) -> bool {
+    deleted_id.is_some() && deleted_id == selected
+}
+
 impl AutomationsView {
     pub fn new(model: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.observe(&model, |_, _, cx| cx.notify());
@@ -36,21 +43,34 @@ impl AutomationsView {
             _subscription: subscription,
         }
     }
+    /// Dispatch one daemon mutation, retaining selection on failure and showing its error.
+    /// Store projections arrive through the model's authoritative watch or event stream.
     fn command(&mut self, command: Command, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
-        let Some(service) = self.model.read(cx).automation_service.clone() else {
-            return;
-        };
+        let client = self.model.read(cx).daemon_client.clone();
         self.busy = true;
         self.error = None;
-        let deleting = matches!(&command, Command::Delete(_));
+        let deleted_id = match &command {
+            Command::Delete { id } => Some(id.clone()),
+            _ => None,
+        };
+        let task = threadlane_provider::exec::get_runtime()
+            .spawn(async move { automation_io::mutate(&client, command).await });
         cx.spawn(async move |this, cx| {
-            let result = service.command(command).await;
+            let result = task
+                .await
+                .map_err(|error| format!("Automation request failed: {error}"))
+                .and_then(|result| result);
             let _ = this.update(cx, |this, cx| {
                 this.busy = false;
-                if result.is_ok() && deleting {
+                if result.is_ok()
+                    && deleted_selection_is_current(
+                        deleted_id.as_deref(),
+                        this.selected.as_deref(),
+                    )
+                {
                     this.selected = None;
                     this.history = true;
                     this.page = 0;
@@ -142,14 +162,14 @@ impl Render for AutomationsView {
                             if editing_existing && definition.is_none() { return; }
                             this.edit(definition, window, cx);
                         }
-                        AutomationAction::RunNow(id) => this.command(Command::RunNow(id), cx),
+                        AutomationAction::RunNow(id) => this.command(Command::RunNow { id }, cx),
                         AutomationAction::SetEnabled(id, enabled) => {
-                            this.command(Command::SetEnabled(id, enabled), cx)
+                            this.command(Command::SetEnabled { id, enabled }, cx)
                         }
-                        AutomationAction::Delete(id) => this.command(Command::Delete(id), cx),
-                        AutomationAction::CancelRun(id) => this.command(Command::Cancel(id), cx),
-                        AutomationAction::ReviewRun(id) => this.command(Command::Review(id), cx),
-                        AutomationAction::DeleteRun(id) => this.command(Command::DeleteRun(id), cx),
+                        AutomationAction::Delete(id) => this.command(Command::Delete { id }, cx),
+                        AutomationAction::CancelRun(id) => this.command(Command::Cancel { id }, cx),
+                        AutomationAction::ReviewRun(id) => this.command(Command::Review { id }, cx),
+                        AutomationAction::DeleteRun(id) => this.command(Command::DeleteRun { id }, cx),
                         AutomationAction::OpenChat(id) => {
                             let result = this.model.update(cx, |state, cx| {
                                 let result = state.open_automation_run(&id);
@@ -157,7 +177,7 @@ impl Render for AutomationsView {
                                 result
                             });
                             match result {
-                                Ok(()) => this.command(Command::Review(id), cx),
+                                Ok(()) => this.command(Command::Review { id }, cx),
                                 Err(error) => this.error = Some(error),
                             }
                         }
@@ -176,13 +196,23 @@ mod tests {
     use gpui_component::WindowExt;
     use threadlane_ui_state::{activate_test_session, AppState};
 
+    /// Remote deletion must not undo a newer selection or a return to the list.
+    #[test]
+    fn delayed_delete_preserves_newer_navigation() {
+        assert!(super::deleted_selection_is_current(Some("a"), Some("a")));
+        assert!(!super::deleted_selection_is_current(Some("a"), Some("b")));
+        assert!(!super::deleted_selection_is_current(Some("a"), None));
+        assert!(!super::deleted_selection_is_current(None, Some("a")));
+        assert!(!super::deleted_selection_is_current(None, None));
+    }
+
     #[gpui::test]
     fn history_filters_attention_keeps_prompts_collapsed_and_retains_chat(cx: &mut TestAppContext) {
         use threadlane_automation::{Definition, Run, RunStatus, Schedule};
         cx.update(gpui_component::init);
         let temp = tempfile::tempdir().unwrap();
         let model = cx.new(|_| {
-            let mut state = AppState::default();
+            let mut state = AppState::for_tests();
             activate_test_session(&mut state, "original", &temp.path().join("original.jsonl"));
             let definition = Definition {
                 id: "research".into(),
@@ -418,7 +448,7 @@ mod tests {
         cx.update(|cx| cx.set_reduce_motion(true));
         let temp = tempfile::tempdir().unwrap();
         let model = cx.new(|_| {
-            let mut state = AppState::default();
+            let mut state = AppState::for_tests();
             activate_test_session(&mut state, "original", &temp.path().join("original.jsonl"));
             state
         });

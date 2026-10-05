@@ -6,7 +6,7 @@
 //! lives in `threadlane_provider::convert`; import it from there directly.
 
 use crate::types::TurnState;
-use threadlane_protocol::{AgentMessage, AgentToolResult, TokenUsage};
+use threadlane_protocol::{AgentMessage, AgentToolResult, TokenUsage, ToolExecutionIdentity};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -254,11 +254,17 @@ fn default_adapter_for(format: PayloadFormat) -> Arc<dyn ProviderAdapter> {
 // ── Recorder type aliases ───────────────────────────────────────────────
 
 pub type ToolIntentRecorder = Arc<
-    dyn Fn(&str, &str, &str) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+    dyn Fn(
+            &str,
+            &str,
+            &str,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolExecutionIdentity, String>> + Send>>
         + Send
         + Sync,
 >;
 
+/// Commits the canonical result before it can reach events or model history.
+/// Failure stops dispatch; it must never become a substitute tool reply.
 pub type ToolCompletionRecorder = Arc<
     dyn Fn(&AgentToolResult) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
         + Send

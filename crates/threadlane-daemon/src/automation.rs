@@ -23,6 +23,9 @@ pub struct Projection {
     pub active_runtime: Option<Arc<SessionController>>,
     pub permissions: HashMap<String, PermissionRequest>,
     pub questions: HashMap<String, QuestionRequest>,
+    /// Complete pending questions in request order; `questions` mirrors
+    /// each session's latest entry for older clients.
+    pub question_queues: HashMap<String, Vec<QuestionRequest>>,
     pub notification: Option<(String, String)>,
 }
 pub enum Command {
@@ -89,6 +92,7 @@ impl AutomationService {
     pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
         self.events.subscribe()
     }
+    /// Handle an automation command and report its persistence/scheduling result.
     pub async fn command(&self, command: Command) -> Result<(), String> {
         let (tx, rx) = oneshot::channel();
         self.commands.send((command, tx)).map_err(|_| {
@@ -147,11 +151,15 @@ impl Actor {
             projection: Projection::default(),
         }
     }
+    /// Publish changes to durable state, pending requests, or the active runtime handle.
     fn publish(&mut self) {
         let current = self.updates.borrow();
         let runtime = self.active.as_ref().and_then(|a| a.runtime.clone());
         if current.snapshot.revision == self.store.snapshot().revision
             && current.error == self.projection.error
+            && current.permissions == self.projection.permissions
+            && current.questions == self.projection.questions
+            && current.question_queues == self.projection.question_queues
             && current.active_runtime.as_ref().map(|r| r.session_file())
                 == runtime.as_ref().map(|r| r.session_file())
         {
@@ -245,6 +253,7 @@ impl Actor {
             self.publish();
         }
     }
+    /// Handle an automation command and report its persistence/scheduling result.
     fn command(&mut self, command: Command) -> Result<(), String> {
         match command {
             Command::Save(d) => {
@@ -291,13 +300,14 @@ impl Actor {
                     {
                         self.projection.permissions.remove(&session_id);
                     }
-                    if self
-                        .projection
-                        .questions
-                        .get(&session_id)
-                        .is_some_and(|r| r.id == request_id)
-                    {
-                        self.projection.questions.remove(&session_id);
+                    if let Some(queue) = self.projection.question_queues.get_mut(&session_id) {
+                        queue.retain(|request| request.id != request_id);
+                        if let Some(latest) = queue.last() {
+                            self.projection.questions.insert(session_id.clone(), latest.clone());
+                        } else {
+                            self.projection.questions.remove(&session_id);
+                            self.projection.question_queues.remove(&session_id);
+                        }
                     }
                     if self.projection.permissions.is_empty()
                         && self.projection.questions.is_empty()
@@ -402,6 +412,7 @@ impl Actor {
         }
         Ok(())
     }
+    /// Fold runtime events into pending-request state and forward the live session events.
     fn event(&mut self, event: Event) -> Result<(), String> {
         match event {
             Event::Prepared(id, result) => {
@@ -476,9 +487,16 @@ impl Actor {
                         Some(RunStatus::WaitingPermission)
                     }
                     AgentEvent::QuestionRequested { request } => {
-                        self.projection
-                            .questions
-                            .insert(session_id.clone(), request.clone());
+                        let queue = self.projection.question_queues
+                            .entry(session_id.clone())
+                            .or_default();
+                        if let Some(existing) = queue.iter_mut().find(|q| q.id == request.id) {
+                            *existing = request.clone();
+                        } else {
+                            queue.push(request.clone());
+                        }
+                        self.projection.questions
+                            .insert(session_id.clone(), queue.last().unwrap().clone());
                         Some(RunStatus::WaitingAnswer)
                     }
                     AgentEvent::AgentError { error } => {
@@ -539,6 +557,7 @@ impl Actor {
         }
         Ok(())
     }
+    /// Persist a terminal outcome before clearing its live requests and runtime.
     fn finish(&mut self, id: &str, status: RunStatus, error: Option<String>) -> Result<(), String> {
         let Some(active) = self.active.as_mut().filter(|a| a.run.id == id) else {
             return Ok(());
@@ -579,6 +598,7 @@ impl Actor {
         }
         self.projection.permissions.clear();
         self.projection.questions.clear();
+        self.projection.question_queues.clear();
         self.active = None;
         Ok(())
     }
@@ -656,6 +676,113 @@ mod tests {
         let (events, _) = broadcast::channel(32);
         Actor::new(store, updates, events)
     }
+
+    /// Create an actor whose parallel questions include a replayed duplicate ID.
+    fn actor_with_pending_questions(root: &std::path::Path) -> Actor {
+        let mut actor = make_actor(root);
+        actor.store.save(definition(root), 0).unwrap();
+        let id = actor.store.enqueue("automation-test", false, 1).unwrap();
+        let run = actor.store.snapshot().runs[0].clone();
+        actor.active = Some(Active {
+            run,
+            runtime: None,
+            elapsed: Duration::ZERO,
+            cancellation: None,
+            completion: None,
+            error: None,
+        });
+        for request_id in ["first", "second", "first"] {
+            actor
+                .event(Event::Agent(
+                    id.clone(),
+                    AgentEvent::QuestionRequested {
+                        request: QuestionRequest {
+                            id: request_id.into(),
+                            questions: vec![],
+                        },
+                    },
+                ))
+                .unwrap();
+        }
+        actor
+    }
+
+    /// Partial resolution must update watchers even when the durable run revision is unchanged.
+    #[test]
+    fn automation_question_queue_resolution_publishes_without_a_run_status_change() {
+        for resolved in ["first", "second"] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut actor = actor_with_pending_questions(temp.path());
+            let session_id = actor.active.as_ref().unwrap().run.session_id.clone();
+            let ids = |projection: &Projection| -> Vec<String> {
+                projection.question_queues[&session_id]
+                    .iter()
+                    .map(|q| q.id.clone())
+                    .collect()
+            };
+            assert_eq!(ids(&actor.projection), vec!["first", "second"]);
+            assert_eq!(actor.projection.questions[&session_id].id, "second");
+            actor.publish();
+            let mut updates = actor.updates.subscribe();
+            let revision = actor.store.snapshot().revision;
+
+            actor
+                .command(Command::Resolved {
+                    session_id: session_id.clone(),
+                    request_id: resolved.into(),
+                })
+                .unwrap();
+            actor.publish();
+            let remaining = if resolved == "first" {
+                "second"
+            } else {
+                "first"
+            };
+            assert_eq!(actor.store.snapshot().revision, revision);
+            assert_eq!(
+                actor.store.snapshot().runs[0].status,
+                RunStatus::WaitingAnswer
+            );
+            assert!(
+                updates.has_changed().unwrap(),
+                "partial resolution must publish its changed queue"
+            );
+            assert_eq!(ids(&updates.borrow_and_update()), vec![remaining]);
+            assert_eq!(actor.projection.questions[&session_id].id, remaining);
+            let wire = crate::core::DaemonCore::automation_projection_wire(&actor.projection);
+            assert_eq!(
+                wire.question_queues,
+                Some(actor.projection.question_queues.clone())
+            );
+
+            actor
+                .command(Command::Resolved {
+                    session_id: session_id.clone(),
+                    request_id: remaining.into(),
+                })
+                .unwrap();
+            actor.publish();
+            assert!(updates.has_changed().unwrap());
+            assert!(actor.projection.questions.is_empty());
+            assert!(actor.projection.question_queues.is_empty());
+            assert_eq!(actor.store.snapshot().runs[0].status, RunStatus::Running);
+        }
+    }
+
+    /// Terminal cleanup publishes an authoritative empty queue for remote clients.
+    #[test]
+    fn finishing_automation_clears_all_pending_questions() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_pending_questions(temp.path());
+        let id = actor.active.as_ref().unwrap().run.id.clone();
+        actor.finish(&id, RunStatus::Interrupted, None).unwrap();
+        actor.publish();
+        assert!(actor.projection.questions.is_empty());
+        assert!(actor.projection.question_queues.is_empty());
+        let wire = crate::core::DaemonCore::automation_projection_wire(&actor.projection);
+        assert_eq!(wire.question_queues, Some(HashMap::new()));
+    }
+
     #[tokio::test]
     async fn automation_uses_controller_and_durable_transcript_then_recovers() {
         let temp = tempfile::tempdir().unwrap();

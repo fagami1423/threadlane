@@ -2498,6 +2498,216 @@ fn tool_completion_stays_on_the_operations_lane() {
     }
 }
 
+fn repeated_call_declaration() -> AgentMessage {
+    AgentMessage::Assistant {
+        content: None,
+        tool_calls: Some(vec![threadlane_provider::openai::ToolCall {
+            id: "repeated-call".into(),
+            r#type: "function".into(),
+            function: threadlane_provider::openai::ToolCallFunction {
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            },
+            thought_signature: None,
+        }]),
+        stop_reason: None,
+        deferred_handle: None,
+    }
+}
+
+#[tokio::test]
+async fn tool_intent_uses_its_operation_when_sibling_call_ids_repeat() {
+    let (_dir, path) = temp_session();
+    let mut harness = CodingSessionHarness::open(&path).unwrap();
+    harness
+        .begin_run("parent-run", AgentMessage::user("inspect", vec![]))
+        .unwrap();
+    let parent_entry = harness.append_message(repeated_call_declaration()).unwrap();
+    let child = harness
+        .start_subagent_lane("worker", "inspect", None)
+        .unwrap();
+    let child_entry = harness
+        .append_message_to_lane(
+            &child.identity.lane_name,
+            &child.identity.run_id,
+            repeated_call_declaration(),
+        )
+        .unwrap();
+    let before = fs::read(&path).unwrap();
+    let spec = ToolSpec {
+        index: 0,
+        call_id: "repeated-call".into(),
+        name: "read_file".into(),
+        effective_args: serde_json::json!({}),
+        result_entry_id: "foreign-result".into(),
+        replay: HarnessToolReplaySafety::Safe,
+    };
+    assert!(harness
+        .store
+        .start_tool_batch("parent-run", &child_entry, &[spec])
+        .is_err());
+    assert!(harness.store.peek_action().is_none());
+    assert!(harness
+        .tool_started_on_lane(
+            &child.identity.lane_name,
+            "parent-run",
+            "unknown-call",
+            "read_file",
+            serde_json::json!({}),
+        )
+        .is_err());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    for (run, entry, lane) in [
+        ("parent-run", parent_entry.as_str(), "main"),
+        (
+            child.identity.run_id.as_str(),
+            child_entry.as_str(),
+            child.identity.lane_name.as_str(),
+        ),
+    ] {
+        let identity = harness
+            .append_tool_intent_after_hook(run, "repeated-call", "read_file", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(identity.run_id, run);
+        assert_eq!(identity.assistant_entry_id, entry);
+        assert_eq!(identity.lane, lane);
+        assert_eq!(identity.session_id, harness.store.session_id());
+        assert!(harness.store.records().iter().any(|record| matches!(
+            record,
+            HarnessRecord::ToolStarted { run_id, assistant_entry_id, .. }
+                if run_id == run && assistant_entry_id == entry
+        )));
+        harness
+            .record_tool_result(
+                run,
+                &AgentToolResult::external("repeated-call", "read_file", run, false),
+            )
+            .unwrap();
+    }
+    let reopened = CodingSessionHarness::open(&path).unwrap();
+    let state = Reducer::reduce(&reopened.store).unwrap();
+    for (lane, entry) in [
+        ("main", parent_entry.as_str()),
+        (child.identity.lane_name.as_str(), child_entry.as_str()),
+    ] {
+        let tool = &state.lane(lane).unwrap().tools[0];
+        assert_eq!(tool.assistant_entry_id, entry);
+        assert!(tool.completed);
+        let identity = reopened
+            .tool_execution_identity(&tool.run_id, "repeated-call")
+            .unwrap();
+        assert_eq!(identity.lane, lane);
+        assert_eq!(identity.assistant_entry_id, entry);
+        assert_eq!(identity.result_entry_id, tool.result_entry_id);
+        assert_eq!(
+            reopened.store.entry(&tool.result_entry_id).unwrap().lane,
+            lane
+        );
+        assert_eq!(
+            reopened
+                .store
+                .store()
+                .assistant_entry_for_run_call(&tool.run_id, "repeated-call")
+                .unwrap()
+                .id,
+            entry
+        );
+    }
+}
+
+#[tokio::test]
+async fn tool_intent_rejects_a_previous_runs_declaration_without_mutation() {
+    let (_dir, path) = temp_session();
+    let mut harness = CodingSessionHarness::open(&path).unwrap();
+    harness
+        .begin_run("old-run", AgentMessage::user("old", vec![]))
+        .unwrap();
+    let old_entry = harness.append_message(repeated_call_declaration()).unwrap();
+    harness
+        .append_tool_intent_after_hook(
+            "old-run",
+            "repeated-call",
+            "read_file",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    harness
+        .record_tool_result(
+            "old-run",
+            &AgentToolResult::external("repeated-call", "read_file", "old", false),
+        )
+        .unwrap();
+    harness
+        .finish_run("old-run", OperationOutcome::Completed, None)
+        .unwrap();
+    harness
+        .begin_run("new-run", AgentMessage::user("new", vec![]))
+        .unwrap();
+    let before = fs::read(&path).unwrap();
+    let spec = ToolSpec {
+        index: 0,
+        call_id: "repeated-call".into(),
+        name: "read_file".into(),
+        effective_args: serde_json::json!({}),
+        result_entry_id: "stale-result".into(),
+        replay: HarnessToolReplaySafety::Safe,
+    };
+    assert!(harness
+        .store
+        .start_tool_batch("new-run", &old_entry, &[spec])
+        .is_err());
+    assert!(harness.store.peek_action().is_none());
+    assert!(harness
+        .append_tool_intent_after_hook(
+            "new-run",
+            "repeated-call",
+            "read_file",
+            serde_json::json!({})
+        )
+        .await
+        .is_err());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    let new_entry = harness.append_message(repeated_call_declaration()).unwrap();
+    harness
+        .append_tool_intent_after_hook(
+            "new-run",
+            "repeated-call",
+            "read_file",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    harness
+        .record_tool_result(
+            "new-run",
+            &AgentToolResult::external("repeated-call", "read_file", "new", false),
+        )
+        .unwrap();
+    let reopened = CodingSessionHarness::open(&path).unwrap();
+    let state = Reducer::reduce(&reopened.store).unwrap();
+    let tools = &state.lane("main").unwrap().tools;
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0].assistant_entry_id, old_entry);
+    assert_eq!(tools[1].assistant_entry_id, new_entry);
+    assert!(tools.iter().all(|tool| tool.completed));
+    assert!(reopened
+        .store
+        .store()
+        .assistant_entry_for_run_call("old-run", "repeated-call")
+        .is_none());
+    assert_eq!(
+        reopened
+            .store
+            .store()
+            .assistant_entry_for_run_call("new-run", "repeated-call")
+            .unwrap()
+            .id,
+        new_entry
+    );
+}
+
 #[test]
 fn sync_messages_persists_identical_empty_assistant_results_for_each_run() {
     let (_dir, path) = temp_session();

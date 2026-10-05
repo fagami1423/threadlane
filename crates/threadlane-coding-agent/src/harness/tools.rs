@@ -3,6 +3,27 @@ use super::*;
 impl CodingSessionHarness {
     // ── Tools ─────────────────────────────────────────────────────────
 
+    pub(crate) fn tool_execution_identity(
+        &self,
+        run_id: &str,
+        tool_call_id: &str,
+    ) -> Result<ToolExecutionIdentity, String> {
+        let (lane, tool) = self
+            .store
+            .store()
+            .tool_state_for_call(run_id, tool_call_id)
+            .ok_or_else(|| format!("missing committed intent for tool {tool_call_id} in run {run_id}"))?;
+        Ok(ToolExecutionIdentity {
+            session_id: self.store.session_id().into(),
+            lane: lane.into(),
+            run_id: tool.run_id.clone(),
+            assistant_entry_id: tool.assistant_entry_id.clone(),
+            tool_call_id: tool.tool_call_id.clone(),
+            tool_name: tool.tool_name.clone(),
+            result_entry_id: tool.result_entry_id.clone(),
+        })
+    }
+
     /// Record a tool intent (after hooks have run).
     pub(crate) async fn append_tool_intent_after_hook(
         &mut self,
@@ -10,15 +31,15 @@ impl CodingSessionHarness {
         tool_call_id: &str,
         tool_name: &str,
         effective_args: Value,
-    ) -> Result<(), String> {
+    ) -> Result<ToolExecutionIdentity, String> {
         self.ensure_fresh()?;
         if self.store.store().has_tool_started(run_id, tool_call_id) {
-            return Ok(());
+            return self.tool_execution_identity(run_id, tool_call_id);
         }
         let (assistant_id, tool_index) = self
             .store
             .store()
-            .assistant_entry_for_call(None, tool_call_id)
+            .assistant_entry_for_run_call(run_id, tool_call_id)
             .and_then(|assistant| match &assistant.message {
                 AgentMessage::Assistant {
                     tool_calls: Some(calls),
@@ -51,7 +72,8 @@ impl CodingSessionHarness {
             .map_err(|error| error.to_string())?;
         self.store
             .drive_to_completion()
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        self.tool_execution_identity(run_id, tool_call_id)
     }
 
     /// Record tool-started on a specific lane (subagent support).
@@ -67,6 +89,16 @@ impl CodingSessionHarness {
         if self.store.store().has_tool_started(run_id, tool_call_id) {
             return Ok(());
         }
+        let (operation_lane, start_seq) = self
+            .store
+            .store()
+            .open_operation_lane(run_id)
+            .ok_or_else(|| format!("harness operation {run_id} is not open"))?;
+        if operation_lane != lane {
+            return Err(format!(
+                "harness operation {run_id} does not belong to lane {lane}"
+            ));
+        }
         let result_entry_id = format!("subagent-result-{run_id}-{tool_call_id}");
         // Prefer the assistant entry that actually declares this call: the
         // reducer validates `(call_id, name)` at `calls[tool_index]`, so both
@@ -77,7 +109,7 @@ impl CodingSessionHarness {
         let declaring = self
             .store
             .store()
-            .assistant_entry_for_call(Some(lane), tool_call_id)
+            .assistant_entry_for_run_call(run_id, tool_call_id)
             .map(|entry| entry.id.clone());
         let assistant_entry_id = match declaring {
             Some(id) => id,
@@ -85,6 +117,7 @@ impl CodingSessionHarness {
                 .store
                 .store()
                 .last_assistant_entry(lane)
+                .filter(|entry| entry.seq > start_seq)
                 .map(|entry| entry.id.clone())
             {
                 Some(id) => id,

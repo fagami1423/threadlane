@@ -6,6 +6,7 @@
 //! to them; `threadlane-runtime` re-exports them for backward compatibility.
 
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use threadlane_protocol::AgentMessage;
 
@@ -86,18 +87,18 @@ pub(crate) fn normalized_tool_call_id(id: &str, empty_index: usize) -> String {
     }
 }
 
-/// Removes incomplete tool-call turns and orphaned results before provider
+/// Removes incomplete or ambiguous tool-call turns and orphaned results before provider
 /// conversion. Provider APIs reject replaying either shape.
 ///
-/// Moved from `threadlane-runtime::loop_engine` (body verbatim): it sits with
+/// Moved from `threadlane-runtime::loop_engine`: it sits with
 /// `normalized_tool_call_id`, which it uses to match calls to results, and
 /// only touches the shared `AgentMessage` contract — never engine state.
-pub(crate) fn repair_interrupted_tool_turn(messages: &mut Vec<AgentMessage>) -> bool {
+pub(crate) fn repair_interrupted_tool_turn(messages: &mut Cow<'_, [AgentMessage]>) -> bool {
     let mut repaired = false;
     let mut index = 0;
     while index < messages.len() {
         if matches!(messages[index], AgentMessage::Tool { .. }) {
-            messages.remove(index);
+            messages.to_mut().remove(index);
             repaired = true;
             continue;
         }
@@ -129,7 +130,10 @@ pub(crate) fn repair_interrupted_tool_turn(messages: &mut Vec<AgentMessage>) -> 
             next += 1;
         }
 
-        if expected_ids == completed_ids && next - index - 1 == tool_calls.len() {
+        if expected_ids.len() == tool_calls.len()
+            && expected_ids == completed_ids
+            && next - index - 1 == tool_calls.len()
+        {
             index = next;
             continue;
         }
@@ -148,7 +152,7 @@ pub(crate) fn repair_interrupted_tool_turn(messages: &mut Vec<AgentMessage>) -> 
             }),
             _ => None,
         };
-        messages.splice(index..next, replacement);
+        messages.to_mut().splice(index..next, replacement);
         repaired = true;
     }
     repaired
@@ -185,10 +189,9 @@ pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<Value> {
                         }
                     })
                 }));
-                Some(serde_json::json!({
-                    "role": "user",
-                    "content": parts
-                }))
+                let mut message = serde_json::json!({"role": "user"});
+                message["content"] = parts.into();
+                Some(message)
             }
             AgentMessage::Assistant {
                 content,
@@ -243,12 +246,13 @@ pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<Value> {
                     }));
                     serde_json::Value::Array(parts)
                 };
-                Some(serde_json::json!({
+                let mut message = serde_json::json!({
                     "role": "tool",
                     "tool_call_id": id_str,
-                    "name": name,
-                    "content": content
-                }))
+                    "name": name
+                });
+                message["content"] = content;
+                Some(message)
             }
             AgentMessage::Custom { .. } => compaction_checkpoint_text(msg).map(|checkpoint| {
                 serde_json::json!({
@@ -266,7 +270,7 @@ pub fn convert_to_codex_llm(messages: &[AgentMessage]) -> (String, Vec<Value>) {
     let mut instructions = String::new();
     let mut items = Vec::new();
 
-    for msg in &messages {
+    for msg in messages.iter() {
         match msg {
             AgentMessage::System { content } => {
                 if !instructions.is_empty() {
@@ -296,11 +300,12 @@ pub fn convert_to_codex_llm(messages: &[AgentMessage]) -> (String, Vec<Value>) {
                         "detail": "auto"
                     })
                 }));
-                items.push(serde_json::json!({
+                let mut message = serde_json::json!({
                     "type": "message",
-                    "role": "user",
-                    "content": parts
-                }));
+                    "role": "user"
+                });
+                message["content"] = parts.into();
+                items.push(message);
             }
             AgentMessage::Assistant {
                 content,
@@ -358,11 +363,12 @@ pub fn convert_to_codex_llm(messages: &[AgentMessage]) -> (String, Vec<Value>) {
                         "detail": "auto"
                     })
                 }));
-                items.push(serde_json::json!({
+                let mut message = serde_json::json!({
                     "type": "function_call_output",
-                    "call_id": tool_call_id,
-                    "output": output
-                }));
+                    "call_id": tool_call_id
+                });
+                message["output"] = output.into();
+                items.push(message);
             }
             AgentMessage::Custom { .. } => {
                 if let Some(checkpoint) = compaction_checkpoint_text(msg) {
@@ -382,62 +388,46 @@ pub fn convert_to_codex_llm(messages: &[AgentMessage]) -> (String, Vec<Value>) {
     (instructions, items)
 }
 
-fn normalize_tool_call_ids(messages: &[AgentMessage]) -> Vec<AgentMessage> {
+fn normalize_tool_call_ids(messages: &[AgentMessage]) -> Cow<'_, [AgentMessage]> {
+    let mut normalized = Cow::Borrowed(messages);
     let mut tool_index = 0;
-    let mut messages = messages
-        .iter()
-        .map(|message| match message {
+    for (index, message) in messages.iter().enumerate() {
+        match message {
             AgentMessage::Assistant {
-                content,
                 tool_calls: Some(tool_calls),
-                stop_reason,
-                deferred_handle,
+                ..
             } => {
                 tool_index = 0;
-                AgentMessage::Assistant {
-                    content: content.clone(),
-                    tool_calls: Some(
-                        tool_calls
-                            .iter()
-                            .enumerate()
-                            .map(|(idx, call)| {
-                                let mut call = call.clone();
-                                call.id = normalized_tool_call_id(&call.id, idx);
-                                call
-                            })
-                            .collect(),
-                    ),
-                    stop_reason: stop_reason.clone(),
-                    deferred_handle: deferred_handle.clone(),
+                if tool_calls.iter().any(|call| call.id.is_empty()) {
+                    let AgentMessage::Assistant {
+                        tool_calls: Some(calls),
+                        ..
+                    } = &mut normalized.to_mut()[index]
+                    else {
+                        unreachable!();
+                    };
+                    for (call_index, call) in calls.iter_mut().enumerate() {
+                        if call.id.is_empty() {
+                            call.id = normalized_tool_call_id("", call_index);
+                        }
+                    }
                 }
             }
-            AgentMessage::Tool {
-                tool_call_id,
-                name,
-                content,
-                is_error,
-                terminate,
-                images,
-            } => {
-                let normalized = normalized_tool_call_id(tool_call_id, tool_index);
+            AgentMessage::Tool { tool_call_id, .. } => {
+                if tool_call_id.is_empty() {
+                    let AgentMessage::Tool { tool_call_id, .. } = &mut normalized.to_mut()[index]
+                    else {
+                        unreachable!();
+                    };
+                    *tool_call_id = normalized_tool_call_id("", tool_index);
+                }
                 tool_index += 1;
-                AgentMessage::Tool {
-                    tool_call_id: normalized,
-                    name: name.clone(),
-                    content: content.clone(),
-                    is_error: *is_error,
-                    terminate: *terminate,
-                    images: images.clone(),
-                }
             }
-            other => {
-                tool_index = 0;
-                other.clone()
-            }
-        })
-        .collect();
-    repair_interrupted_tool_turn(&mut messages);
-    messages
+            _ => tool_index = 0,
+        }
+    }
+    repair_interrupted_tool_turn(&mut normalized);
+    normalized
 }
 
 #[cfg(test)]
@@ -478,12 +468,72 @@ mod repair_tests {
     }
 
     #[test]
+    fn complete_history_is_borrowed_before_provider_payload_allocation() {
+        let messages = vec![assistant_with_calls(&["a"]), tool_result("a")];
+        let normalized = normalize_tool_call_ids(&messages);
+        assert_eq!(normalized.as_ptr(), messages.as_ptr());
+    }
+
+    #[test]
+    fn image_parts_preserve_both_provider_payload_shapes() {
+        let image = threadlane_protocol::ImageAttachment {
+            data_url: "data:image/jpeg;base64,AA==".into(),
+            display_name: "image.jpg".into(),
+        };
+        let mut tool = tool_result("a");
+        if let AgentMessage::Tool { images, .. } = &mut tool {
+            images.push(image.clone());
+        }
+        let messages = vec![
+            AgentMessage::user("see", vec![image.clone()]),
+            assistant_with_calls(&["a"]),
+            tool,
+        ];
+        let chat = convert_to_llm(&messages);
+        let chat_parts = |text| {
+            serde_json::json!([
+                {"type": "text", "text": text},
+                {"type": "image_url", "image_url": {"url": image.data_url, "detail": "auto"}}
+            ])
+        };
+        assert_eq!(
+            chat[0],
+            serde_json::json!({"role": "user", "content": chat_parts("see")})
+        );
+        assert_eq!(
+            chat[2],
+            serde_json::json!({
+                "role": "tool", "tool_call_id": "a", "name": "read_file", "content": chat_parts("ok")
+            })
+        );
+        let (_, responses) = convert_to_codex_llm(&messages);
+        let response_parts = |text| {
+            serde_json::json!([
+                {"type": "input_text", "text": text},
+                {"type": "input_image", "image_url": image.data_url, "detail": "auto"}
+            ])
+        };
+        assert_eq!(
+            responses[0],
+            serde_json::json!({
+                "type": "message", "role": "user", "content": response_parts("see")
+            })
+        );
+        assert_eq!(
+            responses[2],
+            serde_json::json!({
+                "type": "function_call_output", "call_id": "a", "output": response_parts("ok")
+            })
+        );
+    }
+
+    #[test]
     fn complete_turn_is_left_alone() {
-        let mut messages = vec![
+        let mut messages = Cow::Owned(vec![
             assistant_with_calls(&["a", "b"]),
             tool_result("a"),
             tool_result("b"),
-        ];
+        ]);
         assert!(!repair_interrupted_tool_turn(&mut messages));
         assert_eq!(messages.len(), 3);
     }
@@ -494,18 +544,44 @@ mod repair_tests {
             custom_type: "thinking".to_string(),
             payload: serde_json::json!({}),
         };
-        let mut messages = vec![
+        let mut messages = Cow::Owned(vec![
             AgentMessage::user("go", Vec::new()),
             thinking,
             assistant_with_calls(&["a", "b"]),
             tool_result("a"),
             AgentMessage::user("later", Vec::new()),
-        ];
+        ]);
         assert!(repair_interrupted_tool_turn(&mut messages));
         assert_eq!(messages.len(), 3);
         assert!(messages[0].is_user());
         assert!(matches!(messages[1], AgentMessage::Custom { .. }));
         assert!(messages[2].is_user());
+    }
+
+    #[test]
+    fn duplicate_call_ids_are_repaired_only_in_the_provider_projection() {
+        for ids in [["duplicate", "duplicate"], ["call_1", ""]] {
+            let mut assistant = assistant_with_calls(&ids);
+            if let AgentMessage::Assistant { content, .. } = &mut assistant {
+                *content = Some("The operation was interrupted.".into());
+            }
+            let messages = vec![
+                AgentMessage::user("go", Vec::new()),
+                assistant,
+                tool_result(ids[0]),
+                tool_result(ids[1]),
+                AgentMessage::user("continue", Vec::new()),
+            ];
+            let original = serde_json::to_value(&messages).unwrap();
+            let chat = convert_to_llm(&messages);
+            assert_eq!(chat.len(), 3);
+            assert_eq!(chat[1]["content"], "The operation was interrupted.");
+            assert!(chat[1].get("tool_calls").is_none());
+            let (_, responses) = convert_to_codex_llm(&messages);
+            assert_eq!(responses.len(), 3);
+            assert!(responses.iter().all(|item| item["type"] == "message"));
+            assert_eq!(serde_json::to_value(&messages).unwrap(), original);
+        }
     }
 
     #[test]

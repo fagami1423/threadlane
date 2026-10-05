@@ -332,7 +332,7 @@ impl Default for CodingAgentConfig {
             default_recv_timeout_ms: 5000,
             max_recv_timeout_ms: 30_000,
             max_managed_stdout_bytes: 16 * 1024 * 1024,
-            max_broker_continuation_rounds: 4,
+            max_broker_continuation_rounds: 256,
             max_subagent_tasks: 8,
             max_subagent_task_chars: 32_000,
             subagent_concurrency_limit: 4,

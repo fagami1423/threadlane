@@ -7,7 +7,8 @@ use threadlane_ui_kit::automation_form::{
     automation_editor_sheet, automation_form, automation_schedule_fields,
     automation_schedule_preview, schedule_from_fields, AutomationForm, AutomationFormAction,
 };
-use threadlane_ui_state::{automation::Command, AppState};
+use threadlane_protocol::automation::AutomationCommand as Command;
+use threadlane_ui_state::{automation_io, AppState};
 
 fn default_project(state: &AppState) -> Option<&std::path::PathBuf> {
     state
@@ -65,7 +66,7 @@ mod tests {
 
     #[test]
     fn defaults_and_project_switches_use_the_destination_catalog() {
-        let mut state = AppState::default();
+        let mut state = AppState::for_tests();
         state.projects.clear();
         activate_test_session(&mut state, "a", std::path::Path::new("/project-a/a.jsonl"));
         activate_test_session(&mut state, "b", std::path::Path::new("/project-b/b.jsonl"));
@@ -247,6 +248,8 @@ impl Editor {
         )
     }
 
+    /// Validate the draft and save on the owning daemon, closing only after success.
+    /// Validation and transport failures remain visible in the open editor.
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
             return;
@@ -263,13 +266,17 @@ impl Editor {
             cx.notify();
             return;
         }
-        let Some(service) = self.model.read(cx).automation_service.clone() else {
-            return;
-        };
+        let client = self.model.read(cx).daemon_client.clone();
         self.busy = true;
         self.error = None;
+        let task = threadlane_provider::exec::get_runtime().spawn(async move {
+            automation_io::mutate(&client, Command::Save { definition }).await
+        });
         cx.spawn_in(window, async move |this, cx| {
-            let result = service.command(Command::Save(definition)).await;
+            let result = task
+                .await
+                .map_err(|error| format!("Automation request failed: {error}"))
+                .and_then(|result| result);
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
                 match result {
