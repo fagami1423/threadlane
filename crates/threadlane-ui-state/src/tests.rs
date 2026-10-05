@@ -139,6 +139,7 @@ fn automation_projection_refreshes_each_changed_project_once() {
     assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![(0, PathBuf::from("/project-a"))]);
 }
 
+/// Remote events refresh the automation view and requests without triggering local discovery.
 #[test]
 fn remote_automation_projection_refreshes_client_and_view() {
     use threadlane_protocol::automation::{AutomationProjection, Definition, Schedule};
@@ -218,6 +219,7 @@ fn remote_automation_projection_refreshes_client_and_view() {
     );
 }
 
+/// Cross-client answers advance complete queues and preserve unrelated permissions.
 #[test]
 fn remote_automation_projection_resolves_requests_and_promotes_next_question() {
     use threadlane_protocol::automation::AutomationProjection;
@@ -324,6 +326,7 @@ fn remote_automation_projection_resolves_requests_and_promotes_next_question() {
     assert!(state.automations.questions.is_empty());
 }
 
+/// The local watch uses the same FIFO reconciliation as remote projections.
 #[test]
 fn local_automation_projection_preserves_question_queue_order() {
     let mut state = AppState::load_from_registry(Vec::new());
@@ -366,6 +369,7 @@ fn local_automation_projection_preserves_question_queue_order() {
     assert!(!state.queued_questions.contains_key("automation-session"));
 }
 
+/// First snapshots handle both missed resolutions and partial reconnect replay.
 #[test]
 fn remote_automation_first_snapshot_reconciles_coalesced_agent_questions() {
     use threadlane_protocol::automation::AutomationProjection;
@@ -411,6 +415,7 @@ fn remote_automation_first_snapshot_reconciles_coalesced_agent_questions() {
     }
 }
 
+/// Local wire copies cannot replace the service watch projection.
 #[test]
 fn local_automation_watch_remains_authoritative_over_wire_events() {
     let mut state = AppState::load_from_registry(Vec::new());
@@ -441,6 +446,7 @@ fn local_automation_watch_remains_authoritative_over_wire_events() {
     assert_eq!(state.pending_questions, projection.questions);
 }
 
+/// Remote desktops cannot overwrite daemon state with a local service watch.
 #[test]
 fn remote_automation_does_not_subscribe_to_or_apply_local_projections() {
     use threadlane_protocol::automation::AutomationProjection;
@@ -5243,6 +5249,433 @@ fn worktree_setup_failure_and_cancellation_are_scoped_to_the_session() {
     assert!(state.daemon_core.runtimes().is_empty());
 }
 
+/// Build daemon-owned normal/worktree run metadata without creating client-side files.
+fn projected_automation_run(
+    project: &Path,
+    id: &str,
+    worktree: bool,
+) -> threadlane_automation::Run {
+    use threadlane_automation::{Definition, Run, RunStatus, Schedule};
+    let session_id = format!("automation-{id}");
+    let runtime_root = if worktree {
+        project.join(".threadlane/worktrees").join(&session_id)
+    } else {
+        project.to_path_buf()
+    };
+    Run {
+        id: id.into(),
+        definition: Definition {
+            id: "definition".into(),
+            revision: 1,
+            name: "Remote task".into(),
+            prompt: "Review changes".into(),
+            project: project.to_path_buf(),
+            model: "remote-model".into(),
+            effort: "high".into(),
+            worktree,
+            schedule: Schedule::Manual,
+            enabled: false,
+            notify_all: false,
+            anchor: 0,
+            next_at: None,
+            failures: 0,
+            paused_reason: None,
+        },
+        scheduled_for: None,
+        created_at: 1,
+        finished_at: None,
+        status: RunStatus::Running,
+        session_file: Some(
+            runtime_root
+                .join(".threadlane/sessions")
+                .join(format!("{session_id}.jsonl")),
+        ),
+        session_id,
+        error: None,
+        reviewed: false,
+    }
+}
+
+/// Opening remote runs hydrates their exact daemon paths without local files or runtimes.
+#[test]
+fn remote_automation_run_opens_without_client_project_or_transcript_files() {
+    for worktree in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("daemon-only");
+        let run = projected_automation_run(&project, "run", worktree);
+        let file = run.session_file.clone().unwrap();
+        let mut state = AppState::load_from_registry(Vec::new());
+        state.daemon_remote = true;
+        state.sidebar_project_filter = Some(PathBuf::from("/unchanged-filter"));
+        state.automations.snapshot.runs.push(run.clone());
+        state.open_automation_run(&run.id).unwrap();
+        assert_eq!(state.workspace_page, WorkspacePage::Chat);
+        assert_eq!(
+            state.active_session_id.as_deref(),
+            Some(run.session_id.as_str())
+        );
+        assert_eq!(state.active_work_dir.as_ref(), Some(&project));
+        assert_eq!(state.active_session_info().unwrap().session_file, file);
+        assert_eq!(
+            state.active_session_info().unwrap().runtime_work_dir,
+            file.ancestors().nth(3).unwrap()
+        );
+        assert_eq!(state.active_session_info().unwrap().is_worktree, worktree);
+        assert!(state.is_generating);
+        assert_eq!(state.selected_model, "remote-model");
+        assert_eq!(state.reasoning_effort, ReasoningEffort::High);
+        assert_eq!(
+            state.sidebar_project_filter.as_deref(),
+            Some(Path::new("/unchanged-filter"))
+        );
+        assert_eq!(
+            state.take_pending_hydrations(),
+            vec![SessionHydrationRequest {
+                session_id: run.session_id,
+                session_file: file,
+                reload_messages: true,
+                runtime_options: None,
+            }]
+        );
+        assert!(state.daemon_core.runtimes().is_empty());
+        assert!(
+            !project.exists(),
+            "remote navigation must not read/create client project state"
+        );
+    }
+}
+
+/// Previously received daemon session metadata takes precedence over a lightweight run stub.
+#[test]
+fn remote_automation_navigation_uses_projected_session_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("daemon-only");
+    let run = projected_automation_run(&project, "run", true);
+    let mut session = test_session(&run.session_id, run.session_file.as_ref().unwrap());
+    session.work_dir = project.clone();
+    session.title = "Daemon session title".into();
+    session.git_branch = Some("daemon-branch".into());
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.daemon_remote = true;
+    assert!(state.drain_chat_stream(vec![SessionEvent::ProjectChanged {
+        project: ProjectInfo {
+            work_dir: project.clone(),
+            name: "Daemon project".into(),
+            sessions: vec![session.clone()],
+            is_expanded: true,
+        }
+    }]));
+    state.automations.snapshot.runs.push(run.clone());
+    state.open_automation_run(&run.id).unwrap();
+    assert_eq!(state.active_session_info(), Some(&session));
+    assert_eq!(state.projects[0].name, "Daemon project");
+    assert!(!project.exists());
+}
+
+/// An older project list cannot erase the selected worktree identity before hydration arrives.
+#[test]
+fn remote_automation_loading_identity_survives_late_project_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("daemon-only");
+    let run = projected_automation_run(&project, "run", true);
+    let file = run.session_file.clone().unwrap();
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.daemon_remote = true;
+    state.automations.snapshot.runs.push(run.clone());
+    state.open_automation_run(&run.id).unwrap();
+    state.take_pending_hydrations();
+    assert!(state.drain_chat_stream(vec![SessionEvent::ProjectChanged {
+        project: ProjectInfo {
+            work_dir: project.clone(),
+            name: "Older project snapshot".into(),
+            sessions: vec![],
+            is_expanded: true,
+        }
+    }]));
+    assert!(state.active_session_matches(&run.session_id, &file));
+    assert!(state.active_session_is_loading());
+
+    let mut session = state.active_session_info().unwrap().clone();
+    session.title = "Hydrated remote title".into();
+    session.git_branch = Some("automation/branch".into());
+    let snapshot = threadlane_protocol::daemon::SessionSnapshot {
+        session: session.clone(),
+        messages: vec![queued_echo("remote-message")],
+        ..Default::default()
+    };
+    assert!(state.drain_chat_stream(vec![SessionEvent::SessionSnapshot {
+        session_id: run.session_id,
+        snapshot: Box::new(snapshot),
+    }]));
+    assert_eq!(state.active_session_info(), Some(&session));
+    assert_eq!(state.messages[0].id, "remote-message");
+    assert!(!state.active_session_is_loading());
+    assert!(state.session_status.is_none());
+    assert!(state.presented_completion.is_none());
+    assert!(!state.acknowledge_presented_completion());
+    assert!(!project.exists());
+}
+
+/// Foreign or superseded hydration cannot overwrite the currently selected chat.
+#[test]
+fn remote_automation_hydration_rejects_foreign_identity_and_newer_navigation_wins() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("daemon-only");
+    let first = projected_automation_run(&project, "first", true);
+    let second = projected_automation_run(&project, "second", false);
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.daemon_remote = true;
+    state
+        .automations
+        .snapshot
+        .runs
+        .extend([first.clone(), second.clone()]);
+    state.open_automation_run(&first.id).unwrap();
+    state.take_pending_hydrations();
+    let original = state.active_session_info().unwrap().clone();
+    for variant in 0..3 {
+        let mut foreign = original.clone();
+        match variant {
+            0 => foreign.id = "other-session".into(),
+            1 => foreign.work_dir = root.path().join("other-project"),
+            _ => foreign.session_file = root.path().join("other-transcript.jsonl"),
+        }
+        assert!(!state.apply_session_snapshot(
+            &first.session_id,
+            threadlane_protocol::daemon::SessionSnapshot {
+                session: foreign,
+                messages: vec![queued_echo("wrong-message")],
+                ..Default::default()
+            }
+        ));
+        assert!(state.active_session_is_loading());
+        assert!(state.messages.is_empty());
+    }
+    state.open_automation_run(&second.id).unwrap();
+    assert!(!state.apply_session_snapshot(
+        &first.session_id,
+        threadlane_protocol::daemon::SessionSnapshot {
+            session: original,
+            messages: vec![queued_echo("late-message")],
+            ..Default::default()
+        }
+    ));
+    assert_eq!(
+        state.active_session_id.as_deref(),
+        Some(second.session_id.as_str())
+    );
+    assert!(state.messages.is_empty());
+    assert!(!project.exists());
+}
+
+/// Remote generation state preserves live trajectory rows over an older hydration snapshot.
+#[test]
+fn remote_automation_hydration_preserves_live_activity_without_a_local_runtime() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("daemon-only");
+    let run = projected_automation_run(&project, "live", false);
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.daemon_remote = true;
+    state.automations.snapshot.runs.push(run.clone());
+    state.open_automation_run(&run.id).unwrap();
+    let key = AppState::projection_key(&run.session_id, run.session_file.as_ref().unwrap());
+    state
+        .trajectory_by_session
+        .insert(key.clone(), vec![live_tool_entry("live", "still running")]);
+    let snapshot = threadlane_protocol::daemon::SessionSnapshot {
+        session: state.active_session_info().unwrap().clone(),
+        trajectory: vec![file_tool_entry(1, "older", "finished earlier")],
+        ..Default::default()
+    };
+    assert!(state.apply_session_snapshot(&run.session_id, snapshot));
+    let entries = &state.trajectory_by_session[&key];
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].correlation_id.as_deref(), Some("older"));
+    assert_eq!(entries[1].correlation_id.as_deref(), Some("live"));
+    assert!(state.daemon_core.runtimes().is_empty());
+    assert!(!project.exists());
+}
+
+/// Remote snapshots correct stale run health unless a newer live lifecycle event already won.
+#[test]
+fn remote_automation_hydration_reconciles_health_and_preserves_newer_live_status() {
+    for (initial_status, snapshot_health, live_event, expected) in [
+        (
+            threadlane_automation::RunStatus::Running,
+            SessionHealth::Healthy,
+            None,
+            false,
+        ),
+        (
+            threadlane_automation::RunStatus::Succeeded,
+            SessionHealth::Working,
+            None,
+            true,
+        ),
+        (
+            threadlane_automation::RunStatus::Succeeded,
+            SessionHealth::Healthy,
+            Some(AgentEvent::AgentStart),
+            true,
+        ),
+        (
+            threadlane_automation::RunStatus::Running,
+            SessionHealth::Working,
+            Some(AgentEvent::AgentEnd {
+                usage: Default::default(),
+            }),
+            false,
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("daemon-only");
+        let mut run = projected_automation_run(&project, "status", false);
+        run.status = initial_status;
+        let mut state = AppState::load_from_registry(Vec::new());
+        state.daemon_remote = true;
+        state.automations.snapshot.runs.push(run.clone());
+        state.open_automation_run(&run.id).unwrap();
+        state.take_pending_hydrations();
+        if let Some(event) = live_event {
+            state.drain_chat_stream(vec![SessionEvent::Agent {
+                session_id: run.session_id.clone(),
+                event,
+            }]);
+        }
+        let mut session = state.active_session_info().unwrap().clone();
+        session.health = snapshot_health;
+        assert!(state.apply_session_snapshot(
+            &run.session_id,
+            threadlane_protocol::daemon::SessionSnapshot {
+                session,
+                ..Default::default()
+            }
+        ));
+        assert_eq!(state.is_generating, expected);
+        assert_eq!(
+            state.active_session_info().unwrap().health == SessionHealth::Working,
+            expected
+        );
+        assert!(state.session_status.is_none());
+    }
+}
+
+/// A deferred completion from an older background run is not newer than fresh hydration.
+#[test]
+fn remote_automation_hydration_status_wins_over_deferred_completion() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("daemon-only");
+    let run = projected_automation_run(&project, "restarted", false);
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.daemon_remote = true;
+    state.automations.snapshot.runs.push(run.clone());
+    state.drain_chat_stream(vec![SessionEvent::Finished {
+        session_id: run.session_id.clone(),
+        session_file: run.session_file.clone().unwrap(),
+    }]);
+    state.open_automation_run(&run.id).unwrap();
+    let session = state.active_session_info().unwrap().clone();
+    assert_eq!(session.health, SessionHealth::Working);
+    state.drain_chat_stream(vec![SessionEvent::SessionSnapshot {
+        session_id: run.session_id,
+        snapshot: Box::new(threadlane_protocol::daemon::SessionSnapshot {
+            session,
+            ..Default::default()
+        }),
+    }]);
+    assert!(state.is_generating);
+    assert!(state.remote_live_status.is_none());
+}
+
+/// A reconnect snapshot can repair a terminal lifecycle event missed by the previous connection.
+#[test]
+fn remote_automation_reconnect_snapshot_restores_missed_status() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("daemon-only");
+    let run = projected_automation_run(&project, "status", false);
+    let client = Arc::new(RecordingDaemonClient::default());
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.daemon_remote = true;
+    state.daemon_client = client.clone();
+    state.automations.snapshot.runs.push(run.clone());
+    state.open_automation_run(&run.id).unwrap();
+    state.drain_chat_stream(vec![SessionEvent::Agent {
+        session_id: run.session_id.clone(),
+        event: AgentEvent::AgentStart,
+    }]);
+    client.epoch.store(1, std::sync::atomic::Ordering::SeqCst);
+    let mut session = state.active_session_info().unwrap().clone();
+    session.health = SessionHealth::Healthy;
+    assert!(state.apply_session_snapshot(
+        &run.session_id,
+        threadlane_protocol::daemon::SessionSnapshot {
+            session,
+            ..Default::default()
+        }
+    ));
+    assert!(!state.is_generating);
+}
+
+/// Remote completion refreshes go to the daemon and cannot be overwritten by local discovery.
+#[tokio::test]
+async fn remote_automation_completion_refreshes_daemon_project_only() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("daemon-only");
+    let run = projected_automation_run(&project, "done", true);
+    let client = Arc::new(RecordingDaemonClient::default());
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.daemon_remote = true;
+    state.daemon_client = client.clone();
+    let (tx, rx) = mpsc::channel();
+    state.session_refresh_tx = tx;
+    state.automations.snapshot.runs.push(run.clone());
+    state.open_automation_run(&run.id).unwrap();
+    state.drain_chat_stream(vec![SessionEvent::Finished {
+        session_id: run.session_id.clone(),
+        session_file: run.session_file.clone().unwrap(),
+    }]);
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if client.commands.lock().unwrap().iter().any(|command| matches!(command, SessionCommand::GetProjectState { work_dir } if work_dir == &project)) { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert!(rx.try_recv().is_err());
+    assert!(!state.apply_session_refresh(
+        project.clone(),
+        Vec::new(),
+        state.session_refresh_generation
+    ));
+    assert_eq!(
+        state.active_session_id.as_deref(),
+        Some(run.session_id.as_str())
+    );
+    assert_eq!(state.projects[0].sessions.len(), 1);
+    assert!(!project.exists());
+}
+
+/// Missing run/transcript metadata fails before changing the current selection.
+#[test]
+fn remote_automation_run_without_chat_fails_without_changing_selection() {
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.daemon_remote = true;
+    state.active_session_id = Some("original".into());
+    let mut run = projected_automation_run(Path::new("/daemon/project"), "pending", false);
+    run.session_file = None;
+    state.automations.snapshot.runs.push(run);
+    assert_eq!(
+        state.open_automation_run("pending").unwrap_err(),
+        "This run has no chat yet"
+    );
+    assert_eq!(
+        state.open_automation_run("missing").unwrap_err(),
+        "Run no longer exists"
+    );
+    assert_eq!(state.active_session_id.as_deref(), Some("original"));
+    assert!(state.projects.is_empty());
+    assert!(state.pending_hydrations.is_empty());
+}
+
 #[test]
 fn automation_navigation_preserves_chat_and_project_scope() {
     let mut state = crate::AppState::load_from_registry(vec![]);
@@ -5685,6 +6118,7 @@ struct RecordingDaemonClient {
     commands: Mutex<Vec<SessionCommand>>,
     requests: Mutex<Vec<CommandRequest>>,
     supports_requests: bool,
+    epoch: std::sync::atomic::AtomicU64,
 }
 
 #[async_trait::async_trait]
@@ -5712,6 +6146,10 @@ impl threadlane_client::DaemonClient for RecordingDaemonClient {
 
     fn supports_github_automation(&self) -> bool {
         false
+    }
+
+    fn file_search_connection_epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<SessionEvent> {

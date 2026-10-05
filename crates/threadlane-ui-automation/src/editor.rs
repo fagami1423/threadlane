@@ -305,6 +305,8 @@ impl Editor {
             }
         }
     }
+    /// Validate the draft and save on the owning daemon, closing only after success.
+    /// Validation and transport failures remain visible in the open editor.
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
             return;
@@ -321,13 +323,17 @@ impl Editor {
             cx.notify();
             return;
         }
-        let Some(service) = self.model.read(cx).automation_service.clone() else {
-            return;
-        };
+        let client = self.model.read(cx).daemon_client.clone();
         self.busy = true;
         self.error = None;
+        let task = threadlane_provider::exec::get_runtime().spawn(async move {
+            automation_io::mutate(&client, Command::Save { definition }).await
+        });
         cx.spawn_in(window, async move |this, cx| {
-            let result = service.command(Command::Save(definition)).await;
+            let result = task
+                .await
+                .map_err(|error| format!("Automation request failed: {error}"))
+                .and_then(|result| result);
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
                 match result {

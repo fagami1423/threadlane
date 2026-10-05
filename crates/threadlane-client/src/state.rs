@@ -655,6 +655,7 @@ mod tests {
         assert!(!state.queued_questions.contains_key("two"));
     }
 
+    /// Build a minimal request with a stable identity for reconciliation tests.
     fn question(id: &str) -> QuestionRequest {
         QuestionRequest {
             id: id.into(),
@@ -662,6 +663,7 @@ mod tests {
         }
     }
 
+    /// Apply a legacy latest-only projection, including an empty retraction.
     fn project_question(state: &mut ClientState, session_id: &str, id: Option<&str>) {
         let mut projection = threadlane_protocol::automation::AutomationProjection::default();
         if let Some(id) = id {
@@ -670,6 +672,7 @@ mod tests {
         state.apply_event(SessionEvent::AutomationChanged { projection });
     }
 
+    /// Deliver a request through the production Agent-event path.
     fn emit_question(state: &mut ClientState, session_id: &str, id: &str) {
         state.apply_event(SessionEvent::Agent {
             session_id: session_id.into(),
@@ -679,6 +682,7 @@ mod tests {
         });
     }
 
+    /// Apply a complete authoritative queue while retaining the legacy latest entry.
     fn project_question_queue(state: &mut ClientState, session_id: &str, ids: &[&str]) {
         let questions: Vec<_> = ids.iter().map(|id| question(id)).collect();
         let mut projection = threadlane_protocol::automation::AutomationProjection {
@@ -696,6 +700,7 @@ mod tests {
         state.apply_event(SessionEvent::AutomationChanged { projection });
     }
 
+    /// An unchanged latest question must not hide resolution of an earlier queued request.
     #[test]
     fn automation_complete_queue_reconciles_an_earlier_question_answered_on_another_client() {
         let mut state = state();
@@ -715,6 +720,7 @@ mod tests {
         assert!(!state.pending_questions.contains_key("one"));
     }
 
+    /// A coalesced replacement snapshot retires the resolved request without an empty intermediate state.
     #[test]
     fn automation_complete_queue_handles_coalesced_resolution_and_new_question() {
         let mut state = state();
@@ -726,6 +732,7 @@ mod tests {
         assert!(!state.queued_questions.contains_key("one"));
     }
 
+    /// The first complete snapshot can retire requests observed only through Agent events.
     #[test]
     fn automation_complete_queue_removes_requests_resolved_before_the_first_projection() {
         let mut state = state();
@@ -738,6 +745,7 @@ mod tests {
         assert!(!state.queued_questions.contains_key("one"));
     }
 
+    /// A reconnect snapshot restores FIFO order even when only the later Agent event was replayed.
     #[test]
     fn automation_complete_queue_restores_snapshot_order_after_partial_agent_replay() {
         let mut state = state();
@@ -747,6 +755,7 @@ mod tests {
         assert_eq!(state.queued_questions["one"], vec![question("second")]);
     }
 
+    /// An authoritative empty queue clears the active automation without touching unrelated sessions.
     #[test]
     fn automation_complete_empty_queue_clears_unprojected_requests_for_the_active_run_only() {
         let mut state = state();
@@ -763,6 +772,7 @@ mod tests {
         assert_eq!(state.pending_questions["two"].id, "unrelated");
     }
 
+    /// Complete snapshots can restore and resolve queues without replaying their Agent events.
     #[test]
     fn automation_complete_queue_restores_pending_questions_without_agent_replay() {
         let mut state = state();
@@ -778,6 +788,7 @@ mod tests {
         assert!(!state.queued_questions.contains_key("two"));
     }
 
+    /// An upgraded daemon can authoritatively replace a request first seen through a legacy payload.
     #[test]
     fn automation_complete_queue_reconciles_a_previous_legacy_projection() {
         let mut state = state();
@@ -787,6 +798,7 @@ mod tests {
         assert!(!state.queued_questions.contains_key("one"));
     }
 
+    /// Legacy projections preserve the visible question and deduplicate both active/background replay.
     #[test]
     fn automation_projection_preserves_question_fifo_without_replaying_duplicates() {
         // Exercise both active and background Agent-event insertion paths.
@@ -808,6 +820,7 @@ mod tests {
         }
     }
 
+    /// A newer legacy question joins the FIFO rather than replacing an unanswered predecessor.
     #[test]
     fn automation_projection_appends_new_questions_and_preserves_earlier_projected_requests() {
         let mut state = state();
@@ -829,6 +842,7 @@ mod tests {
         assert!(!state.queued_questions.contains_key("one"));
     }
 
+    /// Legacy retraction removes only its contributed queued ID and preserves other requests.
     #[test]
     fn automation_projection_retracts_resolved_queued_request_without_dropping_other_questions() {
         let mut state = state();
@@ -849,6 +863,7 @@ mod tests {
         assert!(!state.queued_questions.contains_key("one"));
     }
 
+    /// Resolving the visible projected request promotes the next unanswered question exactly once.
     #[test]
     fn automation_projection_promotes_next_question_when_visible_request_resolves_elsewhere() {
         let mut state = state();
@@ -862,6 +877,7 @@ mod tests {
         assert!(!state.queued_questions.contains_key("one"));
     }
 
+    /// Reconciliation repairs duplicate IDs across both request surfaces before promotion.
     #[test]
     fn automation_projection_deduplicates_pending_and_queued_questions_before_promotion() {
         let mut state = state();
@@ -881,6 +897,7 @@ mod tests {
         assert!(!state.queued_questions.contains_key("one"));
     }
 
+    /// A late retraction cannot remove a newer Agent request with a different identity.
     #[test]
     fn automation_projection_removes_only_the_last_contributed_question_id() {
         let mut state = state();

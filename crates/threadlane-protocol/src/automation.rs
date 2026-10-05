@@ -81,6 +81,7 @@ pub enum AutomationResponse {
 mod tests {
     use super::*;
 
+    /// Wire decoding distinguishes an omitted legacy field from an authoritative empty queue.
     #[test]
     fn automation_question_queues_distinguish_legacy_from_authoritative_empty() {
         let legacy = serde_json::to_value(AutomationProjection::default()).unwrap();

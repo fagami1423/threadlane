@@ -1,4 +1,4 @@
-//! Automation navigation, editor, and paged run history. Execution stays in UI state.
+//! Automation navigation, editor, and paged run history. Execution stays in the owning daemon.
 mod editor;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -9,7 +9,8 @@ use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, Selectable, Sizable, StyledExt, WindowExt};
 use std::path::PathBuf;
 use threadlane_automation::{display_time, Definition, RunStatus};
-use threadlane_ui_state::{automation::Command, AppState};
+use threadlane_protocol::automation::AutomationCommand as Command;
+use threadlane_ui_state::{automation_io, AppState};
 
 actions!(threadlane_automation_ui, [SaveAutomation]);
 pub fn init(cx: &mut App) {
@@ -60,6 +61,12 @@ pub struct AutomationsView {
     busy: bool,
     _subscription: Subscription,
 }
+
+/// A completed delete may reset navigation only while its definition remains selected.
+fn deleted_selection_is_current(deleted_id: Option<&str>, selected: Option<&str>) -> bool {
+    deleted_id.is_some() && deleted_id == selected
+}
+
 impl AutomationsView {
     pub fn new(model: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.observe(&model, |_, _, cx| cx.notify());
@@ -75,21 +82,34 @@ impl AutomationsView {
             _subscription: subscription,
         }
     }
+    /// Dispatch one daemon mutation, retaining selection on failure and showing its error.
+    /// Store projections arrive through the model's authoritative watch or event stream.
     fn command(&mut self, command: Command, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
-        let Some(service) = self.model.read(cx).automation_service.clone() else {
-            return;
-        };
+        let client = self.model.read(cx).daemon_client.clone();
         self.busy = true;
         self.error = None;
-        let deleting = matches!(&command, Command::Delete(_));
+        let deleted_id = match &command {
+            Command::Delete { id } => Some(id.clone()),
+            _ => None,
+        };
+        let task = threadlane_provider::exec::get_runtime()
+            .spawn(async move { automation_io::mutate(&client, command).await });
         cx.spawn(async move |this, cx| {
-            let result = service.command(command).await;
+            let result = task
+                .await
+                .map_err(|error| format!("Automation request failed: {error}"))
+                .and_then(|result| result);
             let _ = this.update(cx, |this, cx| {
                 this.busy = false;
-                if result.is_ok() && deleting {
+                if result.is_ok()
+                    && deleted_selection_is_current(
+                        deleted_id.as_deref(),
+                        this.selected.as_deref(),
+                    )
+                {
                     this.selected = None;
                     this.history = true;
                     this.page = 0;
@@ -201,7 +221,7 @@ impl Render for AutomationsView {
                             .label("Run now")
                             .disabled(self.busy || active)
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.command(Command::RunNow(run_id.clone()), cx)
+                                this.command(Command::RunNow { id: run_id.clone() }, cx)
                             })),
                     )
                     .child(
@@ -209,7 +229,10 @@ impl Render for AutomationsView {
                             .label(if enabled { "Pause" } else { "Resume" })
                             .disabled(self.busy)
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.command(Command::SetEnabled(pause_id.clone(), !enabled), cx)
+                                this.command(
+                                    Command::SetEnabled { id: pause_id.clone(), enabled: !enabled },
+                                    cx,
+                                )
                             })),
                     )
                     .child(
@@ -231,7 +254,7 @@ impl Render for AutomationsView {
                                         .disabled(active)
                                         .on_click(move |_, _, cx| {
                                             let _ = owner.update(cx, |this, cx| {
-                                                this.command(Command::Delete(id.clone()), cx)
+                                                this.command(Command::Delete { id: id.clone() }, cx)
                                             });
                                         }),
                                 )
@@ -420,7 +443,9 @@ impl Render for AutomationsView {
                                             result
                                         });
                                         match result {
-                                            Ok(()) => this.command(Command::Review(id.clone()), cx),
+                                            Ok(()) => {
+                                                this.command(Command::Review { id: id.clone() }, cx)
+                                            }
                                             Err(error) => {
                                                 this.error = Some(error);
                                                 cx.notify();
@@ -435,7 +460,7 @@ impl Render for AutomationsView {
                                         .label("Cancel run")
                                         .disabled(self.busy)
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.command(Command::Cancel(cancel_id.clone()), cx)
+                                            this.command(Command::Cancel { id: cancel_id.clone() }, cx)
                                         })),
                                 )
                             })
@@ -446,7 +471,7 @@ impl Render for AutomationsView {
                                         .label("Mark reviewed")
                                         .disabled(self.busy)
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.command(Command::Review(review_id.clone()), cx)
+                                            this.command(Command::Review { id: review_id.clone() }, cx)
                                         })),
                                 )
                             })
@@ -467,7 +492,7 @@ impl Render for AutomationsView {
                                         .on_click({
                                             let id = run.id.clone();
                                             cx.listener(move |this, _, _, cx| {
-                                                this.command(Command::DeleteRun(id.clone()), cx)
+                                                this.command(Command::DeleteRun { id: id.clone() }, cx)
                                             })
                                         }),
                                 )
@@ -534,6 +559,16 @@ mod tests {
     use gpui::{AppContext, Modifiers, TestAppContext};
     use gpui_component::WindowExt;
     use threadlane_ui_state::{activate_test_session, AppState};
+
+    /// Remote deletion must not undo a newer selection or a return to the list.
+    #[test]
+    fn delayed_delete_preserves_newer_navigation() {
+        assert!(super::deleted_selection_is_current(Some("a"), Some("a")));
+        assert!(!super::deleted_selection_is_current(Some("a"), Some("b")));
+        assert!(!super::deleted_selection_is_current(Some("a"), None));
+        assert!(!super::deleted_selection_is_current(None, Some("a")));
+        assert!(!super::deleted_selection_is_current(None, None));
+    }
 
     #[gpui::test]
     fn history_keeps_long_prompts_collapsed_and_only_finished_runs_removable(

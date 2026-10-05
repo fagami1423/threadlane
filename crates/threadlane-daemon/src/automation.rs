@@ -92,6 +92,7 @@ impl AutomationService {
     pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
         self.events.subscribe()
     }
+    /// Handle an automation command and report its persistence/scheduling result.
     pub async fn command(&self, command: Command) -> Result<(), String> {
         let (tx, rx) = oneshot::channel();
         self.commands.send((command, tx)).map_err(|_| {
@@ -150,6 +151,7 @@ impl Actor {
             projection: Projection::default(),
         }
     }
+    /// Publish changes to durable state, pending requests, or the active runtime handle.
     fn publish(&mut self) {
         let current = self.updates.borrow();
         let runtime = self.active.as_ref().and_then(|a| a.runtime.clone());
@@ -251,6 +253,7 @@ impl Actor {
             self.publish();
         }
     }
+    /// Handle an automation command and report its persistence/scheduling result.
     fn command(&mut self, command: Command) -> Result<(), String> {
         match command {
             Command::Save(d) => {
@@ -409,6 +412,7 @@ impl Actor {
         }
         Ok(())
     }
+    /// Fold runtime events into pending-request state and forward the live session events.
     fn event(&mut self, event: Event) -> Result<(), String> {
         match event {
             Event::Prepared(id, result) => {
@@ -553,6 +557,7 @@ impl Actor {
         }
         Ok(())
     }
+    /// Persist a terminal outcome before clearing its live requests and runtime.
     fn finish(&mut self, id: &str, status: RunStatus, error: Option<String>) -> Result<(), String> {
         let Some(active) = self.active.as_mut().filter(|a| a.run.id == id) else {
             return Ok(());
@@ -672,6 +677,7 @@ mod tests {
         Actor::new(store, updates, events)
     }
 
+    /// Create an actor whose parallel questions include a replayed duplicate ID.
     fn actor_with_pending_questions(root: &std::path::Path) -> Actor {
         let mut actor = make_actor(root);
         actor.store.save(definition(root), 0).unwrap();
@@ -701,6 +707,7 @@ mod tests {
         actor
     }
 
+    /// Partial resolution must update watchers even when the durable run revision is unchanged.
     #[test]
     fn automation_question_queue_resolution_publishes_without_a_run_status_change() {
         for resolved in ["first", "second"] {
@@ -762,6 +769,7 @@ mod tests {
         }
     }
 
+    /// Terminal cleanup publishes an authoritative empty queue for remote clients.
     #[test]
     fn finishing_automation_clears_all_pending_questions() {
         let temp = tempfile::tempdir().unwrap();
