@@ -1485,12 +1485,14 @@ impl ChatListView {
         let theme = cx.theme().colors;
         let checkout = session.runtime_work_dir.clone();
         let checkout_display = session_checkout_display(session);
-        let branch = session.git_branch.clone().or_else(|| {
-            state
-                .git_statuses
-                .get(&session.runtime_work_dir)
-                .and_then(|status| status.branch.clone())
-        });
+        // Live status wins over the discovery snapshot: branch switches in
+        // the review panel update `git_statuses` immediately, while
+        // `SessionInfo::git_branch` only refreshes on the next scan.
+        let branch = state
+            .git_statuses
+            .get(&session.runtime_work_dir)
+            .and_then(|status| status.branch.clone())
+            .or_else(|| session.git_branch.clone());
         let available = session.worktree_available;
         let detail = if available {
             format!(
