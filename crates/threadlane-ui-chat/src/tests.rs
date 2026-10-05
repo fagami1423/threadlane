@@ -6291,3 +6291,32 @@ fn composer_at_completion_late_probe_cannot_edit_another_checkout(cx: &mut gpui:
     cx.run_until_parked();
     chat.read_with(cx, |chat, cx| assert_eq!(chat.input_state.read(cx).value().as_ref(), "@"));
 }
+
+#[test]
+fn session_checkout_display_keeps_worktrees_relative_and_homes_short() {
+    use std::path::PathBuf;
+    use threadlane_protocol::daemon::SessionInfo;
+
+    let mut session = SessionInfo {
+        work_dir: PathBuf::from("/repo"),
+        runtime_work_dir: PathBuf::from("/repo/.threadlane/worktrees/agent-7"),
+        is_worktree: true,
+        ..SessionInfo::default()
+    };
+    assert_eq!(
+        super::session_checkout_display(&session),
+        ".threadlane/worktrees/agent-7"
+    );
+
+    session.runtime_work_dir = PathBuf::from("/repo");
+    assert_eq!(super::session_checkout_display(&session), "/repo");
+
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        session.runtime_work_dir = home.join("project");
+        assert_eq!(
+            super::session_checkout_display(&session),
+            "~/project"
+        );
+    }
+}

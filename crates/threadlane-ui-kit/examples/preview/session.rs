@@ -1670,6 +1670,7 @@ pub(super) fn saved_environment(fixture: &Arc<Snapshot>, on_action: impl Fn(kit:
     kit::environment_panel(
         project,
         location,
+        Some(session.runtime_work_dir.display().to_string()),
         fixture.git_status.as_ref(),
         session.worktree_available,
         move |menu, _, _| {

@@ -29,7 +29,7 @@ use threadlane_ui_editor::EditorView;
 use threadlane_ui_mirror::MirrorView;
 use threadlane_ui_state::{actions::AppAction, controller};
 use threadlane_ui_state::{
-    AppState, ChatMessageInfo, SessionEvent, MessageRole, SessionAttention,
+    AppState, ChatMessageInfo, SessionEvent, MessageRole, SessionAttention, SessionInfo,
     SubagentActivityStatus, ToolActivityInfo, WorkMode, WorkspacePage,
 };
 
@@ -103,6 +103,34 @@ fn last_retryable_prompt(messages: &[ChatMessageInfo]) -> Option<String> {
         .rev()
         .find(|message| message.role == MessageRole::User && !message.content.trim().is_empty())
         .map(|message| message.content.clone())
+}
+
+/// Compact but unambiguous checkout path: worktrees inside the project root
+/// render relative to it (`.threadlane/worktrees/<name>`), anything else
+/// shrinks `$HOME`/`%USERPROFILE%` to `~`.
+fn session_checkout_display(session: &SessionInfo) -> String {
+    if let Ok(relative) = session.runtime_work_dir.strip_prefix(&session.work_dir) {
+        if relative.components().next().is_some() {
+            return relative.display().to_string();
+        }
+    }
+    let display = session.runtime_work_dir.to_string_lossy().into_owned();
+    for variable in ["HOME", "USERPROFILE"] {
+        let Some(home) = std::env::var_os(variable) else {
+            continue;
+        };
+        let home = home.to_string_lossy();
+        if !home.is_empty() && display.starts_with(home.as_ref()) {
+            let rest = &display[home.len()..];
+            if rest.is_empty() {
+                return "~".to_string();
+            }
+            if rest.starts_with(['/', '\\']) {
+                return format!("~{rest}");
+            }
+        }
+    }
+    display
 }
 
 use threadlane_ui_kit::format_run_elapsed;
@@ -1351,11 +1379,15 @@ impl ChatListView {
             Some(dir) if Some(dir) != project => "Worktree",
             Some(_) => "Local",
         };
+        let checkout_path = checkout
+            .as_ref()
+            .map(|dir| dir.display().to_string());
         let menu_model = self.model.clone();
         let model = self.model.clone();
         threadlane_ui_kit::environment_panel(
             name,
             location,
+            checkout_path,
             status,
             checkout.is_some(),
             move |menu, _, cx| {
@@ -1432,6 +1464,160 @@ impl ChatListView {
             state.active_token_efficiency(),
             state.is_generating,
             cx,
+        )
+    }
+
+    /// Pinned execution context for worktree sessions: a resumed — or
+    /// compaction-restored — chat looks identical to a local one while its
+    /// agent runs in an isolated checkout, so the path and branch stay
+    /// visible above the transcript instead of hiding in tooltips or the
+    /// width-gated environment panel.
+    fn render_session_context(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let state = self.model.read(cx);
+        let session = state
+            .projects
+            .iter()
+            .flat_map(|project| project.sessions.iter())
+            .find(|session| state.active_session_id.as_deref() == Some(&session.id))?;
+        if !session.is_worktree {
+            return None;
+        }
+        let theme = cx.theme().colors;
+        let checkout = session.runtime_work_dir.clone();
+        let checkout_display = session_checkout_display(session);
+        // Live status wins over the discovery snapshot: branch switches in
+        // the review panel update `git_statuses` immediately, while
+        // `SessionInfo::git_branch` only refreshes on the next scan.
+        let branch = state
+            .git_statuses
+            .get(&session.runtime_work_dir)
+            .and_then(|status| status.branch.clone())
+            .or_else(|| session.git_branch.clone());
+        let available = session.worktree_available;
+        let detail = if available {
+            format!(
+                "This session runs in an isolated worktree{}\nAgent, terminal, and tools use it as the working directory\n{}",
+                branch
+                    .as_ref()
+                    .map(|branch| format!(" on branch {branch}"))
+                    .unwrap_or_default(),
+                checkout.display()
+            )
+        } else {
+            format!(
+                "This session's worktree is not checked out; its recorded path is shown\nSession history remains available\n{}",
+                checkout.display()
+            )
+        };
+        let accent = if available {
+            theme.muted_foreground
+        } else {
+            theme.warning
+        };
+        let aria = format!(
+            "Session runs in a worktree{} at {}",
+            if available { "" } else { " not checked out" },
+            checkout.display(),
+        );
+        let aria = match branch.as_deref() {
+            Some(branch) => format!("{aria}, branch {branch}"),
+            None => aria,
+        };
+        Some(
+            div()
+                .id("session-worktree-context")
+                .debug_selector(|| "session-worktree-context".into())
+                .role(Role::Group)
+                .aria_label(aria)
+                .tooltip(move |window, cx| {
+                    gpui_component::tooltip::Tooltip::new(detail.clone()).build(window, cx)
+                })
+                .w_full()
+                .px_4()
+                .py_1p5()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_xs()
+                .border_b_1()
+                .border_color(theme.border.opacity(0.4))
+                .child(
+                    Icon::new(IconName::Folder)
+                        .xsmall()
+                        .flex_none()
+                        .text_color(accent),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(accent)
+                        .child(if available {
+                            "Worktree"
+                        } else {
+                            "Not checked out"
+                        }),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_color(theme.muted_foreground)
+                        .child(checkout_display),
+                )
+                .children(branch.map(|branch| {
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_1p5()
+                        .py(rems(0.125))
+                        .rounded_full()
+                        .bg(theme.muted.opacity(0.3))
+                        .child(
+                            Icon::default()
+                                .path("icons/git/branch.svg")
+                                .size(rems(0.6875))
+                                .text_color(theme.muted_foreground.opacity(0.85)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.muted_foreground)
+                                .max_w(rems(9.0))
+                                .truncate()
+                                .child(branch),
+                        )
+                }))
+                .children(available.then(|| {
+                    Button::new("session-worktree-terminal")
+                        .debug_selector(|| "session-worktree-terminal".into())
+                        .icon(IconName::SquareTerminal)
+                        .label("Terminal")
+                        .ghost()
+                        .xsmall()
+                        .accessibility_label(format!(
+                            "Open a terminal in {}",
+                            checkout.display()
+                        ))
+                        .tooltip("Open a terminal in this worktree")
+                        .on_click({
+                            let model = self.model.clone();
+                            move |_, _, cx| {
+                                model.update(cx, |state, cx| {
+                                    controller::dispatch(
+                                        state,
+                                        AppAction::OpenTerminalAt(checkout.clone()),
+                                    );
+                                    cx.notify();
+                                });
+                            }
+                        })
+                }))
+                .into_any_element(),
         )
     }
 
@@ -4834,6 +5020,7 @@ impl Render for ChatListView {
                     .justify_center()
                     .child(
                         threadlane_ui_kit::conversation_column(show_environment)
+                            .children(self.render_session_context(cx))
                             .children(
                                 (self.current_tab == CentralTab::Chat && !is_generating)
                                     .then(|| self.model.read(cx).active_run_elapsed_seconds())
