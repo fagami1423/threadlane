@@ -8,6 +8,7 @@ pub struct CodeSamples {
     markdown: HashMap<(SharedString, String), kit::markdown::MarkdownRenderState>,
     copied: Option<String>,
     copy_task: Option<Task<()>>,
+    wrapped: std::collections::HashSet<String>,
 }
 impl CodeSamples {
     pub fn new() -> Self {
@@ -15,6 +16,7 @@ impl CodeSamples {
             markdown: HashMap::new(),
             copied: None,
             copy_task: None,
+            wrapped: std::collections::HashSet::new(),
         }
     }
 }
@@ -44,7 +46,18 @@ impl Render for CodeSamples {
                 true,
             ),
         ] {
+            let wrapped = self.wrapped.contains(key);
             let actions = kit::code_block_actions()
+                .child(
+                    kit::code_block_wrap_button(key, wrapped).on_click(cx.listener(
+                        move |host, _, _, cx| {
+                            if !host.wrapped.remove(key) {
+                                host.wrapped.insert(key.into());
+                            }
+                            cx.notify();
+                        },
+                    )),
+                )
                 .children((language == "shell" && !streaming).then(|| {
                     kit::code_block_run_button(key).on_click(|_, window, cx| {
                         window.push_notification(
@@ -104,10 +117,12 @@ impl Render for CodeSamples {
                             actions,
                             cx,
                         ))
-                        .child(
-                            kit::code_block_body(cx)
-                                .child(kit::markdown::markdown_view(&state, |_, _| {})),
-                        ),
+                        .child(kit::code_block_body(
+                            key,
+                            cx,
+                            wrapped,
+                            kit::markdown::markdown_view(&state, |_, _| {}),
+                        )),
                 );
         }
         samples

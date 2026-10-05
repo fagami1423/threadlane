@@ -2,7 +2,7 @@
 use gpui::{prelude::*, *};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::scroll::ScrollableElement;
-use gpui_component::{ActiveTheme, Icon, IconName, Sizable};
+use gpui_component::{ActiveTheme, Icon, IconName, Selectable, Sizable};
 
 pub fn code_block_surface(key: &str, cx: &App) -> Stateful<Div> {
     let selector = format!("code-block-{key}");
@@ -118,11 +118,60 @@ pub fn code_block_copy_button(key: &str, copied: bool, cx: &App) -> Button {
         })
 }
 
-pub fn code_block_body(cx: &App) -> impl IntoElement + ParentElement {
-    div()
-        .min_w_0()
-        .overflow_x_scrollbar()
-        .p_3()
-        .font_family(cx.theme().mono_font_family.clone())
-        .text_xs()
+/// Per-block soft-wrap toggle. `selected`/`toggled` expose the on state to
+/// eyes and assistive technology; the button stays quiet when off.
+pub fn code_block_wrap_button(key: &str, wrapped: bool) -> Button {
+    let selector = format!("wrap-lines-{key}");
+    Button::new(SharedString::from(selector.clone()))
+        .debug_selector(move || selector.clone())
+        .label("Wrap lines")
+        .accessibility_label(if wrapped {
+            "Stop wrapping code lines"
+        } else {
+            "Wrap code lines"
+        })
+        .tooltip(if wrapped {
+            "Stop wrapping code lines"
+        } else {
+            "Wrap code lines"
+        })
+        .xsmall()
+        .ghost()
+        .selected(wrapped)
+        .toggled(wrapped)
+}
+
+/// Code body layout. Unwrapped keeps source line boundaries inside a
+/// block-local horizontal scroller (keyed per block so positions don't
+/// leak between blocks); wrapped constrains the text to the pane width and
+/// soft-wraps long lines and tokens without touching the source that
+/// Copy/Run consume.
+pub fn code_block_body(
+    key: &str,
+    cx: &App,
+    wrapped: bool,
+    content: impl IntoElement,
+) -> AnyElement {
+    let base = |mode: &'static str| {
+        let selector = format!("code-body-{mode}-{key}");
+        div()
+            .min_w_0()
+            .p_3()
+            .font_family(cx.theme().mono_font_family.clone())
+            .text_xs()
+            .debug_selector(move || selector.clone())
+    };
+    if wrapped {
+        base("wrap")
+            .w_full()
+            .overflow_x_hidden()
+            .child(content)
+            .into_any_element()
+    } else {
+        base("scroll")
+            .overflow_x_scrollbar()
+            .id(SharedString::from(format!("code-body-scroll-{key}")))
+            .child(content)
+            .into_any_element()
+    }
 }

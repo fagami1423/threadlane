@@ -397,6 +397,12 @@ pub struct ChatListView {
     copy_feedback_task: Option<Task<()>>,
     expanded_tool_aggregates: HashSet<String>,
     segment_cache: HashMap<String, (String, Vec<MarkdownSegment>)>,
+    /// Per-code-block soft-wrap choices for the active conversation, keyed
+    /// by message id then fenced-block index. View-only: wrapped text never
+    /// feeds Copy/Run. Reset on session change, pruned with removed
+    /// messages, and dropped when a message's content is replaced (rather
+    /// than appended to) so a reused index cannot wrap unrelated code.
+    code_wrap_blocks: HashMap<String, HashSet<usize>>,
     _subscriptions: Vec<Subscription>,
 }
 /// Maximum chat-stream events per pump tick: bounds one redraw's work so a
@@ -785,6 +791,7 @@ impl ChatListView {
             copy_feedback_task: None,
             expanded_tool_aggregates: HashSet::new(),
             segment_cache: HashMap::new(),
+            code_wrap_blocks: HashMap::new(),
             _subscriptions: vec![sub1, sub2, sub_editor, find_subscription],
         }
     }
@@ -1570,6 +1577,11 @@ impl ChatListView {
 
     fn sync_transcript_rows(&mut self, messages: Arc<Vec<ChatMessageInfo>>, generating: bool, session_changed: bool) {
         self.transcript.sync(messages, generating, session_changed, self.find_open || self.outline_selected_id.is_some());
+        if !self.code_wrap_blocks.is_empty() {
+            let messages = &self.transcript.messages;
+            self.code_wrap_blocks
+                .retain(|id, blocks| !blocks.is_empty() && messages.iter().any(|m| &m.id == id));
+        }
     }
 
     fn render_transcript_row(
@@ -1618,6 +1630,13 @@ impl ChatListView {
     }
 
     fn cached_segments(&mut self, message_id: &str, content: &str) -> Vec<MarkdownSegment> {
+        if let Some((source, _)) = self.segment_cache.get(message_id) {
+            if source != content
+                && classify_markdown_update(source, content) == MarkdownUpdate::Replace
+            {
+                self.code_wrap_blocks.remove(message_id);
+            }
+        }
         threadlane_ui_kit::markdown::markdown_segments(&mut self.segment_cache, message_id, content)
     }
 
@@ -1651,7 +1670,18 @@ impl ChatListView {
         let path_for_open = (!streaming).then(|| path_opt.clone()).flatten();
 
         let key = format!("{msg_id}-{block_index}");
+        let wrapped = self
+            .code_wrap_blocks
+            .get(msg_id)
+            .is_some_and(|blocks| blocks.contains(&block_index));
         let actions = threadlane_ui_kit::code_block_actions()
+            .child({
+                let msg_id = msg_id.to_string();
+                threadlane_ui_kit::code_block_wrap_button(&key, wrapped)
+                    .on_click(cx.listener(move |host, _, _, cx| {
+                        host.toggle_code_block_wrap(&msg_id, block_index, cx);
+                    }))
+            })
             .children(is_runnable.then(|| {
                 let cmd = code_str.clone();
                 let model = model.clone();
@@ -1706,7 +1736,33 @@ impl ChatListView {
         let code_state = self.markdown_state(format!("code-{key}"), &formatted_code, cx);
         threadlane_ui_kit::code_block_surface(&key, cx)
             .child(threadlane_ui_kit::code_block_header(&key, language, path_opt.as_deref(), actions, cx))
-            .child(threadlane_ui_kit::code_block_body(cx).child(self.chat_markdown_view(&code_state)))
+            .child(threadlane_ui_kit::code_block_body(
+                &key,
+                cx,
+                wrapped,
+                self.chat_markdown_view(&code_state),
+            ))
+    }
+
+    /// Flip one fenced block between horizontal-scroll and soft-wrap. The
+    /// row's measured height changes, so invalidate just that transcript row
+    /// and leave the list's reading anchor alone.
+    fn toggle_code_block_wrap(&mut self, msg_id: &str, block_index: usize, cx: &mut Context<Self>) {
+        let blocks = self.code_wrap_blocks.entry(msg_id.to_string()).or_default();
+        if !blocks.remove(&block_index) {
+            blocks.insert(block_index);
+        }
+        if blocks.is_empty() {
+            self.code_wrap_blocks.remove(msg_id);
+        }
+        let row = self.transcript.rows.iter().position(|row| {
+            matches!(row, TranscriptRow::Message(index)
+                if self.transcript.messages[*index].id == msg_id)
+        });
+        if let Some(row) = row {
+            self.transcript.list.remeasure_items(row..row + 1);
+        }
+        cx.notify();
     }
 
     fn render_reasoning_block(
@@ -4710,6 +4766,7 @@ impl Render for ChatListView {
             self.clear_file_completion();
             self.question_selections.clear();
             self.question_inputs.clear();
+            self.code_wrap_blocks.clear();
         }
         if self.permission_details_request.is_some()
             && (session_changed || self.permission_details_request != active_permission_id)

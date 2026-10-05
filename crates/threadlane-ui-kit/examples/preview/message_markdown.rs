@@ -44,6 +44,10 @@ impl SessionPreview {
                             _ => None,
                         }
                     });
+                    let wrapped = self
+                        .code_wrap_blocks
+                        .get(&message.id)
+                        .is_some_and(|blocks| blocks.contains(&index));
                     // Shell availability is captured from the desktop host;
                     // browser environment variables cannot represent its shell.
                     let runnable = !message.streaming
@@ -55,6 +59,14 @@ impl SessionPreview {
                             .any(|supported| supported.eq_ignore_ascii_case(&language))
                             || matches!(language.as_str(), "shell" | "terminal" | "console"));
                     let actions = kit::code_block_actions()
+                        .child({
+                            let message_id = message.id.clone();
+                            kit::code_block_wrap_button(&key, wrapped).on_click(cx.listener(
+                                move |host, _, _, cx| {
+                                    host.toggle_code_block_wrap(&message_id, index, cx);
+                                },
+                            ))
+                        })
                         .children(runnable.then(|| {
                             kit::code_block_run_button(&key).on_click(|_, window, cx| {
                                 Self::preview_notice("Run in Terminal", window, cx);
@@ -95,15 +107,45 @@ impl SessionPreview {
                             actions,
                             cx,
                         ))
-                        .child(
-                            kit::code_block_body(cx)
-                                .child(kit::markdown::markdown_view(&state, |_, _| {})),
-                        )
+                        .child(kit::code_block_body(
+                            &key,
+                            cx,
+                            wrapped,
+                            kit::markdown::markdown_view(&state, |_, _| {}),
+                        ))
                         .into_any_element()
                 }
             };
             body = body.child(element);
         }
         body.into_any_element()
+    }
+
+    /// Same per-block wrap toggle as the chat surface, including the
+    /// targeted transcript-row remeasure so heights update in place.
+    fn toggle_code_block_wrap(
+        &mut self,
+        message_id: &str,
+        block_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let blocks = self
+            .code_wrap_blocks
+            .entry(message_id.to_string())
+            .or_default();
+        if !blocks.remove(&block_index) {
+            blocks.insert(block_index);
+        }
+        if blocks.is_empty() {
+            self.code_wrap_blocks.remove(message_id);
+        }
+        let row = self.transcript.rows.iter().position(|row| {
+            matches!(row, kit::transcript::TranscriptRow::Message(index)
+                if self.messages[*index].id == message_id)
+        });
+        if let Some(row) = row {
+            self.transcript.list.remeasure_items(row..row + 1);
+        }
+        cx.notify();
     }
 }
