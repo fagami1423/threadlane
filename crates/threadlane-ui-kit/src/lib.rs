@@ -656,16 +656,18 @@ pub fn reasoning_card(
                 .gap_2()
                 .min_w_0()
                 .flex_1()
-                .child(
+                .child(if is_streaming {
+                    gpui_component::spinner::Spinner::new()
+                        .xsmall()
+                        .color(theme.primary)
+                        .into_any_element()
+                } else {
                     gpui_component::Icon::default()
                         .data(gpui_kit_assets::__private::Asterisk.1)
                         .xsmall()
-                        .text_color(if is_streaming {
-                            theme.primary
-                        } else {
-                            theme.muted_foreground
-                        }),
-                )
+                        .text_color(theme.muted_foreground)
+                        .into_any_element()
+                })
                 .child(
                     div()
                         .text_sm()

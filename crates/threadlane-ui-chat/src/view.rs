@@ -2088,7 +2088,11 @@ impl ChatListView {
                     div()
                         .flex_none()
                         .text_xs()
-                        .text_color(theme.muted_foreground)
+                        .text_color(match status {
+                            "Failed" | "Running · failed" => theme.danger,
+                            "Running" => theme.info,
+                            _ => theme.muted_foreground,
+                        })
                         .child(status),
                 ),
         )

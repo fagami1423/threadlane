@@ -95,11 +95,11 @@ impl Gallery {
             selected: vec!["Compact".into()],
             completed_expanded: false,
             tools: [
-                ("read", "read_file", "Read src/app.rs", "Result", "40:a3f|pub fn render() {\n41:b4e|    // Shared controls preserve keyboard navigation, theme typography, scroll ownership, and source details on native and web. End of source line.\n42:c5d|}"),
-                ("search", "grep_search", "Search for composer", "Working", "src/app.rs:42: Composer::new(input)"),
-                ("command", "run_command", "Run cargo check", "Result", "Exit Status: 0\n--- STDOUT ---\nChecking crates/threadlane-ui-kit/examples/preview/components/a-long-component-path-for-shared-native-and-web-rendering.rs — End of output line\nFinished dev profile\n0 errors\n--- STDERR ---\n"),
-                ("running", "run_command", "Run cargo metadata", "Working", ""),
-                ("failed", "run_command", "Run cargo nextest", "Error", "Exit Status: 1\n--- STDOUT ---\nOne test failed.\n--- STDERR ---\nInspect the assertion before rerunning."),
+                ("read", "read_file", "Read · src/app.rs", "Result", "40:a3f|pub fn render() {\n41:b4e|    // Shared controls preserve keyboard navigation, theme typography, scroll ownership, and source details on native and web. End of source line.\n42:c5d|}"),
+                ("search", "grep_search", "Search · composer", "Working", "src/app.rs:42: Composer::new(input)"),
+                ("command", "run_command", "Run · cargo check", "Result", "Exit Status: 0\n--- STDOUT ---\nChecking crates/threadlane-ui-kit/examples/preview/components/a-long-component-path-for-shared-native-and-web-rendering.rs — End of output line\nFinished dev profile\n0 errors\n--- STDERR ---\n"),
+                ("running", "run_command", "Run · cargo metadata", "Working", ""),
+                ("failed", "run_command", "Run · cargo nextest", "Error", "Exit Status: 1\n--- STDOUT ---\nOne test failed.\n--- STDERR ---\nInspect the assertion before rerunning."),
             ].into_iter().map(|(id, title, summary, category, detail)| ToolActivityInfo {
                 id: id.into(), title: title.into(), display_summary: summary.into(),
                 category: category.into(), detail: detail.into(),
