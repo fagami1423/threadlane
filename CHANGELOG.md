@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.42](https://github.com/wheregmis/threadlane/compare/v0.1.41...v0.1.42) (2026-10-06)
+
+
+### Features
+
+* add Threadlane website and live preview on GitHub Pages ([87b8bd3](https://github.com/wheregmis/threadlane/commit/87b8bd3a777e65474173bd2c54dd7b3103c36114))
+
+
+### Bug Fixes
+
+* use preview toolchain throughout Pages build ([8bae23c](https://github.com/wheregmis/threadlane/commit/8bae23cc8f0cceb74062a18bf995fde0d0018b0c))
+
 ## [0.1.41](https://github.com/wheregmis/threadlane/compare/v0.1.40...v0.1.41) (2026-10-05)
 
 
