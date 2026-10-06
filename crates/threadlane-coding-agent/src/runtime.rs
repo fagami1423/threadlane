@@ -1109,6 +1109,20 @@ impl CodingAgent {
             Some(options.work_dir.clone()),
         ));
         let mut registry = threadlane_runtime::CapabilityRegistry::new();
+        let automation_result_required = harness.as_ref().is_some_and(|h| {
+            h.store
+                .store()
+                .facts()
+                .get("automation_result_contract")
+                .map(String::as_str)
+                == Some("1")
+        });
+        if let Some(session_file) = session_file.as_ref().filter(|_| automation_result_required) {
+            registry.register(Box::new(crate::automation::AutomationResultCapability {
+                session_file: session_file.clone(),
+                run_id: harness_run_id.clone(),
+            }));
+        }
         if let Some(session_file) = options.session_file.clone() {
             registry.register(Box::new(crate::automation_tool::AutomationCapability {
                 work_dir: options.work_dir.clone(), session_file, model: effective_model.clone(),
@@ -1186,6 +1200,11 @@ impl CodingAgent {
             .project_root = Some(options.work_dir.clone());
 
         let mut system_prompt_config = options.system_prompt.clone();
+        if automation_result_required {
+            system_prompt_config.guidelines.push(
+                "For the original automation operation (not later interactive follow-ups), before your final response call report_automation_result with evidence of success or the exact unresolved blocker. If access restrictions prevent the task, report blocked; do not treat a normal final response or unperformed research as success. Do not bypass read-only policy.".into(),
+            );
+        }
         if initial_tool_policy == ToolPolicy::ReadOnly {
             system_prompt_config.guidelines.push(
                 "The current workspace tool policy is read-only; do not request file mutations or host commands."
