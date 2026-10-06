@@ -77,9 +77,22 @@ pub fn completed_activity_group<'a>(
                     .debug_selector(|| "activity-group-label".into())
                     .min_w_0()
                     .flex_1()
-                    .truncate()
-                    .text_color(theme.muted_foreground)
-                    .child(label),
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::CircleCheck)
+                            .xsmall()
+                            .text_color(theme.success),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_color(theme.muted_foreground)
+                            .child(label),
+                    ),
             )
             .debug_selector(|| "activity-group-disclosure".into())
             .when(expanded, |button| button.bg(theme.muted.opacity(0.25)))
@@ -109,8 +122,8 @@ pub fn tool_activity(
     let theme = cx.theme().colors;
     let (status, status_color) = match activity.category.as_str() {
         "Error" => ("Failed", theme.danger),
-        "Working" => ("Running", theme.primary),
-        "Thinking" => ("Thinking", theme.primary),
+        "Working" => ("Running", theme.info),
+        "Thinking" => ("Thinking", theme.info),
         "Completed" | "Result" | "Edited" | "Created" | "Ran" | "Loaded" | "Explored" => {
             ("Completed", theme.muted_foreground)
         }
@@ -170,10 +183,46 @@ pub fn tool_activity(
                     div()
                         .min_w_0()
                         .flex_1()
-                        .truncate()
-                        .text_sm()
-                        .text_color(theme.foreground)
-                        .child(display_summary.clone()),
+                        .flex()
+                        .items_baseline()
+                        .gap_2()
+                        .children(
+                            activity
+                                .display_summary
+                                .split_once(" · ")
+                                .map(|(verb, target)| {
+                                    (
+                                        div()
+                                            .flex_none()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme.foreground)
+                                            .child(verb.to_owned()),
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .truncate()
+                                            .rounded_md()
+                                            .px_1p5()
+                                            .py_0p5()
+                                            .bg(theme.muted.opacity(0.4))
+                                            .text_xs()
+                                            .font_family(cx.theme().mono_font_family.clone())
+                                            .text_color(theme.muted_foreground)
+                                            .child(target.to_owned()),
+                                    )
+                                })
+                                .map(|(verb, target)| vec![verb, target])
+                                .unwrap_or_else(|| {
+                                    vec![div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_sm()
+                                        .text_color(theme.foreground)
+                                        .child(display_summary.clone())]
+                                }),
+                        ),
                 )
                 .child(
                     div()
