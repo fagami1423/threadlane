@@ -9,7 +9,7 @@ use std::{
 use threadlane_automation::{now, Definition, Run, RunStatus, Snapshot, Store};
 use threadlane_coding_agent::automation_tool::{install_creator, CreationRequest};
 use threadlane_coding_agent::{
-    automation::{durable_status, prepare, record_outcome, PreparedRun},
+    automation::{durable_result, prepare, record_outcome, PreparedRun},
     controller::{SessionController, SessionStatus},
 };
 use threadlane_protocol::{AgentEvent, PermissionRequest, QuestionRequest};
@@ -181,24 +181,24 @@ impl Actor {
                 .as_ref()
                 .and_then(|p| JsonlStore::open_read_only(p).ok())
                 .and_then(|s| s.facts().get("automation_outcome").cloned());
+            let durable = run.session_file.as_ref().and_then(|p| durable_result(p));
             let status = match outcome.as_deref() {
                 Some("succeeded") => RunStatus::Succeeded,
                 Some("failed") => RunStatus::Failed,
                 Some("cancelled") => RunStatus::Cancelled,
                 Some("interrupted") => RunStatus::Interrupted,
-                _ => run
-                    .session_file
+                _ => durable
                     .as_ref()
-                    .and_then(|p| durable_status(p))
+                    .map(|(status, _)| *status)
                     .unwrap_or(RunStatus::Interrupted),
             };
             self.store.update_run(
                 &run.id,
                 status,
-                (status != RunStatus::Succeeded).then(||
-                    "Recovered after Threadlane stopped. Review the chat before running again."
-                        .into()
-                ),
+                (status != RunStatus::Succeeded).then(|| {
+                    durable.and_then(|(_, error)| error).unwrap_or_else(||
+                        "Recovered after Threadlane stopped. Review the chat before running again.".into())
+                }),
                 None,
                 now(),
             )?;
@@ -533,11 +533,16 @@ impl Actor {
                     return Ok(());
                 };
                 let runtime = active.runtime.as_ref().unwrap();
-                let error = active.error.clone().or_else(|| match runtime.status() {
-                    SessionStatus::Error(e) => Some(e),
-                    _ => None,
-                });
-                let durable = durable_status(runtime.session_file());
+                let durable = durable_result(runtime.session_file());
+                let error = active
+                    .error
+                    .clone()
+                    .or_else(|| match runtime.status() {
+                        SessionStatus::Error(e) => Some(e),
+                        _ => None,
+                    })
+                    .or_else(|| durable.as_ref().and_then(|(_, error)| error.clone()));
+                let durable = durable.map(|(status, _)| status);
                 let status = if let Some((status, _)) = &active.cancellation {
                     *status
                 } else if durable == Some(RunStatus::Cancelled) {
@@ -651,6 +656,162 @@ mod tests {
             "test"
         }
     }
+    struct ResultProvider {
+        status: &'static str,
+        reported: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl ProviderPort for ResultProvider {
+        async fn stream_request(
+            &self,
+            request: RuntimeRequest,
+            events: mpsc::Sender<RuntimeStreamEvent>,
+        ) {
+            let first = !self
+                .reported
+                .swap(true, std::sync::atomic::Ordering::SeqCst);
+            if first {
+                assert!(format!("{:?}", request).contains("report_automation_result"));
+            }
+            let tool_calls = if first && self.status != "missing" {
+                vec![threadlane_protocol::RuntimeToolCall {
+                    id: "result".into(), r#type: "function".into(), thought_signature: None,
+                    function: threadlane_protocol::RuntimeToolCallFunction {
+                        name: "report_automation_result".into(),
+                        arguments: serde_json::json!({"status":self.status,"summary":"GitHub access blocked"}).to_string(),
+                    },
+                }]
+            } else {
+                vec![]
+            };
+            if tool_calls.is_empty() {
+                events
+                    .send(RuntimeStreamEvent::ContentToken(
+                        "Automation task result reported".into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            events
+                .send(RuntimeStreamEvent::Finished {
+                    tool_calls,
+                    usage: RuntimeUsage::default(),
+                })
+                .await
+                .unwrap();
+        }
+        async fn fetch_deferred(&self, _: &str, _: &str) -> Result<DeferredResponse, String> {
+            Ok(DeferredResponse::Pending)
+        }
+        async fn cancel_deferred(&self, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn provider_kind(&self, _: &str) -> &'static str {
+            "test"
+        }
+    }
+
+    #[tokio::test]
+    async fn automation_explicit_task_result_controls_status_notification_and_recovery() {
+        for reported in ["blocked", "succeeded", "missing"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().to_path_buf();
+            let mut actor = make_actor(&root.join("automations"));
+            actor.store.save(definition(&root), now()).unwrap();
+            let id = actor
+                .store
+                .enqueue("automation-test", false, now())
+                .unwrap();
+            let run = actor.store.snapshot().runs[0].clone();
+            let session = root
+                .join(".threadlane/sessions")
+                .join(format!("{}.jsonl", run.session_id));
+            threadlane_coding_agent::harness::CodingSessionHarness::append_fact_to_path(
+                &session,
+                "main",
+                "automation_result_contract",
+                "1",
+                None,
+            )
+            .unwrap();
+            let options = crate::projection::coding_agent_options(
+                root.clone(),
+                session.clone(),
+                "gpt-4o".into(),
+                Default::default(),
+                Default::default(),
+            );
+            let runtime = tokio::task::spawn_blocking(move || {
+                threadlane_coding_agent::controller::test_support::session_controller_with_provider(
+                    options,
+                    Arc::new(ResultProvider {
+                        status: reported,
+                        reported: Default::default(),
+                    }),
+                )
+            })
+            .await
+            .unwrap();
+            actor.active = Some(Active {
+                run,
+                runtime: None,
+                elapsed: Duration::ZERO,
+                cancellation: None,
+                completion: None,
+                error: None,
+            });
+            actor
+                .event(Event::Prepared(
+                    id.clone(),
+                    Ok(PreparedRun {
+                        runtime,
+                        work_dir: root.clone(),
+                        effort: Default::default(),
+                    }),
+                ))
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while actor.active.is_some() {
+                    let event = actor.rx.recv().await.unwrap();
+                    actor.event(event).unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            let expected = if reported == "succeeded" {
+                RunStatus::Succeeded
+            } else {
+                RunStatus::Failed
+            };
+            assert_eq!(actor.store.snapshot().runs[0].status, expected);
+            if reported == "blocked" {
+                assert_eq!(
+                    actor.store.snapshot().runs[0].error.as_deref(),
+                    Some("GitHub access blocked")
+                );
+            }
+            assert_eq!(
+                actor.projection.notification.is_some(),
+                expected == RunStatus::Failed
+            );
+            // Simulate a crash before the automation store's terminal update.
+            actor
+                .store
+                .update_run(&id, RunStatus::Running, None, None, now())
+                .unwrap();
+            drop(actor);
+            let mut recovered = make_actor(&root.join("automations"));
+            recovered.recover().unwrap();
+            assert_eq!(recovered.store.snapshot().runs[0].status, expected);
+            if reported == "blocked" {
+                assert_eq!(
+                    recovered.store.snapshot().runs[0].error.as_deref(),
+                    Some("GitHub access blocked")
+                );
+            }
+        }
+    }
+
     fn definition(root: &std::path::Path) -> Definition {
         Definition {
             id: "automation-test".into(),
