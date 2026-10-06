@@ -13,6 +13,8 @@
 
 Threadlane brings project workspaces, persistent conversation sessions, coding-agent execution, and developer tools into one native application. Its Rust workspace includes provider integrations, external ACP agents, MCP support, and sandboxed WASI extensions.
 
+Explore the [website and live UI-Kit demo](https://wheregmis.github.io/threadlane/).
+
 > **Release status:** The release workflow currently builds signed Apple Silicon macOS artifacts. The application also builds and runs on Linux, and CI compiles `threadlane-gpui` on both macOS and Linux. The embedded browser works on Linux/X11 via WebKitGTK.
 
 <p align="center">

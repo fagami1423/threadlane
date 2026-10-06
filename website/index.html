@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Threadlane is a native workspace for AI-assisted development. Bring your agents, conversations, code, and terminal into one lane.">
+  <meta name="theme-color" content="#f3f3ed">
+  <title>Threadlane — A workspace for your next idea</title>
+  <link rel="icon" href="assets/threadlane-logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+  <script src="coi-serviceworker.js"></script>
+  <script src="site.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="shell navigation">
+    <a class="brand" href="./" aria-label="Threadlane home"><img src="assets/threadlane-logo.svg" width="32" height="32" alt="">Threadlane</a>
+    <nav aria-label="Main navigation"><a href="#workspace">Workspace</a><a href="#demo">Live demo</a><a href="https://github.com/wheregmis/threadlane">GitHub <span aria-hidden="true">↗</span></a></nav>
+  </header>
+  <main id="main">
+    <section class="shell hero" aria-labelledby="hero-title">
+      <p class="eyebrow"><span class="dot"></span> Native app. Open source. Your workspace.</p>
+      <h1 id="hero-title">Big ideas.<br>One <span>clear lane.</span></h1>
+      <div class="hero-bottom">
+        <p class="intro">From the first prompt to the final diff. Bring AI agents, conversations, code, and your terminal together in a native desktop workspace.</p>
+        <div class="actions"><a class="button primary" href="https://github.com/wheregmis/threadlane/releases/latest">Download for macOS <span aria-hidden="true">↗</span></a><a class="button secondary" href="#demo">Explore the live demo <span aria-hidden="true">↓</span></a></div>
+      </div>
+      <p class="release-note">Apple Silicon releases · Built with Rust + GPUI · MIT licensed</p>
+      <figure class="workspace-image"><div class="image-bar"><span><i></i><i></i><i></i></span><span>Threadlane / your next idea</span><span class="image-bar-end">NATIVE WORKSPACE</span></div><img src="assets/threadlane-workspace.png" width="1600" alt="Threadlane desktop workspace with project sessions, conversation, tool output, and code review"><figcaption>Less switching. More making.</figcaption></figure>
+    </section>
+    <section class="shell workspace" id="workspace" aria-labelledby="workspace-title">
+      <div class="section-heading"><p class="eyebrow">01 / THE WORKSPACE</p><h2 id="workspace-title">Everything in context.<br>Room to think.</h2><p>Keep the conversation close to the work. Follow what your agents are doing and pick up exactly where you left off.</p></div>
+      <div class="features">
+        <article><span class="feature-number">/ 01</span><h3>Your agents, together.</h3><p>Connect built-in providers or external ACP agents. Work across projects with persistent conversations and session trees.</p></article>
+        <article><span class="feature-number">/ 02</span><h3>See the whole change.</h3><p>Read tool output, edit files, use the terminal, and review Git diffs in the same workspace as your conversation.</p></article>
+        <article><span class="feature-number">/ 03</span><h3>Keep work moving.</h3><p>Schedule recurring prompts with durable run history and optional isolated worktrees while Threadlane is open.</p></article>
+      </div>
+    </section>
+    <section class="demo-section" id="demo" aria-labelledby="demo-title">
+      <div class="shell">
+        <div class="demo-heading"><div><p class="eyebrow">02 / TAKE A LOOK AROUND</p><h2 id="demo-title">A real workspace.<br>Right in your browser.</h2></div><p>Explore the same UI-Kit components used by the desktop app. Try the editor, expand a message, or open the Components gallery.</p></div>
+        <div class="demo-toolbar"><span><span class="dot"></span> INTERACTIVE PREVIEW</span><a href="demo/" target="_blank" rel="noopener">Open full screen <span aria-hidden="true">↗</span></a></div>
+        <div class="demo-frame"><p id="demo-status" role="status">Preparing the interactive preview…</p><iframe id="live-demo" data-src="demo/" title="Interactive Threadlane UI-Kit preview" allow="cross-origin-isolated; clipboard-read; clipboard-write" hidden></iframe></div>
+        <p class="demo-note">A local sample, ready to explore. Draft edits stay in the preview; it doesn’t run agents or change your files. First load may take a moment.</p>
+        <noscript><p>The live demo requires JavaScript. You can still explore the desktop workspace above or download Threadlane.</p></noscript>
+      </div>
+    </section>
+    <section class="shell closing"><p class="eyebrow">MAKE SOMETHING THAT MATTERS</p><h2>Your next idea<br>starts here.</h2><a class="button primary" href="https://github.com/wheregmis/threadlane/releases/latest">Get Threadlane <span aria-hidden="true">↗</span></a><p>Building on Linux? <a href="https://github.com/wheregmis/threadlane#quick-start">Start from source.</a></p></section>
+  </main>
+  <footer class="shell"><a class="brand" href="./"><img src="assets/threadlane-logo.svg" width="26" height="26" alt="">Threadlane</a><p>Built in the open. Made for the work.</p><div><a href="https://github.com/wheregmis/threadlane">Source</a><a href="https://github.com/wheregmis/threadlane/issues">Issues</a><a href="https://github.com/wheregmis/threadlane/blob/main/LICENSE">MIT License</a></div></footer>
+</body>
+</html>

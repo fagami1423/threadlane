@@ -84,6 +84,10 @@ Open <http://127.0.0.1:8080>. `trunk build` creates `dist/` for a static preview
 Trunk watches the gallery, kit source, and shared theme source; edits rebuild
 and reload the page. The native app's Rust 1.95 toolchain stays unchanged.
 
+The [Threadlane website](../../../../website/README.md) embeds this preview and
+deploys it to GitHub Pages. Its build sets `THREADLANE_PREVIEW_PUBLIC_SAMPLE=1`
+to force the checked-in sample instead of any private `session.local.json`.
+
 The setup follows Zed's [GPUI Web hello_web example](https://github.com/zed-industries/zed/tree/main/crates/gpui_web/examples/hello_web):
 one canvas window, a retained `ApplicationHandle`, embedded fonts, WASM atomics,
 rebuilt standard library, and COOP/COEP response headers. It uses Threadlane's

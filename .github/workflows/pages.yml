@@ -1,0 +1,58 @@
+name: Website
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the preview toolchain
+        run: rustup toolchain install nightly-2026-06-18 --profile minimal --component rust-src --target wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: website-wasm
+      - name: Install Trunk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk@0.21.14
+      - name: Configure Pages
+        id: pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v5
+      - name: Verify public build
+        run: python3 -m unittest discover -s website -p 'test_*.py'
+      - name: Build website and demo
+        env:
+          PAGES_BASE_PATH: ${{ github.event_name == 'pull_request' && '/threadlane' || steps.pages.outputs.base_path }}
+        run: python3 website/build.py --public-url "${PAGES_BASE_PATH}/"
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: website/dist
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy website
+        id: deployment
+        uses: actions/deploy-pages@v4
