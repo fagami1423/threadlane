@@ -15,7 +15,7 @@ Threadlane brings project workspaces, persistent conversation sessions, coding-a
 
 Explore the [website and live UI-Kit demo](https://wheregmis.github.io/threadlane/).
 
-> **Release status:** The release workflow currently builds signed Apple Silicon macOS artifacts. The application also builds and runs on Linux, and CI compiles `threadlane-gpui` on both macOS and Linux. The embedded browser works on Linux/X11 via WebKitGTK.
+> **Platforms:** The release workflow builds Linux x86_64 and ARM64, Windows x86_64, and signed Apple Silicon macOS artifacts. An [experimental iOS client](mobile/README.md) can be built from this repository and paired with the desktop app. The embedded browser works on Linux/X11 via WebKitGTK.
 
 <p align="center">
   <a href="assets/images/threadlane-workspace.png">
