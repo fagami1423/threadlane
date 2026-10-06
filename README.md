@@ -245,4 +245,5 @@ Update artifacts are signed with Ed25519 keys through `cargo-packager-updater`.
 
 ## License
 
-This repository does not currently include a license file.
+Threadlane is licensed under the [MIT License](LICENSE). Third-party components
+retain their respective licenses.
