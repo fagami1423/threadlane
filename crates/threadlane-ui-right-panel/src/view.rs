@@ -70,6 +70,9 @@ pub struct RightPanelView {
     stash_include_untracked: bool,
     collapsed_tree_folders: HashSet<String>,
     review_diff_revision: u64,
+    /// Bumped only on an explicit diff-target open; reloads and background
+    /// refreshes keep it so an in-progress read does not jump back to the top.
+    review_diff_scroll_key: u64,
     review_diff_options: threadlane_git::DiffOptions,
     review_diff_request: Option<ReviewDiffRequest>,
     review_diff_state: Option<ReviewDiffState>,
@@ -364,10 +367,11 @@ impl RightPanelView {
             stash_include_untracked: true,
             collapsed_tree_folders: HashSet::new(),
             review_diff_revision: 0,
+            review_diff_scroll_key: 0,
             review_diff_options: threadlane_git::DiffOptions::default(),
             review_diff_request: None,
             review_diff_state: None,
-            review_nav_focus: cx.focus_handle(),
+            review_nav_focus: cx.focus_handle().tab_stop(false),
             #[cfg(test)]
             review_diff_load_count: 0,
             git_status: None,
@@ -752,10 +756,12 @@ impl RightPanelView {
     }
 
     fn open_file_diff(&mut self, path: String, cx: &mut Context<Self>) {
+        self.review_diff_scroll_key = self.review_diff_scroll_key.wrapping_add(1);
         self.open_review_diff(ReviewDiffTarget::File(path), cx);
     }
 
     fn open_combined_diff(&mut self, cx: &mut Context<Self>) {
+        self.review_diff_scroll_key = self.review_diff_scroll_key.wrapping_add(1);
         self.open_review_diff(ReviewDiffTarget::AllChanges, cx);
     }
 
@@ -1707,12 +1713,12 @@ impl RightPanelView {
             ReviewDiffState::Ready { empty: true } => ReviewDiffContent::Empty,
             ReviewDiffState::Ready { empty: false } => ReviewDiffContent::Ready(&self.document_state),
         };
-        // Key the scroll area by request revision so an explicit new target
-        // starts at the top of its patch instead of inheriting the previous
-        // file's offset.
+        // Key the scroll area by explicit-open count so a new target starts
+        // at the top of its patch while reloads and background refreshes of
+        // the same target keep the reader's offset.
         let scroll_id = ElementId::Name(SharedString::from(format!(
             "review-diff-body-{}",
-            self.review_diff_revision
+            self.review_diff_scroll_key
         )));
         threadlane_ui_kit::review_diff_body(content, self.review_diff_options.ignore_whitespace,
             scroll_id,
@@ -3979,8 +3985,7 @@ mod review_diff_tests {
     fn review_diff_navigation_follows_filtered_inventory(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
         let model = cx.new(|_| {
-            let mut state = AppState::default();
-            // Default restores a persisted chat; this fixture owns only a project.
+            let mut state = AppState::for_tests();
             state.active_session_id = None;
             state.active_work_dir = Some(PathBuf::from("/workspace"));
             state
