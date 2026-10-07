@@ -175,9 +175,6 @@ impl WorkspaceView {
             return;
         }
         let state = self.model.read(cx);
-        if !state.pending_permissions.is_empty() || !state.pending_questions.is_empty() {
-            return;
-        }
         if self.session_picker.is_some() {
             return;
         }
@@ -212,9 +209,6 @@ impl WorkspaceView {
             return;
         }
         let state = self.model.read(cx);
-        if !state.pending_permissions.is_empty() || !state.pending_questions.is_empty() {
-            return;
-        }
         let valid = picker.generation == generation
             && picker.epoch == epoch
             && self.session_navigation.valid_context(picker, state)

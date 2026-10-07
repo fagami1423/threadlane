@@ -470,6 +470,13 @@ impl RemoteDaemon {
             backoff = RECONNECT_BACKOFF_INITIAL;
             connected.store(true, Ordering::SeqCst);
             connection.send_replace(ConnectionState::Connected);
+            // Cursor replay may be empty on an idle daemon. Refresh inventory
+            // for this epoch so clients need not trust pre-disconnect metadata.
+            let inventory = serde_json::to_string(&SessionCommand::GetProjects)
+                .expect("GetProjects is serializable");
+            if socket.send(Message::Text(inventory.into())).await.is_err() {
+                continue;
+            }
             let mut connection_seq = 0u64;
             // Server replays the journal tail newer than `?since=` first,
             // then live events — the same attach semantics LocalDaemon's
@@ -770,6 +777,28 @@ impl Drop for RemoteDaemon {
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn idle_connections_request_inventory_on_every_epoch() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for epoch in 1..=2 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+                // An idle daemon sends no replay events: refresh must be client-driven.
+                let frame = tokio::time::timeout(Duration::from_secs(3), socket.next())
+                    .await.expect("missing inventory refresh").unwrap().unwrap();
+                let command: SessionCommand = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                assert!(matches!(command, SessionCommand::GetProjects), "epoch {epoch}");
+                socket.close(None).await.unwrap();
+            }
+        });
+        let _client = RemoteDaemon::connect_with_runtime(
+            format!("ws://{address}"), None, tokio::runtime::Handle::current(),
+        );
+        tokio::time::timeout(Duration::from_secs(10), server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn file_search_old_daemon_fails_before_enqueue() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let pending = Arc::new(Mutex::new(HashMap::new()));
@@ -846,6 +875,8 @@ mod tests {
                 )
                 .await
                 .unwrap();
+                let frame = socket.next().await.unwrap().unwrap().into_text().unwrap();
+                assert!(matches!(serde_json::from_str::<SessionCommand>(&frame).unwrap(), SessionCommand::GetProjects));
                 // Same daemon resumes at 2; a restarted daemon starts at 1.
                 let seq = if attempt == 1 { 2 } else { 1 };
                 for _duplicate in 0..2 {
