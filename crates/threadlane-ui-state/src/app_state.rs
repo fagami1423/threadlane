@@ -93,6 +93,9 @@ pub struct AppState {
     /// Live lifecycle status seen since remote selection, scoped to the
     /// connection epoch so reconnect snapshots can restore missed changes.
     remote_live_status: Option<(SessionProjectionKey, u64)>,
+    /// Project metadata received in the current transport epoch. A connected
+    /// socket alone does not mean its cached inventory is safe to navigate.
+    remote_inventory: Option<(Arc<dyn threadlane_client::DaemonClient>, u64, HashSet<PathBuf>)>,
     pub git_statuses: HashMap<PathBuf, threadlane_git::GitStatus>,
     pub git_prs: HashMap<(PathBuf, String), Option<threadlane_git::GitHubPrInfo>>,
     pub auto_address_pr_reviews_enabled: bool,
@@ -1086,6 +1089,7 @@ impl AppState {
             pending_hydrations: Vec::new(),
             in_flight_hydrations: HashMap::new(),
             remote_live_status: None,
+            remote_inventory: None,
             git_statuses: HashMap::new(),
             git_prs: HashMap::new(),
             auto_address_pr_reviews_enabled: threadlane_git::load_auto_address_pr_reviews_enabled(),
@@ -1772,6 +1776,17 @@ impl AppState {
             self.session_refresh_generation,
             work_dir.to_path_buf(),
         ));
+    }
+
+    /// Remote navigation must wait for authoritative metadata after reconnect.
+    pub fn session_inventory_available(&self, work_dir: &Path) -> bool {
+        if !self.daemon_client.is_connected() { return false; }
+        if !self.daemon_remote { return true; }
+        self.remote_inventory.as_ref().is_some_and(|(client, epoch, projects)| {
+            Arc::ptr_eq(client, &self.daemon_client)
+                && *epoch == self.daemon_client.file_search_connection_epoch()
+                && projects.contains(work_dir)
+        })
     }
 
     /// Apply a current local discovery result; remote metadata arrives through ProjectChanged.
@@ -5339,6 +5354,15 @@ impl AppState {
                 }
                 SessionEvent::ProjectChanged { mut project } => {
                     if self.daemon_remote {
+                        let epoch = self.daemon_client.file_search_connection_epoch();
+                        if !self.remote_inventory.as_ref().is_some_and(|(client, previous, _)| {
+                            Arc::ptr_eq(client, &self.daemon_client) && *previous == epoch
+                        }) {
+                            self.remote_inventory = Some((self.daemon_client.clone(), epoch, HashSet::new()));
+                        }
+                        if let Some((_, _, projects)) = &mut self.remote_inventory {
+                            projects.insert(project.work_dir.clone());
+                        }
                         // A project snapshot can predate the run we just
                         // opened. Keep its exact in-flight identity until
                         // the matching session hydration supplies metadata.

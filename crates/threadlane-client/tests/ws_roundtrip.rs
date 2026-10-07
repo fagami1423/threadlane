@@ -441,6 +441,8 @@ fn file_search_remote_root_never_needs_to_exist_on_client() {
                 response.headers_mut().insert(PROTOCOL_VERSION_HEADER, "6".parse().unwrap());
                 Ok(response)
             }).await.unwrap();
+            let inventory = socket.next().await.unwrap().unwrap();
+            assert!(matches!(serde_json::from_str::<SessionCommand>(inventory.to_text().unwrap()).unwrap(), SessionCommand::GetProjects));
             let message = socket.next().await.unwrap().unwrap();
             let request: CommandRequest = serde_json::from_str(message.to_text().unwrap()).unwrap();
             let SessionCommand::SearchProjectFiles { work_dir, query } = request.command else { panic!("wrong request") };

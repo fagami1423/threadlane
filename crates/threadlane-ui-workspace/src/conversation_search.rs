@@ -130,6 +130,12 @@ impl WorkspaceView {
     /// Route every "close the palette" call through this so a palette open in
     /// search mode also cancels its scan.
     pub(super) fn close_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_picker.take().is_some() {
+            self.command_state.update(cx, |state, cx| {
+                state.set_loading(false, window, cx);
+                state.set_query("", window, cx);
+            });
+        }
         self.exit_conversation_search(window, cx);
         close_command_palette(
             &mut self.command_palette_open,

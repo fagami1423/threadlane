@@ -19,6 +19,7 @@ impl SessionPreview {
         } else {
             self.palette_previous_focus = window.focused(cx);
             self.palette_search = false;
+            self.palette_sessions = false;
             self.palette_open = true;
             self.palette_matches.clear();
             self.command_state.update(cx, |state, cx| {
@@ -32,6 +33,7 @@ impl SessionPreview {
     fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = false;
         self.palette_search = false;
+        self.palette_sessions = false;
         self.palette_matches.clear();
         if let Some(focus) = self.palette_previous_focus.take() {
             focus.focus(window, cx);
@@ -50,6 +52,7 @@ impl SessionPreview {
                 self.palette_previous_focus = window.focused(cx);
                 self.palette_open = true;
                 self.palette_search = key == "search_conversations";
+                self.palette_sessions = key == "go_task";
                 self.command_state.update(cx, |state, cx| {
                     state.set_query("", window, cx);
                     state.focus(window, cx);
@@ -96,7 +99,34 @@ impl SessionPreview {
         let view_cancel = cx.weak_entity();
         let view_confirm = cx.weak_entity();
         let view_backdrop = cx.weak_entity();
-        let command = if self.palette_search {
+        let command = if self.palette_sessions {
+            let searching = !self.command_state.read(cx).query(cx).trim().is_empty();
+            let query_view = cx.weak_entity();
+            let clear_view = cx.weak_entity();
+            kit::session_switcher_command(
+                &self.command_state,
+                vec![kit::palette_session_item("Review navigation", "Threadlane", Some("review/session-switcher"), "review"),
+                     kit::palette_session_item("会話の切り替えを検証する", "Desktop", Some("feature/長いブランチ名"), "unicode")],
+                vec![kit::palette_session_item("Implement navigation", "Threadlane", Some("feature/session-switcher"), "implementation")],
+                searching, "Deterministic preview sessions · no saved session is changed",
+            )
+            .on_query(move |_, _, cx| { let _ = query_view.update(cx, |_, cx| cx.notify()); })
+            .empty(move |_, _, cx| {
+                let clear = clear_view.clone();
+                kit::session_switcher_empty(searching, move |window, cx| {
+                    let _ = clear.update(cx, |host, cx| {
+                        host.command_state.update(cx, |state, cx| state.set_query("", window, cx));
+                        cx.notify();
+                    });
+                }, cx)
+            })
+            .on_confirm(move |_, window, cx| {
+                let _ = view_confirm.update(cx, |host, cx| {
+                    host.close_palette(window, cx);
+                    window.push_notification("Preview session selected. The captured session is unchanged.", cx);
+                });
+            })
+        } else if self.palette_search {
             let query_hint = self.command_state.read(cx).query(cx).trim().chars().count() < 2;
             let mut results = CommandGroup::new().label("Conversations");
             for hit in &self.palette_matches {
@@ -282,6 +312,11 @@ impl SessionPreview {
         let command = command.on_cancel(move |window, cx| {
             let _ = view_cancel.update(cx, |host, cx| host.close_palette(window, cx));
         });
+        if self.palette_sessions {
+            return kit::session_switcher_frame(command, move |window, cx| {
+                let _ = view_backdrop.update(cx, |host, cx| host.close_palette(window, cx));
+            }, cx).into_any_element();
+        }
         kit::workspace_palette_frame(
             command,
             move |window, cx| {

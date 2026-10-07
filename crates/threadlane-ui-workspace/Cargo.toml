@@ -9,6 +9,7 @@ gpui.workspace = true
 gpui-component.workspace = true
 rfd.workspace = true
 threadlane-coding-agent.workspace = true
+threadlane-client.workspace = true
 threadlane-daemon.workspace = true
 threadlane-git.workspace = true
 threadlane-ui-chat.workspace = true
@@ -28,3 +29,4 @@ tokio = { workspace = true, features = ["full"] }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+threadlane-ui-state = { workspace = true, features = ["test-support"] }
