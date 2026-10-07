@@ -56,6 +56,8 @@ pub enum ModelPickerValue {
     },
     /// Recovery affordance when an agent did not advertise settings.
     OpenAgentSettings,
+    /// Clear the cached provider inventories and re-fetch every model list.
+    RefreshModels,
 }
 
 pub type ModelPickerItem = threadlane_ui_kit::PickerItem<ModelPickerValue>;
@@ -192,6 +194,26 @@ pub fn picker_sections(
         }
     }
 
+    // Manual recovery row: clears the cached provider inventories and
+    // re-fetches every model list, so a newly released model can be picked
+    // up without waiting out the refresh TTL.
+    sections.push(PickerSection {
+        header: "Actions".into(),
+        items: vec![ModelPickerItem {
+            value: ModelPickerValue::RefreshModels,
+            title: "Refresh model list".into(),
+            secondary: Some("Fetch the latest models from each connected provider".into()),
+            icon_path: None,
+            current: false,
+            indented: false,
+            haystack: ModelPickerItem::haystack_for(&[
+                "refresh models",
+                "model list",
+                "clear cache",
+            ]),
+        }],
+    });
+
     // Distinguishing ids as secondary text only where labels collide.
     let mut title_counts: HashMap<String, usize> = HashMap::new();
     for section in &sections {
@@ -207,7 +229,9 @@ pub fn picker_sections(
                 let identity = match &item.value {
                     ModelPickerValue::Model(id) => id.clone(),
                     ModelPickerValue::AgentChoice { value, .. } => value.clone(),
-                    ModelPickerValue::OpenAgentSettings => continue,
+                    ModelPickerValue::OpenAgentSettings | ModelPickerValue::RefreshModels => {
+                        continue;
+                    }
                 };
                 item.secondary = Some(identity.into());
             }
@@ -221,7 +245,7 @@ pub fn picker_sections(
 /// identity (model id, config id, choice value) against the live catalog.
 pub fn choice_is_stale(value: &ModelPickerValue, state: &AppState) -> bool {
     match value {
-        ModelPickerValue::OpenAgentSettings => false,
+        ModelPickerValue::OpenAgentSettings | ModelPickerValue::RefreshModels => false,
         ModelPickerValue::Model(id) => {
             !state.available_models().iter().any(|option| option.id == *id)
         }
@@ -297,7 +321,12 @@ mod tests {
         ];
         let sections = picker_sections(&options, &HashMap::new(), "gpt-5-mini");
         let headers: Vec<&str> = sections.iter().map(|s| s.header.as_ref()).collect();
-        assert_eq!(headers, ["OpenAI", "Antigravity", "OpenCode"]);
+        assert_eq!(headers, ["OpenAI", "Antigravity", "OpenCode", "Actions"]);
+        assert_eq!(
+            sections[3].items[0].value,
+            ModelPickerValue::RefreshModels,
+            "the manual refresh row trails the provider sections"
+        );
         assert_eq!(sections[0].items.len(), 2);
         assert!(sections[0].items[1].current);
         assert!(!sections[0].items[0].current);
@@ -323,7 +352,7 @@ mod tests {
         );
         // Claude is the selected agent: only its choices may be marked.
         let sections = picker_sections(&options, &acp_sections, "acp/claude");
-        assert_eq!(sections.len(), 1);
+        assert_eq!(sections.len(), 2);
         let items = &sections[0].items;
         // agent + 2 choices + agent + 1 choice
         assert_eq!(items.len(), 5);
@@ -391,7 +420,7 @@ mod tests {
         let sections = picker_sections(&options, &acp_sections, "");
 
         let all = filter_sections(&sections, "");
-        assert_eq!(all.len(), 3);
+        assert_eq!(all.len(), 4);
 
         let hits = filter_sections(&sections, "claude opus");
         assert_eq!(hits.len(), 2, "native row + agent choice survive");

@@ -73,6 +73,8 @@ pub enum SettingsProviderAction {
     TestKey(SettingsProvider),
     SetActiveAccount(String),
     RemoveAccount(String),
+    /// Clear the cached model lists and re-fetch every provider's inventory.
+    RefreshModels,
 }
 type Callback = Rc<dyn Fn(SettingsProviderAction, &mut Window, &mut App)>;
 
@@ -453,6 +455,47 @@ fn connection_controls(provider: SettingsProvider, connected: bool, callback: Ca
         )
 }
 
+/// Manual escape hatch for a stale picker: clears the cached model lists
+/// and re-fetches each connected provider's inventory on click.
+fn model_catalog_row(callback: Callback, cx: &App) -> Div {
+    let hint = "Clear the cached provider lists and fetch the latest models";
+    section()
+        .debug_selector(|| "provider-model-catalog".into())
+        .flex()
+        .items_center()
+        .gap_4()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("Model catalog"),
+                )
+                .child(
+                    div()
+                        .mt_1()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Provider model lists are cached briefly between fetches. Refresh to pick up newly released models right away."),
+                ),
+        )
+        .child(
+            Button::new("provider-refresh-models")
+                .debug_selector(|| "provider-refresh-models".into())
+                .icon(IconName::Redo)
+                .label("Refresh models")
+                .outline()
+                .accessibility_label(hint)
+                .tooltip(hint)
+                .on_click(move |_, window, cx| {
+                    callback(SettingsProviderAction::RefreshModels, window, cx)
+                }),
+        )
+}
+
 pub fn settings_providers(
     providers: &SettingsProviders,
     github: &Entity<InputState>,
@@ -653,11 +696,8 @@ pub fn settings_providers(
             window,
             cx,
         );
-        page = page.child(if provider == SettingsProvider::OpenAI {
-            separator(row, cx)
-        } else {
-            row
-        });
+        page = page.child(separator(row, cx));
     }
+    page = page.child(model_catalog_row(callback.clone(), cx));
     page.into_any_element()
 }

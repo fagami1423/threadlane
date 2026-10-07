@@ -615,6 +615,54 @@ pub fn cached_acp_error(agent_id: &str) -> Option<String> {
         })
 }
 
+/// Expires every cached provider inventory so the next `refresh_*` call
+/// hits the network instead of serving the cached snapshot. Cached data is
+/// deliberately kept: a failed refetch still serves the last known list.
+pub fn invalidate_model_caches() {
+    let expired = std::time::Instant::now() - std::time::Duration::from_secs(10 * 60);
+    if let Some(mut guard) = DISCOVERED_OPENCODE
+        .get()
+        .and_then(|cache| cache.lock().ok())
+    {
+        guard.0 = expired;
+    }
+    if let Some(mut guard) = DISCOVERED_OPENAI
+        .get()
+        .and_then(|cache| cache.lock().ok())
+    {
+        guard.0 = expired;
+    }
+    if let Some(mut guard) = DISCOVERED_ANTIGRAVITY
+        .get()
+        .and_then(|cache| cache.lock().ok())
+    {
+        guard.0 = expired;
+    }
+    if let Some(mut guard) = CACHED_ACP_MODELS
+        .get()
+        .and_then(|cache| cache.lock().ok())
+    {
+        guard.0 = expired;
+    }
+    // The provider clients keep their own TTL caches under the daemon's:
+    // expiring only `DISCOVERED_*` would let a fresh lower-level entry
+    // answer the "refetch" without any network request.
+    threadlane_provider::opencode::invalidate_models_cache();
+    threadlane_provider::openai::invalidate_model_cache();
+}
+
+/// Clears the cached model lists and re-fetches every provider's
+/// inventory, so newly released models reach the picker without a restart.
+/// Providers without credentials skip their own fetch; failed fetches keep
+/// the last successful list.
+pub async fn refresh_all_models(project_root: Option<std::path::PathBuf>) {
+    invalidate_model_caches();
+    refresh_discovered_models().await;
+    refresh_openai_models().await;
+    refresh_antigravity_models().await;
+    refresh_acp_models(project_root).await;
+}
+
 fn provider_for_id(id: &str, declared: Option<&str>) -> ModelProvider {
     match declared.unwrap_or_default().to_ascii_lowercase().as_str() {
         "openai" => ModelProvider::OpenAi,
@@ -910,6 +958,48 @@ mod tests {
                 .into_iter()
                 .collect(),
         ));
+    }
+
+    #[test]
+    fn invalidate_model_caches_expires_every_refresh_timestamp() {
+        // Serializes with the other fixtures touching the process-global
+        // caches; with_antigravity_cache restores the guard afterwards.
+        with_antigravity_cache(None, || {
+            let fresh = std::time::Instant::now();
+            if let Some(mut guard) = DISCOVERED_OPENCODE
+                .get_or_init(|| std::sync::Mutex::new((std::time::Instant::now(), Vec::new())))
+                .lock()
+                .ok()
+            {
+                guard.0 = fresh;
+            }
+            if let Some(mut guard) = DISCOVERED_ANTIGRAVITY
+                .get()
+                .and_then(|cache| cache.lock().ok())
+            {
+                guard.0 = fresh;
+            }
+            invalidate_model_caches();
+            let ttl = std::time::Duration::from_secs(5 * 60);
+            for timestamp in [
+                DISCOVERED_OPENCODE
+                    .get()
+                    .and_then(|cache| cache.lock().ok())
+                    .map(|guard| guard.0),
+                DISCOVERED_ANTIGRAVITY
+                    .get()
+                    .and_then(|cache| cache.lock().ok())
+                    .map(|guard| guard.0),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                assert!(
+                    timestamp.elapsed() >= ttl,
+                    "invalidated timestamp must read as stale"
+                );
+            }
+        });
     }
 
     /// Serializes tests that seed the process-global Antigravity cache or the

@@ -47,6 +47,18 @@ pub async fn refresh_acp_models_and_update(
     refresh_models(model, cx);
 }
 
+/// Clears every cached provider inventory and re-fetches them all, then
+/// refreshes the app's model state. Used by the manual "Refresh models"
+/// controls; providers without credentials skip their own fetch.
+pub async fn refresh_all_models_and_update(
+    model: gpui::Entity<threadlane_ui_state::AppState>,
+    cx: &mut gpui::AsyncApp,
+    project_root: Option<std::path::PathBuf>,
+) {
+    threadlane_daemon::catalog::refresh_all_models(project_root).await;
+    refresh_models(model, cx);
+}
+
 fn refresh_models(
     model: gpui::Entity<threadlane_ui_state::AppState>,
     cx: &mut gpui::AsyncApp,

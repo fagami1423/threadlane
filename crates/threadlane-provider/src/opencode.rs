@@ -53,6 +53,18 @@ struct ModelsCacheEntry {
 
 static MODELS_CACHE: OnceLock<StdMutex<HashMap<u64, ModelsCacheEntry>>> = OnceLock::new();
 
+/// Drops every cached `/models` response so the next fetch hits the network.
+/// Used by the manual "refresh models" flow; entries never serve stale past
+/// their TTL, so clearing loses no recovery path.
+pub fn invalidate_models_cache() {
+    if let Some(mut cache) = MODELS_CACHE
+        .get()
+        .and_then(|cache| cache.lock().ok())
+    {
+        cache.clear();
+    }
+}
+
 fn models_cache_key(api_key: &str) -> u64 {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let mut hasher = DefaultHasher::new();

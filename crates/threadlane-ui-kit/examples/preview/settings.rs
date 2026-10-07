@@ -370,6 +370,7 @@ impl SettingsPreview {
                     "Enter a sample key before testing. No network request was sent."
                 } else { "Sample key test passed. No network request was sent." }
             }
+            Action::RefreshModels => "Sample model refresh finished. No network request was sent.",
         };
         self.providers.status = Some(kit::SettingsProviderStatus { text: message.into(), kind });
         cx.notify();
