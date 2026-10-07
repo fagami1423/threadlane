@@ -133,6 +133,9 @@ pub struct ReviewPreview {
     /// Bumped on each explicit document open so a navigated file's scroll
     /// area starts at the top rather than inheriting a prior offset.
     document_revision: u64,
+    /// Non-tab-stop focus target for the navigation group when the
+    /// initiating control becomes disabled at a boundary.
+    review_nav_focus: FocusHandle,
     document_state: Entity<TextViewState>,
     ignore_whitespace: bool,
     can_create_pr: bool,
@@ -216,6 +219,7 @@ impl ReviewPreview {
             collapsed: HashSet::new(),
             document: None,
             document_revision: 0,
+            review_nav_focus: cx.focus_handle().tab_stop(false),
             document_state: cx.new(|cx| TextViewState::markdown("", cx)),
             ignore_whitespace: false,
             draft_pr,
@@ -799,9 +803,9 @@ impl Render for ReviewPreview {
                             current: Some(path.as_str()),
                             filter: (!query.is_empty()).then_some(query.as_str()),
                             unavailable: None,
-                            focus: None,
+                            focus: Some(&self.review_nav_focus),
                         },
-                        cx.listener(|host, action: &kit::ReviewDiffNavAction, _, cx| {
+                        cx.listener(|host, action: &kit::ReviewDiffNavAction, window, cx| {
                             let Some(current) = host.document.clone() else {
                                 return;
                             };
@@ -820,6 +824,18 @@ impl Render for ReviewPreview {
                                 kit::ReviewDiffNavAction::Next => adjacency.next,
                             };
                             if let Some(target) = target {
+                                let boundary = kit::review_diff_adjacency(&paths, &target)
+                                    .is_some_and(|next_adjacency| match action {
+                                        kit::ReviewDiffNavAction::Previous => {
+                                            next_adjacency.previous.is_none()
+                                        }
+                                        kit::ReviewDiffNavAction::Next => {
+                                            next_adjacency.next.is_none()
+                                        }
+                                    });
+                                if boundary {
+                                    window.focus(&host.review_nav_focus, cx);
+                                }
                                 host.open_diff(target, cx);
                             }
                         }),
