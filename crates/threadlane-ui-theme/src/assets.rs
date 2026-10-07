@@ -26,6 +26,7 @@ pub fn vendored_icon_bytes(path: &str) -> Option<&'static [u8]> {
         "icons/refresh-cw.svg" => Some(include_bytes!("../assets/icons/refresh-cw.svg")),
         "icons/archive.svg" => Some(include_bytes!("../assets/icons/archive.svg")),
         "icons/square-pen.svg" => Some(include_bytes!("../assets/icons/square-pen.svg")),
+        "icons/quote.svg" => Some(include_bytes!("../assets/icons/quote.svg")),
         "icons/crosshair.svg" => Some(include_bytes!("../assets/icons/crosshair.svg")),
         "icons/lock.svg" => Some(include_bytes!("../assets/icons/lock.svg")),
         "icons/pin.svg" => Some(include_bytes!("../assets/icons/pin.svg")),

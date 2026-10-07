@@ -254,6 +254,12 @@ actions!(
     ]
 );
 
+actions!(threadlane_chat, [QuoteSelection]);
+
+#[path = "quote_selection.rs"]
+mod quote_selection;
+use quote_selection::*;
+
 #[path = "conversation_find.rs"]
 mod conversation_find;
 #[path = "file_completion.rs"]
@@ -382,6 +388,14 @@ pub struct ChatListView {
     expanded_activity_groups: HashSet<String>,
     progress_summary_expanded: bool,
     markdown_states: HashMap<(SharedString, String), MarkdownRenderState>,
+    /// Selection snapshots armed per assistant message id for Quote controls.
+    /// Pressing the Quote control clears the window selection in the capture
+    /// phase, so the render-time snapshot must survive until the press's
+    /// bubble-phase mouse-down consumes it; a later render that sees no (or
+    /// a different) selection drops it so the action cannot replay a stale
+    /// selection. `Rc` because the context menu closure re-evaluates
+    /// eligibility without access to `self`.
+    armed_quotes: std::rc::Rc<std::cell::RefCell<HashMap<String, QuoteSnapshot>>>,
     markdown_cache_namespace: SharedString,
     pasted_images: Vec<ImageAttachment>,
     image_preview: Option<ImagePreviewState>,
@@ -791,6 +805,7 @@ impl ChatListView {
             expanded_activity_groups: HashSet::new(),
             progress_summary_expanded: false,
             markdown_states: HashMap::new(),
+            armed_quotes: Default::default(),
             markdown_cache_namespace: SharedString::from(""),
             pasted_images: Vec::new(),
             image_preview: None,
@@ -1871,6 +1886,7 @@ impl ChatListView {
         header_path: Option<&str>,
         code: &str,
         streaming: bool,
+        content_states: &mut Vec<Entity<TextViewState>>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let model = self.model.clone();
@@ -1950,6 +1966,7 @@ impl ChatListView {
             }));
         let formatted_code = format!("```{language}\n{}\n```", code.trim_end());
         let code_state = self.markdown_state(format!("code-{key}"), &formatted_code, cx);
+        content_states.push(code_state.clone());
         threadlane_ui_kit::code_block_surface(&key, cx)
             .child(threadlane_ui_kit::code_block_header(&key, language, path_opt.as_deref(), actions, cx))
             .child(threadlane_ui_kit::code_block_body(
@@ -2197,10 +2214,15 @@ impl ChatListView {
         cx.notify();
     }
 
-    fn render_message_copy_button(
+    /// Message action row: Copy for every role, plus Quote selection on
+    /// assistant responses. `quote` carries the render-time eligibility —
+    /// enabled/disabled, the readable reason when disabled, and the
+    /// selection snapshot taken before focus moved to the control.
+    fn render_message_actions(
         &self,
         msg: &ChatMessageInfo,
         align_end: bool,
+        quote: Option<QuoteControl>,
         cx: &mut Context<Self>,
     ) -> Div {
         let copy_key = format!("message-copy-{}", msg.id);
@@ -2210,12 +2232,169 @@ impl ChatListView {
             .is_some_and(|(id, time)| id == &copy_key && time.elapsed() < COPIED_FEEDBACK_WINDOW);
         let content = msg.content.clone();
         let copy_key_click = copy_key.clone();
-        threadlane_ui_kit::message_actions(align_end).child(
-            threadlane_ui_kit::message_copy_button(&msg.id, is_copied, cx)
-                .on_click(cx.listener(move |this, _event, _window, cx| {
-                    this.copy_text(copy_key_click.clone(), content.clone(), cx);
-                })),
-        )
+        threadlane_ui_kit::message_actions(align_end)
+            .when_some(quote, |el, quote| {
+                let msg_id = msg.id.clone();
+                let snapshot = quote.snapshot.clone();
+                el.child(
+                    div()
+                        // Activate on mouse-down, not click: the press clears
+                        // the window selection during the capture phase, and
+                        // the render it triggers shows the control disabled
+                        // again — a `click` bound to the button would never
+                        // dispatch against that disabled frame. The armed
+                        // snapshot still exists when this bubble-phase
+                        // handler runs.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _event, window, cx| {
+                                this.activate_quote_selection(
+                                    &msg_id,
+                                    snapshot.clone(),
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        )
+                        .child(threadlane_ui_kit::message_quote_button(
+                            &msg.id,
+                            quote.enabled,
+                            quote.reason.clone(),
+                        )),
+                )
+            })
+            .child(
+                threadlane_ui_kit::message_copy_button(&msg.id, is_copied, cx)
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.copy_text(copy_key_click.clone(), content.clone(), cx);
+                    })),
+            )
+    }
+
+    /// Inserts the snapshot selection as a labeled blockquote into the
+    /// current draft, then focuses the composer. Revalidates that the
+    /// assistant message is still present and settled, that the snapshot's
+    /// view is alive, and that any still-active selection still matches the
+    /// snapshot — a click that only cleared the selection to reach this
+    /// control keeps the snapshot; a genuinely different selection fails
+    /// with `STALE_SELECTION_MESSAGE` and touches nothing. The quote lands
+    /// through `append_draft_text_for`, so a session/project switch that
+    /// raced the activation cannot write into the wrong draft.
+    fn activate_quote_selection(
+        &mut self,
+        message_id: &str,
+        snapshot: Option<QuoteSnapshot>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = snapshot.or_else(|| {
+            self.armed_quotes.borrow_mut().remove(message_id)
+        });
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        // A live snapshot is consumed once: success or a stale report both
+        // leave the control disabled until the user selects again.
+        self.armed_quotes.borrow_mut().remove(message_id);
+        let still_present = self.transcript.messages.iter().any(|msg| {
+            msg.id == message_id && msg.role == MessageRole::Assistant && !msg.streaming
+        });
+        let text = match (still_present, snapshot.state.upgrade()) {
+            (true, Some(state)) => {
+                let current = state.read(cx).selected_text();
+                if current.trim().is_empty() || current == snapshot.text {
+                    snapshot.text.clone()
+                } else {
+                    window.push_notification(
+                        Notification::info(STALE_SELECTION_MESSAGE),
+                        cx,
+                    );
+                    return;
+                }
+            }
+            _ => {
+                window.push_notification(
+                    Notification::info(STALE_SELECTION_MESSAGE),
+                    cx,
+                );
+                return;
+            }
+        };
+        if text.chars().count() > MAX_QUOTE_SCALARS {
+            window.push_notification(Notification::info(OVER_LIMIT_MESSAGE), cx);
+            return;
+        }
+        let destination = self.composer_key.clone();
+        let quote = format_quote_block(&text);
+        if !self.append_draft_text_for(destination, &quote, window, cx) {
+            window.push_notification(
+                Notification::info(STALE_SELECTION_MESSAGE),
+                cx,
+            );
+        }
+    }
+
+    /// Dispatched `QuoteSelection` from a message's context menu: activates
+    /// that message's render-time snapshot.
+    fn quote_selection_action(
+        &mut self,
+        message_id: &str,
+        snapshot: Option<QuoteSnapshot>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_quote_selection(message_id, snapshot, window, cx);
+    }
+
+    /// Live quote eligibility for one assistant message: `content_states`
+    /// are the entities its rendered prose/code segments draw from. Streaming
+    /// and empty responses are never quotable.
+    ///
+    /// Pressing the Quote control clears the window selection in the
+    /// capture phase, so the render-time `armed_quotes` entry bridges to the
+    /// press's bubble-phase mouse-down. Any render that sees no matching
+    /// selection — cleared by an unrelated press, or replaced by a different
+    /// one — drops the arm, so a Quote press after the selection moved can
+    /// never replay stale text.
+    fn quote_control(
+        armed_quotes: &std::rc::Rc<std::cell::RefCell<HashMap<String, QuoteSnapshot>>>,
+        message_id: &str,
+        streaming: bool,
+        content_states: &[Entity<TextViewState>],
+        window: &mut Window,
+        cx: &mut App,
+    ) -> QuoteControl {
+        let disabled = |reason: &'static str| QuoteControl {
+            enabled: false,
+            reason: SharedString::from(reason),
+            snapshot: None,
+        };
+        if streaming || content_states.is_empty() {
+            return disabled(NO_SELECTION_MESSAGE);
+        }
+        let window_selection = gpui_kit::base::TextSelection::selected_text(window, cx);
+        match quote_owner(content_states, &window_selection, cx) {
+            QuoteEligibility::Eligible(state) => {
+                let snapshot = QuoteSnapshot {
+                    state: state.downgrade(),
+                    text: state.read(cx).selected_text(),
+                };
+                armed_quotes
+                    .borrow_mut()
+                    .insert(message_id.to_string(), snapshot.clone());
+                QuoteControl {
+                    enabled: true,
+                    reason: SharedString::from(""),
+                    snapshot: Some(snapshot),
+                }
+            }
+            QuoteEligibility::Rejected(reason) => {
+                // No live matching selection: the arm — if one exists —
+                // belongs to a selection that was cleared or replaced.
+                armed_quotes.borrow_mut().remove(message_id);
+                disabled(reason.message())
+            }
+        }
     }
 
     fn render_message(
@@ -2279,7 +2458,7 @@ impl ChatListView {
                             }),
                     )
                     .children((!msg.content.is_empty()).then(|| {
-                        let mut footer = self.render_message_copy_button(msg, true, cx);
+                        let mut footer = self.render_message_actions(msg, true, None, cx);
                         if !self.model.read(cx).is_generating {
                             let content = msg.content.clone();
                             footer = footer.child(
@@ -2320,59 +2499,121 @@ impl ChatListView {
                     .collect();
                 let tools_element = self.render_tool_activities_block(&msg.id, &filtered_tools, window, row_index, cx);
 
+                // Content `TextViewState` entities in render order: the only
+                // views whose selections are quotable for this message.
+                let mut content_states: Vec<Entity<TextViewState>> = Vec::new();
+                let content_column = if !msg.content.is_empty() {
+                    let segments = self.cached_segments(&msg.id, &msg.content);
+                    let rendered_segments: Vec<AnyElement> = segments
+                        .into_iter()
+                        .enumerate()
+                        .map(|(idx, seg)| match seg {
+                            MarkdownSegment::Markdown(text) => {
+                                let markdown_state = self.markdown_state(
+                                    format!("{}-seg-{}", msg.id, idx),
+                                    &text,
+                                    cx,
+                                );
+                                content_states.push(markdown_state.clone());
+                                self.chat_markdown_view(&markdown_state)
+                                    .into_any_element()
+                            }
+                            MarkdownSegment::CodeBlock {
+                                language,
+                                header_path,
+                                code,
+                            } => self
+                                .render_interactive_code_block(
+                                    &msg.id,
+                                    idx,
+                                    &language,
+                                    header_path.as_deref(),
+                                    &code,
+                                    msg.streaming,
+                                    &mut content_states,
+                                    cx,
+                                )
+                                .into_any_element(),
+                        })
+                        .collect();
+
+                    Some(
+                        threadlane_ui_kit::message_content_column()
+                            .children(rendered_segments),
+                    )
+                } else {
+                    None
+                };
+                let quote = Self::quote_control(
+                    &self.armed_quotes,
+                    &msg.id,
+                    msg.streaming,
+                    &content_states,
+                    window,
+                    cx,
+                );
+                let quote_snapshot = quote.snapshot.clone();
+
                 threadlane_ui_kit::message_row(MessageRole::Assistant)
+                    // The context menu's focus path bubbles through this row,
+                    // so a dispatched `QuoteSelection` lands here.
+                    .on_action({
+                        let msg_id = msg.id.clone();
+                        cx.listener(move |this, _: &QuoteSelection, window, cx| {
+                            this.quote_selection_action(
+                                &msg_id,
+                                quote_snapshot.clone(),
+                                window,
+                                cx,
+                            );
+                        })
+                    })
                     .child(
                         threadlane_ui_kit::assistant_message_content()
                             .children(reasoning_element)
-                            .children(if !msg.content.is_empty() {
-                                let segments = self.cached_segments(&msg.id, &msg.content);
-                                let rendered_segments: Vec<AnyElement> = segments
-                                    .into_iter()
-                                    .enumerate()
-                                    .map(|(idx, seg)| match seg {
-                                        MarkdownSegment::Markdown(text) => {
-                                            let markdown_state = self.markdown_state(
-                                                format!("{}-seg-{}", msg.id, idx),
-                                                &text,
-                                                cx,
-                                            );
-                                            self.chat_markdown_view(&markdown_state)
-                                                .into_any_element()
-                                        }
-                                        MarkdownSegment::CodeBlock {
-                                            language,
-                                            header_path,
-                                            code,
-                                        } => self
-                                            .render_interactive_code_block(
-                                                &msg.id,
-                                                idx,
-                                                &language,
-                                                header_path.as_deref(),
-                                                &code,
-                                                msg.streaming,
-                                                cx,
-                                            )
-                                            .into_any_element(),
-                                    })
-                                    .collect();
-
-                                Some(
-                                    threadlane_ui_kit::message_content_column()
-                                        .children(rendered_segments),
-                                )
-                            } else {
-                                None
-                            })
+                            .children(content_column)
                             .children(tools_element)
                             .children((!msg.streaming && !msg.content.is_empty()).then(|| {
-                                self.render_message_copy_button(msg, false, cx)
+                                self.render_message_actions(
+                                    msg,
+                                    false,
+                                    Some(quote.clone()),
+                                    cx,
+                                )
                             }))
                             .context_menu({
                                 let content = msg.content.clone();
-                                move |menu, window, _cx| {
+                                let states = content_states.clone();
+                                let streaming = msg.streaming;
+                                let armed_quotes = self.armed_quotes.clone();
+                                let menu_message_id = msg.id.clone();
+                                move |menu, window, cx| {
                                     let text = content.clone();
-                                    threadlane_ui_kit::message_context_menu(menu,
+                                    // Re-evaluate live: the selection may have moved
+                                    // since the frame that rendered this message.
+                                    // Activation itself goes through the scoped
+                                    // `QuoteSelection` action dispatched onto this
+                                    // element's dispatch path.
+                                    let QuoteControl { enabled, reason, .. } = Self::quote_control(
+                                        &armed_quotes,
+                                        &menu_message_id,
+                                        streaming,
+                                        &states,
+                                        window,
+                                        cx,
+                                    );
+                                    let quote_item = threadlane_ui_kit::message_quote_menu_item(
+                                        enabled,
+                                        (!enabled).then_some(reason),
+                                        move |_event, window, cx| {
+                                            window.dispatch_action(
+                                                Box::new(QuoteSelection),
+                                                cx,
+                                            );
+                                        },
+                                    );
+                                    threadlane_ui_kit::message_context_menu_with_quote(
+                                        menu,
                                         move |_event, window, cx| {
                                             cx.write_to_clipboard(ClipboardItem::new_string(
                                                 text.clone(),
@@ -2382,6 +2623,7 @@ impl ChatListView {
                                                 cx,
                                             );
                                         },
+                                        Some(quote_item),
                                     )
                                 }
                             }),

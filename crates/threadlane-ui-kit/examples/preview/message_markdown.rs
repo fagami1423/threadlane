@@ -3,6 +3,7 @@ use super::SessionPreview;
 use gpui::{prelude::*, *};
 use gpui_component::{notification::Notification, WindowExt};
 use threadlane_protocol::daemon::ChatMessageInfo;
+use gpui_component::text::TextViewState;
 use threadlane_ui_kit::{
     self as kit,
     markdown::{ChatLinkTarget, MarkdownSegment},
@@ -13,12 +14,13 @@ impl SessionPreview {
         &mut self,
         message: &ChatMessageInfo,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> (AnyElement, Vec<Entity<TextViewState>>) {
         let segments = kit::markdown::markdown_segments(
             &mut self.segment_cache,
             &message.id,
             &message.content,
         );
+        let mut content_states = Vec::new();
         let mut body = kit::message_content_column();
         for (index, segment) in segments.into_iter().enumerate() {
             let key = format!("{}-{index}", message.id);
@@ -31,6 +33,7 @@ impl SessionPreview {
                         &text,
                         cx,
                     );
+                    content_states.push(state.clone());
                     kit::markdown::markdown_view(&state, |_, _| {}).into_any_element()
                 }
                 MarkdownSegment::CodeBlock {
@@ -99,6 +102,7 @@ impl SessionPreview {
                         &formatted,
                         cx,
                     );
+                    content_states.push(state.clone());
                     kit::code_block_surface(&key, cx)
                         .child(kit::code_block_header(
                             &key,
@@ -118,7 +122,7 @@ impl SessionPreview {
             };
             body = body.child(element);
         }
-        body.into_any_element()
+        (body.into_any_element(), content_states)
     }
 
     /// Same per-block wrap toggle as the chat surface, including the
