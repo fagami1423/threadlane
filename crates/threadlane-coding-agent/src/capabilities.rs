@@ -802,7 +802,11 @@ pub(crate) fn render_agent_catalog(work_dir: &Path) -> String {
 }
 
 pub(crate) fn restored_tool_policy(extensions: &WasiExtensionManager) -> ToolPolicy {
-    match extensions.host_state("tools.policy") {
+    // Peek rather than `host_state`: restore runs during construction, before
+    // this manager owns the state scope. `host_state` acquires the owner lease,
+    // so a second live runtime viewing the same session would fail closed to
+    // read-only even though no read-only policy was ever persisted.
+    match extensions.peek_host_state("tools.policy") {
         Ok(None) => ToolPolicy::FullAccess,
         Ok(Some(Value::String(policy))) if policy == "full" => ToolPolicy::FullAccess,
         Ok(Some(Value::String(policy))) if policy == "read_only" => ToolPolicy::ReadOnly,
@@ -1816,11 +1820,27 @@ mod read_only_policy_tests {
         manager
             .set_host_state("tools.policy", serde_json::json!("full"))
             .unwrap();
-        // A second live manager cannot load a full policy from an owned cache scope.
+        // A second live manager does not own the scope's lease, but policy
+        // restore must still observe the persisted value instead of failing
+        // closed: the automation in session_1791331052121687000 silently lost
+        // run_command access when a second runtime adopted its open run while
+        // the owner lease was held.
+        assert_eq!(
+            restored_tool_policy(&WasiExtensionManager::for_project_session(project.path(), "policy")),
+            ToolPolicy::FullAccess,
+        );
+        manager
+            .set_host_state("tools.policy", serde_json::json!("read_only"))
+            .unwrap();
+        // An intentionally persisted read-only policy is still honored under
+        // the same contention.
         assert_eq!(
             restored_tool_policy(&WasiExtensionManager::for_project_session(project.path(), "policy")),
             ToolPolicy::ReadOnly,
         );
+        manager
+            .set_host_state("tools.policy", serde_json::json!("full"))
+            .unwrap();
         drop(manager);
         assert_eq!(
             restored_tool_policy(&WasiExtensionManager::for_project_session(project.path(), "policy")),

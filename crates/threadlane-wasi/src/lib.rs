@@ -1779,6 +1779,21 @@ impl WasiExtensionManager {
         Ok(Some(value))
     }
 
+    /// Reads persisted host-owned state for the active session scope without
+    /// acquiring the state-owner lease. Callers that run before this manager
+    /// has proven ownership — for example tool-policy restore during runtime
+    /// construction — must observe the persisted value rather than fail on
+    /// another live owner's lock; ownership serializes writes, not reads.
+    pub fn peek_host_state(&self, key: &str) -> Result<Option<Value>, String> {
+        if self.state_dir.is_none() {
+            return Ok(None);
+        }
+        let path = self
+            .host_state_path(key)
+            .ok_or("Extension session lock poisoned")?;
+        read_json_state(&path)
+    }
+
     /// Persists host-owned state in the active session scope.
     pub fn set_host_state(&self, key: &str, value: Value) -> Result<(), String> {
         let _commit = self
