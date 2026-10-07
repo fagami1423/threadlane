@@ -1,5 +1,50 @@
 # Changelog
 
+## [0.1.44](https://github.com/wheregmis/threadlane/compare/v0.1.43...v0.1.44) (2026-10-07)
+
+
+### Features
+
+* add file editor selection to chat draft ([add8f01](https://github.com/wheregmis/threadlane/commit/add8f012d9a93f06393494d26fcc76ba9950158b))
+* add file editor selection to chat draft ([e226a32](https://github.com/wheregmis/threadlane/commit/e226a32822392f1dcb774d875e84a5a39d3a43b8))
+* **review:** navigate adjacent local Review diffs with Previous/Next file ([7c28167](https://github.com/wheregmis/threadlane/commit/7c281670ec7e14f68f0282013d3b43b426c3fac2))
+* **review:** navigate adjacent local Review diffs with Previous/Next file ([6157a47](https://github.com/wheregmis/threadlane/commit/6157a47f88cc989cf35aabf46f733f41051f5fc2)), closes [#402](https://github.com/wheregmis/threadlane/issues/402)
+* switch sessions with a window-local recent-visits picker ([fea00cf](https://github.com/wheregmis/threadlane/commit/fea00cfc3ae206c176c1ba4eacfdf0a3ee444c38))
+* **ui-chat:** quote selected assistant text into the composer draft ([6d319a7](https://github.com/wheregmis/threadlane/commit/6d319a7b8292a684d9bd15672fb9ff532196a475))
+* **ui-chat:** quote selected assistant text into the composer draft ([3248f6c](https://github.com/wheregmis/threadlane/commit/3248f6c050b4084bac2dcdbc1f4fb10153c1368d)), closes [#405](https://github.com/wheregmis/threadlane/issues/405)
+
+
+### Bug Fixes
+
+* compile the kit preview's draft strip ([d996bd8](https://github.com/wheregmis/threadlane/commit/d996bd873125ef20c77e14b07978aebe3d0b2032))
+* harden the panel file open path ([6b86e23](https://github.com/wheregmis/threadlane/commit/6b86e23995a3748e86c76aeb93b92f10182b605b))
+* **preview:** retain boundary focus for review diff navigation ([10d904b](https://github.com/wheregmis/threadlane/commit/10d904b810eb106c32020085ebff707eb0b46374))
+* refresh add-selection controls and wire the panel file host ([ed4aa4a](https://github.com/wheregmis/threadlane/commit/ed4aa4af3b995f46b97d1223c8872a0d64c97fee))
+* refresh remote inventory and allow navigation to pending sessions ([ae33f59](https://github.com/wheregmis/threadlane/commit/ae33f590dbf6143d97a3a6252b7b8a54e1418fc3))
+* **review:** preserve diff scroll on refresh, isolate test fixture, drop nav tab stop ([c8f768e](https://github.com/wheregmis/threadlane/commit/c8f768e377c94896aa88454471ac53c06728795c))
+* **ui-chat:** apply the menu-time snapshot when Quote selection is clicked ([d5e8f55](https://github.com/wheregmis/threadlane/commit/d5e8f55714e0b5e0e9a41dd11b5d48c5b2337833))
+* **ui-chat:** ignore outer blank lines when quoting a selection ([f4948f7](https://github.com/wheregmis/threadlane/commit/f4948f7a0804b13a2f0b9b6f9ea1e8b79a3b1bea))
+* **ui-chat:** quote selection menu click and trailing-newline handling ([398c7c8](https://github.com/wheregmis/threadlane/commit/398c7c856c844239824564dee72719779512221d))
+* **ui-chat:** vendor quote icon and expire armed quotes on deselection ([c31a0f3](https://github.com/wheregmis/threadlane/commit/c31a0f3ac66b50378e820abb2faf924205b23f93))
+
+
+### Build System
+
+* **deps:** bump actions/configure-pages from 5 to 6 ([47a171e](https://github.com/wheregmis/threadlane/commit/47a171e0f3cfbecfef0d95d622cddfdc12d97a72))
+* **deps:** bump actions/configure-pages from 5 to 6 ([ccd10e6](https://github.com/wheregmis/threadlane/commit/ccd10e6bc0c7a75a335980bca24638d452da9ef0))
+* **deps:** bump actions/deploy-pages from 4 to 5 ([9487d71](https://github.com/wheregmis/threadlane/commit/9487d71e4758d92765f8f2862a0ef99650a29543))
+* **deps:** bump actions/deploy-pages from 4 to 5 ([b525ae0](https://github.com/wheregmis/threadlane/commit/b525ae0d1c1871a8d93c109a5377614e3b97d174))
+* **deps:** bump actions/upload-pages-artifact from 4 to 5 ([b2ae4fe](https://github.com/wheregmis/threadlane/commit/b2ae4feb2361244627bf70a38646844c126df946))
+* **deps:** bump actions/upload-pages-artifact from 4 to 5 ([c5aeeb3](https://github.com/wheregmis/threadlane/commit/c5aeeb3fe165ef9ff5934d518e28e4a5731ea6b9))
+* **deps:** bump hotpath from 0.26.1 to 0.28.4 ([a030179](https://github.com/wheregmis/threadlane/commit/a0301790e702c6d95cc131c5f76ca22a37be44ea))
+* **deps:** bump hotpath from 0.26.1 to 0.28.4 ([1ea29c6](https://github.com/wheregmis/threadlane/commit/1ea29c6366139bac61f6f1fe55a9a40663cd434a))
+* **deps:** bump rustix from 1.1.4 to 1.1.5 ([ab06c9a](https://github.com/wheregmis/threadlane/commit/ab06c9a373c777c8bc646ff3f89ef7c9fe42a82e))
+* **deps:** bump rustix from 1.1.4 to 1.1.5 ([05aa364](https://github.com/wheregmis/threadlane/commit/05aa364d18893f6c1ae314afa1b264a2889e823d))
+* **deps:** bump tokio from 1.53.1 to 1.53.2 ([55d1d6e](https://github.com/wheregmis/threadlane/commit/55d1d6eb8eaccde4f6a885b98de871bbf6247fba))
+* **deps:** bump tokio from 1.53.1 to 1.53.2 ([b4682b3](https://github.com/wheregmis/threadlane/commit/b4682b36768c58cb1b8d6211c21d2f90efd95258))
+* **deps:** bump webview2-com from 0.38.2 to 0.39.1 ([7feec46](https://github.com/wheregmis/threadlane/commit/7feec4649dca335dfbc5e48217d736db0900b226))
+* **deps:** bump webview2-com from 0.38.2 to 0.39.1 ([2111dac](https://github.com/wheregmis/threadlane/commit/2111dac7dbac15784c92e9d7aae3c601b69d16bb))
+
 ## [0.1.43](https://github.com/wheregmis/threadlane/compare/v0.1.42...v0.1.43) (2026-10-07)
 
 
