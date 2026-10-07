@@ -954,3 +954,144 @@ fn shared_review_draft_pr_button_opens_retained_local_form(cx: &mut TestAppConte
     assert_eq!(draft.read_with(cx, |draft, cx| draft.fields(cx).base), "changed-base");
     assert_eq!(view.read_with(cx, |view, _| serde_json::to_value(&view.status).unwrap()), recorded);
 }
+
+#[gpui::test]
+fn shared_review_diff_navigates_adjacent_files_in_filtered_order(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    cx.update(threadlane_ui_theme::init_bundled);
+    let mut snapshot = fixture();
+    // Capture every file but README.md: it exercises the unavailable-snapshot
+    // state while navigation keeps working around it.
+    for path in ["src/sidebar.rs", "src/chat.rs"] {
+        snapshot.review_diffs.insert(
+            path.into(),
+            super::CapturedReviewDiff {
+                text: format!("diff --git a/{path} b/{path}\n@@ -1 +1 @@\n-old\n+new"),
+                ignore_whitespace: String::new(),
+            },
+        );
+    }
+    let saved = Rc::new(RefCell::new(None));
+    let capture = saved.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let view = cx.new(|cx| ReviewPreview::new(Some(&snapshot), window, cx));
+        *capture.borrow_mut() = Some(view.clone());
+        gpui_component::Root::new(cx.new(|_| PanelHarness(view)), window, cx)
+    });
+    let view = saved.borrow_mut().take().unwrap();
+    cx.simulate_resize(gpui::size(gpui::px(480.0), gpui::px(900.0)));
+    draw(cx);
+
+    // Three consecutive files without returning to the list.
+    click(cx, "review-open-src/main.rs");
+    assert!(cx.debug_bounds("review-diff-nav").is_some());
+    assert!(cx.debug_bounds("review-diff-nav-position").is_some());
+    assert_eq!(
+        view.read_with(cx, |host, _| host.document.clone()),
+        Some("src/main.rs".into())
+    );
+    // First file: Previous is a bounded no-op.
+    click(cx, "review-diff-prev");
+    assert_eq!(
+        view.read_with(cx, |host, _| host.document.clone()),
+        Some("src/main.rs".into())
+    );
+    click(cx, "review-diff-next");
+    assert_eq!(
+        view.read_with(cx, |host, _| host.document.clone()),
+        Some("src/sidebar.rs".into())
+    );
+    click(cx, "review-diff-next");
+    assert_eq!(
+        view.read_with(cx, |host, _| host.document.clone()),
+        Some("src/chat.rs".into())
+    );
+    // README.md has no captured patch; the row stays usable around the
+    // explicit unavailable-snapshot body.
+    click(cx, "review-diff-next");
+    assert_eq!(
+        view.read_with(cx, |host, _| host.document.clone()),
+        Some("README.md".into())
+    );
+    assert!(cx.debug_bounds("review-diff-nav").is_some());
+    // Last file: Next is a bounded no-op.
+    click(cx, "review-diff-next");
+    assert_eq!(
+        view.read_with(cx, |host, _| host.document.clone()),
+        Some("README.md".into())
+    );
+    click(cx, "review-diff-prev");
+    assert_eq!(
+        view.read_with(cx, |host, _| host.document.clone()),
+        Some("src/chat.rs".into())
+    );
+
+    // Filtering the current file out shows the removed-file state and
+    // disables navigation rather than retargeting a row index. The filter
+    // input is not mounted in document view, so set it directly.
+    cx.update(|window, cx| {
+        view.update(cx, |host, cx| {
+            host.filter
+                .update(cx, |input, cx| input.set_value("sidebar", window, cx));
+            cx.notify();
+        });
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("review-diff-nav").is_some());
+    click(cx, "review-diff-prev");
+    click(cx, "review-diff-next");
+    assert_eq!(
+        view.read_with(cx, |host, _| host.document.clone()),
+        Some("src/chat.rs".into())
+    );
+    cx.update(|window, cx| {
+        view.update(cx, |host, cx| {
+            host.filter
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            cx.notify();
+        });
+    });
+    draw(cx);
+
+    // Filtered order: README.md is out, so src/chat.rs is the boundary.
+    cx.update(|window, cx| {
+        view.update(cx, |host, cx| {
+            host.filter
+                .update(cx, |input, cx| input.set_value("src/", window, cx));
+            cx.notify();
+        });
+    });
+    draw(cx);
+    click(cx, "review-diff-prev");
+    click(cx, "review-diff-prev");
+    assert_eq!(
+        view.read_with(cx, |host, _| host.document.clone()),
+        Some("src/main.rs".into())
+    );
+    click(cx, "review-diff-next");
+    click(cx, "review-diff-next");
+    click(cx, "review-diff-next");
+    assert_eq!(
+        view.read_with(cx, |host, _| host.document.clone()),
+        Some("src/chat.rs".into())
+    );
+
+    // A refresh that removes the current file disables navigation.
+    view.update(cx, |host, cx| {
+        host.status
+            .as_mut()
+            .unwrap()
+            .files
+            .retain(|file| file.path != "src/chat.rs");
+        cx.notify();
+    });
+    draw(cx);
+    click(cx, "review-diff-prev");
+    assert_eq!(
+        view.read_with(cx, |host, _| host.document.clone()),
+        Some("src/chat.rs".into())
+    );
+    // Back still returns to the list.
+    click(cx, "right-panel-document-back");
+    assert!(view.read_with(cx, |host, _| host.document.is_none()));
+}
