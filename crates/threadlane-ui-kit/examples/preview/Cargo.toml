@@ -16,6 +16,8 @@ image = { version = "0.25", default-features = false }
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui-component.workspace = true
+# Window-level text selection for the Quote-selection preview path.
+gpui-kit.workspace = true
 threadlane-ui-kit.workspace = true
 threadlane-ui-theme.workspace = true
 threadlane-protocol.workspace = true

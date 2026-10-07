@@ -724,16 +724,16 @@ impl SessionPreview {
         let content = match row {
             TranscriptRow::Message(index) => {
                 let message = self.messages[index].clone();
-                let body = if message.role == MessageRole::Assistant {
+                let (body, content_states) = if message.role == MessageRole::Assistant {
                     self.render_message_markdown(&message, cx)
                 } else {
                     let markdown = kit::markdown::markdown_state(&mut self.markdown, "saved-session-preview".into(), message.id.clone(), &message.content, cx);
-                    kit::markdown::markdown_view(&markdown, |_, _| {}).into_any_element()
+                    (kit::markdown::markdown_view(&markdown, |_, _| {}).into_any_element(), Vec::new())
                 };
                 match message.role {
                     MessageRole::User => kit::message_row(MessageRole::User)
-                        .child(kit::user_message_bubble(cx).child(body).context_menu(Self::message_context_menu(&message)))
-                        .children((!message.content.is_empty()).then(|| self.render_message_actions(&message, true, cx)))
+                        .child(kit::user_message_bubble(cx).child(body).context_menu(self.message_context_menu(&message, None, cx)))
+                        .children((!message.content.is_empty()).then(|| self.render_message_actions(&message, true, None, cx)))
                         .into_any_element(),
                     MessageRole::Assistant => {
                         let reasoning = message.reasoning_content.as_ref().map(|text| {
@@ -779,6 +779,8 @@ impl SessionPreview {
                             .filter(|tool| tool.title != "update_plan")
                             .map(|tool| self.render_tool(tool, window, cx))
                             .collect::<Vec<_>>();
+                        let quote = (!message.streaming && !message.content.is_empty())
+                            .then(|| Self::quote_control(&content_states, message.streaming, window, cx));
                         kit::message_row(MessageRole::Assistant)
                             .child(
                                 kit::assistant_message_content()
@@ -788,8 +790,8 @@ impl SessionPreview {
                                             .then(|| body),
                                     )
                                     .children(tools)
-                                    .children((!message.streaming && !message.content.is_empty()).then(|| self.render_message_actions(&message, false, cx)))
-                                    .context_menu(Self::message_context_menu(&message)),
+                                    .children(quote.clone().map(|quote| self.render_message_actions(&message, false, Some(quote), cx)))
+                                    .context_menu(self.message_context_menu(&message, Some(content_states), cx)),
                             )
                             .into_any_element()
                     }

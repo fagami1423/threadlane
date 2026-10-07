@@ -2698,6 +2698,120 @@ fn streaming_assistant_message_hides_copy_action(cx: &mut gpui::TestAppContext) 
     );
 }
 
+fn mount_assistant_message<'a>(
+    content: &str,
+    streaming: bool,
+    cx: &'a mut gpui::TestAppContext,
+) -> (
+    gpui::Entity<super::ChatListView>,
+    &'a mut gpui::VisualTestContext,
+) {
+    use gpui::AppContext as _;
+    cx.update(gpui_component::init);
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::for_tests();
+        state.is_new_task = false;
+        state.messages = vec![ChatMessageInfo {
+            id: "assistant-1".into(),
+            role: MessageRole::Assistant,
+            content: content.into(),
+            tool_activities: Vec::new(),
+            streaming,
+            reasoning_content: None,
+            reasoning_expanded: false,
+        }]
+        .into();
+        state
+    });
+    let holder: std::rc::Rc<
+        std::cell::RefCell<Option<gpui::Entity<super::ChatListView>>>,
+    > = Default::default();
+    let holder_clone = holder.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        holder_clone.borrow_mut().replace(chat.clone());
+        gpui_component::Root::new(chat, window, cx)
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let chat = holder
+        .borrow()
+        .as_ref()
+        .expect("chat view mounted")
+        .clone();
+    (chat, cx)
+}
+
+#[gpui::test]
+fn quote_selection_appends_labeled_blockquote_to_draft(cx: &mut gpui::TestAppContext) {
+    use gpui::Focusable as _;
+    let (chat, cx) =
+        mount_assistant_message("Completed response", false, cx);
+    let quote = cx
+        .debug_bounds("message-quote-assistant-1")
+        .expect("settled assistant message exposes a quote action");
+
+    // Nothing selected yet: quoting must not alter the draft or clipboard.
+    cx.simulate_click(quote.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, cx| {
+        assert!(
+            chat.input_state.read(cx).value().is_empty(),
+            "a disabled quote action never inserts"
+        );
+    });
+
+    // Select the rendered content, then quote it.
+    let content_state = chat.read_with(cx, |chat, _| {
+        chat.markdown_states
+            .iter()
+            .find(|((_, key), _)| key == "assistant-1-seg-0")
+            .map(|(_, render)| render.state.clone())
+            .expect("assistant content renders a cached TextViewState")
+    });
+    content_state.update(cx, |state, cx| state.select_all(cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let quote = cx
+        .debug_bounds("message-quote-assistant-1")
+        .expect("quote action remains visible");
+    cx.simulate_click(quote.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(
+            chat.input_state.read(cx).value().as_ref(),
+            "Quoted from assistant response:\n> Completed response\n> \n\n",
+            "quote appends the labeled blockquote plus a blank line"
+        );
+    });
+    let composer_focus = chat.read_with(cx, |chat, cx| {
+        chat.input_state.read(cx).focus_handle(cx)
+    });
+    cx.update(|window, cx| {
+        assert_eq!(
+            window.focused(cx),
+            Some(composer_focus),
+            "quoting hands focus to the composer"
+        );
+    });
+    assert!(
+        cx.read_from_clipboard().is_none(),
+        "quoting never touches the clipboard"
+    );
+}
+
+#[gpui::test]
+fn streaming_assistant_message_hides_quote_action(cx: &mut gpui::TestAppContext) {
+    let (_chat, cx) = mount_assistant_message("Partial response", true, cx);
+    assert!(
+        cx.debug_bounds("message-quote-assistant-1").is_none(),
+        "streaming response defers its quote action until generation completes"
+    );
+}
+
 #[test]
 fn run_elapsed_formats_seconds_minutes_and_hours() {
     assert_eq!(super::format_run_elapsed(7), "7s");

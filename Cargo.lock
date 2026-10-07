@@ -8738,6 +8738,7 @@ name = "threadlane-ui-kit-preview"
 version = "0.1.0"
 dependencies = [
  "gpui-component",
+ "gpui-kit",
  "gpui-pre",
  "gpui-pre-platform",
  "image",

@@ -2,7 +2,7 @@
 use gpui::{prelude::*, *};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
-use gpui_component::{ActiveTheme, Icon, IconName, Sizable};
+use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Sizable};
 
 pub const MESSAGE_COPY_FEEDBACK_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -38,6 +38,43 @@ pub fn message_copy_button(message_id: &str, copied: bool, cx: &App) -> Button {
             "Copy message"
         })
 }
+/// Quote controls carry one of two states: enabled, or disabled with an
+/// explanation readable without color (`reason` doubles as tooltip and
+/// accessibility label).
+pub fn message_quote_button(message_id: &str, enabled: bool, reason: SharedString) -> Button {
+    let selector = format!("message-quote-{message_id}");
+    Button::new(SharedString::from(selector.clone()))
+        .debug_selector(move || selector.clone())
+        .icon(Icon::default().path("icons/reply.svg"))
+        .xsmall()
+        .ghost()
+        .disabled(!enabled)
+        .tooltip(if enabled {
+            "Quote the selected text into the composer"
+        } else {
+            reason.as_ref()
+        })
+        .accessibility_label(if enabled {
+            "Quote selection"
+        } else {
+            reason.as_ref()
+        })
+}
+/// Context-menu entry mirroring `message_quote_button`; disabled entries keep
+/// a readable reason in the label so the menu explains itself.
+pub fn message_quote_menu_item(
+    enabled: bool,
+    disabled_label: Option<SharedString>,
+    on_quote: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> PopupMenuItem {
+    let label = match (enabled, disabled_label) {
+        (true, _) | (_, None) => SharedString::from("Quote selection"),
+        (false, Some(reason)) => reason,
+    };
+    PopupMenuItem::new(label)
+        .disabled(!enabled)
+        .on_click(on_quote)
+}
 pub fn message_edit_button(message_id: &str) -> Button {
     let selector = format!("message-edit-{message_id}");
     Button::new(SharedString::from(selector.clone()))
@@ -52,7 +89,17 @@ pub fn message_context_menu(
     menu: PopupMenu,
     on_copy: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> PopupMenu {
-    menu.item(PopupMenuItem::new("Copy Message").on_click(on_copy))
+    message_context_menu_with_quote(menu, on_copy, None)
+}
+/// Copy plus an optional host-supplied quote item (see
+/// `message_quote_menu_item`), kept ahead of Copy.
+pub fn message_context_menu_with_quote(
+    menu: PopupMenu,
+    on_copy: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    quote: Option<PopupMenuItem>,
+) -> PopupMenu {
+    menu.when_some(quote, |menu, item| menu.item(item))
+        .item(PopupMenuItem::new("Copy Message").on_click(on_copy))
 }
 
 pub fn format_run_elapsed(seconds: u64) -> String {
