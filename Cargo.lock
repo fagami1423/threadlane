@@ -8928,6 +8928,7 @@ dependencies = [
  "gpui-component",
  "gpui-pre",
  "rfd",
+ "threadlane-client",
  "threadlane-coding-agent",
  "threadlane-daemon",
  "threadlane-git",

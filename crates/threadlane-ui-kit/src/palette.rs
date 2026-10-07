@@ -52,11 +52,15 @@ pub fn workspace_commands() -> Vec<WorkspaceCommand> {
         ),
         (
             "Go to Task…",
-            "Jump to a recent task or session",
+            "Switch to a recently visited session",
             "go_task",
             Icon::from(IconName::Search),
             &["go", "task", "jump", "find", "session", "recent"],
-            "",
+            if cfg!(target_os = "macos") {
+                "⇧⌘K"
+            } else {
+                "Ctrl+Shift+K"
+            },
         ),
         (
             "Open File…",
@@ -449,4 +453,106 @@ pub fn palette_footer(text: impl Into<SharedString>, cx: &App) -> Div {
         .text_xs()
         .text_color(cx.theme().muted_foreground)
         .child(text.into())
+}
+
+/// Session-only mode uses stable groups so metadata updates never retarget a row.
+pub fn session_switcher_command(
+    state: &Entity<CommandState>,
+    recent: Vec<CommandItem>,
+    other: Vec<CommandItem>,
+    searching: bool,
+    footer: &'static str,
+) -> Command {
+    use gpui_component::command::CommandGroup;
+    workspace_palette_command(state)
+        .placeholder("Search sessions by title, project, ID, or branch…")
+        .header(|_, _, cx| palette_scope("Switch session", cx))
+        .group(
+            CommandGroup::new()
+                .label(if searching {
+                    "Search results"
+                } else {
+                    "Recently visited"
+                })
+                .items(recent),
+        )
+        .group(
+            CommandGroup::new()
+                .label(if searching {
+                    "More results"
+                } else {
+                    "Other sessions"
+                })
+                .items(other),
+        )
+        .footer(move |_, _, cx| palette_footer(footer, cx))
+}
+
+pub fn palette_session_item(
+    title: &str,
+    project: &str,
+    branch: Option<&str>,
+    id: &str,
+) -> CommandItem {
+    let title = if title.is_empty() { id } else { title };
+    let subtitle = branch.map_or_else(
+        || project.to_owned(),
+        |branch| format!("{project} · {branch}"),
+    );
+    palette_item(title.to_owned(), subtitle, IconName::SquareTerminal).keywords([
+        project.to_owned(),
+        id.to_owned(),
+        branch.unwrap_or_default().to_owned(),
+    ])
+}
+
+pub fn session_switcher_empty(
+    searching: bool,
+    clear: impl Fn(&mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    use gpui_component::button::{Button, ButtonVariants};
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap_2()
+        .child(palette_empty(
+            if searching {
+                "No matching sessions"
+            } else {
+                "No other sessions to switch to"
+            },
+            cx,
+        ))
+        .when(searching, |view| {
+            view.child(
+                Button::new("clear-session-query")
+                    .label("Clear search")
+                    .ghost()
+                    .on_click(move |_, window, cx| clear(window, cx)),
+            )
+        })
+        .into_any_element()
+}
+
+/// Session switching is choice-only: Escape dismisses even with a query and
+/// cannot bubble into the workspace's stop-generation action.
+pub fn session_switcher_frame(
+    content: impl IntoElement,
+    on_dismiss: impl Fn(&mut Window, &mut App) + 'static,
+    cx: &App,
+) -> impl IntoElement {
+    let dismiss = std::rc::Rc::new(on_dismiss);
+    let backdrop = dismiss.clone();
+    workspace_palette_frame(
+        div()
+            .capture_action(move |_: &gpui_kit::base::actions::Cancel, window, cx| {
+                dismiss(window, cx);
+                cx.stop_propagation();
+            })
+            .child(content),
+        move |window, cx| backdrop(window, cx),
+        cx,
+    )
 }

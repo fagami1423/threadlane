@@ -14,6 +14,7 @@ actions!(
     threadlane_workspace,
     [
         ToggleCommandPalette,
+        SwitchSession,
         ToggleRightPanel,
         ToggleTerminal,
         OpenSettings,
@@ -61,6 +62,9 @@ use threadlane_updater::UpdateStatus;
 #[path = "conversation_search.rs"]
 mod conversation_search;
 use conversation_search::*;
+#[path = "session_switcher.rs"]
+mod session_switcher;
+use session_switcher::{SessionNavigation, SessionPicker};
 
 fn close_command_palette(open: &mut bool, previous_focus: &mut Option<FocusHandle>, window: &mut Window, cx: &mut App) {
     *open = false;
@@ -147,6 +151,10 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-alt-h", HideOtherApplications, None),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-m", MinimizeWindow, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-k", SwitchSession, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-k", SwitchSession, None),
         KeyBinding::new("cmd-k", ToggleCommandPalette, None),
         KeyBinding::new("ctrl-k", ToggleCommandPalette, None),
         KeyBinding::new("cmd-b", ToggleSidebar, None),
@@ -221,6 +229,7 @@ pub fn init(cx: &mut App) {
             ]),
             Menu::new("View").items([
                 MenuItem::action("Command Palette", ToggleCommandPalette),
+                MenuItem::action("Switch Session…", SwitchSession),
                 MenuItem::separator(),
                 MenuItem::action("Toggle Sidebar", ToggleSidebar),
                 MenuItem::action("Toggle Right Panel", ToggleRightPanel),
@@ -399,9 +408,12 @@ pub struct WorkspaceView {
     command_palette_open: bool,
     command_palette_previous_focus: Option<FocusHandle>,
     command_state: Entity<CommandState>,
+    command_state_subscription: Subscription,
     /// Some while the palette is showing project conversation search
     /// instead of the commands list; `conversation_search.rs` owns the mode.
     conversation_search: Option<ConversationSearch>,
+    session_navigation: SessionNavigation,
+    session_picker: Option<SessionPicker>,
     recent_palette_actions: Vec<&'static str>,
     last_git_work_dir: Option<PathBuf>,
     last_git_pr_targets: HashSet<(PathBuf, String)>,
@@ -611,6 +623,7 @@ impl WorkspaceView {
             let focus_handle = cx.focus_handle();
             focus_handle.focus(window, cx);
             let sub = cx.observe(&model_clone, move |this: &mut Self, model, cx| {
+                this.session_navigation.observe(model.read(cx));
                 this.sync_git_status_with_active_project(cx);
                 if let Some(cmd) =
                     model.update(cx, |state, _cx| state.requested_terminal_command.take())
@@ -738,6 +751,8 @@ impl WorkspaceView {
                 last_link_terminal: None,
                 focus_handle,
                 rendered_page: model.read(cx).workspace_page,
+                session_navigation: SessionNavigation::new(model.read(cx)),
+                session_picker: None,
                 model,
                 sidebar,
                 chat_list,
@@ -753,6 +768,7 @@ impl WorkspaceView {
                 command_palette_open: false,
                 command_palette_previous_focus: None,
                 command_state,
+                command_state_subscription: command_state_sub,
                 conversation_search: None,
                 recent_palette_actions: Vec::new(),
                 last_git_work_dir: None,
@@ -766,7 +782,7 @@ impl WorkspaceView {
                 updater_tx,
                 pending_terminal_close: None,
                 terminal_subscriptions: Vec::new(),
-                _subscriptions: vec![sub, right_panel_sub, command_state_sub],
+                _subscriptions: vec![sub, right_panel_sub],
             }
         });
         view.update(cx, |view, cx| {
@@ -849,14 +865,26 @@ impl WorkspaceView {
         let view_handle = view.downgrade();
         let shortcut_subscription = cx.intercept_keystrokes(move |event, window, cx| {
             let keystroke = &event.keystroke;
-            if keystroke.key.eq_ignore_ascii_case("k")
-                && (keystroke.modifiers.platform || keystroke.modifiers.control)
-                && !keystroke.modifiers.alt
-                && !keystroke.modifiers.shift
-            {
+            let switch_session = keystroke.modifiers.shift;
+            let modifier = if switch_session && cfg!(target_os = "macos") {
+                keystroke.modifiers.platform
+            } else {
+                keystroke.modifiers.platform || keystroke.modifiers.control
+            };
+            if keystroke.key.eq_ignore_ascii_case("k") && modifier && !keystroke.modifiers.alt {
+                if switch_session && event.context_stack.iter().any(|context| {
+                    context.contains("PopupMenu") || context.contains("Dialog") || context.contains("Sheet")
+                }) {
+                    cx.stop_propagation();
+                    return;
+                }
                 if let Some(view) = view_handle.upgrade() {
                     view.update(cx, |view, cx| {
-                        view.toggle_command_palette(&ToggleCommandPalette, window, cx);
+                        if switch_session {
+                            view.switch_session_action(&SwitchSession, window, cx);
+                        } else {
+                            view.toggle_command_palette(&ToggleCommandPalette, window, cx);
+                        }
                     });
                     cx.stop_propagation();
                 }
@@ -1494,15 +1522,8 @@ impl WorkspaceView {
                 self.right_panel_visible = !self.right_panel_visible;
             }
             "go_task" => {
-                // Focus the session search in the palette itself — just clear the
-                // query so the sessions group is prominent.
-                self.command_palette_previous_focus = window.focused(cx);
-                self.command_palette_open = true;
-                self.command_state.update(cx, |state, cx| {
-                    state.set_query("", window, cx);
-                    state.focus(window, cx);
-                });
-                return; // keep palette open
+                self.switch_session_action(&SwitchSession, window, cx);
+                return;
             }
             "search_conversations" => {
                 // Reopen the palette in conversation-search mode (the
@@ -2705,6 +2726,7 @@ impl Render for WorkspaceView {
                     this.open_agents_panel(cx);
                 }),
             )
+            .on_action(cx.listener(Self::switch_session_action))
             .on_action(cx.listener(Self::toggle_terminal_action))
             .on_action(cx.listener(Self::begin_new_task_action))
             .on_action(cx.listener(Self::open_settings_action))
@@ -2763,7 +2785,9 @@ impl Render for WorkspaceView {
                     }))
             }))
             .children(self.command_palette_open.then(|| {
-                if self.conversation_search.is_some() {
+                if self.session_picker.is_some() {
+                    self.render_session_picker(cx)
+                } else if self.conversation_search.is_some() {
                     self.render_conversation_search(cx).into_any_element()
                 } else {
                     self.render_command_palette(cx).into_any_element()

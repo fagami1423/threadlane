@@ -731,6 +731,7 @@ pub fn settings_shortcuts(cx: &App) -> AnyElement {
             "Global",
             vec![
                 ("⌘ K", "Open Command Palette"),
+                (if cfg!(target_os = "macos") { "⇧ ⌘ K" } else { "Ctrl Shift K" }, "Switch session"),
                 ("⌘ ,", "Open Settings"),
                 ("⌘ B", "Toggle Left Sidebar"),
                 ("⌘ R", "Toggle Right Panel"),
