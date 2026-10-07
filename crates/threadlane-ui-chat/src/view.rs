@@ -1142,10 +1142,12 @@ impl ChatListView {
         if let ModelPickerValue::RefreshModels = value {
             // Clear every cached provider inventory and re-fetch, so a newly
             // released model reaches this picker without a restart or TTL wait.
+            const REFRESH_PENDING: &str = "Refreshing model lists…";
+            const REFRESH_DONE: &str = "Model lists refreshed.";
             let model = self.model.clone();
             let project = self.model.read(cx).active_work_dir.clone();
             self.model.update(cx, |state, cx| {
-                state.session_status = Some("Refreshing model lists…".into());
+                state.session_status = Some(REFRESH_PENDING.into());
                 cx.notify();
             });
             cx.spawn(async move |_, cx| {
@@ -1153,7 +1155,12 @@ impl ChatListView {
                 let _ = cx.update(|cx| {
                     model.update(cx, |state, cx| {
                         state.refresh_available_models();
-                        state.session_status = Some("Model lists refreshed.".into());
+                        // A session switch or new turn may have replaced the
+                        // marker: only the still-showing refresh message gets
+                        // the completion, never whatever status owns the slot now.
+                        if state.session_status.as_deref() == Some(REFRESH_PENDING) {
+                            state.session_status = Some(REFRESH_DONE.into());
+                        }
                         cx.notify();
                     })
                 });

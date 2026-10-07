@@ -644,6 +644,11 @@ pub fn invalidate_model_caches() {
     {
         guard.0 = expired;
     }
+    // The provider clients keep their own TTL caches under the daemon's:
+    // expiring only `DISCOVERED_*` would let a fresh lower-level entry
+    // answer the "refetch" without any network request.
+    threadlane_provider::opencode::invalidate_models_cache();
+    threadlane_provider::openai::invalidate_model_cache();
 }
 
 /// Clears the cached model lists and re-fetches every provider's

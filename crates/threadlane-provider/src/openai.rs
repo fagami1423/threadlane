@@ -59,6 +59,18 @@ fn model_cache_key(api_key: &str, account_id: Option<&str>) -> u64 {
     hasher.finish()
 }
 
+/// Drops every cached `/v1/models` response so the next fetch hits the
+/// network. Used by the manual "refresh models" flow; entries never serve
+/// stale past their TTL, so clearing loses no recovery path.
+pub fn invalidate_model_cache() {
+    if let Some(mut cache) = MODEL_CACHE
+        .get()
+        .and_then(|cache| cache.lock().ok())
+    {
+        cache.clear();
+    }
+}
+
 fn fresh_models(entry: &ModelCacheEntry, now: Instant) -> Option<Arc<[String]>> {
     (now.duration_since(entry.stored_at) <= MODEL_CACHE_TTL).then(|| entry.models.clone())
 }
