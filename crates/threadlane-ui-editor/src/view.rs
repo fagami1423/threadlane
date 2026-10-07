@@ -4,6 +4,7 @@ use gpui::*;
 use gpui_component::input::{EditorState, InputEvent, TabSize};
 use gpui_component::menu::ContextMenuExt;
 use gpui_component::text::TextViewState;
+use gpui_component::WindowExt;
 
 use threadlane_ui_state::AppState;
 
@@ -94,6 +95,116 @@ impl EditorView {
             .and_then(|idx| self.tabs.get(idx))
             .map(|tab| tab.is_diff)
             .unwrap_or(false)
+    }
+
+    /// The active tab's buffer entity — `None` for diff/loading documents.
+    /// Selection guards still apply; this is the underlying buffer for
+    /// command surfaces and tests.
+    pub fn active_editor(&self) -> Option<Entity<EditorState>> {
+        self.active_tab_index
+            .and_then(|index| self.tabs.get(index))
+            .and_then(|tab| tab.editor_state.clone())
+    }
+
+    /// Reason the **Add selection to chat** command is unavailable for the
+    /// active tab — `None` when ready. Diff documents, loading buffers,
+    /// files outside the active checkout, and empty or oversized selections
+    /// each carry a textual reason.
+    pub fn selection_block_reason(&self, cx: &App) -> Option<SharedString> {
+        let Some(tab) = self
+            .active_tab_index
+            .and_then(|index| self.tabs.get(index))
+        else {
+            return Some("Open a file first".into());
+        };
+        if tab.is_diff {
+            return Some("Diffs can't be added to chat — open the file itself".into());
+        }
+        if tab.loading || tab.pending_content.is_some() {
+            return Some("The file is still loading".into());
+        }
+        let Some(editor) = tab.editor_state.as_ref() else {
+            return Some("The document is not editable".into());
+        };
+        if self.model.read(cx).active_git_work_dir().as_ref() != Some(&tab.project_dir) {
+            return Some("The file is not in the active checkout".into());
+        }
+        threadlane_ui_kit::editor_excerpt_block_reason(
+            threadlane_ui_kit::editor_selection_snapshot(editor.read(cx)).as_ref(),
+        )
+        .map(SharedString::from)
+    }
+
+    /// Activates **Add selection to chat** for the active tab: validates the
+    /// selection, captures buffer identity plus the composer destination,
+    /// and emits `EditorSelectionRequest` for the parent surface to append.
+    /// On any guard failure the reason is shown and nothing is appended.
+    pub fn request_add_selection_to_chat(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(reason) = self.selection_block_reason(cx) {
+            window.push_notification(reason.to_string(), cx);
+            return;
+        }
+        let Some(tab) = self
+            .active_tab_index
+            .and_then(|index| self.tabs.get(index))
+        else {
+            return;
+        };
+        let Some(editor) = tab.editor_state.clone() else {
+            return;
+        };
+        let Some(snapshot) =
+            threadlane_ui_kit::editor_selection_snapshot(editor.read(cx))
+        else {
+            return;
+        };
+        let destination = {
+            let state = self.model.read(cx);
+            (
+                state.active_work_dir.clone(),
+                state.active_session_id.clone(),
+            )
+        };
+        cx.emit(threadlane_ui_kit::EditorSelectionRequest {
+            editor,
+            checkout: tab.project_dir.clone(),
+            relative_path: tab.relative_path.clone(),
+            dirty: tab.is_dirty,
+            snapshot,
+            destination,
+        });
+    }
+
+    /// Whether `request` still names the active tab's buffer and the
+    /// buffer's live selection is the captured one.
+    pub fn selection_request_is_current(
+        &self,
+        request: &threadlane_ui_kit::EditorSelectionRequest,
+        cx: &App,
+    ) -> bool {
+        let Some(tab) = self
+            .active_tab_index
+            .and_then(|index| self.tabs.get(index))
+        else {
+            return false;
+        };
+        if tab.is_diff
+            || tab.loading
+            || tab.pending_content.is_some()
+            || tab.project_dir != request.checkout
+            || tab.relative_path != request.relative_path
+        {
+            return false;
+        }
+        let Some(editor) = tab.editor_state.as_ref() else {
+            return false;
+        };
+        editor.entity_id() == request.editor.entity_id()
+            && editor.read(cx).selected_range() == request.snapshot.byte_range
     }
 
     fn sync_pending_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -688,6 +799,7 @@ impl EditorView {
 
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let owner = cx.entity();
+        let selection_reason = self.selection_block_reason(cx);
         threadlane_ui_kit::editor_tab_bar(cx)
             .child(
                 threadlane_ui_kit::editor_tabs().children(self.tabs.iter().enumerate().map(
@@ -761,6 +873,18 @@ impl EditorView {
             )
             .child(threadlane_ui_kit::editor_actions(
                 self.visible_status(),
+                Some(
+                    threadlane_ui_kit::editor_add_selection_button(
+                        "editor-add-selection",
+                        &threadlane_ui_kit::AddSelectionControl {
+                            enabled: selection_reason.is_none(),
+                            reason: selection_reason,
+                        },
+                    )
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.request_add_selection_to_chat(window, cx)
+                    })),
+                ),
                 threadlane_ui_kit::editor_save_button(
                     self.is_active_dirty(),
                     self.is_active_diff(),
@@ -776,12 +900,17 @@ impl EditorView {
 
 }
 
+impl EventEmitter<threadlane_ui_kit::EditorSelectionRequest> for EditorView {}
+
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_pending_file(window, cx);
         self.sync_pending_content(window, cx);
         threadlane_ui_kit::editor_surface(cx)
             .on_action(cx.listener(Self::save_file_action))
+            .on_action(cx.listener(|view, _: &threadlane_ui_kit::AddSelectionToChat, window, cx| {
+                view.request_add_selection_to_chat(window, cx)
+            }))
             .children(self.has_tabs().then(|| self.render_tab_bar(cx)))
             .child(if let Some(idx) = self.active_tab_index {
                 if let Some(active_tab) = self.tabs.get(idx) {
@@ -898,6 +1027,46 @@ mod navigation_tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.debug_bounds("editor-save-btn").is_none());
     }
+    #[gpui::test]
+    fn add_selection_reports_disabled_reasons(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let project = std::path::PathBuf::from("/editor-preview-test");
+        let model = cx.new(|_| {
+            let mut state = threadlane_ui_state::AppState::default();
+            state.projects.clear();
+            state.pending_hydrations.clear();
+            state.active_session_id = None;
+            state.active_work_dir = Some(project.clone());
+            state
+        });
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let editor = cx.new(|cx| {
+                let mut view = EditorView::new(model, window, cx);
+                view.open_diff("one.rs", "+one", cx);
+                view
+            });
+            gpui_component::Root::new(editor, window, cx)
+        });
+        let editor = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<EditorView>().unwrap()
+        });
+        // A diff document can never hand a selection to chat.
+        editor.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.selection_block_reason(cx).as_deref(),
+                Some("Diffs can't be added to chat — open the file itself")
+            );
+        });
+        editor.update(cx, |view, cx| view.close_tab(0, cx));
+        // No open file at all.
+        editor.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.selection_block_reason(cx).as_deref(),
+                Some("Open a file first")
+            );
+        });
+    }
+
     #[gpui::test]
     fn opens_at_requested_line_after_loading_and_reuses_tab(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);

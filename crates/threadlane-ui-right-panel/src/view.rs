@@ -943,6 +943,101 @@ impl RightPanelView {
         }
     }
 
+    /// Whether the open document is an editable file buffer (eligible host
+    /// for **Add selection to chat**); Review/diff documents and the plain
+    /// text view are not.
+    pub fn editable_file_open(&self) -> bool {
+        self.editor_state.is_some()
+    }
+
+    /// Reason the **Add selection to chat** command is unavailable for the
+    /// open document — `None` when ready. Review/diff documents, pending
+    /// loads, files outside the active checkout, and empty or oversized
+    /// selections each carry a textual reason.
+    pub fn files_selection_block_reason(&self, cx: &App) -> Option<SharedString> {
+        if self.document_title.is_none() {
+            return Some("Open a file first".into());
+        }
+        if self.pending_document.is_some() {
+            return Some("The file is still loading".into());
+        }
+        let Some(editor) = self.editor_state.as_ref() else {
+            return Some("This document can't be added to chat".into());
+        };
+        match &self.project {
+            Some(project)
+                if self.model.read(cx).active_git_work_dir().as_ref() == Some(project) => {}
+            _ => return Some("The file is not in the active checkout".into()),
+        }
+        threadlane_ui_kit::editor_excerpt_block_reason(
+            threadlane_ui_kit::editor_selection_snapshot(editor.read(cx)).as_ref(),
+        )
+        .map(SharedString::from)
+    }
+
+    /// Activates **Add selection to chat** for the open document: validates
+    /// the selection, captures buffer identity plus the composer
+    /// destination, and emits `EditorSelectionRequest` for the workspace to
+    /// append. On any guard failure the reason is shown and nothing is
+    /// appended.
+    pub fn request_add_selection_to_chat(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(reason) = self.files_selection_block_reason(cx) {
+            window.push_notification(reason.to_string(), cx);
+            return;
+        }
+        let (Some(editor), Some(project), Some(title)) = (
+            self.editor_state.clone(),
+            self.project.clone(),
+            self.document_title.clone(),
+        ) else {
+            return;
+        };
+        let Some(snapshot) =
+            threadlane_ui_kit::editor_selection_snapshot(editor.read(cx))
+        else {
+            return;
+        };
+        let destination = {
+            let state = self.model.read(cx);
+            (
+                state.active_work_dir.clone(),
+                state.active_session_id.clone(),
+            )
+        };
+        cx.emit(threadlane_ui_kit::EditorSelectionRequest {
+            editor,
+            checkout: project,
+            relative_path: title,
+            dirty: self.is_dirty,
+            snapshot,
+            destination,
+        });
+    }
+
+    /// Whether `request` still names the open document's buffer and the
+    /// buffer's live selection is the captured one.
+    pub fn selection_request_is_current(
+        &self,
+        request: &threadlane_ui_kit::EditorSelectionRequest,
+        cx: &App,
+    ) -> bool {
+        if self.pending_document.is_some()
+            || self.document_title.as_ref() != Some(&request.relative_path)
+            || self.project.as_ref() != Some(&request.checkout)
+        {
+            return false;
+        }
+        let Some(editor) = self.editor_state.as_ref() else {
+            return false;
+        };
+        editor.entity_id() == request.editor.entity_id()
+            && editor.read(cx).selected_range() == request.snapshot.byte_range
+    }
+
     fn save_active_document(&mut self, cx: &mut Context<Self>) {
         let Some(editor) = self.editor_state.as_ref() else {
             return;
@@ -1733,20 +1828,29 @@ impl RightPanelView {
             let is_dirty = self.is_dirty;
             let has_editor = self.editor_state.is_some();
             let lang = detect_language(title);
+            let selection_reason = self.files_selection_block_reason(cx);
             return div()
                 .flex_1()
                 .min_h_0()
                 .flex()
                 .flex_col()
+                .on_action(cx.listener(|this, _: &threadlane_ui_kit::AddSelectionToChat, window, cx| {
+                    this.request_add_selection_to_chat(window, cx)
+                }))
                 .child(threadlane_ui_kit::panel_document_header(
                     title,
                     is_dirty,
                     has_editor.then_some(lang),
                     self.active_surface == Some(Surface::Review),
-                    cx.listener(|this, action: &threadlane_ui_kit::PanelDocumentAction, _, cx| {
+                    has_editor.then_some(threadlane_ui_kit::AddSelectionControl {
+                        enabled: selection_reason.is_none(),
+                        reason: selection_reason,
+                    }),
+                    cx.listener(|this, action: &threadlane_ui_kit::PanelDocumentAction, window, cx| {
                         use threadlane_ui_kit::PanelDocumentAction;
                         match action {
                             PanelDocumentAction::Save => this.save_active_document(cx),
+                            PanelDocumentAction::AddSelectionToChat => this.request_add_selection_to_chat(window, cx),
                             PanelDocumentAction::Back | PanelDocumentAction::Close => this.close_document(cx),
                         }
                     }),
@@ -2802,6 +2906,8 @@ impl RightPanelView {
             .into_any_element()
     }
 }
+
+impl EventEmitter<threadlane_ui_kit::EditorSelectionRequest> for RightPanelView {}
 
 impl Render for RightPanelView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

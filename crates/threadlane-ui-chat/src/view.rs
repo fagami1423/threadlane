@@ -608,6 +608,14 @@ impl ChatListView {
             cx.notify();
         });
 
+        let sub_editor_selection = cx.subscribe_in(
+            &editor,
+            window,
+            |this, _editor, request: &threadlane_ui_kit::EditorSelectionRequest, window, cx| {
+                this.insert_editor_selection(request.clone(), window, cx);
+            },
+        );
+
         let model_clone = model.clone();
         let submit_list_state = transcript_list_state.clone();
         let sub2 = cx.subscribe_in(
@@ -835,7 +843,7 @@ impl ChatListView {
             expanded_tool_aggregates: HashSet::new(),
             segment_cache: HashMap::new(),
             code_wrap_blocks: HashMap::new(),
-            _subscriptions: vec![sub1, sub2, sub_editor, find_subscription],
+            _subscriptions: vec![sub1, sub2, sub_editor, sub_editor_selection, find_subscription],
         }
     }
 
@@ -868,6 +876,64 @@ impl ChatListView {
         self.input_state.update(cx, |input, cx| {
             input.set_value(draft.text, window, cx);
         });
+    }
+
+    /// Whether the central Editor surface is showing (command-surface
+    /// targeting for **Add selection to chat**).
+    pub fn editor_is_current_tab(&self) -> bool {
+        self.current_tab == CentralTab::Editor
+    }
+
+    /// Reason the embedded editor cannot currently hand a selection to the
+    /// draft — `None` when ready.
+    pub fn editor_selection_block_reason(&self, cx: &App) -> Option<SharedString> {
+        self.editor.read(cx).selection_block_reason(cx)
+    }
+
+    /// Palette/command-surface entry for the embedded editor's **Add
+    /// selection to chat**: runs the same capture+emit path the header
+    /// button uses, so every activation flows through
+    /// `insert_editor_selection`.
+    pub fn add_editor_selection_to_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| {
+            editor.request_add_selection_to_chat(window, cx)
+        });
+    }
+
+    /// Appends a captured editor selection to the draft it names. The
+    /// source buffer, selection range, checkout, and destination key were
+    /// captured together at activation and are revalidated here: a stale
+    /// tab, moved selection, or raced session/project switch leaves the
+    /// draft and the editor untouched.
+    fn insert_editor_selection(
+        &mut self,
+        request: threadlane_ui_kit::EditorSelectionRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let still_current = self
+            .editor
+            .update(cx, |editor, cx| editor.selection_request_is_current(&request, cx));
+        let checkout_active = self.model.read(cx).active_git_work_dir().as_ref()
+            == Some(&request.checkout);
+        if !still_current || !checkout_active {
+            window.push_notification(
+                Notification::info("The editor selection changed — it was not added"),
+                cx,
+            );
+            return;
+        }
+        let excerpt = threadlane_ui_kit::format_editor_excerpt(
+            &request.relative_path,
+            &request.snapshot,
+            request.dirty,
+        );
+        if !self.append_draft_text_for(request.destination.clone(), &excerpt, window, cx) {
+            window.push_notification(
+                Notification::info("The chat draft changed — the selection was not added"),
+                cx,
+            );
+        }
     }
 
     fn preview_attachment_is_current(&self, preview: &ImagePreviewState) -> bool {

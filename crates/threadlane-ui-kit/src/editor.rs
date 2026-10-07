@@ -1,19 +1,173 @@
 //! Editor presentation. Hosts own buffers, file access, selection and save/close guards.
+use std::path::PathBuf;
+
 use gpui::{prelude::*, *};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
-use gpui_component::input::{Editor, EditorState};
+use gpui_component::input::{Editor, EditorState, RopeExt};
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use gpui_component::scroll::{Scrollable, ScrollableElement};
 use gpui_component::tag::Tag;
 use gpui_component::text::TextViewState;
 use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Sizable};
 
+actions!(editor, [AddSelectionToChat]);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PanelDocumentAction {
     Back,
     Save,
+    AddSelectionToChat,
     Close,
+}
+
+/// Largest editor selection excerpt a chat handoff accepts, in UTF-8 bytes.
+/// Matches the terminal excerpt limit and the "Select less code" notice.
+pub const EDITOR_EXCERPT_LIMIT: usize = 32 * 1024;
+
+/// A snapshot of a file editor's active selection captured for the chat
+/// handoff. Line numbers are one-based inclusive positions in the buffer at
+/// capture time — a snapshot, not a live reference into disk contents.
+#[derive(Clone, Debug)]
+pub struct EditorSelectionSnapshot {
+    /// Exact selected buffer text. Never truncated: oversized selections are
+    /// rejected by `editor_excerpt_block_reason` instead.
+    pub text: String,
+    /// UTF-8 byte range the snapshot was taken from; revalidation compares
+    /// the buffer's live `selected_range` against it.
+    pub byte_range: std::ops::Range<usize>,
+    /// One-based buffer line the selection starts on.
+    pub start_line: usize,
+    /// One-based buffer line the selection ends on. An exclusive end at the
+    /// next line's first byte still counts as the previous line.
+    pub end_line: usize,
+}
+
+/// Snapshot the active selection of `editor`, `None` when it is empty.
+/// Multiple cursors contribute only the active selection.
+pub fn editor_selection_snapshot(editor: &EditorState) -> Option<EditorSelectionSnapshot> {
+    let byte_range = editor.selected_range();
+    if byte_range.start >= byte_range.end {
+        return None;
+    }
+    let text = editor.text().slice(byte_range.clone()).to_string();
+    let start = editor.text().offset_to_point(byte_range.start);
+    let end = editor.text().offset_to_point(byte_range.end);
+    // `end.column == 0` means the selection ends exactly at a line's first
+    // byte; the one-based inclusive label must name the previous line.
+    let end_line = if end.column == 0 {
+        end.row.max(1)
+    } else {
+        end.row + 1
+    };
+    Some(EditorSelectionSnapshot {
+        text,
+        byte_range,
+        start_line: start.row + 1,
+        end_line,
+    })
+}
+
+/// `None` when the selection can be handed to the chat draft; otherwise the
+/// user-facing reason the command is disabled or a stale activation is
+/// rejected. Reasons are textual, never color-only.
+pub fn editor_excerpt_block_reason(
+    snapshot: Option<&EditorSelectionSnapshot>,
+) -> Option<&'static str> {
+    match snapshot {
+        None => Some("Select code in the file first"),
+        Some(snapshot) if snapshot.byte_range.len() > EDITOR_EXCERPT_LIMIT => {
+            Some("Select less code (maximum 32 KiB)")
+        }
+        Some(_) => None,
+    }
+}
+
+/// A markdown code fence longer than any backtick run in `text`, so the
+/// fenced block always parses as one unit.
+pub fn safe_fence(text: &str) -> String {
+    let longest_run = text
+        .split(|ch| ch != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    "`".repeat((longest_run + 1).max(3))
+}
+
+/// The labeled, safely fenced plain-text block appended to the draft. The
+/// line numbers are one-based inclusive positions in the captured buffer,
+/// partial lines and interior whitespace are preserved verbatim, and the
+/// provenance label distinguishes an unsaved buffer from a saved snapshot.
+pub fn format_editor_excerpt(
+    relative_path: &str,
+    snapshot: &EditorSelectionSnapshot,
+    dirty: bool,
+) -> String {
+    let lines = if snapshot.start_line == snapshot.end_line {
+        format!("buffer line {}", snapshot.start_line)
+    } else {
+        format!("buffer lines {}–{}", snapshot.start_line, snapshot.end_line)
+    };
+    let provenance = if dirty {
+        "Unsaved buffer"
+    } else {
+        "Buffer snapshot"
+    };
+    let fence = safe_fence(&snapshot.text);
+    let body = snapshot.text.trim_end_matches('\n');
+    format!("File excerpt: {relative_path} · {lines} · {provenance}\n{fence}\n{body}\n{fence}")
+}
+
+/// Hand-off emitted by a file-editor host when its **Add selection to chat**
+/// command activates. Everything the destination needs is captured
+/// synchronously at activation; receivers revalidate buffer identity,
+/// selection range, checkout, and destination key before appending so a
+/// stale activation never rewrites a changed draft.
+#[derive(Clone)]
+pub struct EditorSelectionRequest {
+    /// The buffer entity the selection was read from.
+    pub editor: Entity<EditorState>,
+    /// Checkout the file belongs to (`active_git_work_dir` at capture).
+    pub checkout: PathBuf,
+    /// Checkout-relative file path, for the excerpt label and identity checks.
+    pub relative_path: String,
+    /// Whether the buffer held unsaved edits when captured.
+    pub dirty: bool,
+    pub snapshot: EditorSelectionSnapshot,
+    /// Composer destination key `(active_work_dir, active_session_id)`
+    /// captured at activation.
+    pub destination: (Option<PathBuf>, Option<String>),
+}
+
+/// Render-time state for the shared **Add selection to chat** control: the
+/// enabled flag plus the textual reason when disabled.
+pub struct AddSelectionControl {
+    pub enabled: bool,
+    pub reason: Option<SharedString>,
+}
+
+/// The quiet labeled button both file-editor hosts show beside file actions.
+/// Its accessible name and tooltip explain that multiple cursors contribute
+/// only the active selection, and carry the disabled reason when blocked.
+pub fn editor_add_selection_button(
+    id: impl Into<ElementId>,
+    control: &AddSelectionControl,
+) -> Button {
+    let hint: SharedString = control
+        .reason
+        .clone()
+        .unwrap_or_else(|| {
+            "Append the selected code to the chat draft. Multiple cursors add only the active selection."
+                .into()
+        });
+    Button::new(id)
+        .debug_selector(|| "editor-add-selection".into())
+        .ghost()
+        .xsmall()
+        .label("Add selection to chat")
+        .accessibility_label(hint.clone())
+        .tooltip(hint)
+        .disabled(!control.enabled)
 }
 
 /// Compact header used by the Files and Review panels. Save/close guards belong to the host.
@@ -22,6 +176,7 @@ pub fn panel_document_header(
     dirty: bool,
     language: Option<&str>,
     reviewing: bool,
+    add_selection: Option<AddSelectionControl>,
     on_action: impl Fn(&PanelDocumentAction, &mut Window, &mut App) + 'static,
 ) -> Div {
     let callback = std::rc::Rc::new(on_action);
@@ -89,6 +244,10 @@ pub fn panel_document_header(
                 .flex()
                 .items_center()
                 .gap_1()
+                .children(add_selection.map(|control| {
+                    editor_add_selection_button("panel-add-selection", &control)
+                        .on_click(request(PanelDocumentAction::AddSelectionToChat))
+                }))
                 .children(language.map(|_| {
                     Button::new("save-document")
                         .debug_selector(|| "save-document".into())
@@ -318,7 +477,12 @@ pub fn editor_save_button(dirty: bool, diff: bool) -> Button {
         .tooltip(hint)
 }
 
-pub fn editor_actions(status: Option<(String, bool)>, save: Button, cx: &App) -> Div {
+pub fn editor_actions(
+    status: Option<(String, bool)>,
+    add_selection: Option<Button>,
+    save: Button,
+    cx: &App,
+) -> Div {
     div()
         .flex_none()
         .flex()
@@ -338,6 +502,7 @@ pub fn editor_actions(status: Option<(String, bool)>, save: Button, cx: &App) ->
                 .px_2()
                 .child(message)
         }))
+        .children(add_selection)
         .child(save)
 }
 

@@ -809,6 +809,7 @@ impl Render for Gallery {
                 .on_click(cx.listener(move |host, _, window, cx| { host.draft_pr.update(cx, |this, cx| this.set_sample(sample, cx)); crate::draft_pr::open(host.draft_pr.clone(), window, cx); })))))
             .child(heading("Panel document header · local sample", cx))
             .child(kit::panel_document_header("example.rs", self.document_dirty, Some("Rust"), true,
+                Some(kit::AddSelectionControl { enabled: false, reason: Some("Select code in the file first".into()) }),
                 cx.listener(|host, action: &kit::PanelDocumentAction, window, cx| {
                     if *action == kit::PanelDocumentAction::Save { host.document_dirty = false; }
                     else { window.push_notification(gpui_component::notification::Notification::info("Sample header action · no file was closed"), cx); }

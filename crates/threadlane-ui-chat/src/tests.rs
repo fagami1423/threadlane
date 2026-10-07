@@ -6434,3 +6434,118 @@ fn session_checkout_display_keeps_worktrees_relative_and_homes_short() {
         );
     }
 }
+
+#[gpui::test]
+fn editor_selection_appends_labeled_excerpt_and_rejects_stale(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui::AppContext as _;
+
+    cx.update(gpui_component::init);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.rs"),
+        "fn a() {}\nfn b() {}\nfn c() {}\n",
+    )
+    .unwrap();
+    let project = dir.path().to_path_buf();
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::for_tests();
+        state.active_work_dir = Some(project.clone());
+        state.active_session_id = None;
+        state
+    });
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        gpui_component::Root::new(chat, window, cx)
+    });
+    let chat = root.read_with(cx, |root, _| {
+        root.view()
+            .clone()
+            .downcast::<super::ChatListView>()
+            .unwrap()
+    });
+
+    // With no selection the command reports its disabled reason.
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(
+            chat.editor_selection_block_reason(cx).as_deref(),
+            Some("Open a file first")
+        );
+    });
+
+    chat.update_in(cx, |chat, _window, cx| {
+        chat.editor.update(cx, |editor, cx| {
+            editor.open_file_at_line(project.clone(), "config.rs", None, cx)
+        });
+        // The embedded editor only renders (and applies its pending open)
+        // while the Editor tab is showing.
+        chat.set_tab(super::CentralTab::Editor, cx);
+    });
+    cx.run_until_parked();
+    for _ in 0..6 {
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+    }
+
+    // An empty selection is disabled too.
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(
+            chat.editor_selection_block_reason(cx).as_deref(),
+            Some("Select code in the file first")
+        );
+    });
+
+    // Select buffer line 1 ("fn a() {}\n") and run the command.
+    chat.update_in(cx, |chat, window, cx| {
+        let buffer = chat.editor.read(cx).active_editor().expect("file buffer");
+        buffer.update(cx, |buffer, cx| buffer.set_selected_range(0..10, cx));
+        assert!(chat.editor_selection_block_reason(cx).is_none());
+        chat.add_editor_selection_to_chat(window, cx);
+    });
+
+    let draft = chat.read_with(cx, |chat, cx| chat.input_state.read(cx).value().to_string());
+    assert!(
+        draft.contains("File excerpt: config.rs · buffer line 1 · Buffer snapshot\n```\nfn a() {}\n```"),
+        "draft: {draft}"
+    );
+    chat.read_with(cx, |chat, _| {
+        assert_eq!(chat.current_tab, super::CentralTab::Chat);
+    });
+
+    // A request whose captured buffer/selection no longer matches is
+    // rejected without touching the draft.
+    let (request, _buffer) = chat.read_with(cx, |chat, cx| {
+        let buffer = chat.editor.read(cx).active_editor().unwrap();
+        let snapshot = threadlane_ui_kit::editor_selection_snapshot(buffer.read(cx)).unwrap();
+        (
+            threadlane_ui_kit::EditorSelectionRequest {
+                editor: buffer.clone(),
+                checkout: std::path::PathBuf::from("/elsewhere"),
+                relative_path: "config.rs".into(),
+                dirty: false,
+                snapshot,
+                destination: (Some(std::path::PathBuf::from("/elsewhere")), None),
+            },
+            buffer,
+        )
+    });
+    chat.update_in(cx, |chat, window, cx| {
+        chat.insert_editor_selection(request, window, cx);
+    });
+    let draft = chat.read_with(cx, |chat, cx| chat.input_state.read(cx).value().to_string());
+    assert!(
+        draft.contains("File excerpt: config.rs"),
+        "stale request must not rewrite the draft: {draft}"
+    );
+    assert!(!draft.contains("elsewhere"));
+
+    // Undo removes the inserted block.
+    cx.simulate_keystrokes("cmd-z");
+    cx.run_until_parked();
+    let draft = chat.read_with(cx, |chat, cx| chat.input_state.read(cx).value().to_string());
+    assert!(!draft.contains("File excerpt"), "undo removed insert: {draft}");
+}

@@ -41,7 +41,7 @@ impl WorkspaceCommand {
 
 /// One catalogue for every host. Capability policy is supplied when rendering each item.
 pub fn workspace_commands() -> Vec<WorkspaceCommand> {
-    let commands: [(&str, &str, &str, Icon, &[&str], &str); 26] = [
+    let commands: [(&str, &str, &str, Icon, &[&str], &str); 27] = [
         (
             "New Task",
             "Start a fresh session",
@@ -92,6 +92,14 @@ pub fn workspace_commands() -> Vec<WorkspaceCommand> {
             "add_terminal_selection",
             Icon::default().path("icons/square-pen.svg"),
             &["terminal", "selection", "chat", "draft", "add", "output"],
+            "",
+        ),
+        (
+            "Add File Selection to Chat",
+            "Append the selected editor code to the chat draft",
+            "add_editor_selection",
+            Icon::default().path("icons/square-pen.svg"),
+            &["editor", "selection", "code", "chat", "draft", "add", "file", "excerpt"],
             "",
         ),
         (

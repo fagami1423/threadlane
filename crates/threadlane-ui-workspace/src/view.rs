@@ -322,17 +322,21 @@ fn terminal_excerpt_block_reason(status: Option<SelectionStatus>) -> Option<&'st
 /// The fence grows past the excerpt's longest backtick run so the block
 /// parses as one unit; whitespace inside is preserved.
 fn format_terminal_excerpt(shell: usize, launched_in: &Path, text: &str) -> String {
-    let longest_run = text
-        .split(|ch| ch != '`')
-        .map(str::len)
-        .max()
-        .unwrap_or(0);
-    let fence = "`".repeat((longest_run + 1).max(3));
+    let fence = threadlane_ui_kit::safe_fence(text);
     format!(
         "Terminal · Shell {shell} · launched in {}\n{fence}\n{}\n{fence}",
         launched_in.display(),
         text.trim_end_matches('\n')
     )
+}
+
+/// Which file-editor host the **Add selection to chat** command surface
+/// acts on.
+enum EditorSelectionTarget {
+    /// The chat view's embedded central Editor tab.
+    CentralEditor,
+    /// The right panel's open Files document.
+    FilesPanel,
 }
 
 /// A threadlane-managed worktree lives at `<project>/.threadlane/worktrees/<name>`.
@@ -741,6 +745,14 @@ impl WorkspaceView {
                 cx.notify();
             });
 
+            let right_panel_selection_sub = cx.subscribe_in(
+                &right_panel,
+                window,
+                |this, _panel, request: &threadlane_ui_kit::EditorSelectionRequest, window, cx| {
+                    this.insert_files_selection_to_chat(request.clone(), window, cx);
+                },
+            );
+
             let command_state_sub =
                 cx.observe(&command_state, |_this: &mut Self, _command_state, cx| {
                     cx.notify();
@@ -782,7 +794,7 @@ impl WorkspaceView {
                 updater_tx,
                 pending_terminal_close: None,
                 terminal_subscriptions: Vec::new(),
-                _subscriptions: vec![sub, right_panel_sub],
+                _subscriptions: vec![sub, right_panel_sub, right_panel_selection_sub],
             }
         });
         view.update(cx, |view, cx| {
@@ -1148,6 +1160,70 @@ impl WorkspaceView {
         let excerpt = format_terminal_excerpt(shell, &snapshot.launched_in, &snapshot.text);
         let added = self.chat_list.update(cx, |chat, cx| {
             chat.append_draft_text_for(destination, &excerpt, window, cx)
+        });
+        if !added {
+            window.push_notification(
+                "The chat draft changed — the selection was not added",
+                cx,
+            );
+        }
+    }
+
+    /// Which file-editor host the **Add selection to chat** command acts
+    /// on. A visible host wins; when neither is visible the embedded
+    /// central editor still qualifies — its buffer and selection persist
+    /// behind the Chat tab. `Err` carries the textual disabled reason.
+    fn editor_selection_target(&self, cx: &App) -> Result<EditorSelectionTarget, SharedString> {
+        let chat = self.chat_list.read(cx);
+        let panel = self.right_panel.read(cx);
+        let central_reason = chat.editor_selection_block_reason(cx);
+        let files_reason = panel.files_selection_block_reason(cx);
+        let files_visible = self.right_panel_visible && panel.editable_file_open();
+        if chat.editor_is_current_tab() {
+            return match central_reason {
+                None => Ok(EditorSelectionTarget::CentralEditor),
+                Some(reason) => Err(reason),
+            };
+        }
+        if files_visible {
+            return match files_reason {
+                None => Ok(EditorSelectionTarget::FilesPanel),
+                Some(reason) => Err(reason),
+            };
+        }
+        match central_reason {
+            None => Ok(EditorSelectionTarget::CentralEditor),
+            Some(central) => Err(files_reason.unwrap_or(central)),
+        }
+    }
+
+    /// Appends a Files-panel editor selection to the chat draft. Source
+    /// buffer, selection range, checkout, and destination were captured at
+    /// activation; all are revalidated so a raced close or project switch
+    /// leaves the draft untouched.
+    fn insert_files_selection_to_chat(
+        &mut self,
+        request: threadlane_ui_kit::EditorSelectionRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let still_current = self
+            .right_panel
+            .update(cx, |panel, cx| panel.selection_request_is_current(&request, cx));
+        if !still_current {
+            window.push_notification(
+                "The editor selection changed — it was not added",
+                cx,
+            );
+            return;
+        }
+        let excerpt = threadlane_ui_kit::format_editor_excerpt(
+            &request.relative_path,
+            &request.snapshot,
+            request.dirty,
+        );
+        let added = self.chat_list.update(cx, |chat, cx| {
+            chat.append_draft_text_for(request.destination.clone(), &excerpt, window, cx)
         });
         if !added {
             window.push_notification(
@@ -1563,6 +1639,15 @@ impl WorkspaceView {
                     None => window.push_notification("No terminal is visible", cx),
                 }
             }
+            "add_editor_selection" => match self.editor_selection_target(cx) {
+                Ok(EditorSelectionTarget::CentralEditor) => self
+                    .chat_list
+                    .update(cx, |chat, cx| chat.add_editor_selection_to_chat(window, cx)),
+                Ok(EditorSelectionTarget::FilesPanel) => self
+                    .right_panel
+                    .update(cx, |panel, cx| panel.request_add_selection_to_chat(window, cx)),
+                Err(reason) => window.push_notification(reason.to_string(), cx),
+            },
             "open_issue" => {
                 model.update(cx, |state, cx| {
                     open_github_from_palette(state, || cx.notify());
@@ -1830,12 +1915,20 @@ impl WorkspaceView {
             None => Some("No terminal is visible"),
         };
 
+        // Editor selection availability mirrors the visible host's
+        // disabled state; both hosts carry textual reasons.
+        let editor_selection_block = self
+            .editor_selection_target(cx)
+            .err()
+            .map(|reason| reason.to_string());
+
         // Conversation search scopes to the attached project; with none it
         // stays listed but disabled, carrying its reason in the subtitle.
         let no_project = conversation_search_scope(state).is_none();
         let mut commands_group = CommandGroup::new().label("Commands & Actions");
         let disabled_reason = |key: &str| match key {
             "add_terminal_selection" => excerpt_block,
+            "add_editor_selection" => editor_selection_block.as_deref(),
             "search_conversations" if no_project => Some("Select a project first"),
             _ => None,
         };
