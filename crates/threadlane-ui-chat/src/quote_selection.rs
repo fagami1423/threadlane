@@ -233,4 +233,27 @@ mod tests {
             other => panic!("expected eligibility at the cap, got {other:?}"),
         }
     }
+
+    #[gpui::test]
+    fn format_drops_the_trailing_newline_of_a_full_segment_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = selected_state("Completed response", cx);
+        let selected = cx.update(|cx| state.read(cx).selected_text());
+        assert_eq!(
+            format_quote_block(&selected),
+            "Quoted from assistant response:\n> Completed response\n\n"
+        );
+    }
+
+    #[gpui::test]
+    fn owner_accepts_a_full_segment_of_exactly_the_limit(cx: &mut gpui::TestAppContext) {
+        let exact = "x".repeat(MAX_QUOTE_SCALARS);
+        let state = selected_state(&exact, cx);
+        let selected = cx.update(|cx| state.read(cx).selected_text());
+        match cx.update(|cx| quote_owner(&[state.clone()], &selected, cx)) {
+            QuoteEligibility::Eligible(_) => {}
+            other => panic!("the rendered trailing newline is not selected text, got {other:?}"),
+        }
+    }
 }
