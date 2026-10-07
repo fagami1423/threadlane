@@ -45,7 +45,7 @@ pub fn message_quote_button(message_id: &str, enabled: bool, reason: SharedStrin
     let selector = format!("message-quote-{message_id}");
     Button::new(SharedString::from(selector.clone()))
         .debug_selector(move || selector.clone())
-        .icon(Icon::default().path("icons/reply.svg"))
+        .icon(Icon::default().path("icons/quote.svg"))
         .xsmall()
         .ghost()
         .disabled(!enabled)

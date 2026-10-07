@@ -389,11 +389,12 @@ pub struct ChatListView {
     progress_summary_expanded: bool,
     markdown_states: HashMap<(SharedString, String), MarkdownRenderState>,
     /// Selection snapshots armed per assistant message id for Quote controls.
-    /// Pressing any control clears the window selection before the click
-    /// dispatches, so an armed snapshot keeps the control enabled (and its
-    /// payload intact) through that press; it is consumed on activation and
-    /// dropped when a different selection appears. `Rc` because the context
-    /// menu closure re-evaluates eligibility without access to `self`.
+    /// Pressing the Quote control clears the window selection in the capture
+    /// phase, so the render-time snapshot must survive until the press's
+    /// bubble-phase mouse-down consumes it; a later render that sees no (or
+    /// a different) selection drops it so the action cannot replay a stale
+    /// selection. `Rc` because the context menu closure re-evaluates
+    /// eligibility without access to `self`.
     armed_quotes: std::rc::Rc<std::cell::RefCell<HashMap<String, QuoteSnapshot>>>,
     markdown_cache_namespace: SharedString,
     pasted_images: Vec<ImageAttachment>,
@@ -2234,20 +2235,32 @@ impl ChatListView {
         threadlane_ui_kit::message_actions(align_end)
             .when_some(quote, |el, quote| {
                 let msg_id = msg.id.clone();
+                let snapshot = quote.snapshot.clone();
                 el.child(
-                    threadlane_ui_kit::message_quote_button(
-                        &msg.id,
-                        quote.enabled,
-                        quote.reason.clone(),
-                    )
-                    .on_click(cx.listener(move |this, _event, window, cx| {
-                        this.activate_quote_selection(
-                            &msg_id,
-                            quote.snapshot.clone(),
-                            window,
-                            cx,
-                        );
-                    })),
+                    div()
+                        // Activate on mouse-down, not click: the press clears
+                        // the window selection during the capture phase, and
+                        // the render it triggers shows the control disabled
+                        // again — a `click` bound to the button would never
+                        // dispatch against that disabled frame. The armed
+                        // snapshot still exists when this bubble-phase
+                        // handler runs.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _event, window, cx| {
+                                this.activate_quote_selection(
+                                    &msg_id,
+                                    snapshot.clone(),
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        )
+                        .child(threadlane_ui_kit::message_quote_button(
+                            &msg.id,
+                            quote.enabled,
+                            quote.reason.clone(),
+                        )),
                 )
             })
             .child(
@@ -2337,10 +2350,12 @@ impl ChatListView {
     /// are the entities its rendered prose/code segments draw from. Streaming
     /// and empty responses are never quotable.
     ///
-    /// Pressing a control clears the window selection in the capture phase
-    /// before the click dispatches, so an `armed_quotes` entry armed by a
-    /// live-eligible render keeps the control enabled (and clickable) while
-    /// the selection is merely absent; a *different* live selection drops it.
+    /// Pressing the Quote control clears the window selection in the
+    /// capture phase, so the render-time `armed_quotes` entry bridges to the
+    /// press's bubble-phase mouse-down. Any render that sees no matching
+    /// selection — cleared by an unrelated press, or replaced by a different
+    /// one — drops the arm, so a Quote press after the selection moved can
+    /// never replay stale text.
     fn quote_control(
         armed_quotes: &std::rc::Rc<std::cell::RefCell<HashMap<String, QuoteSnapshot>>>,
         message_id: &str,
@@ -2374,23 +2389,10 @@ impl ChatListView {
                 }
             }
             QuoteEligibility::Rejected(reason) => {
-                let armed = armed_quotes.borrow().get(message_id).cloned();
-                match armed {
-                    // The press that cleared the selection hasn't landed yet:
-                    // stay enabled so the click dispatches against this frame.
-                    Some(snapshot) if window_selection.trim().is_empty() => {
-                        QuoteControl {
-                            enabled: true,
-                            reason: SharedString::from(""),
-                            snapshot: Some(snapshot),
-                        }
-                    }
-                    Some(_) => {
-                        armed_quotes.borrow_mut().remove(message_id);
-                        disabled(reason.message())
-                    }
-                    None => disabled(reason.message()),
-                }
+                // No live matching selection: the arm — if one exists —
+                // belongs to a selection that was cleared or replaced.
+                armed_quotes.borrow_mut().remove(message_id);
+                disabled(reason.message())
             }
         }
     }

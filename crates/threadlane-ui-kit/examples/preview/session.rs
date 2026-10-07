@@ -347,6 +347,11 @@ pub struct SessionPreview {
     code_wrap_blocks: HashMap<String, HashSet<usize>>,
     copied_message: Option<String>,
     copy_feedback_task: Option<Task<()>>,
+    /// Quote snapshots armed per message id: a press on the Quote control
+    /// clears the window selection in the capture phase, so the render-time
+    /// text must survive until the press's bubble-phase mouse-down consumes
+    /// it; any later render without a matching selection drops it.
+    armed_quotes: std::cell::RefCell<HashMap<String, String>>,
     find_input: Entity<InputState>,
     find_open: bool,
     find_query: String,
@@ -541,7 +546,7 @@ impl SessionPreview {
             prompt_rail_active_id: None,
             outline_list: ListState::new(0, ListAlignment::Top, window.rem_size() * 20.0),
             outline_open: false, outline_focus: cx.focus_handle(), outline_focus_id: None, outline_selected_id: None,
-            prompt_recall: None, segment_cache: HashMap::new(), code_wrap_blocks: HashMap::new(), copied_message: None, copy_feedback_task: None,
+            prompt_recall: None, segment_cache: HashMap::new(), code_wrap_blocks: HashMap::new(), copied_message: None, copy_feedback_task: None, armed_quotes: std::cell::RefCell::new(HashMap::new()),
             find_input, find_open: false, find_query: String::new(), find_results: Vec::new(),
             find_selected: None, find_previous_focus: None, _find_subscription: find_subscription,
             split: cx.new(|_| ResizableState::default()),
@@ -780,7 +785,7 @@ impl SessionPreview {
                             .map(|tool| self.render_tool(tool, window, cx))
                             .collect::<Vec<_>>();
                         let quote = (!message.streaming && !message.content.is_empty())
-                            .then(|| Self::quote_control(&content_states, message.streaming, window, cx));
+                            .then(|| Self::quote_control(&self.armed_quotes, &message.id, &content_states, message.streaming, window, cx));
                         kit::message_row(MessageRole::Assistant)
                             .child(
                                 kit::assistant_message_content()
