@@ -2320,7 +2320,7 @@ impl ChatListView {
                 return;
             }
         };
-        if text.chars().count() > MAX_QUOTE_SCALARS {
+        if quoted_text(&text).chars().count() > MAX_QUOTE_SCALARS {
             window.push_notification(Notification::info(OVER_LIMIT_MESSAGE), cx);
             return;
         }
@@ -2587,29 +2587,40 @@ impl ChatListView {
                                 let streaming = msg.streaming;
                                 let armed_quotes = self.armed_quotes.clone();
                                 let menu_message_id = msg.id.clone();
+                                let chat = cx.entity().downgrade();
                                 move |menu, window, cx| {
                                     let text = content.clone();
                                     // Re-evaluate live: the selection may have moved
                                     // since the frame that rendered this message.
-                                    // Activation itself goes through the scoped
-                                    // `QuoteSelection` action dispatched onto this
-                                    // element's dispatch path.
-                                    let QuoteControl { enabled, reason, .. } = Self::quote_control(
-                                        &armed_quotes,
-                                        &menu_message_id,
-                                        streaming,
-                                        &states,
-                                        window,
-                                        cx,
-                                    );
+                                    let QuoteControl { enabled, reason, snapshot } =
+                                        Self::quote_control(
+                                            &armed_quotes,
+                                            &menu_message_id,
+                                            streaming,
+                                            &states,
+                                            window,
+                                            cx,
+                                        );
+                                    let chat = chat.clone();
+                                    let message_id = menu_message_id.clone();
                                     let quote_item = threadlane_ui_kit::message_quote_menu_item(
                                         enabled,
                                         (!enabled).then_some(reason),
+                                        // Apply the snapshot taken while the menu was
+                                        // built: a left press on this item clears the
+                                        // window selection, and the render it causes
+                                        // drops the row's armed snapshot, before the
+                                        // click is delivered.
                                         move |_event, window, cx| {
-                                            window.dispatch_action(
-                                                Box::new(QuoteSelection),
-                                                cx,
-                                            );
+                                            chat.update(cx, |chat, cx| {
+                                                chat.activate_quote_selection(
+                                                    &message_id,
+                                                    snapshot.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })
+                                            .ok();
                                         },
                                     );
                                     threadlane_ui_kit::message_context_menu_with_quote(

@@ -69,17 +69,36 @@ pub fn quote_owner(
     if selected.len() != 1 || *text != window_selection {
         return QuoteEligibility::Rejected(QuoteRejection::MixedSelection);
     }
-    if text.chars().count() > MAX_QUOTE_SCALARS {
+    if quoted_text(text).chars().count() > MAX_QUOTE_SCALARS {
         return QuoteEligibility::Rejected(QuoteRejection::OverLimit);
     }
     QuoteEligibility::Eligible(owner.clone())
 }
 
+/// The part of a selection that is quoted and counted against the cap.
+/// Leading and trailing blank lines are dropped — a fully selected segment
+/// reports its rendered trailing newline — while interior blank lines,
+/// indentation and every other character are kept.
+pub fn quoted_text(selected: &str) -> &str {
+    let start = selected
+        .split_inclusive('\n')
+        .take_while(|line| line.trim().is_empty())
+        .map(str::len)
+        .sum::<usize>();
+    let rest = &selected[start..];
+    let content_end = rest.trim_end().len();
+    let line_end = rest[content_end..]
+        .find(['\r', '\n'])
+        .map_or(rest.len(), |offset| content_end + offset);
+    &rest[..line_end]
+}
+
 /// Formats selected display text as a labeled Markdown blockquote followed by
-/// a blank line for the user's follow-up. Every selected line is prefixed
-/// with `> `; all other characters — indentation, blank lines, `>` and
-/// backticks, tabs, Unicode — are preserved verbatim.
+/// a blank line for the user's follow-up. Every line of [`quoted_text`] is
+/// prefixed with `> `; all other characters — indentation, interior blank
+/// lines, `>` and backticks, tabs, Unicode — are preserved verbatim.
 pub fn format_quote_block(selected: &str) -> String {
+    let selected = quoted_text(selected);
     let mut quote = String::with_capacity(selected.len() + QUOTE_INTRO.len() + 4);
     quote.push_str(QUOTE_INTRO);
     quote.push('\n');
@@ -115,9 +134,24 @@ mod tests {
     use gpui_component::text::TextViewState;
 
     use super::{
-        format_quote_block, quote_owner, QuoteEligibility, QuoteRejection,
+        format_quote_block, quote_owner, quoted_text, QuoteEligibility, QuoteRejection,
         MAX_QUOTE_SCALARS, NO_SELECTION_MESSAGE, OVER_LIMIT_MESSAGE,
     };
+
+    #[test]
+    fn quoted_text_drops_only_outer_blank_lines() {
+        assert_eq!(quoted_text("hello\n"), "hello");
+        assert_eq!(
+            quoted_text("\n \n  indented\n\nnext\n\t\n"),
+            "  indented\n\nnext"
+        );
+        assert_eq!(quoted_text("crlf\r\n\r\n"), "crlf");
+        assert_eq!(
+            quoted_text("keeps trailing spaces  \n"),
+            "keeps trailing spaces  "
+        );
+        assert_eq!(quoted_text(" \n\t"), "");
+    }
 
     #[test]
     fn format_wraps_a_single_line() {
@@ -217,8 +251,9 @@ mod tests {
 
     #[gpui::test]
     fn owner_rejects_over_limit_without_truncating(cx: &mut gpui::TestAppContext) {
-        // `selected_text` carries the rendered document's trailing newline.
-        let long = "x".repeat(MAX_QUOTE_SCALARS);
+        // `selected_text` carries the rendered document's trailing newline,
+        // which is not part of the counted selection.
+        let long = "x".repeat(MAX_QUOTE_SCALARS + 1);
         let selected = selected_state(&long, cx);
         let eligibility = cx.update(|cx| quote_owner(&[selected], &format!("{long}\n"), cx));
         assert_eq!(eligibility, QuoteEligibility::Rejected(QuoteRejection::OverLimit));
@@ -231,6 +266,29 @@ mod tests {
         match cx.update(|cx| quote_owner(&[selected], &format!("{exact}\n"), cx)) {
             QuoteEligibility::Eligible(_) => {}
             other => panic!("expected eligibility at the cap, got {other:?}"),
+        }
+    }
+
+    #[gpui::test]
+    fn format_drops_the_trailing_newline_of_a_full_segment_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = selected_state("Completed response", cx);
+        let selected = cx.update(|cx| state.read(cx).selected_text());
+        assert_eq!(
+            format_quote_block(&selected),
+            "Quoted from assistant response:\n> Completed response\n\n"
+        );
+    }
+
+    #[gpui::test]
+    fn owner_accepts_a_full_segment_of_exactly_the_limit(cx: &mut gpui::TestAppContext) {
+        let exact = "x".repeat(MAX_QUOTE_SCALARS);
+        let state = selected_state(&exact, cx);
+        let selected = cx.update(|cx| state.read(cx).selected_text());
+        match cx.update(|cx| quote_owner(&[state.clone()], &selected, cx)) {
+            QuoteEligibility::Eligible(_) => {}
+            other => panic!("the rendered trailing newline is not selected text, got {other:?}"),
         }
     }
 }

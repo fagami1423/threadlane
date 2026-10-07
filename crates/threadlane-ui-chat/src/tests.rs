@@ -2783,7 +2783,7 @@ fn quote_selection_appends_labeled_blockquote_to_draft(cx: &mut gpui::TestAppCon
     chat.read_with(cx, |chat, cx| {
         assert_eq!(
             chat.input_state.read(cx).value().as_ref(),
-            "Quoted from assistant response:\n> Completed response\n> \n\n",
+            "Quoted from assistant response:\n> Completed response\n\n",
             "quote appends the labeled blockquote plus a blank line"
         );
     });
@@ -2810,6 +2810,102 @@ fn streaming_assistant_message_hides_quote_action(cx: &mut gpui::TestAppContext)
         cx.debug_bounds("message-quote-assistant-1").is_none(),
         "streaming response defers its quote action until generation completes"
     );
+}
+
+fn select_first_assistant_segment(
+    chat: &gpui::Entity<super::ChatListView>,
+    cx: &mut gpui::VisualTestContext,
+) {
+    let state = chat.read_with(cx, |chat, _| {
+        chat.markdown_states
+            .iter()
+            .find(|((_, key), _)| key == "assistant-1-seg-0")
+            .map(|(_, render)| render.state.clone())
+            .expect("assistant content renders a cached TextViewState")
+    });
+    state.update(cx, |state, cx| state.select_all(cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+}
+
+/// Right press on the response: opens its context menu and, unlike a left
+/// press, keeps the window selection.
+fn open_assistant_message_menu(cx: &mut gpui::VisualTestContext) -> gpui::Point<gpui::Pixels> {
+    let anchor = cx
+        .debug_bounds("message-copy-assistant-1")
+        .expect("completed response renders its actions")
+        .center();
+    cx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Right,
+        position: anchor,
+        modifiers: Default::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.simulate_event(gpui::MouseUpEvent {
+        button: gpui::MouseButton::Right,
+        position: anchor,
+        modifiers: Default::default(),
+        click_count: 1,
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    anchor
+}
+
+#[gpui::test]
+fn quote_menu_item_quotes_the_selection_on_a_left_click(cx: &mut gpui::TestAppContext) {
+    const CONTENT: &str = "Prefer the second approach.";
+    const UNTOUCHED: &str = "clipboard before quoting";
+    let (chat, cx) = mount_assistant_message(CONTENT, false, cx);
+    // Popup items expose no debug selector, so probe down the menu column
+    // from the press point; the first click that changes the draft or the
+    // clipboard landed on an item. Quote selection is listed first, and a
+    // left press clears the window selection before that item's click fires.
+    let mut outcome = None;
+    for dy in (2..=80).step_by(4) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(UNTOUCHED.into()));
+        select_first_assistant_segment(&chat, cx);
+        let anchor = open_assistant_message_menu(cx);
+        cx.simulate_click(
+            anchor + gpui::point(gpui::px(40.), gpui::px(dy as f32)),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        let draft =
+            chat.read_with(cx, |chat, cx| chat.input_state.read(cx).value().to_string());
+        let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
+        if !draft.is_empty() || clipboard.as_deref() != Some(UNTOUCHED) {
+            outcome = Some((draft, clipboard));
+            break;
+        }
+    }
+    let (draft, clipboard) = outcome.expect("a left click reached the message menu");
+    assert_eq!(
+        draft, "Quoted from assistant response:\n> Prefer the second approach.\n\n",
+        "the first menu item quotes the selection (clipboard: {clipboard:?})"
+    );
+    assert_eq!(clipboard.as_deref(), Some(UNTOUCHED), "quoting never touches the clipboard");
+}
+
+#[gpui::test]
+fn quote_menu_item_quotes_the_selection_from_the_keyboard(cx: &mut gpui::TestAppContext) {
+    use gpui::Focusable as _;
+    let (chat, cx) = mount_assistant_message("Prefer the second approach.", false, cx);
+    select_first_assistant_segment(&chat, cx);
+    open_assistant_message_menu(cx);
+    cx.simulate_keystrokes("down enter");
+    cx.run_until_parked();
+    chat.update_in(cx, |chat, window, cx| {
+        assert_eq!(
+            chat.input_state.read(cx).value().as_ref(),
+            "Quoted from assistant response:\n> Prefer the second approach.\n\n"
+        );
+        assert!(
+            chat.input_state.read(cx).focus_handle(cx).is_focused(window),
+            "quoting hands focus to the composer"
+        );
+    });
+    assert!(cx.read_from_clipboard().is_none(), "quoting never touches the clipboard");
 }
 
 #[test]
