@@ -564,6 +564,22 @@ impl SettingsView {
                 Provider::OpenCode => { let _ = provider_auth::test_opencode_connection(&self.opencode_input.read(cx).value(), self.auth_tx.clone()); }
                 _ => return,
             },
+            Action::RefreshModels => {
+                self.auth_message = Some(AuthStatusMessage::new(
+                    "Refreshing provider model lists…",
+                    AuthStatusKind::Info,
+                ));
+                let tx = self.auth_tx.clone();
+                let model = self.model.clone();
+                let project = self.active_project(cx);
+                cx.spawn(async move |_, cx| {
+                    crate::refresh_all_models_and_update(model, cx, project).await;
+                    let _ = tx.send(provider_auth::ProviderAuthEvent::Status(
+                        "Model lists refreshed.".into(),
+                    ));
+                })
+                .detach();
+            }
             Action::SetActiveAccount(id) | Action::RemoveAccount(id) => {
                 // Both commands refresh the same inventory and live model catalog.
                 let command = if activating_account {

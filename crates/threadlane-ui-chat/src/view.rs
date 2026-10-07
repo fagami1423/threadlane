@@ -1139,6 +1139,29 @@ impl ChatListView {
             });
             return;
         }
+        if let ModelPickerValue::RefreshModels = value {
+            // Clear every cached provider inventory and re-fetch, so a newly
+            // released model reaches this picker without a restart or TTL wait.
+            let model = self.model.clone();
+            let project = self.model.read(cx).active_work_dir.clone();
+            self.model.update(cx, |state, cx| {
+                state.session_status = Some("Refreshing model lists…".into());
+                cx.notify();
+            });
+            cx.spawn(async move |_, cx| {
+                threadlane_daemon::catalog::refresh_all_models(project).await;
+                let _ = cx.update(|cx| {
+                    model.update(cx, |state, cx| {
+                        state.refresh_available_models();
+                        state.session_status = Some("Model lists refreshed.".into());
+                        cx.notify();
+                    })
+                });
+            })
+            .detach();
+            cx.defer_in(window, |this, window, cx| this.focus_composer(window, cx));
+            return;
+        }
         let owner_current = self
             .model_picker_owner
             .as_ref()
@@ -1175,7 +1198,7 @@ impl ChatListView {
                         );
                     }
                 }
-                ModelPickerValue::OpenAgentSettings => {}
+                ModelPickerValue::OpenAgentSettings | ModelPickerValue::RefreshModels => {}
             }
             cx.notify();
         });
