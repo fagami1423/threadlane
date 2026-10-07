@@ -1053,6 +1053,15 @@ impl WasiExtensionManager {
             state: state(),
             error: error.to_string(),
         };
+        // Fence the candidate for readers that never take the owner lease.
+        if let Some(marker) = unconfirmed_marker_path(path) {
+            if let Err(marker_error) = fs::write(&marker, &write.error) {
+                tracing::warn!(
+                    "Cannot mark unconfirmed replacement {} for concurrent readers: {marker_error}",
+                    marker.display()
+                );
+            }
+        }
         let message = write.blocked_message();
         match self.unconfirmed_write.lock() {
             Ok(mut pending) => *pending = Some(write),
@@ -1128,6 +1137,19 @@ impl WasiExtensionManager {
                     write.blocked_message()
                 )
             })?;
+        if let Some(marker) = unconfirmed_marker_path(&write.path) {
+            match fs::remove_file(&marker) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "Confirmed {} but could not clear its unconfirmed marker {}: {error}; preserve the marker and repair storage",
+                        write.path.display(),
+                        marker.display()
+                    ))
+                }
+            }
+        }
 
         // Acquire caches only after I/O; leave the fence intact if a lock fails.
         let mut states = self
@@ -1281,6 +1303,20 @@ impl WasiExtensionManager {
             .open(&path)
             .map_err(|error| error.to_string())?;
         lease.try_lock().map_err(|error| format!("Extension state {} is owned by another manager/process, or storage is unavailable: {error}; use the owning manager or wait for it to close. Do not replace checkpoints or delete the owner lock", directory.display()))?;
+        // A prior owner's `.unconfirmed` markers die with its lease: this
+        // manager is the only possible writer now, so the files on disk are
+        // authoritative. Sweep before returning ownership to readers.
+        if let Ok(entries) = fs::read_dir(&directory) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".unconfirmed"))
+                {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
         // Sync all containing directories, including existing ones: a prior
         // interrupted creation may have left visible but unsynced entries.
         #[cfg(unix)]
@@ -1777,6 +1813,67 @@ impl WasiExtensionManager {
             .map_err(|_| "Host state lock poisoned".to_string())?
             .insert(key.to_string(), value.clone());
         Ok(Some(value))
+    }
+
+    /// Reads persisted host-owned state for the active session scope without
+    /// acquiring the state-owner lease. Callers that run before this manager
+    /// has proven ownership — for example tool-policy restore during runtime
+    /// construction — must observe the persisted value rather than fail on
+    /// another live owner's lock; ownership serializes writes, not reads.
+    ///
+    /// Two fences still apply so the read never upgrades what the owner
+    /// fenced: unavailable project storage errors instead of reporting an
+    /// absent value, and a `.unconfirmed` marker left by a replaced-but-
+    /// unsynced write errors instead of treating the candidate as committed.
+    pub fn peek_host_state(&self, key: &str) -> Result<Option<Value>, String> {
+        let Some(directory) = self.state_dir.as_ref() else {
+            return Ok(None);
+        };
+        let directory = match self.session_scope()? {
+            Some(session) => directory
+                .join("sessions")
+                .join(encode_state_component(&session)),
+            None => directory.clone(),
+        };
+        let project_root = self
+            .project_root
+            .as_ref()
+            .ok_or("Extension storage has no project root")?;
+        if !directory.starts_with(project_root) {
+            return Err("Extension storage is outside its project root".into());
+        }
+        let root_path = if project_root.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            project_root
+        };
+        let root_metadata = fs::metadata(root_path).map_err(|error| {
+            format!(
+                "Extension project root {} is unavailable: {error}; restore the work directory before opening state",
+                root_path.display()
+            )
+        })?;
+        if !root_metadata.is_dir() {
+            return Err(format!(
+                "Extension project root {} must be an existing work directory",
+                root_path.display()
+            ));
+        }
+        let path = directory.join(host_state_file_name(key));
+        if let Some(marker) = unconfirmed_marker_path(&path) {
+            match fs::symlink_metadata(&marker) {
+                Ok(_) => {
+                    return Err(format!(
+                        "Extension state {} has an unconfirmed replacement; preserve {} and have the owning host call recover_state_commit",
+                        path.display(),
+                        marker.display()
+                    ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        read_json_state(&path)
     }
 
     /// Persists host-owned state in the active session scope.
@@ -2861,6 +2958,15 @@ impl WasiExtensionManager {
                 .cloned(),
         ))
     }
+}
+
+/// Marks a replaced-but-unsynced state file so lease-free readers
+/// (`peek_host_state`) do not treat the visible candidate as committed. The
+/// owning manager removes the marker when `recover_state_commit` confirms the
+/// write; a new owner sweeps stale markers once it holds the lease.
+fn unconfirmed_marker_path(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    Some(path.with_file_name(format!("{name}.unconfirmed")))
 }
 
 fn read_json_state(path: &Path) -> Result<Option<Value>, String> {
