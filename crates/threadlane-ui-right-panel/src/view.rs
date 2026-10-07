@@ -113,9 +113,16 @@ pub struct RightPanelView {
     document_state: Entity<TextViewState>,
     editor_state: Option<Entity<EditorState>>,
     editor_subscription: Option<Subscription>,
+    /// Re-renders when the open document buffer notifies; selection moves
+    /// emit no `InputEvent`, but the add-selection control tracks them.
+    editor_observe: Option<Subscription>,
     saved_content: String,
     is_dirty: bool,
     pending_document: Option<(String, String)>,
+    /// Monotonic id of the latest panel-file open request; async reads older
+    /// than it are discarded so a slower earlier read can never reopen over a
+    /// newer document (or its unsaved edits).
+    panel_document_request: u64,
     browser: Option<Entity<BrowserView>>,
     event_tx: tokio::sync::mpsc::UnboundedSender<PanelEvent>,
     _watcher: Option<WorkspaceWatcher>,
@@ -405,9 +412,11 @@ impl RightPanelView {
             document_state,
             editor_state: None,
             editor_subscription: None,
+            editor_observe: None,
             saved_content: String::new(),
             is_dirty: false,
             pending_document: None,
+            panel_document_request: 0,
             browser,
             event_tx,
             _watcher: None,
@@ -808,6 +817,7 @@ impl RightPanelView {
         self.review_diff_state = Some(ReviewDiffState::Loading);
         self.editor_state = None;
         self.editor_subscription = None;
+        self.editor_observe = None;
         self.saved_content.clear();
         self.is_dirty = false;
         self.document_state
@@ -862,6 +872,7 @@ impl RightPanelView {
         self.document_title = None;
         self.editor_state = None;
         self.editor_subscription = None;
+        self.editor_observe = None;
         self.saved_content.clear();
         self.is_dirty = false;
         self.pending_document = None;
@@ -899,6 +910,51 @@ impl RightPanelView {
         cx.notify();
     }
 
+    /// Fulfills an `AppState::request_open_panel_file` request: reads the file
+    /// on the background executor, then installs it via `pending_document` so
+    /// `sync_pending_document` (which owns the `Window`) opens it as the
+    /// editable document. Checkout or project drift before the read lands
+    /// silently drops it; read failures publish `session_status`.
+    fn start_panel_document_read(
+        &mut self,
+        project: PathBuf,
+        relative_path: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.panel_document_request += 1;
+        let request_id = self.panel_document_request;
+        let read_client = self.model.read(cx).daemon_client.clone();
+        let read_project = project.clone();
+        let read_path = relative_path.clone();
+        let read = cx.background_executor().spawn(async move {
+            threadlane_ui_state::project_io::read_file(&read_client, &read_project, read_path)
+                .await
+        });
+        cx.spawn(async move |this, cx| {
+            let result = read.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.panel_document_request != request_id
+                    || this.project.as_ref() != Some(&project)
+                    || this.model.read(cx).active_git_work_dir().as_ref() != Some(&project)
+                {
+                    return;
+                }
+                match result {
+                    Ok(content) => {
+                        this.pending_document = Some((relative_path, content));
+                    }
+                    Err(error) => {
+                        this.model.update(cx, |state, _| {
+                            state.client.session_status = Some(error);
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn sync_pending_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((title, content)) = self.pending_document.take() else {
             return;
@@ -911,6 +967,7 @@ impl RightPanelView {
         if title.starts_with("Review ·") {
             self.editor_state = None;
             self.editor_subscription = None;
+        self.editor_observe = None;
             let markdown = format!("```diff\n{}\n```", content.replace("```", "` ` `"));
             self.document_state
                 .update(cx, |state, cx| state.set_text(&markdown, cx));
@@ -938,9 +995,106 @@ impl RightPanelView {
                     }
                 }
             });
+            let observe = cx.observe(&editor, |_this, _editor, cx| cx.notify());
             self.editor_state = Some(editor);
             self.editor_subscription = Some(subscription);
+            self.editor_observe = Some(observe);
         }
+    }
+
+    /// Whether the open document is an editable file buffer (eligible host
+    /// for **Add selection to chat**); Review/diff documents and the plain
+    /// text view are not.
+    pub fn editable_file_open(&self) -> bool {
+        self.editor_state.is_some()
+    }
+
+    /// Reason the **Add selection to chat** command is unavailable for the
+    /// open document — `None` when ready. Review/diff documents, pending
+    /// loads, files outside the active checkout, and empty or oversized
+    /// selections each carry a textual reason.
+    pub fn files_selection_block_reason(&self, cx: &App) -> Option<SharedString> {
+        if self.document_title.is_none() {
+            return Some("Open a file first".into());
+        }
+        if self.pending_document.is_some() {
+            return Some("The file is still loading".into());
+        }
+        let Some(editor) = self.editor_state.as_ref() else {
+            return Some("This document can't be added to chat".into());
+        };
+        match &self.project {
+            Some(project)
+                if self.model.read(cx).active_git_work_dir().as_ref() == Some(project) => {}
+            _ => return Some("The file is not in the active checkout".into()),
+        }
+        threadlane_ui_kit::editor_excerpt_block_reason(
+            threadlane_ui_kit::editor_selection_snapshot(editor.read(cx)).as_ref(),
+        )
+        .map(SharedString::from)
+    }
+
+    /// Activates **Add selection to chat** for the open document: validates
+    /// the selection, captures buffer identity plus the composer
+    /// destination, and emits `EditorSelectionRequest` for the workspace to
+    /// append. On any guard failure the reason is shown and nothing is
+    /// appended.
+    pub fn request_add_selection_to_chat(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(reason) = self.files_selection_block_reason(cx) {
+            window.push_notification(reason.to_string(), cx);
+            return;
+        }
+        let (Some(editor), Some(project), Some(title)) = (
+            self.editor_state.clone(),
+            self.project.clone(),
+            self.document_title.clone(),
+        ) else {
+            return;
+        };
+        let Some(snapshot) =
+            threadlane_ui_kit::editor_selection_snapshot(editor.read(cx))
+        else {
+            return;
+        };
+        let destination = {
+            let state = self.model.read(cx);
+            (
+                state.active_work_dir.clone(),
+                state.active_session_id.clone(),
+            )
+        };
+        cx.emit(threadlane_ui_kit::EditorSelectionRequest {
+            editor,
+            checkout: project,
+            relative_path: title,
+            dirty: self.is_dirty,
+            snapshot,
+            destination,
+        });
+    }
+
+    /// Whether `request` still names the open document's buffer and the
+    /// buffer's live selection is the captured one.
+    pub fn selection_request_is_current(
+        &self,
+        request: &threadlane_ui_kit::EditorSelectionRequest,
+        cx: &App,
+    ) -> bool {
+        if self.pending_document.is_some()
+            || self.document_title.as_ref() != Some(&request.relative_path)
+            || self.project.as_ref() != Some(&request.checkout)
+        {
+            return false;
+        }
+        let Some(editor) = self.editor_state.as_ref() else {
+            return false;
+        };
+        editor.entity_id() == request.editor.entity_id()
+            && editor.read(cx).selected_range() == request.snapshot.byte_range
     }
 
     fn save_active_document(&mut self, cx: &mut Context<Self>) {
@@ -1733,20 +1887,29 @@ impl RightPanelView {
             let is_dirty = self.is_dirty;
             let has_editor = self.editor_state.is_some();
             let lang = detect_language(title);
+            let selection_reason = self.files_selection_block_reason(cx);
             return div()
                 .flex_1()
                 .min_h_0()
                 .flex()
                 .flex_col()
+                .on_action(cx.listener(|this, _: &threadlane_ui_kit::AddSelectionToChat, window, cx| {
+                    this.request_add_selection_to_chat(window, cx)
+                }))
                 .child(threadlane_ui_kit::panel_document_header(
                     title,
                     is_dirty,
                     has_editor.then_some(lang),
                     self.active_surface == Some(Surface::Review),
-                    cx.listener(|this, action: &threadlane_ui_kit::PanelDocumentAction, _, cx| {
+                    has_editor.then_some(threadlane_ui_kit::AddSelectionControl {
+                        enabled: selection_reason.is_none(),
+                        reason: selection_reason,
+                    }),
+                    cx.listener(|this, action: &threadlane_ui_kit::PanelDocumentAction, window, cx| {
                         use threadlane_ui_kit::PanelDocumentAction;
                         match action {
                             PanelDocumentAction::Save => this.save_active_document(cx),
+                            PanelDocumentAction::AddSelectionToChat => this.request_add_selection_to_chat(window, cx),
                             PanelDocumentAction::Back | PanelDocumentAction::Close => this.close_document(cx),
                         }
                     }),
@@ -1801,6 +1964,10 @@ impl RightPanelView {
                             match action {
                                 ProjectFileAction::Open(path) => model.update(cx, |state, cx| {
                                     state.request_open_file(path.clone());
+                                    cx.notify();
+                                }),
+                                ProjectFileAction::OpenInPanel(path) => model.update(cx, |state, cx| {
+                                    state.request_open_panel_file(path.clone());
                                     cx.notify();
                                 }),
                                 ProjectFileAction::CopyRelative(path) | ProjectFileAction::CopyAbsolute(path) => {
@@ -2803,6 +2970,8 @@ impl RightPanelView {
     }
 }
 
+impl EventEmitter<threadlane_ui_kit::EditorSelectionRequest> for RightPanelView {}
+
 impl Render for RightPanelView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_project(cx);
@@ -2817,6 +2986,12 @@ impl Render for RightPanelView {
             self.should_clear_commit_message = false;
             self.commit_message_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        if let Some((project, relative_path)) = self
+            .model
+            .update(cx, |state, _| state.requested_panel_document.take())
+        {
+            self.start_panel_document_read(project, relative_path, cx);
         }
         self.sync_pending_document(window, cx);
         let theme = cx.theme().colors;
@@ -4321,6 +4496,51 @@ mod environment_shortcut_tests {
             });
             assert!(window.has_active_dialog(cx));
             window.close_dialog(cx);
+        });
+    }
+}
+
+#[cfg(test)]
+mod panel_document_tests {
+    use super::RightPanelView;
+    use gpui::{AppContext, TestAppContext};
+    use threadlane_ui_state::AppState;
+
+    /// `request_open_panel_file` must produce a live editable document —
+    /// the Files host Codex flagged as unreachable when only tests wrote
+    /// `pending_document`.
+    #[gpui::test]
+    fn open_in_panel_loads_an_editable_document(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("note.rs"), "fn note() {}\n").unwrap();
+        let project = dir.path().to_path_buf();
+        let model = cx.new(|_| {
+            let mut state = AppState::for_tests();
+            state.active_session_id = None;
+            state.active_work_dir = Some(project.clone());
+            state
+        });
+        let (panel, cx) =
+            cx.add_window_view(|window, cx| RightPanelView::new(model.clone(), window, cx));
+
+        model.update(cx, |state, _| {
+            state.request_open_panel_file("note.rs".into())
+        });
+        panel.update(cx, |_panel, cx| cx.notify());
+        cx.run_until_parked();
+        for _ in 0..8 {
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.run_until_parked();
+        }
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.document_title.as_deref(), Some("note.rs"));
+            assert!(panel.editor_state.is_some());
+            assert!(panel.editable_file_open());
         });
     }
 }

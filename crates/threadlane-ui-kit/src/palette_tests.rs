@@ -82,7 +82,7 @@ fn palette_filtering_preserves_original_commands_and_disabled_activation(cx: &mu
     );
     for (query, expected) in [
         ("add selection to chat", None),
-        ("toggle sidebar", Some((0, 23))),
+        ("toggle sidebar", Some((0, 24))),
         ("themes", Some((1, 0))),
     ] {
         cx.update(|window, cx| {

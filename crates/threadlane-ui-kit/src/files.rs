@@ -113,6 +113,7 @@ pub fn project_file_tree(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProjectFileAction {
     Open(String),
+    OpenInPanel(String),
     CopyRelative(String),
     CopyAbsolute(String),
 }
@@ -128,6 +129,7 @@ pub fn project_file_menu(
     let mut actions = Vec::new();
     if !folder {
         actions.push(("Open in Editor Tab", ProjectFileAction::Open(path.into())));
+        actions.push(("Open in Panel", ProjectFileAction::OpenInPanel(path.into())));
     }
     actions.push((
         "Copy Relative Path",

@@ -1,10 +1,11 @@
 //! Sample buffers; all presentation comes from the production UI kit.
 use gpui::{prelude::*, *};
-use gpui_component::WindowExt;
+use gpui_component::{ActiveTheme, WindowExt};
 use gpui_component::button::ButtonVariant;
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::input::{EditorState, InputEvent, TabSize};
 use gpui_component::menu::ContextMenuExt;
+use gpui_component::scroll::ScrollableElement;
 use gpui_component::text::TextViewState;
 use std::collections::HashMap;
 use threadlane_ui_kit as kit;
@@ -24,6 +25,8 @@ pub struct EditorPreview {
     tabs: Vec<String>,
     selected: Option<String>,
     status: Option<String>,
+    /// Text appended by the sample **Add selection to chat** control.
+    draft: String,
     _subscription: Subscription,
 }
 
@@ -55,6 +58,7 @@ impl EditorPreview {
             tabs: vec![FILE.into(), DIFF.into()],
             selected: Some(FILE.into()),
             status: None,
+            draft: String::new(),
             _subscription: subscription,
         }
     }
@@ -218,6 +222,33 @@ impl Render for EditorPreview {
                     })))
                     .child(kit::editor_actions(
                         self.status.clone().map(|message| (message, false)),
+                        (self.selected.as_deref() == Some(FILE)).then(|| {
+                            let reason = kit::editor_excerpt_block_reason(
+                                kit::editor_selection_snapshot(self.buffer.read(cx)).as_ref(),
+                            );
+                            kit::editor_add_selection_button(
+                                "preview-add-selection",
+                                &kit::AddSelectionControl {
+                                    enabled: reason.is_none(),
+                                    reason: reason.map(SharedString::from),
+                                },
+                            )
+                            .on_click(cx.listener(|host, _, window, cx| {
+                                let Some(snapshot) =
+                                    kit::editor_selection_snapshot(host.buffer.read(cx))
+                                else {
+                                    window.push_notification("Select code in the file first", cx);
+                                    return;
+                                };
+                                let dirty = host.dirty(cx);
+                                host.draft.push_str(&kit::format_editor_excerpt(
+                                    FILE, &snapshot, dirty,
+                                ));
+                                host.draft.push('\n');
+                                host.status = Some("Added to the sample draft below".into());
+                                cx.notify();
+                            }))
+                        }),
                         kit::editor_save_button(
                             dirty && self.selected.as_deref() == Some(FILE),
                             selected_diff,
@@ -232,6 +263,22 @@ impl Render for EditorPreview {
                 kit::editor_diff(diff, cx).into_any_element()
             } else {
                 kit::editor_empty_state(cx).into_any_element()
+            })
+            .when(!self.draft.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .max_h(rems(10.0))
+                        .overflow_y_scrollbar()
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .px_3()
+                        .py_2()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .whitespace_normal()
+                        .child(self.draft.clone()),
+                )
             })
     }
 }

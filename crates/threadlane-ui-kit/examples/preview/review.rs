@@ -777,6 +777,7 @@ impl Render for ReviewPreview {
                     false,
                     None,
                     true,
+                    None,
                     cx.listener(|host, _: &kit::PanelDocumentAction, _, cx| {
                         host.document = None;
                         cx.notify();

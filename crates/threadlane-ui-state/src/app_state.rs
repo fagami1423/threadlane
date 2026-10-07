@@ -117,6 +117,9 @@ pub struct AppState {
     pub auth_status_msg: Option<String>,
     pub update_status: threadlane_updater::UpdateStatus,
     pub requested_editor_target: Option<RequestedEditorTarget>,
+    /// Files-panel "Open in Panel" requests as `(project, relative_path)`;
+    /// `RightPanelView` takes the request and opens the editable document.
+    pub requested_panel_document: Option<(PathBuf, String)>,
     pub requested_github_issue: Option<(PathBuf, u64)>,
     pub requested_composer_prompt: Option<String>,
     pub requested_terminal_command: Option<String>,
@@ -1054,6 +1057,7 @@ impl AppState {
             auth_status_msg: None,
             update_status: threadlane_updater::UpdateStatus::Idle,
             requested_editor_target: None,
+            requested_panel_document: None,
             requested_github_issue: None,
             requested_composer_prompt: None,
             requested_terminal_command: None,
@@ -2042,35 +2046,65 @@ impl AppState {
     }
 
     pub fn request_open_file_at_line(&mut self, relative_path: String, line: Option<usize>) {
-        let Some(root) = self.active_git_work_dir() else {
+        let Some((root, relative)) = self.resolve_workspace_file(&relative_path) else {
             return;
         };
-        let path = match threadlane_tools::validate_path_in_workspace(&relative_path, &root) {
+        self.requested_editor_target = Some(RequestedEditorTarget::File {
+            project: root,
+            path: relative,
+            line,
+        });
+    }
+
+    /// Requests that `relative_path` open as an editable document inside the
+    /// right panel's Files host — the second file-editor surface. Shares the
+    /// checkout validation of `request_open_file_at_line`; `RightPanelView`
+    /// takes the request and loads the buffer.
+    pub fn request_open_panel_file(&mut self, relative_path: String) {
+        if let Some((root, relative)) = self.resolve_workspace_file(&relative_path) {
+            self.requested_panel_document = Some((root, relative));
+        }
+    }
+
+    /// Validates `relative_path` inside the active checkout and returns the
+    /// checkout root plus normalized workspace-relative path, publishing any
+    /// failure to `client.session_status`. A remote checkout's filesystem
+    /// lives behind the daemon, so its path cannot canonicalize on the UI
+    /// host: containment is checked lexically and the daemon-backed project
+    /// I/O read enforces it at open time.
+    fn resolve_workspace_file(&mut self, relative_path: &str) -> Option<(PathBuf, String)> {
+        let root = self.active_git_work_dir()?;
+        if !root.exists() {
+            let Some(relative) = lexically_normalized_relative(relative_path) else {
+                self.client.session_status =
+                    Some("File is outside the workspace".to_string());
+                return None;
+            };
+            return Some((root, relative));
+        }
+        let path = match threadlane_tools::validate_path_in_workspace(relative_path, &root) {
             Ok(path) => path,
             Err(error) => {
                 self.client.session_status = Some(error);
-                return;
+                return None;
             }
         };
         let canonical_root = match root.canonicalize() {
             Ok(root) => root,
             Err(error) => {
                 self.client.session_status = Some(format!("Invalid workspace root: {error}"));
-                return;
+                return None;
             }
         };
-        let relative = match path.strip_prefix(canonical_root) {
+        let relative = match path.strip_prefix(&canonical_root) {
             Ok(relative) => relative,
             Err(error) => {
-                self.client.session_status = Some(format!("File is outside the workspace: {error}"));
-                return;
+                self.client.session_status =
+                    Some(format!("File is outside the workspace: {error}"));
+                return None;
             }
         };
-        self.requested_editor_target = Some(RequestedEditorTarget::File {
-            project: root,
-            path: relative.to_string_lossy().into_owned(),
-            line,
-        });
+        Some((root, relative.to_string_lossy().into_owned()))
     }
 
     pub fn request_open_diff(&mut self, project: PathBuf, relative_path: String, content: String) {
@@ -6070,3 +6104,34 @@ impl AppState {
 #[path = "tests.rs"]
 #[cfg(test)]
 mod tests;
+
+/// Normalizes a workspace-relative path without touching the filesystem:
+/// resolves `.`/`..` lexically, rejects absolute paths, empty results, and
+/// `..` components that would escape the workspace. Used for checkouts that
+/// only exist on a remote daemon's filesystem.
+fn lexically_normalized_relative(relative_path: &str) -> Option<String> {
+    let path = std::path::Path::new(relative_path);
+    if path.is_absolute() {
+        return None;
+    }
+    let mut normalized: Vec<std::ffi::OsString> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop()?;
+            }
+            component => normalized.push(component.as_os_str().to_owned()),
+        }
+    }
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(
+        normalized
+            .iter()
+            .collect::<PathBuf>()
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
