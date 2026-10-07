@@ -2320,7 +2320,7 @@ impl ChatListView {
                 return;
             }
         };
-        if text.chars().count() > MAX_QUOTE_SCALARS {
+        if quoted_text(&text).chars().count() > MAX_QUOTE_SCALARS {
             window.push_notification(Notification::info(OVER_LIMIT_MESSAGE), cx);
             return;
         }

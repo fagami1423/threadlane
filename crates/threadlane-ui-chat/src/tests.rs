@@ -2783,7 +2783,7 @@ fn quote_selection_appends_labeled_blockquote_to_draft(cx: &mut gpui::TestAppCon
     chat.read_with(cx, |chat, cx| {
         assert_eq!(
             chat.input_state.read(cx).value().as_ref(),
-            "Quoted from assistant response:\n> Completed response\n> \n\n",
+            "Quoted from assistant response:\n> Completed response\n\n",
             "quote appends the labeled blockquote plus a blank line"
         );
     });
