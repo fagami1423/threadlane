@@ -1,10 +1,11 @@
 //! Sample buffers; all presentation comes from the production UI kit.
 use gpui::{prelude::*, *};
-use gpui_component::WindowExt;
+use gpui_component::{ActiveTheme, WindowExt};
 use gpui_component::button::ButtonVariant;
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::input::{EditorState, InputEvent, TabSize};
 use gpui_component::menu::ContextMenuExt;
+use gpui_component::scroll::ScrollableElement;
 use gpui_component::text::TextViewState;
 use std::collections::HashMap;
 use threadlane_ui_kit as kit;
@@ -268,7 +269,7 @@ impl Render for EditorPreview {
                     div()
                         .flex_none()
                         .max_h(rems(10.0))
-                        .overflow_y_scroll()
+                        .overflow_y_scrollbar()
                         .border_t_1()
                         .border_color(cx.theme().border)
                         .px_3()
