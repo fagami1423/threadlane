@@ -42,7 +42,7 @@ cairo-rs = { version = "0.18", features = ["png"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 wry = { version = "0.53.3", package = "lb-wry" }
 raw-window-handle = "0.6"
-webview2-com = "0.38"
+webview2-com = "0.39"
 windows-core = "0.61"
 image.workspace = true
 
