@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.1.43](https://github.com/wheregmis/threadlane/compare/v0.1.42...v0.1.43) (2026-10-07)
+
+
+### Features
+
+* **catalog:** add manual refresh for provider model caches ([26b00b9](https://github.com/wheregmis/threadlane/commit/26b00b968fa9ae3fb464d621c62930b53455cd9a))
+* **catalog:** add manual refresh for provider model caches ([1a60ee8](https://github.com/wheregmis/threadlane/commit/1a60ee8e79a5e152abc2f244d58f12cd1d404d7e))
+
+
+### Bug Fixes
+
+* **automation:** distinguish blocked tasks from successful agent turns ([0d34f2a](https://github.com/wheregmis/threadlane/commit/0d34f2a36e4edc80a133456d8532bac4a189a0b2))
+* **automation:** require explicit task outcomes for new runs ([7c6b438](https://github.com/wheregmis/threadlane/commit/7c6b43814e11884d32824ac3d2c888f482b0a8d5))
+* **catalog:** invalidate provider-level model caches and guard status write ([44a1137](https://github.com/wheregmis/threadlane/commit/44a1137a6fd5aeb985f69964469e9b053499871a))
+* **policy:** keep unconfirmed replacements and storage validation fenced ([d1d2c0e](https://github.com/wheregmis/threadlane/commit/d1d2c0e21161014417836d6047b934dbc02128d6))
+* **policy:** restore tools.policy without taking the state-owner lease ([5659380](https://github.com/wheregmis/threadlane/commit/5659380e0550f80e9631d3b9bd496778d0264702))
+* **policy:** restore tools.policy without taking the state-owner lease ([8c97323](https://github.com/wheregmis/threadlane/commit/8c97323ff18fa04420302569b236214b00f89e70))
+* **preview:** handle RefreshModels in settings preview match ([944d71b](https://github.com/wheregmis/threadlane/commit/944d71b410942e7ae316948739b253d74e1d2ead))
+
 ## [0.1.42](https://github.com/wheregmis/threadlane/compare/v0.1.41...v0.1.42) (2026-10-06)
 
 
