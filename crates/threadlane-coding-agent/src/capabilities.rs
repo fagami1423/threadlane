@@ -1846,6 +1846,26 @@ mod read_only_policy_tests {
             restored_tool_policy(&WasiExtensionManager::for_project_session(project.path(), "policy")),
             ToolPolicy::FullAccess,
         );
+        // A replaced-but-unsynced policy stays fenced for concurrent readers:
+        // the owner keeps the old value until recover_state_commit confirms it,
+        // so a `.unconfirmed` marker must not be read as committed "full".
+        std::fs::write(path.with_file_name(".host.tools.policy.json.unconfirmed"), "sync failed")
+            .unwrap();
+        assert_eq!(
+            restored_tool_policy(&WasiExtensionManager::for_project_session(project.path(), "policy")),
+            ToolPolicy::ReadOnly,
+        );
+        std::fs::remove_file(path.with_file_name(".host.tools.policy.json.unconfirmed")).unwrap();
+        // An unavailable work directory is not an absent policy: restoring on
+        // missing storage keeps failing closed instead of granting access.
+        let missing_root = project.path().join("removed-work-dir");
+        assert_eq!(
+            restored_tool_policy(&WasiExtensionManager::for_project_session(
+                &missing_root,
+                "policy"
+            )),
+            ToolPolicy::ReadOnly,
+        );
     }
 
     #[test]
