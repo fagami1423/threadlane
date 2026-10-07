@@ -73,6 +73,10 @@ pub struct RightPanelView {
     review_diff_options: threadlane_git::DiffOptions,
     review_diff_request: Option<ReviewDiffRequest>,
     review_diff_state: Option<ReviewDiffState>,
+    /// Stable focus target for the adjacent-file navigation group: when the
+    /// initiating control becomes disabled at a boundary, focus lands here
+    /// instead of being dropped.
+    review_nav_focus: FocusHandle,
     #[cfg(test)]
     review_diff_load_count: usize,
     git_status: Option<GitStatus>,
@@ -363,6 +367,7 @@ impl RightPanelView {
             review_diff_options: threadlane_git::DiffOptions::default(),
             review_diff_request: None,
             review_diff_state: None,
+            review_nav_focus: cx.focus_handle(),
             #[cfg(test)]
             review_diff_load_count: 0,
             git_status: None,
@@ -1702,7 +1707,15 @@ impl RightPanelView {
             ReviewDiffState::Ready { empty: true } => ReviewDiffContent::Empty,
             ReviewDiffState::Ready { empty: false } => ReviewDiffContent::Ready(&self.document_state),
         };
+        // Key the scroll area by request revision so an explicit new target
+        // starts at the top of its patch instead of inheriting the previous
+        // file's offset.
+        let scroll_id = ElementId::Name(SharedString::from(format!(
+            "review-diff-body-{}",
+            self.review_diff_revision
+        )));
         threadlane_ui_kit::review_diff_body(content, self.review_diff_options.ignore_whitespace,
+            scroll_id,
             cx.listener(|this, action: &ReviewDiffAction, _, cx| match action {
                 ReviewDiffAction::Retry => this.reload_review_diff(cx),
                 ReviewDiffAction::ShowWhitespace => this.set_ignore_whitespace(false, cx),
@@ -1739,6 +1752,7 @@ impl RightPanelView {
                         cx,
                     )
                 }))
+                .children(self.review_diff_nav_row(cx))
                 .child(Separator::horizontal())
                 .child(if let Some(ref editor) = self.editor_state {
                     threadlane_ui_kit::editor_buffer(editor).into_any_element()
@@ -1830,6 +1844,97 @@ impl RightPanelView {
                 this.run_git_action(action, window, cx);
             });
         }
+    }
+
+    /// `Previous file · File X of Y · Next file` for a single-file local
+    /// Review diff. Absent for All changes, editor documents and non-Review
+    /// surfaces. Position and identities resolve by exact path against the
+    /// filtered inventory on every render, so list refreshes cannot retarget
+    /// a displayed patch.
+    fn review_diff_nav_row(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.active_surface != Some(Surface::Review) {
+            return None;
+        }
+        let request = self.review_diff_request.as_ref()?;
+        let ReviewDiffTarget::File(path) = &request.target else {
+            return None;
+        };
+        let paths: Vec<String> = self
+            .filtered_review_files(cx)
+            .iter()
+            .map(|file| file.path.clone())
+            .collect();
+        let query = self.review_filter_input.read(cx).value().trim().to_string();
+        let unavailable = if self.git_checkout_pending {
+            Some("Checkout is switching…".to_owned())
+        } else if self.review_error.is_some() {
+            Some("Changes list unavailable".to_owned())
+        } else {
+            None
+        };
+        Some(threadlane_ui_kit::review_diff_nav(
+            &threadlane_ui_kit::ReviewDiffNavigation {
+                paths: &paths,
+                current: Some(path.as_str()),
+                filter: (!query.is_empty()).then_some(query.as_str()),
+                unavailable: unavailable.as_deref(),
+                focus: Some(&self.review_nav_focus),
+            },
+            cx.listener(|this, action: &threadlane_ui_kit::ReviewDiffNavAction, window, cx| {
+                this.navigate_review_diff(*action, window, cx)
+            }),
+            cx,
+        ))
+    }
+
+    /// Load the bounded adjacent file through the same `open_file_diff` path,
+    /// revalidating checkout state and inventory membership at activation.
+    /// Advances from the currently requested path so rapid actions stay
+    /// deterministic; never stages, commits, discards or marks files.
+    fn navigate_review_diff(
+        &mut self,
+        action: threadlane_ui_kit::ReviewDiffNavAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.git_checkout_pending || self.review_error.is_some() {
+            return;
+        }
+        let Some(request) = &self.review_diff_request else {
+            return;
+        };
+        let ReviewDiffTarget::File(current) = &request.target else {
+            return;
+        };
+        let paths: Vec<String> = self
+            .filtered_review_files(cx)
+            .iter()
+            .map(|file| file.path.clone())
+            .collect();
+        let Some(adjacency) = threadlane_ui_kit::review_diff_adjacency(&paths, current) else {
+            return;
+        };
+        use threadlane_ui_kit::ReviewDiffNavAction;
+        let target = match action {
+            ReviewDiffNavAction::Previous => adjacency.previous,
+            ReviewDiffNavAction::Next => adjacency.next,
+        };
+        let Some(target) = target else {
+            return;
+        };
+        // When the direction just taken ends at a boundary the initiating
+        // button becomes disabled; move focus to the stable navigation group
+        // rather than dropping it.
+        if let Some(next_adjacency) = threadlane_ui_kit::review_diff_adjacency(&paths, &target) {
+            let boundary = match action {
+                ReviewDiffNavAction::Previous => next_adjacency.previous.is_none(),
+                ReviewDiffNavAction::Next => next_adjacency.next.is_none(),
+            };
+            if boundary {
+                window.focus(&self.review_nav_focus, cx);
+            }
+        }
+        self.open_file_diff(target, cx);
     }
 
     fn filtered_review_files(&self, cx: &Context<Self>) -> Vec<GitFile> {
@@ -3867,6 +3972,116 @@ mod review_diff_tests {
             assert!(!panel.review_diff_options.ignore_whitespace);
             assert!(panel.review_diff_request.is_none());
             assert!(panel.document_title.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn review_diff_navigation_follows_filtered_inventory(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let model = cx.new(|_| {
+            let mut state = AppState::default();
+            // Default restores a persisted chat; this fixture owns only a project.
+            state.active_session_id = None;
+            state.active_work_dir = Some(PathBuf::from("/workspace"));
+            state
+        });
+        let (panel, cx) =
+            cx.add_window_view(|window, cx| RightPanelView::new(model.clone(), window, cx));
+        panel.update_in(cx, |panel, window, cx| {
+            use threadlane_git::GitFile;
+            use threadlane_ui_kit::ReviewDiffNavAction;
+            let file = |path: &str| GitFile {
+                path: path.into(),
+                ..Default::default()
+            };
+            panel.review_files = vec![
+                file("a.rs"),
+                file("dir/b.rs"),
+                file("b.rs"),
+                file("z/last.rs"),
+            ];
+            panel.open_file_diff("a.rs".into(), cx);
+            panel.set_ignore_whitespace(true, cx);
+            // First file: Previous is a bounded no-op.
+            panel.navigate_review_diff(ReviewDiffNavAction::Previous, window, cx);
+            assert_eq!(
+                panel.review_diff_request.as_ref().unwrap().target,
+                ReviewDiffTarget::File("a.rs".into())
+            );
+            panel.navigate_review_diff(ReviewDiffNavAction::Next, window, cx);
+            assert_eq!(
+                panel.review_diff_request.as_ref().unwrap().target,
+                ReviewDiffTarget::File("dir/b.rs".into())
+            );
+            // Ignore whitespace survives navigation, and rapid actions while
+            // still loading advance from the requested path deterministically.
+            assert!(panel
+                .review_diff_request
+                .as_ref()
+                .unwrap()
+                .options
+                .ignore_whitespace);
+            panel.navigate_review_diff(ReviewDiffNavAction::Next, window, cx);
+            panel.navigate_review_diff(ReviewDiffNavAction::Next, window, cx);
+            assert_eq!(
+                panel.review_diff_request.as_ref().unwrap().target,
+                ReviewDiffTarget::File("z/last.rs".into())
+            );
+            // The direction just taken ended at the last file, so the disabled
+            // button yielded focus to the stable navigation group.
+            assert!(panel.review_nav_focus.is_focused(window));
+            panel.navigate_review_diff(ReviewDiffNavAction::Next, window, cx);
+            assert_eq!(
+                panel.review_diff_request.as_ref().unwrap().target,
+                ReviewDiffTarget::File("z/last.rs".into())
+            );
+            // Exact paths distinguish duplicate basenames.
+            panel.navigate_review_diff(ReviewDiffNavAction::Previous, window, cx);
+            assert_eq!(
+                panel.review_diff_request.as_ref().unwrap().target,
+                ReviewDiffTarget::File("b.rs".into())
+            );
+            panel.navigate_review_diff(ReviewDiffNavAction::Next, window, cx);
+            // A refresh that removes the current file disables navigation
+            // instead of retargeting a stored row index.
+            panel
+                .review_files
+                .retain(|file| file.path != "z/last.rs");
+            panel.navigate_review_diff(ReviewDiffNavAction::Previous, window, cx);
+            assert_eq!(
+                panel.review_diff_request.as_ref().unwrap().target,
+                ReviewDiffTarget::File("z/last.rs".into())
+            );
+            // A switching checkout blocks navigation entirely.
+            panel.git_checkout_pending = true;
+            panel.navigate_review_diff(ReviewDiffNavAction::Previous, window, cx);
+            assert_eq!(
+                panel.review_diff_request.as_ref().unwrap().target,
+                ReviewDiffTarget::File("z/last.rs".into())
+            );
+            panel.git_checkout_pending = false;
+            // Filtering the current file out behaves like a removed target.
+            panel.review_files.push(file("z/last.rs"));
+            panel
+                .review_filter_input
+                .update(cx, |input, cx| input.set_value("b.rs", window, cx));
+            panel.navigate_review_diff(ReviewDiffNavAction::Previous, window, cx);
+            assert_eq!(
+                panel.review_diff_request.as_ref().unwrap().target,
+                ReviewDiffTarget::File("z/last.rs".into())
+            );
+            panel
+                .review_filter_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            panel.navigate_review_diff(ReviewDiffNavAction::Previous, window, cx);
+            assert_eq!(
+                panel.review_diff_request.as_ref().unwrap().target,
+                ReviewDiffTarget::File("b.rs".into())
+            );
+            // Navigation never touches selection or staged state.
+            assert!(panel.selected_files.is_empty());
+            assert!(!panel.git_busy);
+            panel.review_files.clear();
         });
     }
 

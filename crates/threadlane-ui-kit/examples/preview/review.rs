@@ -130,6 +130,9 @@ pub struct ReviewPreview {
     tab: kit::ReviewTab,
     collapsed: HashSet<String>,
     document: Option<String>,
+    /// Bumped on each explicit document open so a navigated file's scroll
+    /// area starts at the top rather than inheriting a prior offset.
+    document_revision: u64,
     document_state: Entity<TextViewState>,
     ignore_whitespace: bool,
     can_create_pr: bool,
@@ -212,6 +215,7 @@ impl ReviewPreview {
             tab: kit::ReviewTab::Changes,
             collapsed: HashSet::new(),
             document: None,
+            document_revision: 0,
             document_state: cx.new(|cx| TextViewState::markdown("", cx)),
             ignore_whitespace: false,
             draft_pr,
@@ -478,6 +482,7 @@ impl ReviewPreview {
     }
 
     fn open_diff(&mut self, path: String, cx: &mut Context<Self>) {
+        self.document_revision += 1;
         self.document = Some(path);
         self.update_diff(cx);
     }
@@ -781,10 +786,54 @@ impl Render for ReviewPreview {
                     }),
                     cx,
                 ))
+                .children((!path.is_empty()).then(|| {
+                    let paths: Vec<String> = self
+                        .filtered_files(cx)
+                        .iter()
+                        .map(|file| file.path.clone())
+                        .collect();
+                    let query = self.filter.read(cx).value().trim().to_string();
+                    kit::review_diff_nav(
+                        &kit::ReviewDiffNavigation {
+                            paths: &paths,
+                            current: Some(path.as_str()),
+                            filter: (!query.is_empty()).then_some(query.as_str()),
+                            unavailable: None,
+                            focus: None,
+                        },
+                        cx.listener(|host, action: &kit::ReviewDiffNavAction, _, cx| {
+                            let Some(current) = host.document.clone() else {
+                                return;
+                            };
+                            let paths: Vec<String> = host
+                                .filtered_files(cx)
+                                .iter()
+                                .map(|file| file.path.clone())
+                                .collect();
+                            let Some(adjacency) =
+                                kit::review_diff_adjacency(&paths, &current)
+                            else {
+                                return;
+                            };
+                            let target = match action {
+                                kit::ReviewDiffNavAction::Previous => adjacency.previous,
+                                kit::ReviewDiffNavAction::Next => adjacency.next,
+                            };
+                            if let Some(target) = target {
+                                host.open_diff(target, cx);
+                            }
+                        }),
+                        cx,
+                    )
+                }))
                 .child(Separator::horizontal())
                 .child(kit::review_diff_body(
                     content,
                     self.ignore_whitespace,
+                    ElementId::Name(SharedString::from(format!(
+                        "preview-review-diff-{}",
+                        self.document_revision
+                    ))),
                     cx.listener(|host, action: &kit::ReviewDiffAction, window, cx| {
                         if *action == kit::ReviewDiffAction::ShowWhitespace {
                             host.ignore_whitespace = false;

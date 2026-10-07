@@ -574,14 +574,18 @@ pub enum ReviewDiffAction {
 pub fn review_diff_body(
     content: ReviewDiffContent<'_>,
     ignore_whitespace: bool,
+    scroll_id: ElementId,
     on_action: impl Fn(&ReviewDiffAction, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
+    // `scroll_id` keys the retained scroll state; callers pass a per-request
+    // identity so an explicit new target starts at the top of its patch.
     let body = div()
         .flex_1()
         .min_w_0()
         .min_h_0()
         .overflow_y_scrollbar()
+        .id(scroll_id)
         .p_3();
     let callback = std::rc::Rc::new(on_action);
     let request = move |action| {
@@ -647,6 +651,148 @@ pub fn review_diff_body(
             .child(crate::diff_text_view(text, cx))
             .into_any_element(),
     }
+}
+
+/// Ordered position of a file inside the filtered working-tree inventory.
+/// Membership and position resolve by exact path, never by a stored row index,
+/// so a background refresh cannot retarget navigation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewDiffAdjacency {
+    /// 1-based position of the current file.
+    pub position: usize,
+    pub total: usize,
+    pub previous: Option<String>,
+    pub next: Option<String>,
+}
+
+/// Bounded previous/next resolution over the filtered inventory's flat order.
+/// No wrapping: the first file has no previous, the last has no next.
+pub fn review_diff_adjacency(paths: &[String], current: &str) -> Option<ReviewDiffAdjacency> {
+    let index = paths.iter().position(|path| path == current)?;
+    Some(ReviewDiffAdjacency {
+        position: index + 1,
+        total: paths.len(),
+        previous: index.checked_sub(1).map(|prev| paths[prev].clone()),
+        next: paths.get(index + 1).cloned(),
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewDiffNavAction {
+    Previous,
+    Next,
+}
+
+/// Inputs for the single-file Review diff navigation row. The host owns the
+/// inventory, the diff loader and all Git state; this row only requests a
+/// direction and never stages, commits, discards, or marks files.
+pub struct ReviewDiffNavigation<'a> {
+    /// Ordered full relative paths of the filtered inventory.
+    pub paths: &'a [String],
+    /// Currently requested file. `None`/absent shows the removed-file state.
+    pub current: Option<&'a str>,
+    /// Active filter query when the inventory is filtered.
+    pub filter: Option<&'a str>,
+    /// Textual reason navigation is unavailable (inventory unavailable,
+    /// checkout switching).
+    pub unavailable: Option<&'a str>,
+    /// Stable focus target for when the initiating control becomes disabled
+    /// at a boundary.
+    pub focus: Option<&'a FocusHandle>,
+}
+
+/// `Previous file · File X of Y · Next file` for a single-file local Review
+/// diff. Hosts derive `paths` from their filtered inventory each render.
+pub fn review_diff_nav(
+    nav: &ReviewDiffNavigation,
+    on_navigate: impl Fn(&ReviewDiffNavAction, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let theme = cx.theme().colors;
+    let adjacency = nav
+        .current
+        .and_then(|current| review_diff_adjacency(nav.paths, current));
+    let blocked = nav.unavailable.is_some();
+    let previous = adjacency.as_ref().and_then(|adj| adj.previous.clone());
+    let next = adjacency.as_ref().and_then(|adj| adj.next.clone());
+    let status = if let Some(reason) = nav.unavailable {
+        reason.to_owned()
+    } else if let Some(adjacency) = &adjacency {
+        match nav.filter {
+            Some(query) => format!(
+                "File {} of {} matching files · filter \"{query}\"",
+                adjacency.position, adjacency.total
+            ),
+            None => format!("File {} of {}", adjacency.position, adjacency.total),
+        }
+    } else {
+        "File no longer in the current changes list".to_owned()
+    };
+    let previous_hint = previous.clone().map_or_else(
+        || "At the first file".to_owned(),
+        |path| format!("Previous file · {path}"),
+    );
+    let next_hint = next.clone().map_or_else(
+        || "At the last file".to_owned(),
+        |path| format!("Next file · {path}"),
+    );
+    let filter_help = nav
+        .filter
+        .map(|query| format!(" filtered by \"{query}\""))
+        .unwrap_or_default();
+    let callback = std::rc::Rc::new(on_navigate);
+    let request = move |action: ReviewDiffNavAction| {
+        let callback = callback.clone();
+        move |_: &ClickEvent, window: &mut Window, cx: &mut App| callback(&action, window, cx)
+    };
+    div()
+        .id("review-diff-nav")
+        .debug_selector(|| "review-diff-nav".into())
+        .role(Role::Group)
+        .aria_label(format!("Changed file navigation{filter_help}"))
+        .when_some(nav.focus, |row, focus| row.track_focus(focus))
+        .flex_none()
+        .min_w_0()
+        .px_3()
+        .py_1()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(
+            Button::new("review-diff-prev")
+                .debug_selector(|| "review-diff-prev".into())
+                .icon(IconName::ChevronLeft)
+                .label("Previous file")
+                .accessibility_label(previous_hint.clone())
+                .tooltip(previous_hint)
+                .ghost()
+                .xsmall()
+                .disabled(blocked || previous.is_none())
+                .on_click(request(ReviewDiffNavAction::Previous)),
+        )
+        .child(
+            div()
+                .debug_selector(|| "review-diff-nav-position".into())
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(status),
+        )
+        .child(
+            Button::new("review-diff-next")
+                .debug_selector(|| "review-diff-next".into())
+                .icon(IconName::ChevronRight)
+                .label("Next file")
+                .accessibility_label(next_hint.clone())
+                .tooltip(next_hint)
+                .ghost()
+                .xsmall()
+                .disabled(blocked || next.is_none())
+                .on_click(request(ReviewDiffNavAction::Next)),
+        )
+        .into_any_element()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1268,4 +1414,48 @@ pub fn review_commit_footer(
                     )
                 }),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::review_diff_adjacency;
+
+    fn paths(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|path| path.to_string()).collect()
+    }
+
+    #[test]
+    fn adjacency_is_bounded_and_exact() {
+        let files = paths(&["a.rs", "dir/b.rs", "b.rs", "c.rs"]);
+        let first = review_diff_adjacency(&files, "a.rs").unwrap();
+        assert_eq!(first.position, 1);
+        assert_eq!(first.total, 4);
+        assert_eq!(first.previous, None);
+        assert_eq!(first.next.as_deref(), Some("dir/b.rs"));
+        // Exact paths distinguish duplicate basenames.
+        let nested = review_diff_adjacency(&files, "dir/b.rs").unwrap();
+        assert_eq!(nested.position, 2);
+        assert_eq!(nested.next.as_deref(), Some("b.rs"));
+        let last = review_diff_adjacency(&files, "c.rs").unwrap();
+        assert_eq!(last.position, 4);
+        assert_eq!(last.next, None);
+        assert!(review_diff_adjacency(&files, "b.rs").is_some());
+        assert!(review_diff_adjacency(&files, "dir\\b.rs").is_none());
+        assert!(review_diff_adjacency(&files, " missing.rs").is_none());
+    }
+
+    #[test]
+    fn adjacency_handles_special_and_single_entries() {
+        let files = paths(&["All changes", "sp ace.rs", "ünïcode/文件.rs"]);
+        let all_changes = review_diff_adjacency(&files, "All changes").unwrap();
+        assert_eq!(all_changes.position, 1);
+        let unicode = review_diff_adjacency(&files, "ünïcode/文件.rs").unwrap();
+        assert_eq!(unicode.position, 3);
+        assert_eq!(unicode.next, None);
+        let single = paths(&["only.rs"]);
+        let only = review_diff_adjacency(&single, "only.rs").unwrap();
+        assert_eq!((only.position, only.total), (1, 1));
+        assert_eq!((only.previous, only.next), (None, None));
+        assert!(review_diff_adjacency(&[], "only.rs").is_none());
+    }
 }
