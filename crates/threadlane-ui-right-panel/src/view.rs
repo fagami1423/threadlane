@@ -119,6 +119,10 @@ pub struct RightPanelView {
     saved_content: String,
     is_dirty: bool,
     pending_document: Option<(String, String)>,
+    /// Monotonic id of the latest panel-file open request; async reads older
+    /// than it are discarded so a slower earlier read can never reopen over a
+    /// newer document (or its unsaved edits).
+    panel_document_request: u64,
     browser: Option<Entity<BrowserView>>,
     event_tx: tokio::sync::mpsc::UnboundedSender<PanelEvent>,
     _watcher: Option<WorkspaceWatcher>,
@@ -412,6 +416,7 @@ impl RightPanelView {
             saved_content: String::new(),
             is_dirty: false,
             pending_document: None,
+            panel_document_request: 0,
             browser,
             event_tx,
             _watcher: None,
@@ -916,6 +921,8 @@ impl RightPanelView {
         relative_path: String,
         cx: &mut Context<Self>,
     ) {
+        self.panel_document_request += 1;
+        let request_id = self.panel_document_request;
         let read_client = self.model.read(cx).daemon_client.clone();
         let read_project = project.clone();
         let read_path = relative_path.clone();
@@ -926,7 +933,8 @@ impl RightPanelView {
         cx.spawn(async move |this, cx| {
             let result = read.await;
             let _ = this.update(cx, |this, cx| {
-                if this.project.as_ref() != Some(&project)
+                if this.panel_document_request != request_id
+                    || this.project.as_ref() != Some(&project)
                     || this.model.read(cx).active_git_work_dir().as_ref() != Some(&project)
                 {
                     return;
@@ -1958,8 +1966,9 @@ impl RightPanelView {
                                     state.request_open_file(path.clone());
                                     cx.notify();
                                 }),
-                                ProjectFileAction::OpenInPanel(path) => model.update(cx, |state, _| {
+                                ProjectFileAction::OpenInPanel(path) => model.update(cx, |state, cx| {
                                     state.request_open_panel_file(path.clone());
+                                    cx.notify();
                                 }),
                                 ProjectFileAction::CopyRelative(path) | ProjectFileAction::CopyAbsolute(path) => {
                                     cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));

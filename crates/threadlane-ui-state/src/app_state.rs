@@ -2068,9 +2068,20 @@ impl AppState {
 
     /// Validates `relative_path` inside the active checkout and returns the
     /// checkout root plus normalized workspace-relative path, publishing any
-    /// failure to `client.session_status`.
+    /// failure to `client.session_status`. A remote checkout's filesystem
+    /// lives behind the daemon, so its path cannot canonicalize on the UI
+    /// host: containment is checked lexically and the daemon-backed project
+    /// I/O read enforces it at open time.
     fn resolve_workspace_file(&mut self, relative_path: &str) -> Option<(PathBuf, String)> {
         let root = self.active_git_work_dir()?;
+        if !root.exists() {
+            let Some(relative) = lexically_normalized_relative(relative_path) else {
+                self.client.session_status =
+                    Some("File is outside the workspace".to_string());
+                return None;
+            };
+            return Some((root, relative));
+        }
         let path = match threadlane_tools::validate_path_in_workspace(relative_path, &root) {
             Ok(path) => path,
             Err(error) => {
@@ -6093,3 +6104,34 @@ impl AppState {
 #[path = "tests.rs"]
 #[cfg(test)]
 mod tests;
+
+/// Normalizes a workspace-relative path without touching the filesystem:
+/// resolves `.`/`..` lexically, rejects absolute paths, empty results, and
+/// `..` components that would escape the workspace. Used for checkouts that
+/// only exist on a remote daemon's filesystem.
+fn lexically_normalized_relative(relative_path: &str) -> Option<String> {
+    let path = std::path::Path::new(relative_path);
+    if path.is_absolute() {
+        return None;
+    }
+    let mut normalized: Vec<std::ffi::OsString> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop()?;
+            }
+            component => normalized.push(component.as_os_str().to_owned()),
+        }
+    }
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(
+        normalized
+            .iter()
+            .collect::<PathBuf>()
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
