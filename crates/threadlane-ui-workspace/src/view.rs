@@ -1193,7 +1193,7 @@ impl WorkspaceView {
         }
         match central_reason {
             None => Ok(EditorSelectionTarget::CentralEditor),
-            Some(central) => Err(files_reason.unwrap_or(central)),
+            Some(central) => Err(central),
         }
     }
 

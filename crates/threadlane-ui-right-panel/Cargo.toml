@@ -49,3 +49,4 @@ image.workspace = true
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 threadlane-ui-state = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true

@@ -47,6 +47,7 @@ impl Render for FilesPreview {
                     let open = menu_open.clone();
                     kit::project_file_menu(menu, path, folder, None, move |action, window, cx| match action {
                         kit::ProjectFileAction::Open(_) => open(window, cx),
+                        kit::ProjectFileAction::OpenInPanel(_) => open(window, cx),
                         kit::ProjectFileAction::CopyRelative(path) => {
                             cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
                             window.push_notification(Notification::info("Copied relative path"), cx);

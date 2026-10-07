@@ -33,6 +33,10 @@ pub struct EditorTab {
     editor_state: Option<Entity<EditorState>>,
     text_view_state: Option<Entity<TextViewState>>,
     _subscription: Option<Subscription>,
+    /// Re-renders the host whenever the buffer notifies (selection moves
+    /// included — the editor emits no `InputEvent` for selection-only
+    /// changes, and the add-selection control must track them).
+    _observe: Option<Subscription>,
 }
 
 #[derive(Clone, Debug)]
@@ -308,6 +312,7 @@ impl EditorView {
             editor_state: None,
             text_view_state: Some(markdown_state),
             _subscription: None,
+            _observe: None,
         });
 
         self.active_tab_index = Some(self.tabs.len() - 1);
@@ -381,6 +386,8 @@ impl EditorView {
 
         let tab_title = threadlane_ui_kit::editor_tab_title(relative_path, false);
 
+        let observe = cx.observe(&editor, |_this, _editor, cx| cx.notify());
+
         self.tabs.push(EditorTab {
             project_dir: project_dir.to_path_buf(),
             relative_path: relative_path.to_string(),
@@ -395,6 +402,7 @@ impl EditorView {
             editor_state: Some(editor.clone()),
             text_view_state: None,
             _subscription: Some(subscription),
+            _observe: Some(observe),
         });
 
         self.active_tab_index = Some(self.tabs.len() - 1);
@@ -1032,9 +1040,7 @@ mod navigation_tests {
         cx.update(gpui_component::init);
         let project = std::path::PathBuf::from("/editor-preview-test");
         let model = cx.new(|_| {
-            let mut state = threadlane_ui_state::AppState::default();
-            state.projects.clear();
-            state.pending_hydrations.clear();
+            let mut state = threadlane_ui_state::AppState::for_tests();
             state.active_session_id = None;
             state.active_work_dir = Some(project.clone());
             state

@@ -113,6 +113,9 @@ pub struct RightPanelView {
     document_state: Entity<TextViewState>,
     editor_state: Option<Entity<EditorState>>,
     editor_subscription: Option<Subscription>,
+    /// Re-renders when the open document buffer notifies; selection moves
+    /// emit no `InputEvent`, but the add-selection control tracks them.
+    editor_observe: Option<Subscription>,
     saved_content: String,
     is_dirty: bool,
     pending_document: Option<(String, String)>,
@@ -405,6 +408,7 @@ impl RightPanelView {
             document_state,
             editor_state: None,
             editor_subscription: None,
+            editor_observe: None,
             saved_content: String::new(),
             is_dirty: false,
             pending_document: None,
@@ -808,6 +812,7 @@ impl RightPanelView {
         self.review_diff_state = Some(ReviewDiffState::Loading);
         self.editor_state = None;
         self.editor_subscription = None;
+        self.editor_observe = None;
         self.saved_content.clear();
         self.is_dirty = false;
         self.document_state
@@ -862,6 +867,7 @@ impl RightPanelView {
         self.document_title = None;
         self.editor_state = None;
         self.editor_subscription = None;
+        self.editor_observe = None;
         self.saved_content.clear();
         self.is_dirty = false;
         self.pending_document = None;
@@ -899,6 +905,48 @@ impl RightPanelView {
         cx.notify();
     }
 
+    /// Fulfills an `AppState::request_open_panel_file` request: reads the file
+    /// on the background executor, then installs it via `pending_document` so
+    /// `sync_pending_document` (which owns the `Window`) opens it as the
+    /// editable document. Checkout or project drift before the read lands
+    /// silently drops it; read failures publish `session_status`.
+    fn start_panel_document_read(
+        &mut self,
+        project: PathBuf,
+        relative_path: String,
+        cx: &mut Context<Self>,
+    ) {
+        let read_client = self.model.read(cx).daemon_client.clone();
+        let read_project = project.clone();
+        let read_path = relative_path.clone();
+        let read = cx.background_executor().spawn(async move {
+            threadlane_ui_state::project_io::read_file(&read_client, &read_project, read_path)
+                .await
+        });
+        cx.spawn(async move |this, cx| {
+            let result = read.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.project.as_ref() != Some(&project)
+                    || this.model.read(cx).active_git_work_dir().as_ref() != Some(&project)
+                {
+                    return;
+                }
+                match result {
+                    Ok(content) => {
+                        this.pending_document = Some((relative_path, content));
+                    }
+                    Err(error) => {
+                        this.model.update(cx, |state, _| {
+                            state.client.session_status = Some(error);
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn sync_pending_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((title, content)) = self.pending_document.take() else {
             return;
@@ -911,6 +959,7 @@ impl RightPanelView {
         if title.starts_with("Review ·") {
             self.editor_state = None;
             self.editor_subscription = None;
+        self.editor_observe = None;
             let markdown = format!("```diff\n{}\n```", content.replace("```", "` ` `"));
             self.document_state
                 .update(cx, |state, cx| state.set_text(&markdown, cx));
@@ -938,8 +987,10 @@ impl RightPanelView {
                     }
                 }
             });
+            let observe = cx.observe(&editor, |_this, _editor, cx| cx.notify());
             self.editor_state = Some(editor);
             self.editor_subscription = Some(subscription);
+            self.editor_observe = Some(observe);
         }
     }
 
@@ -1906,6 +1957,9 @@ impl RightPanelView {
                                 ProjectFileAction::Open(path) => model.update(cx, |state, cx| {
                                     state.request_open_file(path.clone());
                                     cx.notify();
+                                }),
+                                ProjectFileAction::OpenInPanel(path) => model.update(cx, |state, _| {
+                                    state.request_open_panel_file(path.clone());
                                 }),
                                 ProjectFileAction::CopyRelative(path) | ProjectFileAction::CopyAbsolute(path) => {
                                     cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
@@ -2923,6 +2977,12 @@ impl Render for RightPanelView {
             self.should_clear_commit_message = false;
             self.commit_message_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        if let Some((project, relative_path)) = self
+            .model
+            .update(cx, |state, _| state.requested_panel_document.take())
+        {
+            self.start_panel_document_read(project, relative_path, cx);
         }
         self.sync_pending_document(window, cx);
         let theme = cx.theme().colors;
@@ -4427,6 +4487,51 @@ mod environment_shortcut_tests {
             });
             assert!(window.has_active_dialog(cx));
             window.close_dialog(cx);
+        });
+    }
+}
+
+#[cfg(test)]
+mod panel_document_tests {
+    use super::RightPanelView;
+    use gpui::{AppContext, TestAppContext};
+    use threadlane_ui_state::AppState;
+
+    /// `request_open_panel_file` must produce a live editable document —
+    /// the Files host Codex flagged as unreachable when only tests wrote
+    /// `pending_document`.
+    #[gpui::test]
+    fn open_in_panel_loads_an_editable_document(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("note.rs"), "fn note() {}\n").unwrap();
+        let project = dir.path().to_path_buf();
+        let model = cx.new(|_| {
+            let mut state = AppState::for_tests();
+            state.active_session_id = None;
+            state.active_work_dir = Some(project.clone());
+            state
+        });
+        let (panel, cx) =
+            cx.add_window_view(|window, cx| RightPanelView::new(model.clone(), window, cx));
+
+        model.update(cx, |state, _| {
+            state.request_open_panel_file("note.rs".into())
+        });
+        panel.update(cx, |_panel, cx| cx.notify());
+        cx.run_until_parked();
+        for _ in 0..8 {
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.run_until_parked();
+        }
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.document_title.as_deref(), Some("note.rs"));
+            assert!(panel.editor_state.is_some());
+            assert!(panel.editable_file_open());
         });
     }
 }
