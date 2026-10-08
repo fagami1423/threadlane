@@ -45,7 +45,9 @@ raw-window-handle = "0.6"
 # Must stay on the same version lb-wry 0.53.3 uses (0.38): `WebViewExtWindows`
 # returns wry's webview2-com types, so a mismatched version fails to compile.
 webview2-com = "=0.38.2"
-windows-core = "0.62"
+# Must match the windows-core version lb-wry / webview2-com 0.38 use (0.61):
+# `windows_core::w!` strings and HRESULTs cross into wry's ICoreWebView2 calls.
+windows-core = "0.61"
 image.workspace = true
 
 [dev-dependencies]

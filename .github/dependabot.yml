@@ -8,6 +8,8 @@ updates:
       # Must stay on the version lb-wry uses; a newer webview2-com fails to
       # compile against wry's WebViewExtWindows types.
       - dependency-name: "webview2-com"
+      # Same constraint: must match the windows-core lb-wry builds against.
+      - dependency-name: "windows-core"
 
   - package-ecosystem: github-actions
     directory: /
