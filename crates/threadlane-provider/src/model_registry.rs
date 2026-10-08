@@ -157,6 +157,15 @@ fn builtin_reasoning_entry(
     }
 }
 
+/// Native Anthropic seeds (`anthropic/` prefix); ids and 1M windows per
+/// https://platform.claude.com/docs/en/about-claude/models/overview.
+pub const ANTHROPIC_BUILTIN_MODELS: &[(&str, &str, usize)] = &[
+    ("anthropic/claude-opus-5-5", "Claude Opus 5.5", 1_000_000),
+    ("anthropic/claude-sonnet-5-5", "Claude Sonnet 5.5", 1_000_000),
+    ("anthropic/claude-haiku-5-5", "Claude Haiku 5.5", 1_000_000),
+    ("anthropic/claude-fable-5-1", "Claude Fable 5.1", 1_000_000),
+];
+
 /// Compiled fallback seeds. Prefer `resources/models.json` or user files for
 /// new models; this list only guarantees offline startup.
 pub(crate) fn builtin_models() -> Vec<ModelInfo> {
@@ -202,6 +211,9 @@ pub(crate) fn builtin_models() -> Vec<ModelInfo> {
         ("antigravity/gpt-oss-120b", "GPT-OSS 120B", 128_000),
     ] {
         models.push(builtin_entry(id, label, "antigravity", context));
+    }
+    for (id, label, context) in ANTHROPIC_BUILTIN_MODELS {
+        models.push(builtin_entry(id, label, "anthropic", *context));
     }
     for (id, label) in [
         ("opencode-go/grok-4.6", "Grok 4.6"),

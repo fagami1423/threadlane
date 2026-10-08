@@ -14,7 +14,7 @@ use threadlane_provider::credentials::{
     AntigravityCredentialSnapshot, AntigravityCredentialSource, CodexAccountResolver,
     CodexBackupAccount, SharedAntigravityCredentials, SharedCodexResolver,
 };
-use threadlane_provider::router::{is_antigravity_model, is_opencode_model};
+use threadlane_provider::router::{is_anthropic_model, is_antigravity_model, is_opencode_model};
 
 /// True when `model` signs OpenAI-branch requests with the resolved pair.
 /// Antigravity/OpenCode resolve OAuth internally per request and ACP never
@@ -22,6 +22,7 @@ use threadlane_provider::router::{is_antigravity_model, is_opencode_model};
 pub(crate) fn uses_openai_credentials(model: &str) -> bool {
     !is_antigravity_model(model)
         && !is_opencode_model(model)
+        && !is_anthropic_model(model)
         && !threadlane_acp_engine::is_acp_model(model)
 }
 
@@ -60,6 +61,9 @@ pub fn provider_credentials(model: &str) -> (String, Option<String>) {
             threadlane_auth::opencode_auth::load_opencode_api_key().unwrap_or_default(),
             None,
         );
+    }
+    if is_anthropic_model(model) {
+        return (anthropic_api_key().unwrap_or_default(), None);
     }
     if let Some(api_key) =
         threadlane_auth::openai_auth::load_openai_api_key().filter(|key| !key.trim().is_empty())
@@ -133,6 +137,12 @@ pub fn opencode_api_key() -> Option<String> {
     threadlane_auth::opencode_auth::load_opencode_api_key()
 }
 
+/// Anthropic API key for `anthropic/*` models. Environment only for now
+/// (`ANTHROPIC_API_KEY`); Settings storage arrives with the follow-up PR.
+pub fn anthropic_api_key() -> Option<String> {
+    threadlane_provider::anthropic::api_key_from_env()
+}
+
 /// Builds a fully-wired provider client: stored Codex/Antigravity/OpenCode
 /// credentials resolve exactly as before the provider decoupling.
 pub fn provider_client_for(
@@ -158,6 +168,7 @@ mod tests {
         assert!(uses_openai_credentials("gpt-5.6-sol"));
         assert!(!uses_openai_credentials("antigravity/gemini-3.7-flash"));
         assert!(!uses_openai_credentials("opencode-go/minimax-m2.7"));
+        assert!(!uses_openai_credentials("anthropic/claude-sonnet-5-5"));
         assert!(!uses_openai_credentials("acp/claude"));
     }
 
