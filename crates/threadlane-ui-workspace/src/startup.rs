@@ -1,8 +1,8 @@
 use gpui::{
-    div, App, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
-    Role, StatefulInteractiveElement, Styled, Window,
+    div, AnyElement, App, AppContext, Context, Entity, FontWeight, InteractiveElement,
+    IntoElement, ParentElement, Render, Role, StatefulInteractiveElement, Styled, Window,
 };
-use gpui_component::{button::Button, ActiveTheme};
+use gpui_component::{button::Button, ActiveTheme, Icon, Sizable, TitleBar};
 use threadlane_ui_state::AppState;
 
 use crate::WorkspaceView;
@@ -64,7 +64,44 @@ impl StartupView {
 }
 
 impl Render for StartupView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let body = self.render_body(window, cx);
+        if !threadlane_ui_theme::APP_CAPTION_STRIP {
+            // macOS draws traffic lights inside the transparent titlebar and
+            // every panel header already reserves room for them.
+            return body;
+        }
+        // Elsewhere the frameless window has no native caption: this strip
+        // provides dragging, double-click maximize, and min/max/close (Windows
+        // routes them through native hit-testing, so snap layouts work).
+        let theme = cx.theme();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                TitleBar::new()
+                    .bg(theme.title_bar)
+                    .border_color(theme.border.opacity(0.5))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.foreground)
+                            .child(Icon::default().path("icons/threadlane.svg").small())
+                            .child("Threadlane"),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().w_full().flex().flex_col().child(body))
+            .into_any_element()
+    }
+}
+
+impl StartupView {
+    fn render_body(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if let Some(workspace) = &self.workspace {
             return workspace.clone().into_any_element();
         }

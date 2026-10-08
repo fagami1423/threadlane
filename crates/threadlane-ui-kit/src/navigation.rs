@@ -372,21 +372,62 @@ pub fn sidebar_surface(cx: &App) -> Div {
 }
 
 /// Production brand, new-task control and activity indicator, shared by every host.
+///
+/// `toggle_row` replaces the brand row where the app draws a caption strip
+/// (the brand moves into the strip): the row then only reserves room for the
+/// floating sidebar toggle and keeps the activity indicator.
 pub fn sidebar_header(
     loading: bool,
     working: bool,
     attention: SessionAttention,
     navigation: AnyElement,
+    toggle_row: bool,
     on_new_task: impl Fn(&mut Window, &mut App) + 'static,
     cx: &App,
 ) -> Div {
     let theme = cx.theme().colors;
+    // The toggle floats over this row, so it needs no leading content.
+    let leading = if toggle_row {
+        div().flex_1().into_any_element()
+    } else {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .size(rems(1.5))
+                    .rounded_lg()
+                    .bg(theme.foreground.opacity(0.12))
+                    .border_1()
+                    .border_color(theme.foreground.opacity(0.2))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::default()
+                            .path("icons/threadlane.svg")
+                            .size_4()
+                            .text_color(theme.foreground),
+                    ),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(theme.foreground)
+                    .child("Threadlane"),
+            )
+            .into_any_element()
+    };
     div()
         .flex()
         .flex_col()
         .gap_2()
         .px_2p5()
-        .pt(threadlane_ui_theme::WINDOW_CONTROLS_CLEARANCE)
+        .when(!toggle_row, |header| {
+            header.pt(threadlane_ui_theme::WINDOW_CONTROLS_CLEARANCE)
+        })
         .pb_1p5()
         .bg(theme.title_bar)
         .child(
@@ -394,39 +435,19 @@ pub fn sidebar_header(
                 .flex()
                 .items_center()
                 .justify_between()
+                .gap_2()
                 .px_1p5()
-                .pt_1()
-                .pb_2()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .size(rems(1.5))
-                                .rounded_lg()
-                                .bg(theme.foreground.opacity(0.12))
-                                .border_1()
-                                .border_color(theme.foreground.opacity(0.2))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    Icon::default()
-                                        .path("icons/threadlane.svg")
-                                        .size_4()
-                                        .text_color(theme.foreground),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_semibold()
-                                .text_color(theme.foreground)
-                                .child("Threadlane"),
-                        ),
-                )
+                .map(|row| {
+                    if toggle_row {
+                        // Same height as the other panel headers; the left
+                        // padding clears the floating sidebar toggle.
+                        row.min_h(threadlane_ui_theme::WINDOW_CONTROLS_CLEARANCE)
+                            .pl(rems(threadlane_ui_theme::WINDOW_CONTROLS_CONTENT_INSET - 1.0))
+                    } else {
+                        row.pt_1().pb_2()
+                    }
+                })
+                .child(leading)
                 .child({
                     let is_loading = loading;
                     let active_attention = Some(attention);

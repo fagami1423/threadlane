@@ -956,6 +956,7 @@ impl SidebarView {
             state.is_generating,
             state.active_session_attention().unwrap_or(SessionAttention::Idle),
             self.render_github_nav(cx).into_any_element(),
+            threadlane_ui_theme::APP_CAPTION_STRIP,
             |window, cx| window.dispatch_action(Box::new(crate::BeginNewTask), cx),
             cx,
         )

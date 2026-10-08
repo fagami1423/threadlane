@@ -16,11 +16,29 @@ const BUNDLED_THEMES: &str = include_str!("../themes/threadlane.json");
 /// y=12 in a frameless window). All panel headers share this inset so
 /// coincident header content forms one continuous line. This is a physical
 /// platform-window boundary, hence fixed pixels rather than `rem`.
-pub const WINDOW_CONTROLS_CLEARANCE: Pixels = px(48.0);
+///
+/// Where the app draws its own caption strip ([`APP_CAPTION_STRIP`]) nothing
+/// sits under the headers, so they only need a compact row height.
+pub const WINDOW_CONTROLS_CLEARANCE: Pixels = if APP_CAPTION_STRIP {
+    px(40.0)
+} else {
+    px(48.0)
+};
 
 /// Leading header space, in rem, for window controls and the sidebar toggle
 /// when the sidebar is hidden. Shared by chat and compact inspector headers.
-pub const WINDOW_CONTROLS_CONTENT_INSET: f32 = 6.875;
+/// With a caption strip there are no traffic lights, only the toggle.
+pub const WINDOW_CONTROLS_CONTENT_INSET: f32 = if APP_CAPTION_STRIP { 2.75 } else { 6.875 };
+
+/// Leading offset, in rem, of the floating sidebar toggle: after the traffic
+/// lights on macOS, at the content edge under a caption strip.
+pub const SIDEBAR_TOGGLE_LEFT: f32 = if APP_CAPTION_STRIP { 0.625 } else { 4.75 };
+
+/// True on desktop platforms whose frameless window has no native caption
+/// (Windows, Linux): the shell draws a caption strip with the window
+/// controls, drag area and sidebar toggle. macOS keeps its traffic lights in
+/// the transparent titlebar; the web preview has no window chrome.
+pub const APP_CAPTION_STRIP: bool = cfg!(any(target_os = "windows", target_os = "linux"));
 
 /// Shared reading width for user messages, relative to the interface font size.
 pub const USER_BUBBLE_MAX_WIDTH: f32 = 40.0;

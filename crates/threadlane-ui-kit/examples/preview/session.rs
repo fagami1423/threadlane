@@ -1195,6 +1195,7 @@ impl SessionPreview {
                 false,
                 SessionAttention::Idle,
                 navigation.into_any_element(),
+                false,
                 |window, cx| Self::preview_notice("New task", window, cx),
                 cx,
             ))

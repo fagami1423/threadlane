@@ -71,7 +71,17 @@ pub fn restore_workspace_panel_sizes(
     }
 }
 
+/// Floating toggle pinned to the top-left of the content area (beside the
+/// macOS traffic lights), over the sidebar header or, when collapsed, the
+/// chat header's leading inset.
 pub fn workspace_sidebar_toggle(collapsed: bool, available: bool) -> Button {
+    sidebar_toggle_button(collapsed, available)
+        .absolute()
+        .top(rems(if threadlane_ui_theme::APP_CAPTION_STRIP { 0.5 } else { 0.5625 }))
+        .left(rems(threadlane_ui_theme::SIDEBAR_TOGGLE_LEFT))
+}
+
+fn sidebar_toggle_button(collapsed: bool, available: bool) -> Button {
     let hint = if !available {
         "Sidebar needs a wider window. Use the command palette to switch sessions."
     } else if collapsed {
@@ -87,9 +97,6 @@ pub fn workspace_sidebar_toggle(collapsed: bool, available: bool) -> Button {
         .disabled(!available)
         .ghost()
         .xsmall()
-        .absolute()
-        .top(rems(0.5625))
-        .left(rems(4.75))
 }
 
 /// Keep the selected inspector usable when chat and panel cannot fit side by side.
