@@ -23,6 +23,11 @@ use threadlane_git::GitBranchInfo;
 use threadlane_project::watcher::WorkspaceWatcher;
 use threadlane_ui_state::AppState;
 use threadlane_ui_state::next_event_batch;
+use threadlane_ui_kit::EditorSaveStatus;
+
+#[path = "guarded_save.rs"]
+mod guarded_save;
+use guarded_save::DocumentOrigin;
 
 use super::agents::AgentsPanel;
 use super::browser::BrowserView;
@@ -118,6 +123,11 @@ pub struct RightPanelView {
     /// emit no `InputEvent`, but the add-selection control tracks them.
     editor_observe: Option<Subscription>,
     saved_content: String,
+    saved_version: Option<String>,
+    document_origin: Option<DocumentOrigin>,
+    save_status: EditorSaveStatus,
+    save_generation: u64,
+    buffer_revision: u64,
     is_dirty: bool,
     pending_document: Option<(String, String)>,
     /// Monotonic id of the latest panel-file open request; async reads older
@@ -418,6 +428,11 @@ impl RightPanelView {
             editor_subscription: None,
             editor_observe: None,
             saved_content: String::new(),
+            saved_version: None,
+            document_origin: None,
+            save_status: EditorSaveStatus::Ready,
+            save_generation: 0,
+            buffer_revision: 0,
             is_dirty: false,
             pending_document: None,
             panel_document_request: 0,
@@ -448,8 +463,8 @@ impl RightPanelView {
         };
         if self.project == project
             && self.worktree_unavailable == worktree_unavailable
-            && self.project_io_supported == project_io_supported
         {
+            self.project_io_supported = project_io_supported;
             return;
         }
         self.close_document(cx);
@@ -873,6 +888,11 @@ impl RightPanelView {
     }
 
     fn close_document(&mut self, cx: &mut Context<Self>) {
+        self.saved_version = None;
+        self.document_origin = None;
+        self.save_status = EditorSaveStatus::Ready;
+        self.save_generation = self.save_generation.wrapping_add(1);
+        self.buffer_revision = self.buffer_revision.wrapping_add(1);
         self.panel_document_request = self.panel_document_request.wrapping_add(1);
         self.document_loading = false;
         self.document_error = None;
@@ -944,11 +964,18 @@ impl RightPanelView {
         self.document_loading = true;
         let request_id = self.panel_document_request;
         let read_client = self.model.read(cx).daemon_client.clone();
+        let origin = DocumentOrigin::new(read_client.clone(), project.clone(), relative_path.clone());
+        self.document_origin = Some(origin.clone());
         let read_project = project.clone();
         let read_path = relative_path.clone();
         let read = cx.background_executor().spawn(async move {
-            threadlane_ui_state::project_io::read_file(&read_client, &read_project, read_path)
-                .await
+            if read_client.supports_guarded_saves() {
+                threadlane_ui_state::project_io::read_file_versioned(&read_client, &read_project, read_path)
+                    .await.map(|file| (file.content, Some(file.version))).map_err(|e| e.to_string())
+            } else {
+                threadlane_ui_state::project_io::read_file(&read_client, &read_project, read_path)
+                    .await.map(|content| (content, None))
+            }
         });
         cx.spawn(async move |this, cx| {
             let result = read.await;
@@ -960,8 +987,15 @@ impl RightPanelView {
                     return;
                 }
                 this.document_loading = false;
+                if !origin.is_current(this, cx) {
+                    this.document_error = Some("The daemon connection changed while loading. Reopen this file from the current checkout.".into());
+                    cx.notify();
+                    return;
+                }
                 match result {
-                    Ok(content) => {
+                    Ok((content, version)) => {
+                        this.saved_version = version;
+                        this.save_status = if origin.client.supports_guarded_saves() { EditorSaveStatus::Ready } else { EditorSaveStatus::Unsupported };
                         this.pending_document = Some((relative_path, content));
                     }
                     Err(error) => {
@@ -981,7 +1015,17 @@ impl RightPanelView {
         let Some((title, content)) = self.pending_document.take() else {
             return;
         };
+        if self.document_origin.as_ref().is_some_and(|origin| !origin.is_current(self, cx)) {
+            self.document_error = Some("The daemon connection changed while loading. Reopen this file from the current checkout.".into());
+            return;
+        }
+        let origin = self.document_origin.take();
+        let version = self.saved_version.take();
+        let status = self.save_status.clone();
         self.close_document(cx);
+        self.document_origin = origin;
+        self.saved_version = version;
+        self.save_status = status;
         self.document_title = Some(title.clone());
         self.saved_content = content.clone();
         self.is_dirty = false;
@@ -1009,6 +1053,7 @@ impl RightPanelView {
             });
             let subscription = cx.subscribe(&editor, |this, editor, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
+                    this.buffer_revision = this.buffer_revision.wrapping_add(1);
                     let current = editor.read(cx).value();
                     this.markdown_preview.refresh(current.clone(), cx);
                     let dirty = current.as_str() != this.saved_content.as_str();
@@ -1127,48 +1172,7 @@ impl RightPanelView {
     }
 
     fn save_active_document(&mut self, cx: &mut Context<Self>) {
-        let Some(editor) = self.editor_state.as_ref() else {
-            return;
-        };
-        let Some(title) = self.document_title.as_ref() else {
-            return;
-        };
-        let Some(project) = self.project.as_ref() else {
-            return;
-        };
-        // `title` is the project-relative document path.
-        let path = title.clone();
-        let content = editor.read(cx).value().to_string();
-        let daemon_client = self.model.read(cx).daemon_client.clone();
-        let work_dir = project.clone();
-        cx.spawn(async move |this, cx| {
-            let write_content = content.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    threadlane_ui_state::project_io::write_file(
-                        &daemon_client,
-                        &work_dir,
-                        path,
-                        write_content,
-                    )
-                    .await
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                match result {
-                    Ok(()) => {
-                        this.saved_content = content;
-                        this.is_dirty = false;
-                    }
-                    Err(error) => {
-                        this.git_feedback = Some(format!("Save failed: {error}"));
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        self.save_guarded_document(cx);
     }
 
     fn apply_event(&mut self, event: PanelEvent, cx: &mut Context<Self>) {
@@ -1949,6 +1953,8 @@ impl RightPanelView {
                 .min_h_0()
                 .flex()
                 .flex_col()
+                .key_context("PanelDocument")
+                .on_action(cx.listener(|this, _: &threadlane_ui_kit::SavePanelDocument, _, cx| this.save_active_document(cx)))
                 .on_action(cx.listener(|this, _: &threadlane_ui_kit::AddSelectionToChat, window, cx| {
                     this.request_add_selection_to_chat(window, cx)
                 }))
@@ -1964,6 +1970,7 @@ impl RightPanelView {
                     }),
                     title,
                     is_dirty,
+                    self.document_can_save(cx),
                     has_editor.then_some(lang),
                     self.active_surface == Some(Surface::Review),
                     has_editor.then_some(threadlane_ui_kit::AddSelectionControl {
@@ -1979,6 +1986,7 @@ impl RightPanelView {
                         }
                     }),
                 ))
+                .children(self.render_save_recovery(cx))
                 .children(
                     self.markdown_preview
                         .notice(is_dirty)

@@ -679,6 +679,8 @@ impl DaemonCore {
                 | SessionCommand::ValidateSearchTarget { .. }
                 | SessionCommand::ListProjectFiles { .. }
                 | SessionCommand::ReadProjectFile { .. }
+                | SessionCommand::ReadProjectFileVersioned { .. }
+                | SessionCommand::WriteProjectFileGuarded { .. }
                 | SessionCommand::ProjectFileExists { .. }
                 | SessionCommand::GitRequest { .. }
                 | SessionCommand::GitHubRequest { .. }
@@ -840,6 +842,48 @@ impl DaemonCore {
                 })
                 .await??;
                 return Ok(CommandResponse::FileContent { content });
+            }
+            SessionCommand::ReadProjectFileVersioned { work_dir, path } => {
+                let work_dir = work_dir.clone();
+                let path = path.clone();
+                let result = match run_blocking_io(move || {
+                    threadlane_project::files::read_project_file_versioned(&work_dir, &path)
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(message) => Err(threadlane_protocol::daemon::ProjectFileError::Io {
+                        message,
+                    }),
+                };
+                return Ok(CommandResponse::VersionedFile { result });
+            }
+            SessionCommand::WriteProjectFileGuarded {
+                work_dir,
+                path,
+                content,
+                expected_version,
+            } => {
+                let work_dir = work_dir.clone();
+                let path = path.clone();
+                let content = content.clone();
+                let expected_version = expected_version.clone();
+                let result = match run_blocking_io(move || {
+                    threadlane_project::files::write_project_file_guarded(
+                        &work_dir,
+                        &path,
+                        &content,
+                        &expected_version,
+                    )
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(message) => Err(threadlane_protocol::daemon::ProjectFileError::Io {
+                        message,
+                    }),
+                };
+                return Ok(CommandResponse::GuardedFileWrite { result });
             }
             SessionCommand::ProjectFileExists { work_dir, path } => {
                 let work_dir = work_dir.clone();
@@ -1327,6 +1371,8 @@ impl DaemonCore {
             | SessionCommand::ValidateSearchTarget { .. }
             | SessionCommand::ListProjectFiles { .. }
             | SessionCommand::ReadProjectFile { .. }
+            | SessionCommand::ReadProjectFileVersioned { .. }
+            | SessionCommand::WriteProjectFileGuarded { .. }
             | SessionCommand::ProjectFileExists { .. }
             | SessionCommand::GitRequest { .. }
             | SessionCommand::GitHubRequest { .. }
@@ -1991,5 +2037,76 @@ mod composer_tests {
             serde_json::from_str::<CommandResponse>(&encoded).unwrap(),
             response
         );
+    }
+
+    #[tokio::test]
+    async fn guarded_file_commands_return_typed_point_to_point_replies() {
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("src.rs");
+        std::fs::write(&path, "original").unwrap();
+        let core = DaemonCore::new().unwrap();
+        let read = core
+            .dispatch(SessionCommand::ReadProjectFileVersioned {
+                work_dir: project.path().to_path_buf(),
+                path: "src.rs".into(),
+            })
+            .await
+            .unwrap();
+        let CommandResponse::VersionedFile {
+            result: Ok(versioned),
+        } = read
+        else {
+            panic!("typed versioned-file reply")
+        };
+        assert_eq!(versioned.content, "original");
+
+        let changed = core
+            .dispatch(SessionCommand::WriteProjectFileGuarded {
+                work_dir: project.path().to_path_buf(),
+                path: "src.rs".into(),
+                content: "replacement".into(),
+                expected_version: "sha256:stale".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            changed,
+            CommandResponse::GuardedFileWrite {
+                result: Err(threadlane_protocol::daemon::ProjectFileError::Changed),
+            }
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+
+        let written = core
+            .dispatch(SessionCommand::WriteProjectFileGuarded {
+                work_dir: project.path().to_path_buf(),
+                path: "src.rs".into(),
+                content: "replacement".into(),
+                expected_version: versioned.version,
+            })
+            .await
+            .unwrap();
+        let CommandResponse::GuardedFileWrite { result: Ok(version) } = written else {
+            panic!("typed guarded-write reply")
+        };
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "replacement");
+
+        std::fs::remove_file(&path).unwrap();
+        let deleted = core
+            .dispatch(SessionCommand::WriteProjectFileGuarded {
+                work_dir: project.path().to_path_buf(),
+                path: "src.rs".into(),
+                content: "must not recreate".into(),
+                expected_version: version,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            deleted,
+            CommandResponse::GuardedFileWrite {
+                result: Err(threadlane_protocol::daemon::ProjectFileError::Deleted),
+            }
+        );
+        assert!(!path.exists());
     }
 }

@@ -100,6 +100,8 @@ pub trait DaemonClient: Send + Sync {
 
     /// Distinct capability floor: project I/O alone does not imply search.
     fn supports_file_search(&self) -> bool { false }
+    /// Versioned reads and writes guarded by a previously read version.
+    fn supports_guarded_saves(&self) -> bool { false }
     /// Current transport availability (in-process clients are always connected).
     fn is_connected(&self) -> bool { true }
     /// Changes on reconnect, invalidating ephemeral results from an old host.

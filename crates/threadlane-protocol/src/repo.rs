@@ -2,6 +2,7 @@
 //!
 //! These types cross the daemon boundary: `SessionCommand::GitRequest`,
 //! `SessionCommand::ListProjectFiles`/`ReadProjectFile`/`WriteProjectFile`,
+//! `ReadProjectFileVersioned`/`WriteProjectFileGuarded`,
 //! and `SessionEvent::WorkspaceChanged` carry them so a thin client can
 //! browse the daemon host's file tree and run Git operations on its
 //! checkouts. The canonical definitions live here; `threadlane-git`

@@ -10,11 +10,157 @@ use gpui_component::scroll::{Scrollable, ScrollableElement};
 use gpui_component::tag::Tag;
 use gpui_component::text::TextViewState;
 use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Sizable};
+use gpui_component::WindowExt;
 
-actions!(editor, [AddSelectionToChat, ReopenClosedFile]);
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum EditorSaveStatus {
+    #[default]
+    Ready,
+    Saving,
+    Reloading,
+    Conflict,
+    Deleted,
+    Unsupported,
+    Failed { message: String, save_blocked: bool },
+}
+
+impl EditorSaveStatus {
+    pub fn busy(&self) -> bool {
+        matches!(self, Self::Saving | Self::Reloading)
+    }
+
+    pub fn allows_save(&self) -> bool {
+        matches!(self, Self::Ready | Self::Failed { save_blocked: false, .. })
+    }
+
+    pub fn message(&self) -> Option<&str> {
+        match self {
+            Self::Ready => None,
+            Self::Saving => Some("Saving… You can keep editing."),
+            Self::Reloading => Some("Reading saved file… Your edits are kept until the read succeeds."),
+            Self::Conflict => Some("Couldn't save: this file changed on disk. Your edits are still here."),
+            Self::Deleted => Some("Couldn't save: this file was deleted. Your edits are still here. Restore the file before reloading; Save will not recreate it."),
+            Self::Unsupported => Some("Saving requires an updated daemon with guarded-save support. Your edits are still here."),
+            Self::Failed { message, .. } => Some(message),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditorRecoveryAction { Copy, Reload, RetrySave }
+
+/// Persistent document-local recovery; hosts retain the buffer and own all I/O.
+pub fn editor_save_recovery(
+    target: String,
+    status: &EditorSaveStatus,
+    on_action: impl Fn(&EditorRecoveryAction, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> Option<Div> {
+    let message = status.message()?;
+    let callback = std::rc::Rc::new(on_action);
+    let request = move |action| {
+        let callback = callback.clone();
+        move |_: &ClickEvent, window: &mut Window, cx: &mut App| callback(&action, window, cx)
+    };
+    Some(
+        div()
+            .flex_none()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .id("editor-save-status")
+                    .role(if status.busy() {
+                        Role::Status
+                    } else {
+                        Role::Alert
+                    })
+                    .text_xs()
+                    .whitespace_normal()
+                    .child(format!("{target}: {message}")),
+            )
+            .when(!status.busy(), |view| {
+                view.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .whitespace_normal()
+                        .child("Copy your edits, reload the saved file, then manually reapply your changes."),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            Button::new("editor-copy-edits")
+                                .debug_selector(|| "editor-copy-edits".into())
+                                .outline()
+                                .small()
+                                .label("Copy my edits")
+                                .accessibility_label(format!("Copy all my edits in {target}"))
+                                .on_click(request(EditorRecoveryAction::Copy)),
+                        )
+                        .child(
+                            Button::new("editor-reload-file")
+                                .debug_selector(|| "editor-reload-file".into())
+                                .outline()
+                                .small()
+                                .label("Reload from disk…")
+                                .disabled(matches!(status, EditorSaveStatus::Unsupported))
+                                .accessibility_label(format!("Reload {target} from disk…"))
+                                .on_click(request(EditorRecoveryAction::Reload)),
+                        )
+                        .when(status.allows_save(), |view| {
+                            view.child(
+                                Button::new("editor-retry-save")
+                                    .outline()
+                                    .small()
+                                    .label("Retry Save")
+                                    .on_click(request(EditorRecoveryAction::RetrySave)),
+                            )
+                        }),
+                )
+            }),
+    )
+}
+
+pub fn confirm_editor_reload(
+    target: String,
+    window: &mut Window,
+    cx: &mut App,
+    on_confirm: impl Fn(&mut Window, &mut App) + 'static,
+) {
+    let on_confirm = std::rc::Rc::new(on_confirm);
+    window.open_dialog(cx, move |dialog, _, _| {
+        let on_confirm = on_confirm.clone();
+        dialog.title(format!("Reload “{target}” from disk?"))
+            .child(div().whitespace_normal().child("Unsaved edits will be discarded only after a successful read. Copy your edits first if you want to keep them. If you keep typing, reload will require a new confirmation."))
+            .on_ok(|_, _, _| true)
+            .footer(div().flex().flex_wrap().gap_2()
+                .child(Button::new("editor-cancel-reload").debug_selector(|| "editor-cancel-reload".into()).primary().label("Cancel")
+                    .on_click(|_, window, cx| window.close_dialog(cx)))
+                .child(Button::new("editor-confirm-reload").debug_selector(|| "editor-confirm-reload".into()).danger().label("Discard edits and reload")
+                    .on_click(move |_, window, cx| {
+                        window.close_dialog(cx);
+                        on_confirm(window, cx);
+                    })))
+    });
+}
+
+actions!(editor, [AddSelectionToChat, ReopenClosedFile, SavePanelDocument]);
 
 pub fn init_editor(cx: &mut App) {
     cx.bind_keys([
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-s", SavePanelDocument, Some("PanelDocument")),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-s", SavePanelDocument, Some("PanelDocument")),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-shift-t", ReopenClosedFile, Some("CentralEditor")),
         #[cfg(not(target_os = "macos"))]
@@ -269,6 +415,7 @@ pub fn panel_document_header(
     mode: Option<AnyElement>,
     title: &str,
     dirty: bool,
+    save_enabled: bool,
     language: Option<&str>,
     reviewing: bool,
     add_selection: Option<AddSelectionControl>,
@@ -355,7 +502,7 @@ pub fn panel_document_header(
                         .icon(IconName::Check)
                         .accessibility_label(save)
                         .tooltip(save)
-                        .disabled(!dirty)
+                        .disabled(!save_enabled)
                         .on_click(request(PanelDocumentAction::Save))
                 }))
                 .child(

@@ -184,10 +184,10 @@ fn note_watch(
 /// [`WIRE_PROTOCOL_VERSION`] as a header value — `from_static` needs a
 /// literal, so keep this in step with the constant. The const assert
 /// below fails the build when one moves without the other.
-const WIRE_PROTOCOL_VERSION_STR: &str = "6";
+const WIRE_PROTOCOL_VERSION_STR: &str = "7";
 
 const _: () = assert!(
-    WIRE_PROTOCOL_VERSION == 6,
+    WIRE_PROTOCOL_VERSION == 7,
     "WIRE_PROTOCOL_VERSION_STR must match WIRE_PROTOCOL_VERSION"
 );
 

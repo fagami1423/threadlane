@@ -854,6 +854,7 @@ impl Render for Gallery {
                         Some(self.markdown_preview.control(false, cx)),
                         "README.md",
                         true,
+                        false,
                         Some("Markdown"),
                         false,
                         Some(kit::AddSelectionControl {
@@ -886,7 +887,20 @@ impl Render for Gallery {
                     }),
             )
             .child(heading("Panel document header · local sample", cx))
-            .child(kit::panel_document_header(None, "example.rs", self.document_dirty, Some("Rust"), true,
+            .children([
+                kit::EditorSaveStatus::Saving,
+                kit::EditorSaveStatus::Conflict,
+                kit::EditorSaveStatus::Deleted,
+                kit::EditorSaveStatus::Failed { message: "Couldn't reload: permission denied. Your edits are still here. Check the file and retry Reload from disk.".into(), save_blocked: true },
+                kit::EditorSaveStatus::Unsupported,
+            ].into_iter().enumerate().map(|(index, status)| div().id(("gallery-save-status", index)).children(
+                kit::editor_save_recovery("sample / src/example.rs".into(), &status,
+                    |action, window, cx| {
+                        if *action == kit::EditorRecoveryAction::Reload {
+                            kit::confirm_editor_reload("sample / src/example.rs".into(), window, cx, |window, cx| window.push_notification("Preview only · no buffer was changed", cx));
+                        } else { window.push_notification("Preview only · no file was changed", cx); }
+                    }, cx))))
+            .child(kit::panel_document_header(None, "example.rs", self.document_dirty, self.document_dirty, Some("Rust"), true,
                 Some(kit::AddSelectionControl { enabled: false, reason: Some("Select code in the file first".into()) }),
                 cx.listener(|host, action: &kit::PanelDocumentAction, window, cx| {
                     if *action == kit::PanelDocumentAction::Save { host.document_dirty = false; }
