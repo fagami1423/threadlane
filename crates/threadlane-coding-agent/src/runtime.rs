@@ -992,6 +992,8 @@ impl CodingAgent {
                         child_tool_observer: None,
                         #[cfg(test)]
                         child_run_override: None,
+                        #[cfg(test)]
+                        child_execution_observer: None,
                         semaphore,
                     },
                 )
@@ -1077,6 +1079,8 @@ impl CodingAgent {
                             child_tool_observer: None,
                             #[cfg(test)]
                             child_run_override: None,
+                            #[cfg(test)]
+                            child_execution_observer: None,
                             semaphore,
                         },
                     )

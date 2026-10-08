@@ -1544,6 +1544,8 @@ impl CodingAgent {
                     child_tool_observer: None,
                     #[cfg(test)]
                     child_run_override: None,
+                    #[cfg(test)]
+                    child_execution_observer: None,
                     semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
                     hub: self.hub.clone(),
                 },

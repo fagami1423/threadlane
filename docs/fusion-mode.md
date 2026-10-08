@@ -44,10 +44,12 @@ dynamic tool restrictions. Model, workspace, and isolation compatibility checks
 still apply. No provider credentials belong in this snapshot.
 
 Prompt capture respects `THREADLANE_REDACT_SYSTEM_PROMPTS` and the existing prompt
-size limit. A saved contract with an unavailable/redacted prompt or invalid data
-cannot be restored: start a new child with an explicit brief. Explicit Fusion
-revival also rejects older lanes without a saved contract; legacy interrupted
-recovery retains its compatibility path.
+size limit. Redacted metadata is persisted without the raw prompt, and the first
+execution continues with the already-held in-memory instructions. A saved
+contract with an unavailable/redacted prompt, invalid data, or a prompt hash
+mismatch cannot be restored: start a new child with an explicit brief. Explicit
+Fusion revival also rejects older lanes without a saved contract; legacy
+interrupted recovery retains its compatibility path.
 
 Worker outcome monitoring consumes events while the child runs, keeping bounded
 state rather than retaining its entire event stream. A successful tool result

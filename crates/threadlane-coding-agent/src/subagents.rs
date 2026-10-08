@@ -292,6 +292,8 @@ pub struct SubagentRunContext {
     pub(crate) child_tool_observer: Option<Arc<AtomicBool>>,
     #[cfg(test)]
     pub(crate) child_run_override: Option<(Duration, SubagentRunOverride)>,
+    #[cfg(test)]
+    pub(crate) child_execution_observer: Option<SubagentExecutionObserver>,
     pub(crate) semaphore: Arc<tokio::sync::Semaphore>,
 }
 
@@ -301,6 +303,18 @@ pub type SubagentRunOverride = Arc<
         + Send
         + Sync,
 >;
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SubagentExecutionSnapshot {
+    pub(crate) system_prompt: String,
+    pub(crate) tools: Option<Vec<String>>,
+    pub(crate) peer_info: Option<(Vec<String>, String)>,
+}
+
+#[cfg(test)]
+pub(crate) type SubagentExecutionObserver =
+    Arc<dyn Fn(SubagentExecutionSnapshot) + Send + Sync>;
 
 #[derive(Clone, Debug)]
 pub struct SubagentResult {
@@ -1264,6 +1278,8 @@ pub(crate) async fn run_subagent_task(
     let lane_name = identity.lane_name.clone();
     let journal_run_id = identity.run_id.clone();
     let mut fusion_lane = false;
+    let mut restored_contract = false;
+    let mut peer_info = peer_info;
     if let Some(path) = context.session_file.as_deref() {
         let mut journal = CodingSessionHarness::open(path)?;
         let is_fusion = journal
@@ -1275,15 +1291,7 @@ pub(crate) async fn run_subagent_task(
             })
             .is_some();
         match &contract_mode {
-            LaneContractMode::CaptureIfFusion if is_fusion => {
-                journal.capture_fusion_lane_contract(
-                    &lane_name,
-                    &config.name,
-                    config.tools.clone(),
-                    &config.system_prompt,
-                )?;
-                fusion_lane = true;
-            }
+            LaneContractMode::CaptureIfFusion if is_fusion => fusion_lane = true,
             LaneContractMode::CaptureIfFusion => {}
             LaneContractMode::Restore {
                 expected_agent,
@@ -1292,7 +1300,9 @@ pub(crate) async fn run_subagent_task(
                 let contract =
                     journal.load_fusion_lane_contract(&lane_name, expected_agent.as_deref())?;
                 if let Some(contract) = contract {
-                    contract.restore_into(&mut config);
+                    contract.restore_into(&mut config)?;
+                    peer_info = contract.peer_info();
+                    restored_contract = true;
                     fusion_lane = true;
                 } else if *required {
                     return Err(format!(
@@ -1310,6 +1320,7 @@ pub(crate) async fn run_subagent_task(
         return Err("Fusion lane contract requires session persistence; start a new child".into());
     }
     if fusion_lane
+        && !restored_contract
         && !config
             .system_prompt
             .contains(threadlane_orchestrator::FUSION_SIDEKICK_HEADER)
@@ -1317,10 +1328,6 @@ pub(crate) async fn run_subagent_task(
         config
             .system_prompt
             .push_str(&threadlane_orchestrator::build_fusion_sidekick_directive());
-    }
-    #[cfg(test)]
-    if let Some((_, run)) = &context.child_run_override {
-        return run(task).await;
     }
     let policy = configure_subagent_tools(&mut config);
     let model = context.child_model.clone();
@@ -1386,7 +1393,19 @@ pub(crate) async fn run_subagent_task(
         }
         let _ = agent.register_tool_executor(peer_executor);
     }
-    let system_prompt = if let Some((ref siblings, _)) = peer_info {
+    let effective_tools = config.tools.as_ref().map(|_| {
+        let mut names: Vec<String> = agent
+            .configured_tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    });
+    let system_prompt = if restored_contract {
+        config.system_prompt.clone()
+    } else if let Some((ref siblings, _)) = peer_info {
         let peers: Vec<String> = siblings
             .iter()
             .filter(|sibling| *sibling != &config.name)
@@ -1412,7 +1431,31 @@ pub(crate) async fn run_subagent_task(
             context.work_dir.display(),
         )
     };
-    agent.set_system_prompt(system_prompt).await;
+    agent.set_system_prompt(system_prompt.clone()).await;
+    #[cfg(test)]
+    if let Some(observer) = context.child_execution_observer.as_ref() {
+        observer(SubagentExecutionSnapshot {
+            system_prompt: system_prompt.clone(),
+            tools: effective_tools.clone(),
+            peer_info: peer_info.clone(),
+        });
+    }
+    if fusion_lane && !restored_contract {
+        if let Some(path) = context.session_file.as_deref() {
+            let mut journal = CodingSessionHarness::open(path)?;
+            journal.capture_fusion_lane_contract(
+                &lane_name,
+                &config.name,
+                effective_tools,
+                &system_prompt,
+                peer_info.as_ref(),
+            )?;
+        }
+    }
+    #[cfg(test)]
+    if let Some((_, run)) = &context.child_run_override {
+        return run(task).await;
+    }
     let is_recovery = !resume_messages.is_empty();
     if is_recovery {
         agent.turn.lock().await.messages.extend(
@@ -1919,6 +1962,7 @@ mod result_tests {
             child_work_observer: observer,
             child_tool_observer: None,
             child_run_override: None,
+            child_execution_observer: None,
             semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
@@ -2107,6 +2151,166 @@ mod result_tests {
     }
 
     #[tokio::test]
+    async fn fusion_execution_contract_round_trips_effective_prompt_tools_and_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut journal = CodingSessionHarness::open(&path).unwrap();
+        let fusion_state =
+            threadlane_orchestrator::FusionState::new("main".into(), "test-model".into(), None);
+        journal
+            .set_fact(
+                "main",
+                "fusion_state",
+                serde_json::to_string(&fusion_state).unwrap(),
+            )
+            .unwrap();
+        drop(journal);
+
+        let initial_snapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let initial_observer = initial_snapshots.clone();
+        let mut initial_context = test_context(dir.path().into(), path.clone(), None);
+        initial_context.child_execution_observer = Some(Arc::new(move |snapshot| {
+            initial_observer.lock().unwrap().push(snapshot);
+        }));
+        initial_context.child_run_override = Some((
+            Duration::from_secs(1),
+            Arc::new(|_| Box::pin(async { Ok(success("initial")) })),
+        ));
+        let identity = SubagentLaneIdentity {
+            lane_name: "worker-lane".into(),
+            run_id: "worker-run".into(),
+            source_leaf_id: None,
+            started_seq: 0,
+        };
+        run_subagent_task(
+            AgentDefinition {
+                name: "worker".into(),
+                description: "dynamic definition".into(),
+                tools: Some(vec!["read_file".into(), "run_command".into()]),
+                model: None,
+                system_prompt: "Current dynamic instructions.".into(),
+                source: threadlane_skills::agents::AgentSource::Project,
+                file_path: dir.path().into(),
+            },
+            "edit".into(),
+            initial_context,
+            1,
+            0,
+            identity.clone(),
+            None,
+            Vec::new(),
+            Some((vec!["worker".into(), "sibling".into()], "worker".into())),
+            LaneContractMode::CaptureIfFusion,
+        )
+        .await
+        .unwrap();
+        let initial = initial_snapshots.lock().unwrap()[0].clone();
+        assert!(initial.system_prompt.contains("Current dynamic instructions."));
+        assert!(initial
+            .system_prompt
+            .contains("Sibling subagents in this parallel batch: sibling."));
+        assert_eq!(
+            initial.tools,
+            Some(vec![
+                "grep_search".into(),
+                "list_dir".into(),
+                "message_peer".into(),
+                "read_file".into(),
+            ])
+        );
+        assert_eq!(
+            initial.peer_info,
+            Some((vec!["worker".into(), "sibling".into()], "worker".into()))
+        );
+
+        let restored_snapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let restored_observer = restored_snapshots.clone();
+        let mut restored_context = test_context(dir.path().into(), path.clone(), None);
+        restored_context.child_execution_observer = Some(Arc::new(move |snapshot| {
+            restored_observer.lock().unwrap().push(snapshot);
+        }));
+        restored_context.child_run_override = Some((
+            Duration::from_secs(1),
+            Arc::new(|_| Box::pin(async { Ok(success("restored")) })),
+        ));
+        run_subagent_task(
+            AgentDefinition {
+                name: "worker".into(),
+                description: "changed definition".into(),
+                tools: Some(vec!["write_file".into()]),
+                model: None,
+                system_prompt: "Changed instructions must not win.".into(),
+                source: threadlane_skills::agents::AgentSource::Project,
+                file_path: dir.path().into(),
+            },
+            "edit".into(),
+            restored_context,
+            2,
+            0,
+            identity,
+            None,
+            Vec::new(),
+            None,
+            LaneContractMode::Restore {
+                expected_agent: Some("worker".into()),
+                required: true,
+            },
+        )
+        .await
+        .unwrap();
+        let restored = restored_snapshots.lock().unwrap()[0].clone();
+        assert_eq!(restored, initial);
+
+        let mut redacted_context = test_context(dir.path().into(), path.clone(), None);
+        redacted_context.child_run_override = Some((
+            Duration::from_secs(1),
+            Arc::new(|_| Box::pin(async { Ok(success("first run")) })),
+        ));
+        let oversized_prompt =
+            "redacted prompt".repeat(crate::durable::MAX_PERSISTED_SYSTEM_PROMPT_BYTES / 15 + 1);
+        let redacted_identity = SubagentLaneIdentity {
+            lane_name: "redacted-lane".into(),
+            run_id: "redacted-run".into(),
+            source_leaf_id: None,
+            started_seq: 0,
+        };
+        run_subagent_task(
+            AgentDefinition {
+                name: "worker".into(),
+                description: "redacted definition".into(),
+                tools: Some(vec!["read_file".into()]),
+                model: None,
+                system_prompt: oversized_prompt,
+                source: threadlane_skills::agents::AgentSource::Project,
+                file_path: dir.path().into(),
+            },
+            "inspect".into(),
+            redacted_context,
+            3,
+            0,
+            redacted_identity,
+            None,
+            Vec::new(),
+            None,
+            LaneContractMode::CaptureIfFusion,
+        )
+        .await
+        .unwrap();
+        let mut journal = CodingSessionHarness::open(&path).unwrap();
+        let redacted_contract = journal
+            .store
+            .facts()
+            .get("fusion_lane_contract:redacted-lane")
+            .cloned()
+            .unwrap();
+        assert!(!redacted_contract.contains("redacted prompt"));
+        let error = journal
+            .load_fusion_lane_contract("redacted-lane", Some("worker"))
+            .unwrap_err();
+        assert!(error.contains("no restorable system prompt"), "{error}");
+    }
+
+    #[tokio::test]
     async fn fusion_revival_preserves_child_history_after_parent_compaction() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
@@ -2127,6 +2331,7 @@ mod result_tests {
                 "worker",
                 Some(vec!["read_file".into()]),
                 "Use the worker's captured Fusion instructions.",
+                None,
             )
             .unwrap();
         journal
