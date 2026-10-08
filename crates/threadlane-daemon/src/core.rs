@@ -22,9 +22,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::sync::{broadcast, mpsc};
 
-use threadlane_coding_agent::controller::{
-    spawn_session_runtime_construction, SessionRuntime,
-};
+use threadlane_coding_agent::controller::SessionRuntime;
 use threadlane_protocol::browser::BrowserBridge;
 use threadlane_protocol::daemon::{
     CommandResponse, ProjectInfo, SessionCommand, SessionEvent, SessionHydrationRequest,
@@ -58,6 +56,8 @@ pub struct SessionIdentity {
 pub struct DaemonCore {
     /// Live runtimes keyed by session file (the canonical identity path).
     runtimes: Mutex<HashMap<PathBuf, Arc<SessionRuntime>>>,
+    /// Serializes owner creation before WASI acquires its exclusive state lock.
+    runtime_construction: Mutex<()>,
     /// `session_id` → file/work_dir, populated at registration and hydration.
     identities: Mutex<HashMap<String, SessionIdentity>>,
     /// Work dirs the host attached, fed by AppState/`AddProject` so remote
@@ -130,6 +130,7 @@ impl DaemonCore {
         }
         let core = Arc::new(Self {
             runtimes: Mutex::new(HashMap::new()),
+            runtime_construction: Mutex::new(()),
             identities: Mutex::new(HashMap::new()),
             attached_projects: Mutex::new(BTreeSet::new()),
             worktree_setups: Mutex::new(HashMap::new()),
@@ -341,6 +342,10 @@ impl DaemonCore {
         session_file: PathBuf,
         runtime: Arc<SessionRuntime>,
     ) -> Arc<SessionRuntime> {
+        let _construction = self
+            .runtime_construction
+            .lock()
+            .expect("runtime construction poisoned");
         {
             let mut runtimes = self.runtimes.lock().expect("runtimes poisoned");
             if let Some(existing) = runtimes.get(&session_file) {
@@ -348,11 +353,60 @@ impl DaemonCore {
             }
             runtimes.insert(session_file.clone(), runtime.clone());
         }
-        self.identities
-            .lock()
-            .expect("identities poisoned")
-            .insert(session_id.to_string(), SessionIdentity { session_file, work_dir });
+        self.identities.lock().expect("identities poisoned").insert(
+            session_id.to_string(),
+            SessionIdentity {
+                session_file,
+                work_dir,
+            },
+        );
         runtime
+    }
+
+    /// Serialized check-and-create boundary shared by desktop and paired clients.
+    /// Call on a large-stack worker; construction loads WASI extensions.
+    pub fn get_or_create_runtime(
+        &self,
+        session_id: &str,
+        work_dir: PathBuf,
+        session_file: PathBuf,
+        options: threadlane_coding_agent::CodingAgentOptions,
+        prepared: Option<Arc<SessionRuntime>>,
+    ) -> Arc<SessionRuntime> {
+        let _construction = self
+            .runtime_construction
+            .lock()
+            .expect("runtime construction poisoned");
+        if let Some(runtime) = self.runtime_for_file(&session_file) {
+            return runtime;
+        }
+        let runtime = prepared.unwrap_or_else(|| SessionRuntime::new(options));
+        self.runtimes
+            .lock()
+            .expect("runtimes poisoned")
+            .insert(session_file.clone(), runtime.clone());
+        self.identities.lock().expect("identities poisoned").insert(
+            session_id.to_string(),
+            SessionIdentity {
+                session_file,
+                work_dir: Self::project_dir_for(&work_dir),
+            },
+        );
+        runtime
+    }
+
+    /// Start construction immediately on the shared large-stack blocking pool.
+    pub fn get_or_create_runtime_async(
+        self: Arc<Self>,
+        session_id: String,
+        work_dir: PathBuf,
+        session_file: PathBuf,
+        options: threadlane_coding_agent::CodingAgentOptions,
+        prepared: Option<Arc<SessionRuntime>>,
+    ) -> tokio::task::JoinHandle<Arc<SessionRuntime>> {
+        threadlane_provider::exec::get_runtime().spawn_blocking(move || {
+            self.get_or_create_runtime(&session_id, work_dir, session_file, options, prepared)
+        })
     }
 
     pub fn runtime_for_file(&self, session_file: &Path) -> Option<Arc<SessionRuntime>> {
@@ -469,52 +523,52 @@ impl DaemonCore {
     /// session is known but idle. Construction goes through the shared
     /// blocking pool — wasmi needs real stacks.
     pub async fn ensure_runtime(
-        &self,
+        self: &Arc<Self>,
         session_id: &str,
         work_dir: &Path,
     ) -> Result<Arc<SessionRuntime>, String> {
         if let Some(runtime) = self.runtime_for_session(session_id) {
             return Ok(runtime);
         }
-        // A worktree-prepared session parks its runtime under the session id
-        // before the transcript exists; the first prompt claims it.
-        if let Some(prepared) = crate::runtimes::take_prepared_runtime(session_id) {
-            return Ok(self.register_runtime(
-                session_id,
-                Self::project_dir_for(work_dir),
-                prepared.session_file.clone(),
-                prepared,
-            ));
-        }
+        let prepared = crate::runtimes::take_prepared_runtime(session_id);
         let session_file = self
             .identity(session_id)
             .map(|identity| identity.session_file)
+            .or_else(|| {
+                prepared
+                    .as_ref()
+                    .map(|runtime| runtime.session_file.clone())
+            })
             .unwrap_or_else(|| canonical_session_file(work_dir, session_id));
         let options = coding_agent_options(
             work_dir.to_path_buf(),
             session_file.clone(),
             self.model.read().expect("model poisoned").clone(),
-            self.model_roles.read().expect("model roles poisoned").clone(),
+            self.model_roles
+                .read()
+                .expect("model roles poisoned")
+                .clone(),
             self.browser_bridge
                 .read()
                 .expect("browser bridge poisoned")
                 .clone(),
         );
-        let runtime = spawn_session_runtime_construction(options)
+        Arc::clone(self)
+            .get_or_create_runtime_async(
+                session_id.to_owned(),
+                Self::project_dir_for(work_dir),
+                session_file,
+                options,
+                prepared,
+            )
             .await
-            .map_err(|error| format!("session runtime construction failed: {error}"))?;
-        Ok(self.register_runtime(
-            session_id,
-            Self::project_dir_for(work_dir),
-            session_file,
-            runtime,
-        ))
+            .map_err(|error| format!("session runtime construction failed: {error}"))
     }
 
     /// Construct a runtime with explicit hydration options rather than the
     /// core's current selection (hydration pins the session's own model).
     async fn hydrate_runtime(
-        &self,
+        self: &Arc<Self>,
         request: &SessionHydrationRequest,
     ) -> Result<Option<Arc<SessionRuntime>>, String> {
         let Some(options) = &request.runtime_options else {
@@ -525,9 +579,6 @@ impl DaemonCore {
             Self::project_dir_for(&options.work_dir),
             request.session_file.clone(),
         );
-        if let Some(runtime) = self.runtime_for_file(&request.session_file) {
-            return Ok(Some(runtime));
-        }
         let agent_options = coding_agent_options(
             options.work_dir.clone(),
             request.session_file.clone(),
@@ -538,14 +589,17 @@ impl DaemonCore {
                 .expect("browser bridge poisoned")
                 .clone(),
         );
-        let runtime = spawn_session_runtime_construction(agent_options).await
-        .map_err(|error| format!("session runtime construction failed: {error}"))?;
-        Ok(Some(self.register_runtime(
-            &request.session_id,
-            Self::project_dir_for(&options.work_dir),
-            request.session_file.clone(),
-            runtime,
-        )))
+        let runtime = Arc::clone(self)
+            .get_or_create_runtime_async(
+                request.session_id.clone(),
+                Self::project_dir_for(&options.work_dir),
+                request.session_file.clone(),
+                agent_options,
+                None,
+            )
+            .await
+            .map_err(|error| format!("session runtime construction failed: {error}"))?;
+        Ok(Some(runtime))
     }
 
     // -- command surface --------------------------------------------------
@@ -1579,6 +1633,44 @@ mod composer_tests {
     use super::{canonical_session_file, DaemonCore};
     use threadlane_protocol::daemon::{CommandResponse, SessionCommand};
     use threadlane_protocol::{OrchestratorMode, ReasoningEffort};
+
+    #[tokio::test]
+    async fn desktop_and_phone_resume_share_one_runtime_owner() {
+        use std::sync::Arc;
+        use threadlane_protocol::daemon::{HydrationRuntimeOptions, SessionHydrationRequest};
+
+        let project = tempfile::tempdir().unwrap();
+        let work_dir = project.path().canonicalize().unwrap();
+        let session_id = "shared-resume";
+        let session_file = canonical_session_file(&work_dir, session_id);
+        let core = DaemonCore::new().unwrap();
+        let options = || super::coding_agent_options(
+            work_dir.clone(), session_file.clone(), "test/model".into(),
+            Default::default(), threadlane_protocol::browser::BrowserBridge::unavailable(),
+        );
+        // Desktop hydration and mobile lazy resume can overlap before either
+        // has published its runtime. Construction must be single-owner, not
+        // merely deduplicated after both managers acquire extension state.
+        let desktop = core.clone().get_or_create_runtime_async(
+            session_id.into(), work_dir.clone(), session_file.clone(), options(), None,
+        );
+        let phone = core.clone().get_or_create_runtime_async(
+            session_id.into(), work_dir.clone(), session_file.clone(), options(), None,
+        );
+        let desktop = desktop.await.unwrap();
+        let phone = phone.await.unwrap();
+        assert!(Arc::ptr_eq(&desktop, &phone));
+        let resumed = core.ensure_runtime(session_id, &work_dir).await.unwrap();
+        assert!(Arc::ptr_eq(&desktop, &resumed));
+        let hydrated = core.hydrate_runtime(&SessionHydrationRequest {
+            session_id: session_id.into(), session_file, reload_messages: true,
+            runtime_options: Some(HydrationRuntimeOptions {
+                work_dir, model: "test/model".into(), model_roles: Default::default(),
+            }),
+        }).await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&desktop, &hydrated));
+        assert_eq!(core.runtimes().len(), 1);
+    }
 
     #[test]
     fn automation_bridge_does_not_retain_its_host_core() {

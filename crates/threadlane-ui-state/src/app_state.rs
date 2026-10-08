@@ -2597,14 +2597,9 @@ impl AppState {
         session_file: PathBuf,
     ) -> Arc<SessionRuntime> {
         if let Some(runtime) = self.daemon_core.runtime_for_file(&session_file) {
-            return runtime;
+            return self.register_session_runtime(work_dir, session_file, runtime);
         }
-        // Build on a dedicated thread with a large stack: CodingAgent loads
-        // WASI extensions through wasmi, which needs more than GPUI's 512
-        // KiB GCD worker stacks provide. A plain spawn (not the Tokio
-        // runtime) keeps this lazy path safe whether or not the caller runs
-        // inside async context; the hydrated path in
-        // threadlane-ui-workspace awaits the same constructor asynchronously.
+        // WASI construction needs a larger stack than GPUI's worker stacks.
         let options = coding_agent_options(
             work_dir.clone(),
             session_file.clone(),
@@ -2612,14 +2607,21 @@ impl AppState {
             self.model_roles.clone(),
             self.browser_bridge.clone(),
         );
+        let session_id = threadlane_daemon::core::DaemonCore::session_id_for_file(&session_file)
+            .unwrap_or_default();
+        let core = self.daemon_core.clone();
+        let runtime_work_dir = work_dir.clone();
+        let runtime_file = session_file.clone();
         let runtime = std::thread::Builder::new()
             .name("session-runtime-construct".into())
             .stack_size(8 * 1024 * 1024)
-            .spawn(move || SessionRuntime::new(options))
+            .spawn(move || core.get_or_create_runtime(
+                &session_id, runtime_work_dir, runtime_file, options, None,
+            ))
             .expect("failed to spawn session runtime constructor")
             .join()
             .expect("session runtime construction panicked");
-        self.register_session_runtime(work_dir.clone(), session_file, runtime)
+        self.register_session_runtime(work_dir, session_file, runtime)
     }
 
     pub fn register_session_runtime(
@@ -2628,17 +2630,17 @@ impl AppState {
         session_file: PathBuf,
         runtime: Arc<SessionRuntime>,
     ) -> Arc<SessionRuntime> {
-        if let Some(existing) = self.daemon_core.runtime_for_file(&session_file) {
-            return existing;
-        }
-        if let Ok((handle, results)) = runtime.start_scheduler_supervisor_with_results() {
-            self.scheduler_handles.insert(session_file.clone(), handle);
-            self.scheduler_results.insert(session_file.clone(), results);
-        }
         let session_id = threadlane_daemon::core::DaemonCore::session_id_for_file(&session_file)
             .unwrap_or_default();
-        self.daemon_core
-            .register_runtime(&session_id, work_dir, session_file, runtime.clone());
+        let runtime = self.daemon_core.register_runtime(
+            &session_id, work_dir, session_file.clone(), runtime,
+        );
+        if !self.scheduler_handles.contains_key(&session_file) {
+            if let Ok((handle, results)) = runtime.start_scheduler_supervisor_with_results() {
+                self.scheduler_handles.insert(session_file.clone(), handle);
+                self.scheduler_results.insert(session_file.clone(), results);
+            }
+        }
         runtime
     }
 
