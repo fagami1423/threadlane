@@ -62,6 +62,13 @@ part of the fixture so native and web show the same groups.
 
 ## Native
 
+The public sample includes two captured Review diffs. Open **Review**, then a file
+or **All changes**, and use **Find in diff** (Cmd/Ctrl+F). `LEGACY_TIMEOUT` finds
+deleted text, `CAFÉ` exercises Unicode case folding, `removed_offscreen` reveals
+the end of the long patch, and `not-in-this-patch` exercises the no-match state.
+Previous/Next and Shift+Enter/Enter wrap within the loaded patch. The sample and
+imported patches are read-only; searching never loads files or runs Git.
+
 From the repository root, using the app's Rust toolchain:
 
 ```sh

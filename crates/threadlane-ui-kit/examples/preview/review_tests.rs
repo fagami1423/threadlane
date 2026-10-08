@@ -64,6 +64,38 @@ fn fixture() -> Snapshot {
     .unwrap()
 }
 
+#[gpui::test]
+fn shared_review_sample_combined_diff_deserializes_without_filesystem(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    cx.update(threadlane_ui_theme::init_bundled);
+    let snapshot: Snapshot =
+        serde_json::from_str(include_str!("session.sample.json")).unwrap();
+    let combined = snapshot
+        .review_combined_diff
+        .as_ref()
+        .expect("sample snapshot includes its combined diff");
+    assert!(combined.text.contains("removed_offscreen"));
+    assert!(combined.text.lines().count() > 150);
+
+    let saved = Rc::new(RefCell::new(None));
+    let capture = saved.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let view = cx.new(|cx| ReviewPreview::new(Some(&snapshot), window, cx));
+        *capture.borrow_mut() = Some(view.clone());
+        let panel = cx.new(|_| PanelHarness(view));
+        gpui_component::Root::new(panel, window, cx)
+    });
+    let view = saved.borrow_mut().take().expect("preview mounted");
+    view.update(cx, |host, cx| host.open_diff(String::new(), cx));
+    draw(cx);
+    assert_eq!(
+        view.read_with(cx, |host, _| host.document.clone()),
+        Some(String::new())
+    );
+}
+
 fn record_fixture() -> Snapshot {
     let mut snapshot = fixture();
     let status = snapshot.git_status.as_mut().unwrap();
@@ -196,7 +228,7 @@ fn shared_review_preserves_selection_and_draft_across_diff_and_filter(cx: &mut T
 fn shared_review_controls_fit_narrow_panels_at_zoom(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     cx.update(threadlane_ui_theme::init_bundled);
-    let (_, cx) = cx.add_window_view(|window, cx| {
+    let (_, cx) = cx.add_window_view(move |window, cx| {
         let view = cx.new(|cx| {
             let mut host = ReviewPreview::new(Some(&fixture()), window, cx);
             host.selected.remove("README.md");

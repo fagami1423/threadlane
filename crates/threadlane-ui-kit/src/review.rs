@@ -3,12 +3,14 @@ use gpui::{prelude::*, *};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputState};
-use gpui_component::scroll::ScrollableElement;
+use gpui_component::scroll::{ScrollableElement, ScrollbarAxis};
 use gpui_component::spinner::Spinner;
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::tag::{Tag, TagVariant};
 use gpui_component::text::TextViewState;
-use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable};
+use gpui_component::{
+    ActiveTheme, Disableable, Icon, IconName, InteractiveElementExt, Selectable, Sizable,
+};
 use threadlane_protocol::repo::{GitFile, GitStatus};
 
 pub fn review_can_publish_branch(worktree_available: bool, status: Option<&GitStatus>) -> bool {
@@ -578,15 +580,39 @@ pub fn review_diff_body(
     on_action: impl Fn(&ReviewDiffAction, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
+    review_diff_body_scrolled(
+        content,
+        ignore_whitespace,
+        scroll_id,
+        None,
+        std::rc::Rc::new(std::cell::Cell::new(false)),
+        on_action,
+        cx,
+    )
+}
+
+pub(crate) fn review_diff_body_scrolled(
+    content: ReviewDiffContent<'_>,
+    ignore_whitespace: bool,
+    scroll_id: ElementId,
+    scroll: Option<&ScrollHandle>,
+    reveal_enabled: std::rc::Rc<std::cell::Cell<bool>>,
+    on_action: impl Fn(&ReviewDiffAction, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
     // `scroll_id` keys the retained scroll state; callers pass a per-request
     // identity so an explicit new target starts at the top of its patch.
+    let tracked_scroll = scroll.cloned().unwrap_or_default();
     let body = div()
+        .id(scroll_id)
         .flex_1()
         .min_w_0()
         .min_h_0()
-        .overflow_y_scrollbar()
-        .id(scroll_id)
-        .p_3();
+        .track_scroll(&tracked_scroll)
+        .overflow_y_scroll()
+        .lock_scroll_axis()
+        .p_3()
+        .scrollbar(&tracked_scroll, ScrollbarAxis::Vertical);
     let callback = std::rc::Rc::new(on_action);
     let request = move |action| {
         let callback = callback.clone();
@@ -648,7 +674,20 @@ pub fn review_diff_body(
             )
             .into_any_element(),
         ReviewDiffContent::Ready(text) => body
-            .child(crate::diff_text_view(text, cx))
+            .child(crate::diff_text_view(text, cx).when_some(scroll, |view, scroll| {
+                let scroll = scroll.clone();
+                view.on_reveal(move |line, _, _| {
+                    if !reveal_enabled.get() { return; }
+                    let viewport = scroll.bounds();
+                    let mut offset = scroll.offset();
+                    if line.bottom() > viewport.bottom() {
+                        offset.y -= line.bottom() - viewport.bottom();
+                    } else if line.top() < viewport.top() {
+                        offset.y += viewport.top() - line.top();
+                    }
+                    scroll.set_offset(offset);
+                })
+            }))
             .into_any_element(),
     }
 }

@@ -8733,6 +8733,7 @@ dependencies = [
  "gpui-kit",
  "gpui-kit-assets",
  "gpui-pre",
+ "regex",
  "serde_json",
  "threadlane-automation",
  "threadlane-protocol",

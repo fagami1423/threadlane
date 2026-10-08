@@ -47,6 +47,8 @@ mod files;
 pub use files::*;
 mod review;
 pub use review::*;
+mod review_find;
+pub use review_find::ReviewDiffDocument;
 mod review_actions;
 pub use review_actions::*;
 mod review_branches;

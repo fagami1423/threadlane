@@ -72,10 +72,11 @@ pub struct RightPanelView {
     review_diff_revision: u64,
     /// Bumped only on an explicit diff-target open; reloads and background
     /// refreshes keep it so an in-progress read does not jump back to the top.
-    review_diff_scroll_key: u64,
     review_diff_options: threadlane_git::DiffOptions,
     review_diff_request: Option<ReviewDiffRequest>,
     review_diff_state: Option<ReviewDiffState>,
+    review_document: Entity<threadlane_ui_kit::ReviewDiffDocument>,
+    review_session_id: Option<String>,
     /// Stable focus target for the adjacent-file navigation group: when the
     /// initiating control becomes disabled at a boundary, focus lands here
     /// instead of being dropped.
@@ -141,6 +142,13 @@ impl RightPanelView {
     pub fn new(model: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let agents = cx.new(|cx| AgentsPanel::new(model.clone(), window, cx));
         let document_state = cx.new(|cx| TextViewState::markdown("", cx));
+        let review_document = cx.new(|cx| threadlane_ui_kit::ReviewDiffDocument::new(window, cx));
+        let review_document_subscription = cx.subscribe(&review_document, |this, _, action, cx| {
+            match action {
+                threadlane_ui_kit::ReviewDiffAction::Retry => this.reload_review_diff(cx),
+                threadlane_ui_kit::ReviewDiffAction::ShowWhitespace => this.set_ignore_whitespace(false, cx),
+            }
+        });
         let tree_state = cx.new(|cx| TreeState::new(cx));
         let commit_message_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Summary (required)"));
@@ -377,10 +385,11 @@ impl RightPanelView {
             stash_include_untracked: true,
             collapsed_tree_folders: HashSet::new(),
             review_diff_revision: 0,
-            review_diff_scroll_key: 0,
             review_diff_options: threadlane_git::DiffOptions::default(),
             review_diff_request: None,
             review_diff_state: None,
+            review_document,
+            review_session_id: None,
             review_nav_focus: cx.focus_handle().tab_stop(false),
             #[cfg(test)]
             review_diff_load_count: 0,
@@ -427,13 +436,18 @@ impl RightPanelView {
             event_tx,
             _watcher: None,
             watched_project: None,
-            _subscriptions: vec![observe_model, tree_subscription],
+            _subscriptions: vec![observe_model, tree_subscription, review_document_subscription],
         };
         panel.sync_project(cx);
         panel
     }
 
     fn sync_project(&mut self, cx: &mut Context<Self>) {
+        let session_id = self.model.read(cx).active_session_id.clone();
+        if self.review_session_id != session_id {
+            self.close_document(cx);
+            self.review_session_id = session_id;
+        }
         let (project, worktree_unavailable, project_io_supported) = {
             let state = self.model.read(cx);
             let project = state.active_git_work_dir();
@@ -772,12 +786,12 @@ impl RightPanelView {
     }
 
     fn open_file_diff(&mut self, path: String, cx: &mut Context<Self>) {
-        self.review_diff_scroll_key = self.review_diff_scroll_key.wrapping_add(1);
+        self.review_document.update(cx, |document, cx| document.reset(cx));
         self.open_review_diff(ReviewDiffTarget::File(path), cx);
     }
 
     fn open_combined_diff(&mut self, cx: &mut Context<Self>) {
-        self.review_diff_scroll_key = self.review_diff_scroll_key.wrapping_add(1);
+        self.review_document.update(cx, |document, cx| document.reset(cx));
         self.open_review_diff(ReviewDiffTarget::AllChanges, cx);
     }
 
@@ -801,6 +815,7 @@ impl RightPanelView {
             request.revision = self.review_diff_revision;
             self.pending_document = None;
             self.review_diff_state = Some(ReviewDiffState::Loading);
+            self.review_document.update(cx, |document, cx| document.loading(self.review_diff_options.ignore_whitespace, cx));
             self.document_state
                 .update(cx, |state, cx| state.set_text("", cx));
             cx.notify();
@@ -811,7 +826,9 @@ impl RightPanelView {
         let Some(project) = self.project.clone() else {
             return;
         };
-        self.close_document(cx);
+        if self.review_diff_request.as_ref().is_none_or(|request| request.target != target) {
+            self.close_document(cx);
+        }
         self.review_diff_revision = self.review_diff_revision.wrapping_add(1);
         let request = ReviewDiffRequest {
             project,
@@ -822,6 +839,7 @@ impl RightPanelView {
         self.document_title = Some(request.target.title());
         self.review_diff_request = Some(request.clone());
         self.review_diff_state = Some(ReviewDiffState::Loading);
+        self.review_document.update(cx, |document, cx| document.loading(self.review_diff_options.ignore_whitespace, cx));
         self.editor_state = None;
         self.editor_subscription = None;
         self.editor_observe = None;
@@ -873,6 +891,7 @@ impl RightPanelView {
     }
 
     fn close_document(&mut self, cx: &mut Context<Self>) {
+        self.review_document.update(cx, |document, cx| document.reset(cx));
         self.panel_document_request = self.panel_document_request.wrapping_add(1);
         self.document_loading = false;
         self.document_error = None;
@@ -910,11 +929,10 @@ impl RightPanelView {
                 self.review_diff_state = Some(ReviewDiffState::Ready {
                     empty: content.is_empty(),
                 });
-                let markdown = format!("```diff\n{}\n```", content.replace("```", "` ` `"));
-                self.document_state
-                    .update(cx, |state, cx| state.set_text(&markdown, cx));
+                self.review_document.update(cx, |document, cx| document.set_patch(&content, cx));
             }
             Err(error) => {
+                self.review_document.update(cx, |document, cx| document.failed(error.clone(), cx));
                 self.review_diff_state = Some(ReviewDiffState::Failed(error));
             }
         }
@@ -1652,6 +1670,9 @@ impl RightPanelView {
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.visible = visible
             && self.model.read(cx).workspace_page == threadlane_ui_state::WorkspacePage::Chat;
+        if !self.visible && self.review_diff_request.is_some() {
+            self.close_document(cx);
+        }
         self.sync_browser_visibility(cx);
     }
 
@@ -1888,29 +1909,6 @@ impl RightPanelView {
         )
     }
 
-    fn render_review_diff(&self, state: &ReviewDiffState, cx: &mut Context<Self>) -> AnyElement {
-        use threadlane_ui_kit::{ReviewDiffAction, ReviewDiffContent};
-        let content = match state {
-            ReviewDiffState::Loading => ReviewDiffContent::Loading,
-            ReviewDiffState::Failed(error) => ReviewDiffContent::Failed(error),
-            ReviewDiffState::Ready { empty: true } => ReviewDiffContent::Empty,
-            ReviewDiffState::Ready { empty: false } => ReviewDiffContent::Ready(&self.document_state),
-        };
-        // Key the scroll area by explicit-open count so a new target starts
-        // at the top of its patch while reloads and background refreshes of
-        // the same target keep the reader's offset.
-        let scroll_id = ElementId::Name(SharedString::from(format!(
-            "review-diff-body-{}",
-            self.review_diff_scroll_key
-        )));
-        threadlane_ui_kit::review_diff_body(content, self.review_diff_options.ignore_whitespace,
-            scroll_id,
-            cx.listener(|this, action: &ReviewDiffAction, _, cx| match action {
-                ReviewDiffAction::Retry => this.reload_review_diff(cx),
-                ReviewDiffAction::ShowWhitespace => this.set_ignore_whitespace(false, cx),
-            }), cx)
-    }
-
     fn toggle_markdown_preview(
         &mut self,
         _: &threadlane_ui_kit::ToggleMarkdownPreview,
@@ -2002,8 +2000,8 @@ impl RightPanelView {
                     self.markdown_preview.body(cx)
                 } else if let Some(ref editor) = self.editor_state {
                     threadlane_ui_kit::editor_buffer(editor).into_any_element()
-                } else if let Some(state) = &self.review_diff_state {
-                    self.render_review_diff(state, cx)
+                } else if self.review_diff_state.is_some() {
+                    self.review_document.clone().into_any_element()
                 } else {
                     div()
                         .flex_1()
@@ -3887,7 +3885,10 @@ mod browser_editor_safety_tests {
 
 #[cfg(test)]
 mod review_diff_tests {
-    use super::{GitAction, PanelEvent, ReviewDiffState, ReviewDiffTarget, RightPanelView, Surface};
+    use super::{
+        GitAction, PanelEvent, ReviewDiffRequest, ReviewDiffState, ReviewDiffTarget,
+        RightPanelView, Surface,
+    };
     use gpui::{
         AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, TestAppContext,
         Window, div, px,
@@ -3895,6 +3896,30 @@ mod review_diff_tests {
     use gpui_component::Root;
     use std::path::PathBuf;
     use threadlane_ui_state::AppState;
+
+    fn seed_review_diff(
+        panel: &mut RightPanelView,
+        project: &std::path::Path,
+        content: &str,
+        cx: &mut Context<RightPanelView>,
+    ) -> ReviewDiffRequest {
+        let request = ReviewDiffRequest {
+            project: project.to_path_buf(),
+            target: ReviewDiffTarget::AllChanges,
+            options: threadlane_git::DiffOptions::default(),
+            revision: panel.review_diff_revision.wrapping_add(1),
+        };
+        panel.review_diff_revision = request.revision;
+        panel.review_diff_request = Some(request.clone());
+        panel.review_diff_state = Some(ReviewDiffState::Ready {
+            empty: content.is_empty(),
+        });
+        panel.document_title = Some(request.target.title());
+        panel
+            .review_document
+            .update(cx, |document, cx| document.set_patch(content, cx));
+        request
+    }
 
     struct DiffHost {
         panel: Entity<RightPanelView>,
@@ -3941,6 +3966,79 @@ mod review_diff_tests {
             RightPanelView::handle_review_file_action(panel.clone(), Some(PathBuf::from("/new-checkout")),
                 &threadlane_ui_kit::ReviewFileAction::CopyRelative("src/file.rs".into()), window, cx);
             assert_eq!(cx.read_from_clipboard().unwrap().text().as_deref(), Some("src/file.rs"));
+        });
+    }
+
+    #[gpui::test]
+    fn review_document_resets_for_session_switch_and_leaving_review(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let model = cx.new(|_| {
+            let mut state = AppState::for_tests();
+            let checkout = PathBuf::from("/workspace");
+            state.active_session_id = Some("first".into());
+            state.active_work_dir = Some(checkout.clone());
+            state.projects = vec![threadlane_ui_state::ProjectInfo {
+                name: "workspace".into(),
+                work_dir: checkout.clone(),
+                sessions: ["first", "second"]
+                    .into_iter()
+                    .map(|id| threadlane_ui_state::SessionInfo {
+                        id: id.into(),
+                        work_dir: checkout.clone(),
+                        runtime_work_dir: checkout.clone(),
+                        worktree_available: true,
+                        ..Default::default()
+                    })
+                    .collect(),
+                is_expanded: true,
+            }];
+            state
+        });
+        let (panel, cx) =
+            cx.add_window_view(|window, cx| RightPanelView::new(model.clone(), window, cx));
+
+        panel.update(cx, |panel, cx| {
+            panel.active_surface = Some(Surface::Review);
+            let checkout = PathBuf::from("/workspace");
+            let initial = seed_review_diff(panel, &checkout, "first session patch", cx);
+            assert!(matches!(
+                panel.review_diff_state,
+                Some(ReviewDiffState::Ready { empty: false })
+            ));
+
+            model.update(cx, |state, cx| {
+                state.active_session_id = Some("second".into());
+                cx.notify();
+            });
+            panel.sync_project(cx);
+            assert_eq!(
+                panel.project.as_deref(),
+                Some(std::path::Path::new("/workspace"))
+            );
+            assert!(panel.review_diff_request.is_none());
+            assert!(panel.review_diff_state.is_none());
+            assert!(panel.document_title.is_none());
+            panel.apply_review_diff_result(
+                initial,
+                Ok("stale first session patch".into()),
+                cx,
+            );
+            assert!(panel.review_diff_request.is_none());
+
+            let review_request = seed_review_diff(panel, &checkout, "second session patch", cx);
+            panel.open_surface(Surface::Agents, cx);
+            assert!(panel.review_diff_request.is_none());
+            assert!(panel.review_diff_state.is_none());
+            assert!(panel.document_title.is_none());
+            panel.apply_review_diff_result(
+                review_request,
+                Ok("stale patch after leaving Review".into()),
+                cx,
+            );
+            assert!(panel.review_diff_request.is_none());
+            assert!(panel.review_diff_state.is_none());
         });
     }
 
