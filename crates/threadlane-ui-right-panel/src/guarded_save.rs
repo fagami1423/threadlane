@@ -1,9 +1,19 @@
 use super::RightPanelView;
 use gpui::{App, ClipboardItem, Context, Window};
+use gpui_component::input::EditorState;
 use std::{path::PathBuf, sync::Arc};
 use threadlane_client::DaemonClient;
 use threadlane_ui_kit::{EditorRecoveryAction, EditorSaveStatus};
 use threadlane_ui_state::project_io::{self, ProjectFileError};
+
+#[derive(Clone)]
+struct DocumentReloadSnapshot {
+    editor: gpui::Entity<EditorState>,
+    origin: DocumentOrigin,
+    request: u64,
+    revision: u64,
+    content: String,
+}
 
 #[derive(Clone)]
 pub(super) struct DocumentOrigin {
@@ -117,58 +127,110 @@ impl RightPanelView {
         let request = self.panel_document_request;
         let revision = self.buffer_revision;
         let content = editor.read(cx).value().to_string();
+        let snapshot = DocumentReloadSnapshot {
+            editor,
+            origin: origin.clone(),
+            request,
+            revision,
+            content,
+        };
         let view = cx.entity().downgrade();
         threadlane_ui_kit::confirm_editor_reload(format!("{} / {}", origin.project.display(), origin.path), window, cx, move |window, cx| {
             let _ = view.update(cx, |view, cx| {
-                if view.editor_state.as_ref() != Some(&editor) || view.panel_document_request != request || view.save_status.busy() { return; }
-                if !origin.is_current(view, cx) || view.buffer_revision != revision || editor.read(cx).value().as_str() != content {
-                    view.save_status = EditorSaveStatus::Failed { message: "The document or connection changed after confirmation. Your edits are still here. Choose Reload from disk again.".into(), save_blocked: true };
-                    cx.notify(); return;
-                }
-                view.save_generation = view.save_generation.wrapping_add(1);
-                let generation = view.save_generation;
-                view.save_status = EditorSaveStatus::Reloading;
-                let read_origin = origin.clone();
-                let task = cx.background_executor().spawn(async move {
-                    if read_origin.client.file_search_connection_epoch() != read_origin.epoch { return Err(ProjectFileError::Disconnected); }
-                    project_io::read_file_versioned(&read_origin.client, &read_origin.project, read_origin.path).await
-                });
-                let editor = editor.clone();
-                let origin = origin.clone();
-                let content = content.clone();
-                cx.spawn_in(window, async move |this, cx| {
-                    let result = task.await;
-                    let _ = this.update_in(cx, |this, window, cx| {
-                        if this.editor_state.as_ref() != Some(&editor) || this.panel_document_request != request || this.save_generation != generation { return; }
-                        if !origin.is_current(this, cx) || this.buffer_revision != revision || editor.read(cx).value().as_str() != content {
-                            this.save_status = EditorSaveStatus::Failed { message: "The document or connection changed while reloading. Your edits are still here. Choose Reload from disk again.".into(), save_blocked: true };
-                        } else {
-                            match result {
-                                Ok(file) => {
-                                    editor.update(cx, |editor, cx| editor.set_value(file.content.clone(), window, cx));
-                                    this.markdown_preview.refresh(file.content.clone().into(), cx);
-                                    this.saved_content = file.content;
-                                    this.saved_version = Some(file.version);
-                                    this.document_origin = Some(origin);
-                                    this.is_dirty = false;
-                                    this.buffer_revision = this.buffer_revision.wrapping_add(1);
-                                    this.save_status = EditorSaveStatus::Ready;
-                                }
-                                Err(error) => this.save_status = EditorSaveStatus::Failed { message: format!("Couldn't reload: {error}. Your edits are still here. Check the file and connection, then choose Reload from disk again."), save_blocked: true },
-                            }
-                        }
-                        cx.notify();
-                    });
-                }).detach();
-                cx.notify();
+                view.start_document_reload(snapshot.clone(), window, cx);
             });
         });
+    }
+
+    fn start_document_reload(
+        &mut self,
+        snapshot: DocumentReloadSnapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editor_state.as_ref() != Some(&snapshot.editor)
+            || self.panel_document_request != snapshot.request
+            || self.save_status.busy()
+        {
+            return;
+        }
+        if !snapshot.origin.is_current(self, cx)
+            || self.buffer_revision != snapshot.revision
+            || snapshot.editor.read(cx).value().as_str() != snapshot.content
+        {
+            self.save_status = EditorSaveStatus::Failed {
+                message: "The document or connection changed after confirmation. Your edits are still here. Choose Reload from disk again.".into(),
+                save_blocked: true,
+            };
+            cx.notify();
+            return;
+        }
+        self.save_generation = self.save_generation.wrapping_add(1);
+        let generation = self.save_generation;
+        self.save_status = EditorSaveStatus::Reloading;
+        let read_origin = snapshot.origin.clone();
+        let task = cx.background_executor().spawn(async move {
+            if read_origin.client.file_search_connection_epoch() != read_origin.epoch {
+                return Err(ProjectFileError::Disconnected);
+            }
+            project_io::read_file_versioned(
+                &read_origin.client,
+                &read_origin.project,
+                read_origin.path,
+            )
+            .await
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.editor_state.as_ref() != Some(&snapshot.editor)
+                    || this.panel_document_request != snapshot.request
+                    || this.save_generation != generation
+                {
+                    return;
+                }
+                if !snapshot.origin.is_current(this, cx)
+                    || this.buffer_revision != snapshot.revision
+                    || snapshot.editor.read(cx).value().as_str() != snapshot.content
+                {
+                    this.save_status = EditorSaveStatus::Failed {
+                        message: "The document or connection changed while reloading. Your edits are still here. Choose Reload from disk again.".into(),
+                        save_blocked: true,
+                    };
+                } else {
+                    match result {
+                        Ok(file) => {
+                            snapshot.editor.update(cx, |editor, cx| {
+                                editor.set_value(file.content.clone(), window, cx)
+                            });
+                            this.markdown_preview
+                                .refresh(file.content.clone().into(), cx);
+                            this.saved_content = file.content;
+                            this.saved_version = Some(file.version);
+                            this.document_origin = Some(snapshot.origin);
+                            this.is_dirty = false;
+                            this.buffer_revision = this.buffer_revision.wrapping_add(1);
+                            this.save_status = EditorSaveStatus::Ready;
+                        }
+                        Err(error) => {
+                            this.save_status = EditorSaveStatus::Failed {
+                                message: format!("Couldn't reload: {error}. Your edits are still here. Check the file and connection, then choose Reload from disk again."),
+                                save_blocked: true,
+                            }
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::RightPanelView;
+    use super::{DocumentReloadSnapshot, RightPanelView};
     use gpui::{AppContext, VisualTestContext};
     use threadlane_ui_kit::EditorSaveStatus;
     use threadlane_ui_state::AppState;
@@ -356,6 +418,112 @@ mod tests {
             assert!(panel.editor_state.is_none());
             assert!(panel.saved_content.is_empty());
         });
+    }
+
+    #[gpui::test]
+    fn in_flight_reload_rejects_typing_and_replaced_document(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_path_buf();
+        std::fs::write(project.join("sample.rs"), "original\n").unwrap();
+        std::fs::write(project.join("other.rs"), "different document\n").unwrap();
+        let model = cx.new(|_| {
+            let mut state = AppState::for_tests();
+            state.active_session_id = None;
+            state.active_work_dir = Some(project.clone());
+            state
+        });
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let panel = cx.new(|cx| {
+                let mut panel = RightPanelView::new(model, window, cx);
+                panel.project = Some(project.clone());
+                panel.active_surface = Some(super::super::Surface::Files);
+                panel.start_panel_document_read(project.clone(), "sample.rs".into(), cx);
+                panel
+            });
+            gpui_component::Root::new(panel, window, cx)
+        });
+        let panel = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<RightPanelView>().unwrap()
+        });
+        settle(cx);
+        let editor = panel.read_with(cx, |panel, _| panel.editor_state.clone().unwrap());
+        let baseline_version = panel.read_with(cx, |panel, _| panel.saved_version.clone().unwrap());
+        std::fs::write(project.join("sample.rs"), "external update\n").unwrap();
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.save_status = EditorSaveStatus::Conflict;
+                let snapshot = DocumentReloadSnapshot {
+                    editor: editor.clone(),
+                    origin: panel.document_origin.clone().unwrap(),
+                    request: panel.panel_document_request,
+                    revision: panel.buffer_revision,
+                    content: editor.read(cx).value().to_string(),
+                };
+                panel.start_document_reload(snapshot, window, cx);
+                assert_eq!(panel.save_status, EditorSaveStatus::Reloading);
+                set_editor_value(&editor, "typed after reload started", window, cx);
+            });
+        });
+        settle(cx);
+        panel.read_with(cx, |panel, cx| {
+            assert!(matches!(
+                panel.save_status,
+                EditorSaveStatus::Failed {
+                    save_blocked: true,
+                    ..
+                }
+            ));
+            assert!(panel.is_dirty);
+            assert_eq!(panel.saved_content, "original\n");
+            assert_eq!(panel.saved_version.as_deref(), Some(baseline_version.as_str()));
+            assert_eq!(
+                editor.read(cx).value().as_str(),
+                "typed after reload started"
+            );
+        });
+        assert_eq!(
+            std::fs::read_to_string(project.join("sample.rs")).unwrap(),
+            "external update\n"
+        );
+
+        cx.update(|window, cx| {
+            set_editor_value(&editor, "original\n", window, cx);
+        });
+        settle(cx);
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.save_status = EditorSaveStatus::Conflict;
+                let current_editor = panel.editor_state.clone().unwrap();
+                let snapshot = DocumentReloadSnapshot {
+                    editor: current_editor,
+                    origin: panel.document_origin.clone().unwrap(),
+                    request: panel.panel_document_request,
+                    revision: panel.buffer_revision,
+                    content: panel.editor_state.as_ref().unwrap().read(cx).value().to_string(),
+                };
+                panel.start_document_reload(snapshot, window, cx);
+                assert_eq!(panel.save_status, EditorSaveStatus::Reloading);
+                panel.start_panel_document_read(project.clone(), "other.rs".into(), cx);
+            });
+        });
+        settle(cx);
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.document_title.as_deref(), Some("other.rs"));
+            let editor = panel.editor_state.as_ref().unwrap();
+            assert_eq!(editor.read(cx).value().as_str(), "different document\n");
+            assert_eq!(panel.saved_content, "different document\n");
+            assert!(panel.saved_version.is_some());
+            assert_eq!(panel.save_status, EditorSaveStatus::Ready);
+            assert!(!panel.is_dirty);
+        });
+        assert_eq!(
+            std::fs::read_to_string(project.join("sample.rs")).unwrap(),
+            "external update\n"
+        );
     }
 
     #[gpui::test]

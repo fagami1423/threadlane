@@ -39,6 +39,7 @@ pub struct EditorTab {
     /// editor on the next render (which owns the `Window` that `set_value`
     /// requires). Applied once by `sync_pending_content`, then cleared.
     pending_content: Option<String>,
+    pending_content_version: Option<String>,
     pending_line: Option<usize>,
     loading: bool,
     open_error: Option<String>,
@@ -189,6 +190,7 @@ impl EditorView {
                 tab.client_invalidated = true;
                 tab.loading = false;
                 tab.pending_content = None;
+                tab.pending_content_version = None;
                 tab.open_error = Some(
                     "This file belongs to a previous daemon connection. Close it, then open it from the current checkout."
                         .into(),
@@ -201,6 +203,7 @@ impl EditorView {
                 if tab.loading || tab.pending_content.is_some() {
                     tab.loading = false;
                     tab.pending_content = None;
+                    tab.pending_content_version = None;
                     tab.open_error = Some(
                         "The daemon connection changed while this file was loading. Retry."
                             .into(),
@@ -565,6 +568,7 @@ impl EditorView {
             is_dirty: false,
             is_diff: true,
             pending_content: None,
+            pending_content_version: None,
             pending_line: None,
             loading: false,
             open_error: None,
@@ -657,10 +661,17 @@ impl EditorView {
                     .find(|t| t.project_dir == target_project && t.relative_path == target_path)
                 {
                     // An edit after a read completed must also cancel its queued replacement.
-                    tab.pending_content = None;
+                    let canceled_pending_content = tab.pending_content.take().is_some();
+                    tab.pending_content_version = None;
                     tab.buffer_revision = tab.buffer_revision.wrapping_add(1);
                     tab.markdown_preview.refresh(current.clone(), cx);
                     let dirty = current.as_str() != tab.saved_content.as_str();
+                    if canceled_pending_content && !tab.baseline_loaded {
+                        tab.save_status = EditorSaveStatus::Failed {
+                            message: "The file changed while it was loading. Your edits are preserved, but saving is blocked until the file is reloaded.".into(),
+                            save_blocked: true,
+                        };
+                    }
                     if tab.is_dirty != dirty {
                         tab.is_dirty = dirty;
                         cx.notify();
@@ -688,6 +699,7 @@ impl EditorView {
             is_dirty: false,
             is_diff: false,
             pending_content: None,
+            pending_content_version: None,
             pending_line: None,
             loading: false,
             open_error: None,
@@ -733,12 +745,14 @@ impl EditorView {
         let Some(load_editor) = tab.editor_state.clone() else {
             return;
         };
+        let buffer_revision = tab.buffer_revision;
         let snapshot = self.current_client_snapshot(cx);
         self.next_request_generation = self.next_request_generation.wrapping_add(1);
         let request_generation = self.next_request_generation;
         let tab = &mut self.tabs[index];
         tab.loading = true;
         tab.pending_content = None;
+        tab.pending_content_version = None;
         tab.open_error = None;
         tab.client_origin = Some(snapshot.client.clone());
         tab.client_epoch = snapshot.epoch;
@@ -773,6 +787,7 @@ impl EditorView {
                     &load_path,
                     &load_editor,
                     request_generation,
+                    buffer_revision,
                     snapshot,
                     result,
                     cx,
@@ -784,14 +799,12 @@ impl EditorView {
 
     /// Completes an asynchronous file open started by `open_file_internal`.
     ///
-    /// Window-free: the loaded bytes land on the tab as `pending_content`
-    /// (plus the saved baseline); the next render applies them to the editor
-    /// via `sync_pending_content`, which owns the `Window` that `set_value`
-    /// requires.
+    /// Window-free: the loaded bytes and version land on the tab as pending
+    /// content; `sync_pending_content` applies them and advances the baseline.
     ///
-    /// Never clobbers user input: if the user typed into the loading tab
-    /// while the read was in flight, their text stays and the file content
-    /// becomes the saved baseline (marking the tab dirty, correctly).
+    /// Never clobbers user input: a read is only queued for application when
+    /// the buffer has not changed since the read started. The saved baseline
+    /// advances only when `sync_pending_content` applies the queued content.
     #[cfg(test)]
     fn finish_file_open(
         &mut self,
@@ -818,11 +831,13 @@ impl EditorView {
             })
             .unwrap_or_else(|| self.current_client_snapshot(cx));
         let request_generation = tab.request_generation;
+        let buffer_revision = tab.buffer_revision;
         self.finish_file_open_for_request(
             project_dir,
             relative_path,
             editor,
             request_generation,
+            buffer_revision,
             snapshot,
             result.map(|content| (content, None)),
             cx,
@@ -835,6 +850,7 @@ impl EditorView {
         relative_path: &str,
         editor: &Entity<EditorState>,
         request_generation: u64,
+        buffer_revision_at_start: u64,
         snapshot: ClientSnapshot,
         result: Result<(String, Option<String>), String>,
         cx: &mut Context<Self>,
@@ -865,6 +881,7 @@ impl EditorView {
         if !context_matches {
             tab.loading = false;
             tab.pending_content = None;
+            tab.pending_content_version = None;
             tab.pending_line = None;
             tab.open_error = Some(if replaced {
                 "This file belongs to a previous daemon connection. Close it, then open it from the current checkout."
@@ -880,26 +897,37 @@ impl EditorView {
         match result {
             Ok((content, version)) => {
                 let current = editor.read(cx).value();
-                if !tab.is_dirty && current.as_str() == tab.saved_content {
-                    tab.pending_content = Some(content.clone());
-                    // Matches once `sync_pending_content` applies it.
-                    tab.is_dirty = false;
+                if tab.buffer_revision == buffer_revision_at_start
+                    && !tab.is_dirty
+                    && current.as_str() == tab.saved_content
+                {
+                    tab.pending_content = Some(content);
+                    tab.pending_content_version = version;
+                    tab.save_status = if snapshot.client.supports_guarded_saves() {
+                        EditorSaveStatus::Ready
+                    } else {
+                        EditorSaveStatus::Unsupported
+                    };
                 } else {
-                    tab.is_dirty = current.as_str() != content.as_str();
+                    tab.is_dirty = current.as_str() != tab.saved_content;
+                    if !tab.baseline_loaded {
+                        tab.save_status = if snapshot.client.supports_guarded_saves() {
+                            EditorSaveStatus::Failed {
+                                message: "The file changed while it was loading. Your edits are preserved, but saving is blocked until the file is reloaded.".into(),
+                                save_blocked: true,
+                            }
+                        } else {
+                            EditorSaveStatus::Unsupported
+                        };
+                    }
                 }
-                tab.saved_content = content;
-                tab.saved_version = version;
-                tab.save_status = if snapshot.client.supports_guarded_saves() {
-                    EditorSaveStatus::Ready
-                } else {
-                    EditorSaveStatus::Unsupported
-                };
                 tab.open_error = None;
                 tab.client_invalidated = false;
-                tab.baseline_loaded = true;
             }
             Err(error) => {
                 tab.pending_line = None;
+                tab.pending_content = None;
+                tab.pending_content_version = None;
                 tracing::error!(
                     "Failed to open file {}: {}",
                     project_dir.join(relative_path).display(),
@@ -946,6 +974,7 @@ impl EditorView {
                         .as_ref()
                         .is_none_or(|client| !Arc::ptr_eq(client, &current_client.client));
                     tab.pending_content = None;
+                    tab.pending_content_version = None;
                     tab.loading = false;
                     tab.open_error = Some(if replaced {
                         "This file belongs to a previous daemon connection. Close it, then open it from the current checkout."
@@ -958,6 +987,14 @@ impl EditorView {
                     continue;
                 }
                 if let Some(content) = tab.pending_content.take() {
+                    tab.saved_content = content.clone();
+                    tab.saved_version = tab.pending_content_version.take();
+                    tab.baseline_loaded = true;
+                    tab.save_status = if current_client.client.supports_guarded_saves() {
+                        EditorSaveStatus::Ready
+                    } else {
+                        EditorSaveStatus::Unsupported
+                    };
                     let content: SharedString = content.into();
                     tab.markdown_preview.refresh(content.clone(), cx);
                     editor.update(cx, |editor, cx| editor.set_value(content, window, cx));
@@ -2201,6 +2238,7 @@ mod closed_file_host_tests {
             let generation = view.tabs[0].request_generation;
             view.tabs[0].loading = true;
             view.tabs[0].pending_content = None;
+            view.tabs[0].pending_content_version = None;
             view.tabs[0].client_origin = Some(current.client.clone());
             view.tabs[0].client_epoch = current.epoch.wrapping_add(1);
             view.client_context = Some(ClientSnapshot {
@@ -2219,11 +2257,13 @@ mod closed_file_host_tests {
                 epoch: current.epoch.wrapping_add(1),
                 ..current.clone()
             };
+            let buffer_revision = view.tabs[0].buffer_revision;
             view.finish_file_open_for_request(
                 &project,
                 "sample.rs",
                 &editor,
                 generation,
+                buffer_revision,
                 stale_epoch,
                 Ok(("stale epoch bytes".into(), Some("stale-version".into()))),
                 cx,

@@ -227,6 +227,346 @@ mod tests {
             "original\n"
         );
     }
+
+    #[gpui::test]
+    fn in_flight_reload_rejects_typing_and_closed_tab_completion(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_path_buf();
+        std::fs::write(project.join("sample.rs"), "original\n").unwrap();
+        std::fs::write(project.join("other.rs"), "different document\n").unwrap();
+        let model = cx.new(|_| {
+            let mut model = threadlane_ui_state::AppState::for_tests();
+            model.active_work_dir = Some(project.clone());
+            model
+        });
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = EditorView::new(model, window, cx);
+                view.open_file_internal(&project, "sample.rs", window, cx);
+                view
+            });
+            gpui_component::Root::new(view, window, cx)
+        });
+        let view = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<EditorView>().unwrap()
+        });
+        settle(cx);
+        let editor = view.read_with(cx, |view, _| view.tabs[0].editor_state.clone().unwrap());
+        let baseline_version =
+            view.read_with(cx, |view, _| view.tabs[0].saved_version.clone().unwrap());
+        std::fs::write(project.join("sample.rs"), "external update\n").unwrap();
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let revision = view.tabs[0].buffer_revision;
+                let content = editor.read(cx).value().to_string();
+                let snapshot = view.current_client_snapshot(cx);
+                view.reload_tab(&editor, revision, &content, snapshot, window, cx);
+                assert_eq!(view.tabs[0].save_status, EditorSaveStatus::Reloading);
+                editor.update(cx, |editor, cx| {
+                    editor.set_value("typed after reload started", window, cx);
+                    cx.emit(gpui_component::input::InputEvent::Change);
+                });
+            });
+        });
+        settle(cx);
+        view.read_with(cx, |view, cx| {
+            let tab = &view.tabs[0];
+            assert!(matches!(
+                tab.save_status,
+                EditorSaveStatus::Failed {
+                    save_blocked: true,
+                    ..
+                }
+            ));
+            assert!(tab.is_dirty);
+            assert_eq!(tab.saved_content, "original\n");
+            assert_eq!(tab.saved_version.as_deref(), Some(baseline_version.as_str()));
+            assert_eq!(
+                tab.editor_state.as_ref().unwrap().read(cx).value().as_str(),
+                "typed after reload started"
+            );
+        });
+        assert_eq!(
+            std::fs::read_to_string(project.join("sample.rs")).unwrap(),
+            "external update\n"
+        );
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_value("original\n", window, cx);
+                cx.emit(gpui_component::input::InputEvent::Change);
+            });
+        });
+        settle(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let revision = view.tabs[0].buffer_revision;
+                let content = editor.read(cx).value().to_string();
+                let snapshot = view.current_client_snapshot(cx);
+                view.reload_tab(&editor, revision, &content, snapshot, window, cx);
+                assert_eq!(view.tabs[0].save_status, EditorSaveStatus::Reloading);
+                view.close_tab(0, window, cx);
+                view.open_file_internal(&project, "other.rs", window, cx);
+            });
+        });
+        settle(cx);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.tabs.len(), 1);
+            assert_eq!(view.tabs[0].relative_path, "other.rs");
+            assert_eq!(
+                view.tabs[0]
+                    .editor_state
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .value()
+                    .as_str(),
+                "different document\n"
+            );
+            assert_eq!(view.tabs[0].saved_content, "different document\n");
+            assert_eq!(view.tabs[0].save_status, EditorSaveStatus::Ready);
+        });
+        assert_eq!(
+            std::fs::read_to_string(project.join("sample.rs")).unwrap(),
+            "external update\n"
+        );
+    }
+
+    #[gpui::test]
+    fn reload_refresh_typing_before_read_completion_keeps_original_version(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_path_buf();
+        std::fs::write(project.join("sample.rs"), "original\n").unwrap();
+        let model = cx.new(|_| {
+            let mut model = threadlane_ui_state::AppState::for_tests();
+            model.active_work_dir = Some(project.clone());
+            model
+        });
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = EditorView::new(model, window, cx);
+                view.open_file_internal(&project, "sample.rs", window, cx);
+                view
+            });
+            gpui_component::Root::new(view, window, cx)
+        });
+        let view = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<EditorView>().unwrap()
+        });
+        settle(cx);
+        let (editor, original_version) = view.read_with(cx, |view, _| {
+            (
+                view.tabs[0].editor_state.clone().unwrap(),
+                view.tabs[0].saved_version.clone().unwrap(),
+            )
+        });
+        std::fs::write(project.join("sample.rs"), "external update\n").unwrap();
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.start_file_read(0, cx);
+                assert!(view.tabs[0].loading);
+                editor.update(cx, |editor, cx| {
+                    editor.set_value("typed before read completed", window, cx);
+                    cx.emit(gpui_component::input::InputEvent::Change);
+                });
+            });
+        });
+        settle(cx);
+        view.read_with(cx, |view, cx| {
+            let tab = &view.tabs[0];
+            assert!(tab.is_dirty);
+            assert_eq!(tab.saved_content, "original\n");
+            assert_eq!(tab.saved_version.as_deref(), Some(original_version.as_str()));
+            assert!(tab.pending_content.is_none());
+            assert_eq!(
+                tab.editor_state.as_ref().unwrap().read(cx).value().as_str(),
+                "typed before read completed"
+            );
+        });
+
+        view.update(cx, |view, cx| view.save_tab_at(0, cx));
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].save_status, EditorSaveStatus::Conflict);
+            assert!(view.tabs[0].is_dirty);
+            assert_eq!(view.tabs[0].saved_content, "original\n");
+            assert_eq!(view.tabs[0].saved_version.as_deref(), Some(original_version.as_str()));
+        });
+        assert_eq!(
+            std::fs::read_to_string(project.join("sample.rs")).unwrap(),
+            "external update\n"
+        );
+    }
+
+    #[gpui::test]
+    fn reload_refresh_typing_after_read_completion_keeps_original_version(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_path_buf();
+        std::fs::write(project.join("sample.rs"), "original\n").unwrap();
+        let model = cx.new(|_| {
+            let mut model = threadlane_ui_state::AppState::for_tests();
+            model.active_work_dir = Some(project.clone());
+            model
+        });
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = EditorView::new(model, window, cx);
+                view.open_file_internal(&project, "sample.rs", window, cx);
+                view
+            });
+            gpui_component::Root::new(view, window, cx)
+        });
+        let view = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<EditorView>().unwrap()
+        });
+        settle(cx);
+        let original_version =
+            view.read_with(cx, |view, _| view.tabs[0].saved_version.clone().unwrap());
+        std::fs::write(project.join("sample.rs"), "external update\n").unwrap();
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let editor = view.tabs[0].editor_state.clone().unwrap();
+                let generation = view.tabs[0].request_generation;
+                let buffer_revision = view.tabs[0].buffer_revision;
+                let snapshot = view.current_client_snapshot(cx);
+                view.tabs[0].loading = true;
+                view.finish_file_open_for_request(
+                    &project,
+                    "sample.rs",
+                    &editor,
+                    generation,
+                    buffer_revision,
+                    snapshot,
+                    Ok((
+                        "external update\n".into(),
+                        Some("sha256:external-update".into()),
+                    )),
+                    cx,
+                );
+                assert!(!view.tabs[0].loading);
+                assert_eq!(
+                    view.tabs[0].pending_content.as_deref(),
+                    Some("external update\n")
+                );
+                assert!(view.tabs[0].pending_content_version.is_some());
+                assert_eq!(view.tabs[0].saved_content, "original\n");
+                assert_eq!(
+                    view.tabs[0].saved_version.as_deref(),
+                    Some(original_version.as_str())
+                );
+                editor.update(cx, |editor, cx| {
+                    editor.set_value("typed after read completed", window, cx);
+                    cx.emit(gpui_component::input::InputEvent::Change);
+                });
+            });
+        });
+        view.read_with(cx, |view, cx| {
+            let tab = &view.tabs[0];
+            assert!(tab.pending_content.is_none());
+            assert!(tab.pending_content_version.is_none());
+            assert!(tab.is_dirty);
+            assert_eq!(tab.saved_content, "original\n");
+            assert_eq!(tab.saved_version.as_deref(), Some(original_version.as_str()));
+            assert_eq!(
+                tab.editor_state.as_ref().unwrap().read(cx).value().as_str(),
+                "typed after read completed"
+            );
+        });
+
+        view.update(cx, |view, cx| view.save_tab_at(0, cx));
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].save_status, EditorSaveStatus::Conflict);
+            assert!(view.tabs[0].is_dirty);
+            assert_eq!(view.tabs[0].saved_content, "original\n");
+            assert_eq!(view.tabs[0].saved_version.as_deref(), Some(original_version.as_str()));
+        });
+        assert_eq!(
+            std::fs::read_to_string(project.join("sample.rs")).unwrap(),
+            "external update\n"
+        );
+    }
+
+    #[gpui::test]
+    fn reload_initial_read_with_loading_edits_does_not_grant_a_baseline(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_path_buf();
+        std::fs::write(project.join("sample.rs"), "external update\n").unwrap();
+        let model = cx.new(|_| {
+            let mut model = threadlane_ui_state::AppState::for_tests();
+            model.active_work_dir = Some(project.clone());
+            model
+        });
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = EditorView::new(model, window, cx);
+                view.open_file_internal(&project, "sample.rs", window, cx);
+                view
+            });
+            view.update(cx, |view, cx| {
+                let editor = view.tabs[0].editor_state.clone().unwrap();
+                editor.update(cx, |editor, cx| {
+                    editor.set_value("typed while loading", window, cx);
+                    cx.emit(gpui_component::input::InputEvent::Change);
+                });
+            });
+            gpui_component::Root::new(view, window, cx)
+        });
+        let view = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<EditorView>().unwrap()
+        });
+        settle(cx);
+        view.read_with(cx, |view, cx| {
+            let tab = &view.tabs[0];
+            assert!(!tab.baseline_loaded);
+            assert!(tab.saved_version.is_none());
+            assert!(tab.is_dirty);
+            assert!(matches!(
+                tab.save_status,
+                EditorSaveStatus::Failed {
+                    save_blocked: true,
+                    ..
+                }
+            ));
+            assert_eq!(
+                tab.editor_state.as_ref().unwrap().read(cx).value().as_str(),
+                "typed while loading"
+            );
+        });
+
+        view.update(cx, |view, cx| view.save_tab_at(0, cx));
+        settle(cx);
+        assert_eq!(
+            std::fs::read_to_string(project.join("sample.rs")).unwrap(),
+            "external update\n"
+        );
+        view.read_with(cx, |view, _| {
+            assert!(!view.tabs[0].baseline_loaded);
+            assert!(view.tabs[0].saved_version.is_none());
+            assert!(matches!(
+                view.tabs[0].save_status,
+                EditorSaveStatus::Failed {
+                    save_blocked: true,
+                    ..
+                }
+            ));
+        });
+    }
 }
 
 fn same_client(snapshot: &ClientSnapshot, current: &ClientSnapshot) -> bool {
