@@ -504,10 +504,15 @@ impl ReviewPreview {
     }
 
     fn open_diff(&mut self, path: String, cx: &mut Context<Self>) {
+        let initial_open = self.document.is_none();
         self.review_document.update(cx, |document, cx| document.reset(cx));
         self.document_revision += 1;
         self.document = Some(path);
         self.update_diff(cx);
+        if initial_open {
+            self.review_document
+                .update(cx, |document, cx| document.request_focus(cx));
+        }
     }
 
     fn update_diff(&mut self, cx: &mut Context<Self>) {
@@ -787,6 +792,11 @@ impl Render for ReviewPreview {
                 format!("Review · {path}")
             };
             return kit::review_panel_surface()
+                .key_context("ReviewDiff")
+                .on_action(cx.listener(|host, _: &kit::FindInDiff, window, cx| {
+                    host.review_document
+                        .update(cx, |document, cx| document.open_find(window, cx));
+                }))
                 .child(context)
                 .child(kit::panel_document_header(
                     None,

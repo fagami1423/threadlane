@@ -786,13 +786,23 @@ impl RightPanelView {
     }
 
     fn open_file_diff(&mut self, path: String, cx: &mut Context<Self>) {
+        let initial_open = self.review_diff_request.is_none();
         self.review_document.update(cx, |document, cx| document.reset(cx));
         self.open_review_diff(ReviewDiffTarget::File(path), cx);
+        if initial_open {
+            self.review_document
+                .update(cx, |document, cx| document.request_focus(cx));
+        }
     }
 
     fn open_combined_diff(&mut self, cx: &mut Context<Self>) {
+        let initial_open = self.review_diff_request.is_none();
         self.review_document.update(cx, |document, cx| document.reset(cx));
         self.open_review_diff(ReviewDiffTarget::AllChanges, cx);
+        if initial_open {
+            self.review_document
+                .update(cx, |document, cx| document.request_focus(cx));
+        }
     }
 
     fn set_ignore_whitespace(&mut self, checked: bool, cx: &mut Context<Self>) {
@@ -1673,7 +1683,8 @@ impl RightPanelView {
         self.visible = visible
             && self.model.read(cx).workspace_page == threadlane_ui_state::WorkspacePage::Chat;
         if !self.visible && self.review_diff_request.is_some() {
-            self.close_document(cx);
+            self.review_document
+                .update(cx, |document, cx| document.dismiss_find(cx));
         }
         self.sync_browser_visibility(cx);
     }
@@ -1953,6 +1964,14 @@ impl RightPanelView {
                     this.request_add_selection_to_chat(window, cx)
                 }))
                 .on_action(cx.listener(Self::toggle_markdown_preview))
+                .when(self.review_diff_request.is_some(), |this| {
+                    this.key_context("ReviewDiff").on_action(cx.listener(
+                        |this, _: &threadlane_ui_kit::FindInDiff, window, cx| {
+                            this.review_document
+                                .update(cx, |document, cx| document.open_find(window, cx));
+                        },
+                    ))
+                })
                 .child(threadlane_ui_kit::panel_document_header(
                     (threadlane_ui_kit::markdown_preview_eligible(title)
                         && !title.starts_with("Review ·"))
@@ -4009,6 +4028,22 @@ mod review_diff_tests {
                 panel.review_diff_state,
                 Some(ReviewDiffState::Ready { empty: false })
             ));
+            let retained_request = panel.review_diff_request.clone();
+            let retained_title = panel.document_title.clone();
+            panel.set_visible(false, cx);
+            assert_eq!(panel.review_diff_request, retained_request);
+            assert_eq!(panel.document_title, retained_title);
+            assert!(matches!(
+                panel.review_diff_state,
+                Some(ReviewDiffState::Ready { empty: false })
+            ));
+            panel.set_visible(true, cx);
+            assert_eq!(panel.review_diff_request, retained_request);
+            assert_eq!(panel.document_title, retained_title);
+            assert!(matches!(
+                panel.review_diff_state,
+                Some(ReviewDiffState::Ready { empty: false })
+            ));
 
             model.update(cx, |state, cx| {
                 state.active_session_id = Some("second".into());
@@ -4496,6 +4531,7 @@ mod review_diff_tests {
         let (panel, host) = captured.borrow_mut().take().unwrap();
         cx.update(|window, cx| {
             window.draw(cx).clear(cx);
+            window.blur(cx);
             window.focus_next(cx);
             window.focus_next(cx);
             window.focus_next(cx);

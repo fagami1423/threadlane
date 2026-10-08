@@ -76,6 +76,7 @@ pub struct ReviewDiffDocument {
     scroll: ScrollHandle,
     reveal_enabled: Rc<Cell<bool>>,
     reveal_after_search: bool,
+    focus_requested: bool,
     restore_offset: Option<Point<Pixels>>,
     state: DocumentState,
     ignore_whitespace: bool,
@@ -127,6 +128,7 @@ impl ReviewDiffDocument {
             scroll: ScrollHandle::new(),
             reveal_enabled: Rc::new(Cell::new(false)),
             reveal_after_search: false,
+            focus_requested: false,
             restore_offset: None,
             state: DocumentState::Loading,
             ignore_whitespace: false,
@@ -161,6 +163,7 @@ impl ReviewDiffDocument {
         self.invalidate(cx);
         self.open = false;
         self.query.clear();
+        self.focus_requested = false;
         self.snapshot = None;
         self.text_subscription = None;
         self.text = cx.new(|cx| TextViewState::markdown("", cx));
@@ -169,6 +172,20 @@ impl ReviewDiffDocument {
         self.restore_offset = None;
         self.reveal_after_search = false;
         self.state = DocumentState::Loading;
+        cx.notify();
+    }
+
+    pub fn dismiss_find(&mut self, cx: &mut Context<Self>) {
+        self.invalidate(cx);
+        self.open = false;
+        self.query.clear();
+        self.reveal_after_search = false;
+        self.focus_requested = false;
+        cx.notify();
+    }
+
+    pub fn request_focus(&mut self, cx: &mut Context<Self>) {
+        self.focus_requested = true;
         cx.notify();
     }
 
@@ -318,7 +335,7 @@ impl ReviewDiffDocument {
         }
     }
 
-    fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.open {
             self.open = true;
             self.input
@@ -330,9 +347,7 @@ impl ReviewDiffDocument {
     }
 
     fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.invalidate(cx);
-        self.open = false;
-        self.query.clear();
+        self.dismiss_find(cx);
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -371,6 +386,10 @@ impl ReviewDiffDocument {
 
 impl Render for ReviewDiffDocument {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.focus_requested {
+            self.focus_requested = false;
+            window.focus(&self.focus, cx);
+        }
         if matches!(self.state, DocumentState::Ready { .. }) && !self.waiting_for_parse {
             if let Some(offset) = self.restore_offset.take() {
                 let snapshot = self.snapshot.clone();
@@ -604,6 +623,53 @@ mod tests {
         document.read_with(cx, |document, _| {
             assert_eq!(document.scroll.offset(), offset);
             assert!(!document.reveal_enabled.get());
+        });
+    }
+
+    #[gpui::test]
+    fn review_find_dismiss_keeps_rendered_content_and_scroll(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let saved = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let capture = saved.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let document = cx.new(|cx| ReviewDiffDocument::new(window, cx));
+            document.update(cx, |document, cx| {
+                document.set_patch("diff --git a/a.rs b/a.rs\n+needle", cx);
+                document.open_find(window, cx);
+            });
+            *capture.borrow_mut() = Some(document.clone());
+            gpui_component::Root::new(document, window, cx)
+        });
+        let document = saved.borrow_mut().take().unwrap();
+        settle(cx);
+        let rendered_before =
+            document.read_with(cx, |document, cx| document.text.read(cx).rendered_text());
+        let snapshot_before = document.read_with(cx, |document, _| document.snapshot.clone());
+        let subscription_present =
+            document.read_with(cx, |document, _| document.text_subscription.is_some());
+        document.update(cx, |document, _| {
+            document
+                .scroll
+                .set_offset(gpui::point(gpui::px(0.0), gpui::px(-24.0)));
+        });
+        let offset_before = document.read_with(cx, |document, _| document.scroll.offset());
+        cx.simulate_input("needle");
+        document.read_with(cx, |document, _| {
+            assert!(document.pending || document.task.is_some());
+        });
+        document.update(cx, |document, cx| document.dismiss_find(cx));
+        document.read_with(cx, |document, cx| {
+            assert!(!document.open);
+            assert!(document.query.is_empty());
+            assert!(!document.pending);
+            assert!(document.task.is_none());
+            assert!(!document.reveal_after_search);
+            assert!(!document.focus_requested);
+            assert!(matches!(document.state, super::DocumentState::Ready { .. }));
+            assert_eq!(document.text.read(cx).rendered_text(), rendered_before);
+            assert_eq!(document.snapshot, snapshot_before);
+            assert_eq!(document.scroll.offset(), offset_before);
+            assert_eq!(document.text_subscription.is_some(), subscription_present);
         });
     }
 

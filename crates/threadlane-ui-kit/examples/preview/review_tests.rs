@@ -96,6 +96,53 @@ fn shared_review_sample_combined_diff_deserializes_without_filesystem(
     );
 }
 
+#[gpui::test]
+fn shared_review_find_forwards_from_document_and_navigation_focus(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    cx.update(threadlane_ui_theme::init_bundled);
+    let snapshot = fixture();
+    let saved = Rc::new(RefCell::new(None));
+    let capture = saved.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let view = cx.new(|cx| ReviewPreview::new(Some(&snapshot), window, cx));
+        *capture.borrow_mut() = Some(view.clone());
+        gpui_component::Root::new(cx.new(|_| PanelHarness(view)), window, cx)
+    });
+    let view = saved.borrow_mut().take().unwrap();
+    cx.simulate_resize(gpui::size(gpui::px(480.0), gpui::px(900.0)));
+    draw(cx);
+
+    cx.update(|window, cx| {
+        view.update(cx, |host, cx| {
+            host.filter.update(cx, |input, cx| input.focus(window, cx));
+            host.open_diff("src/main.rs".into(), cx);
+        });
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("review-find-strip").is_none());
+    #[cfg(target_os = "macos")]
+    cx.simulate_keystrokes("cmd-f");
+    #[cfg(not(target_os = "macos"))]
+    cx.simulate_keystrokes("ctrl-f");
+    draw(cx);
+    assert!(cx.debug_bounds("review-find-strip").is_some());
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+
+    click(cx, "review-diff-next");
+    click(cx, "review-diff-next");
+    click(cx, "review-diff-next");
+    cx.update(|window, cx| {
+        assert!(view.read(cx).review_nav_focus.is_focused(window));
+    });
+    #[cfg(target_os = "macos")]
+    cx.simulate_keystrokes("cmd-f");
+    #[cfg(not(target_os = "macos"))]
+    cx.simulate_keystrokes("ctrl-f");
+    draw(cx);
+    assert!(cx.debug_bounds("review-find-strip").is_some());
+}
+
 fn record_fixture() -> Snapshot {
     let mut snapshot = fixture();
     let status = snapshot.git_status.as_mut().unwrap();
