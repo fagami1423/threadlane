@@ -452,28 +452,21 @@ impl CodingAgent {
         ))
     }
 
-    /// Snapshot the armed Fusion main directive for this prompt, including
-    /// an advisory keyword hint. The lead chooses the route after investigation.
-    fn fusion_directive_for_prompt(&self, prompt: &str) -> Option<String> {
+    /// Keep the system prefix stable across tasks; per-task triage belongs in
+    /// the audit, not in the cacheable delegation contract.
+    fn fusion_directive(&self) -> Option<String> {
         let sidekick = self
             .fusion
             .lock()
             .ok()
             .and_then(|guard| guard.as_ref().map(|state| state.sidekick_model.clone()))?;
-        let mut directive = threadlane_orchestrator::build_fusion_main_directive(&sidekick);
-        let triage =
-            threadlane_orchestrator::evaluate_fusion_prompt(prompt, &sidekick).directive_suffix();
-        if let Some(pos) = directive.find(threadlane_orchestrator::FUSION_MAIN_FOOTER) {
-            directive.insert_str(pos, &format!("{triage}\n"));
-        } else {
-            directive.push_str(&triage);
-        }
-        Some(directive)
+        Some(threadlane_orchestrator::build_fusion_main_directive(
+            &sidekick,
+        ))
     }
 
-    /// Drop a previously injected Fusion directive block (header through
-    /// footer, triage suffix included) so an explicit re-arm installs fresh
-    /// per-task triage instead of keeping the arming task's.
+    /// Remove the complete prior contract, including legacy triage, before
+    /// installing the current stable directive.
     async fn strip_fusion_directive(&mut self) {
         let mut turn = self.agent.turn.lock().await;
         let Some(start) = turn
@@ -2095,7 +2088,7 @@ impl CodingAgent {
                     // the injected directive too instead of keeping the
                     // previous task's triage.
                     self.strip_fusion_directive().await;
-                    fusion_directive = self.fusion_directive_for_prompt(&effective_input);
+                    fusion_directive = self.fusion_directive();
                 } else {
                     let output = execute_slash_command(cmd_action, &mut self.agent).await;
                     return Some(Ok(output));
@@ -2125,7 +2118,7 @@ impl CodingAgent {
                 });
             }
             self.strip_fusion_directive().await;
-            fusion_directive = self.fusion_directive_for_prompt(&effective_input);
+            fusion_directive = self.fusion_directive();
         }
 
         if let Some(directive) = fusion_directive {
@@ -3014,15 +3007,23 @@ mod compaction_sync_tests {
     struct RecordingProvider {
         refreshed: Arc<Mutex<Vec<(String, Option<String>)>>>,
         block_once: Arc<Mutex<Option<Arc<tokio::sync::Notify>>>>,
+        system_prompts: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait]
     impl ProviderPort for RecordingProvider {
         async fn stream_request(
             &self,
-            _request: RuntimeRequest,
+            request: RuntimeRequest,
             events: tokio::sync::mpsc::Sender<RuntimeStreamEvent>,
         ) {
+            let messages: Vec<AgentMessage> = serde_json::from_value(request.messages).unwrap();
+            if let Some(prompt) = messages.into_iter().find_map(|message| match message {
+                AgentMessage::System { content } => Some(content),
+                _ => None,
+            }) {
+                self.system_prompts.lock().unwrap().push(prompt);
+            }
             let started = self.block_once.lock().unwrap().take();
             if let Some(started) = started {
                 started.notify_one();
@@ -3158,7 +3159,7 @@ mod compaction_sync_tests {
         let state = resumed.fusion.lock().unwrap().clone().unwrap();
         assert_eq!(state.delegated, 3);
         assert_eq!(state.compaction_generation, 1);
-        assert!(resumed.fusion_directive_for_prompt("Review the design").is_some());
+        assert!(resumed.fusion_directive().is_some());
         let facts = JsonlStore::open_read_only(&path).unwrap().facts().clone();
         assert!(facts.keys().any(|key| key.starts_with("fusion_audit:")));
 
@@ -3190,6 +3191,97 @@ mod compaction_sync_tests {
         config.model_roles.fast = Some("different".into());
         let stale = CodingAgent::new_with_provider(options(config), Arc::new(RecordingProvider::default()));
         assert!(stale.fusion.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn fusion_directive_stays_stable_while_route_audit_tracks_each_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fusion-stable-directive.jsonl");
+        let mut config = threadlane_runtime::AgentConfig::default();
+        config.orchestrator_mode = OrchestratorMode::Fusion;
+        config.model_roles.fast = Some("side".into());
+        let provider = Arc::new(RecordingProvider::default());
+        let mut agent = CodingAgent::new_with_provider(
+            CodingAgentOptions {
+                api_key: "test".into(),
+                account_id: None,
+                model: "main".into(),
+                work_dir: dir.path().to_path_buf(),
+                session_file: Some(path.clone()),
+                system_prompt: SystemPromptConfig::default(),
+                agent_config: Some(config),
+                coding_config: None,
+                browser: BrowserBridge::unavailable(),
+            },
+            provider.clone(),
+        );
+        let prompts = [
+            "Rename the local variable and remove the unused helper.",
+            "Which approach best balances security and usability? Explain the tradeoff.",
+        ];
+        for prompt in prompts {
+            let result = agent.handle_input_with_images(prompt, vec![]).await;
+            assert!(result.is_none(), "prompt failed: {result:?}");
+        }
+
+        let system_prompts = provider.system_prompts.lock().unwrap().clone();
+        assert_eq!(system_prompts.len(), 2);
+        assert_eq!(system_prompts[0].as_bytes(), system_prompts[1].as_bytes());
+        assert_eq!(
+            system_prompts[0]
+                .matches(threadlane_orchestrator::FUSION_MAIN_HEADER)
+                .count(),
+            1
+        );
+        assert_eq!(
+            system_prompts[0]
+                .matches(threadlane_orchestrator::FUSION_MAIN_FOOTER)
+                .count(),
+            1
+        );
+
+        let store = JsonlStore::open_read_only(&path).unwrap();
+        let mut actual = store
+            .records()
+            .iter()
+            .filter_map(|record| match record {
+                Record::FactSet {
+                    seq, key, value, ..
+                } if key.as_str().starts_with("fusion_audit:") => {
+                    let audit: serde_json::Value = serde_json::from_str(value).ok()?;
+                    (audit.get("kind")?.as_str()? == "route").then(|| {
+                        let codes: Vec<String> = audit
+                            .get("reason_codes")
+                            .and_then(serde_json::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                            .collect();
+                        (*seq, codes)
+                    })
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        actual.sort_by_key(|(seq, _)| *seq);
+        let expected = prompts
+            .iter()
+            .map(|prompt| {
+                threadlane_orchestrator::classify_fusion_prompt(prompt)
+                    .reason_codes
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual
+                .into_iter()
+                .map(|(_, codes)| codes)
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[tokio::test]

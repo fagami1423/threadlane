@@ -1,6 +1,87 @@
 use super::*;
+use serde::{Deserialize, Serialize};
+
+const FUSION_LANE_CONTRACT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct FusionLaneContract {
+    version: u32,
+    agent: String,
+    tools: Option<Vec<String>>,
+    system_prompt: PromptSnapshot,
+}
+
+impl FusionLaneContract {
+    pub(crate) fn restore_into(&self, config: &mut threadlane_skills::agents::AgentDefinition) {
+        if let PromptSnapshot::Full { content, .. } = &self.system_prompt {
+            config.name = self.agent.clone();
+            config.tools = self.tools.clone();
+            config.system_prompt = content.as_str().to_owned();
+        }
+    }
+}
+
+fn fusion_lane_contract_key(lane: &str) -> String {
+    format!("fusion_lane_contract:{lane}")
+}
 
 impl CodingSessionHarness {
+    pub(crate) fn capture_fusion_lane_contract(
+        &mut self,
+        lane: &str,
+        agent: &str,
+        tools: Option<Vec<String>>,
+        system_prompt: &str,
+    ) -> Result<(), String> {
+        let system_prompt = crate::durable::durable_prompt_snapshot(system_prompt);
+        let restorable = matches!(system_prompt, PromptSnapshot::Full { .. });
+        let contract = FusionLaneContract {
+            version: FUSION_LANE_CONTRACT_VERSION,
+            agent: agent.to_owned(),
+            tools,
+            system_prompt,
+        };
+        let value = serde_json::to_string(&contract)
+            .map_err(|error| format!("Failed to encode Fusion lane contract: {error}"))?;
+        self.set_fact(lane, &fusion_lane_contract_key(lane), value)?;
+        if restorable {
+            Ok(())
+        } else {
+            Err(format!(
+                "Fusion lane contract for {lane} has a redacted system prompt; start a new child after making its prompt restorable"
+            ))
+        }
+    }
+
+    pub(crate) fn load_fusion_lane_contract(
+        &mut self,
+        lane: &str,
+        expected_agent: Option<&str>,
+    ) -> Result<Option<FusionLaneContract>, String> {
+        self.ensure_fresh()?;
+        let facts = self.store.facts();
+        let Some(value) = facts.get(&fusion_lane_contract_key(lane)) else {
+            return Ok(None);
+        };
+        let contract = serde_json::from_str::<FusionLaneContract>(value).map_err(|_| {
+            format!("Fusion lane contract for {lane} is invalid; start a new child")
+        })?;
+        if contract.version != FUSION_LANE_CONTRACT_VERSION
+            || expected_agent.is_some_and(|agent| contract.agent != agent)
+            || contract.agent.is_empty()
+        {
+            return Err(format!(
+                "Fusion lane contract for {lane} does not match this agent; start a new child"
+            ));
+        }
+        if !matches!(contract.system_prompt, PromptSnapshot::Full { .. }) {
+            return Err(format!(
+                "Fusion lane contract for {lane} has no restorable system prompt; start a new child"
+            ));
+        }
+        Ok(Some(contract))
+    }
+
     pub(crate) fn start_subagent_lane(
         &mut self,
         lane_hint: &str,
@@ -452,5 +533,95 @@ impl CodingSessionHarness {
         self.store
             .drive_to_completion()
             .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod fusion_contract_tests {
+    use super::*;
+
+    #[test]
+    fn fusion_contract_restores_prompt_and_tool_scope_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let original_prompt = "Use the custom project workflow.";
+        let original_tools = Some(vec!["read_file".into(), "grep".into()]);
+        let mut harness = CodingSessionHarness::open(&path).unwrap();
+        harness
+            .capture_fusion_lane_contract(
+                "worker-lane",
+                "worker",
+                original_tools.clone(),
+                original_prompt,
+            )
+            .unwrap();
+        drop(harness);
+
+        let mut harness = CodingSessionHarness::open(&path).unwrap();
+        let contract = harness
+            .load_fusion_lane_contract("worker-lane", Some("worker"))
+            .unwrap()
+            .unwrap();
+        let mut changed_definition = threadlane_skills::agents::AgentDefinition {
+            name: "worker".into(),
+            description: "Changed agent file".into(),
+            tools: None,
+            model: None,
+            system_prompt: "New definition prompt".into(),
+            source: threadlane_skills::agents::AgentSource::Project,
+            file_path: dir.path().to_path_buf(),
+        };
+        contract.restore_into(&mut changed_definition);
+
+        assert_eq!(changed_definition.system_prompt, original_prompt);
+        assert_eq!(changed_definition.tools, original_tools);
+    }
+
+    #[test]
+    fn invalid_mismatched_and_redacted_fusion_contracts_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+
+        let mut harness = CodingSessionHarness::open(&path).unwrap();
+        harness
+            .set_fact("bad", "fusion_lane_contract:bad", "not-json".into())
+            .unwrap();
+        let error = harness
+            .load_fusion_lane_contract("bad", Some("worker"))
+            .unwrap_err();
+        assert!(error.contains("start a new child"), "{error}");
+
+        harness
+            .capture_fusion_lane_contract("mismatch", "worker", None, "custom prompt")
+            .unwrap();
+        let error = harness
+            .load_fusion_lane_contract("mismatch", Some("other-agent"))
+            .unwrap_err();
+        assert!(error.contains("does not match"), "{error}");
+
+        let oversized_prompt = "x".repeat(crate::durable::MAX_PERSISTED_SYSTEM_PROMPT_BYTES + 1);
+        let error = harness
+            .capture_fusion_lane_contract("redacted-new", "worker", None, &oversized_prompt)
+            .unwrap_err();
+        assert!(error.contains("redacted"), "{error}");
+        let redacted_prompt = crate::durable::durable_prompt_snapshot(&oversized_prompt);
+        let redacted_contract = FusionLaneContract {
+            version: FUSION_LANE_CONTRACT_VERSION,
+            agent: "worker".into(),
+            tools: Some(vec!["read_file".into()]),
+            system_prompt: redacted_prompt,
+        };
+        harness
+            .set_fact(
+                "redacted",
+                "fusion_lane_contract:redacted",
+                serde_json::to_string(&redacted_contract).unwrap(),
+            )
+            .unwrap();
+        let error = harness
+            .load_fusion_lane_contract("redacted", Some("worker"))
+            .unwrap_err();
+        assert!(error.contains("restorable system prompt"), "{error}");
+        assert!(error.contains("start a new child"), "{error}");
     }
 }

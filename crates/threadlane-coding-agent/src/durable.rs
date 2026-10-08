@@ -5,8 +5,8 @@ use super::harness::{
 };
 use super::runtime::CodingAgent;
 use super::subagents::{
-    run_subagent_task, subagent_workspace, SubagentLaneStatus, SubagentRunContext,
-    NEXT_SUBAGENT_UI_RUN_ID,
+    LaneContractMode, NEXT_SUBAGENT_UI_RUN_ID, SubagentLaneStatus, SubagentRunContext,
+    run_subagent_task, subagent_workspace,
 };
 use crate::commands::{execute_slash_command, parse_slash_command};
 use log::warn;
@@ -1475,6 +1475,23 @@ impl CodingAgent {
             let accepted = journal
                 .accepted_subagent_run(&identity)
                 .map_err(&retrying)?;
+            let expected_agent = journal
+                .store
+                .records()
+                .iter()
+                .find_map(|record| match record {
+                    HarnessRecord::SubagentLifecycle {
+                        child_run_id,
+                        agent_id,
+                        subagent_lane,
+                        ..
+                    } if child_run_id.as_str() == lane.run_id
+                        && subagent_lane.as_str() == lane.lane =>
+                    {
+                        Some(agent_id.as_str().to_owned())
+                    }
+                    _ => None,
+                });
             let recovery_work_dir = threadlane_git::primary_worktree_root(&self.work_dir)
                 .ok()
                 .map(|root| subagent_workspace(&root, &lane.run_id).0)
@@ -1536,6 +1553,10 @@ impl CodingAgent {
                 Some(accepted),
                 resume_messages.clone(),
                 None,
+                LaneContractMode::Restore {
+                    expected_agent,
+                    required: false,
+                },
             )
             .await;
             let (status, outcome, error, resumed_messages) = match result {
