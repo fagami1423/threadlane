@@ -292,6 +292,9 @@ A normal `cargo run` may be unsuitable for testing installation: update installa
 
 ## Release Automation
 
+- Prefer squash merges with a Conventional Commit title. Plain PR merges retain both implementation commits and the merge body, which Release Please can parse as duplicate changes. If using a plain merge, avoid repeating Conventional Commit messages in its body; follow-up implementation commits still belong in the changelog.
+- The release workflow runs `scripts/clean-release-notes.cjs` after Release Please updates its PR. It removes only same-section, same-description merge entries whose message repeats an implementation subject and whose second parent contains that implementation. Never deduplicate by description alone or rewrite historical release sections. Validate changes with `node scripts/clean-release-notes.test.cjs`.
+
 - Use Conventional Commit subjects for commits and squash-merge titles: `<type>[optional scope][optional !]: <description>`. Use a type configured in `release-please-config.json` (`feat`, `fix`, `perf`, `refactor`, `build`, `ci`, `chore`, or `revert`) so Release Please can parse the change.
 - Keep the `release` job in `.github/workflows/release-please.yml` serialized per branch with stale-run cancellation. A release-please run can observe a release PR merged after its triggering push; without job-level concurrency, that stale run can create the new version tag on its older commit.
 - When a package starts inheriting `workspace.package.version`, add its `Cargo.lock` package entry to the TOML updater in `release-please-config.json`. Release builds use `--locked`, so updating `Cargo.toml` without every corresponding lock entry breaks packaging.

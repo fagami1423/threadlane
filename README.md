@@ -260,6 +260,8 @@ cargo nextest run --workspace
 
 ## Packaging and releases
 
+Prefer squash merges with Conventional Commit titles (`feat:`, `fix:`, etc.). Plain merges can make Release Please list both the implementation and its merge message. The release workflow removes only duplicates verified against the merge message and Git ancestry, from the current release's changelog and PR description. Distinct follow-up commits remain. Run `node scripts/clean-release-notes.test.cjs` when changing this cleanup.
+
 Releases use `cargo-packager`, GitHub Actions, and [Release Please](https://github.com/googleapis/release-please). To create a local release package:
 
 ```bash
