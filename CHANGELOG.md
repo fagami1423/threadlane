@@ -5,7 +5,6 @@
 
 ### Features
 
-* **agents:** require plan-first worker handoffs ([4954b8c](https://github.com/wheregmis/threadlane/commit/4954b8cd004b38601e08cff7b648fd7e12ff59d5))
 * **agents:** require plan-first worker handoffs ([ed20d29](https://github.com/wheregmis/threadlane/commit/ed20d29c1969544a68e1fb87456a23d216db37ef))
 
 
@@ -16,7 +15,6 @@
 * discard prepared handoff when invalidating session runtime ([0b0e65d](https://github.com/wheregmis/threadlane/commit/0b0e65d026e74b8f89e2e810086accafeaa78e06))
 * preserve shared owners across model changes and setup cancellation ([dfc92e9](https://github.com/wheregmis/threadlane/commit/dfc92e931e0355d1c67daabcb23462b42c3523bc))
 * release cancelled preparation owners and bound construction gates ([0208606](https://github.com/wheregmis/threadlane/commit/020860638ad961eecfea96b68c8eb67bf284ec61))
-* share session runtime ownership across desktop and mobile ([ae5fa9b](https://github.com/wheregmis/threadlane/commit/ae5fa9bc39464515d6666e1a126bcac6fa366c7f))
 * share session runtime ownership across desktop and mobile ([d8bf9cc](https://github.com/wheregmis/threadlane/commit/d8bf9ccb65a8de08e129d4c42ad621ad043701d2))
 
 
