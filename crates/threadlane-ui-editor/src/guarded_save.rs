@@ -531,6 +531,7 @@ mod tests {
             root.view().clone().downcast::<EditorView>().unwrap()
         });
         settle(cx);
+        let editor = view.read_with(cx, |view, _| view.tabs[0].editor_state.clone().unwrap());
         view.read_with(cx, |view, cx| {
             let tab = &view.tabs[0];
             assert!(!tab.baseline_loaded);
@@ -565,6 +566,59 @@ mod tests {
                     ..
                 }
             ));
+        });
+
+        let copy = cx.debug_bounds("editor-copy-edits").unwrap();
+        assert!(cx.debug_bounds("editor-reload-file").is_some());
+        cx.simulate_click(copy.center(), Default::default());
+        cx.update(|_, cx| {
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().as_deref(),
+                Some("typed while loading")
+            )
+        });
+        let reload = cx.debug_bounds("editor-reload-file").unwrap();
+        cx.simulate_click(reload.center(), Default::default());
+        settle(cx);
+        cx.update(|window, cx| assert!(window.has_active_dialog(cx)));
+        let confirm = cx.debug_bounds("editor-confirm-reload").unwrap();
+        cx.simulate_click(confirm.center(), Default::default());
+        settle(cx);
+        view.read_with(cx, |view, cx| {
+            let tab = &view.tabs[0];
+            assert!(tab.baseline_loaded);
+            assert!(tab.saved_version.is_some());
+            assert_eq!(tab.saved_content, "external update\n");
+            assert_eq!(tab.save_status, EditorSaveStatus::Ready);
+            assert!(!tab.is_dirty);
+            assert!(!tab.loading);
+            assert!(tab.open_error.is_none());
+            assert!(tab.pending_content.is_none());
+            assert!(tab.pending_content_version.is_none());
+            assert_eq!(editor.read(cx).value().as_str(), "external update\n");
+        });
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_value("edited after reload", window, cx);
+                cx.emit(gpui_component::input::InputEvent::Change);
+            });
+        });
+        settle(cx);
+        view.update(cx, |view, cx| view.save_tab_at(0, cx));
+        settle(cx);
+        assert_eq!(
+            std::fs::read_to_string(project.join("sample.rs")).unwrap(),
+            "edited after reload"
+        );
+        view.read_with(cx, |view, cx| {
+            let tab = &view.tabs[0];
+            assert!(tab.baseline_loaded);
+            assert!(tab.saved_version.is_some());
+            assert_eq!(tab.saved_content, "edited after reload");
+            assert_eq!(tab.save_status, EditorSaveStatus::Ready);
+            assert!(!tab.is_dirty);
+            assert_eq!(editor.read(cx).value().as_str(), "edited after reload");
         });
     }
 }
@@ -679,7 +733,7 @@ impl EditorView {
 
     pub(super) fn render_save_recovery(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let tab = self.active_tab_index.and_then(|index| self.tabs.get(index))?;
-        if tab.is_diff || !tab.baseline_loaded { return None; }
+        if tab.is_diff { return None; }
         let editor = tab.editor_state.clone()?;
         threadlane_ui_kit::editor_save_recovery(
             format!("{} / {}", tab.project_dir.display(), tab.relative_path),
@@ -746,8 +800,13 @@ impl EditorView {
                             tab.markdown_preview.refresh(file.content.clone().into(), cx);
                             tab.saved_content = file.content;
                             tab.saved_version = Some(file.version);
+                            tab.baseline_loaded = true;
                             tab.client_epoch = snapshot.epoch;
                             tab.client_connected = snapshot.connected;
+                            tab.open_error = None;
+                            tab.pending_content = None;
+                            tab.pending_content_version = None;
+                            tab.loading = false;
                             tab.is_dirty = false;
                             tab.buffer_revision = tab.buffer_revision.wrapping_add(1);
                             tab.save_status = EditorSaveStatus::Ready;
