@@ -582,7 +582,6 @@ impl RemoteDaemon {
             // subscribe() exposes.
             loop {
                 tokio::select! {
-                    _ = reconnect.notified() => break,
                     _ = heartbeat.tick() => {
                         if ping_sent_at.is_some_and(|sent_at: Instant| {
                             sent_at.elapsed() >= HEARTBEAT_TIMEOUT
@@ -994,6 +993,93 @@ mod tests {
         .await
         .expect("foreground wake did not reconnect");
         assert_eq!(client.paired_device_id().as_deref(), Some("device-stable-id"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_wake_during_handshake_preserves_the_established_socket() {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            accepted_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                socket,
+                |_request: &Request, mut response: Response| {
+                    response
+                        .headers_mut()
+                        .insert(PROTOCOL_VERSION_HEADER, "6".parse().unwrap());
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+
+            let initial = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            assert!(matches!(
+                serde_json::from_str::<SessionCommand>(&initial).unwrap(),
+                SessionCommand::GetProjects
+            ));
+            let request = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let request: CommandRequest = serde_json::from_str(&request).unwrap();
+            assert!(matches!(request.command, SessionCommand::GetProjects));
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "response": CommandReply {
+                            request_id: request.request_id,
+                            result: Ok(CommandResponse::Ack),
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            match tokio::time::timeout(Duration::from_millis(250), socket.next()).await {
+                Err(_) => {}
+                Ok(Some(Ok(message))) => {
+                    panic!("established socket received an unexpected frame: {message:?}")
+                }
+                Ok(Some(Err(error))) => panic!("established socket closed with error: {error}"),
+                Ok(None) => panic!("established socket closed after handshake wake"),
+            }
+        });
+
+        let client = RemoteDaemon::connect_with_runtime(
+            format!("ws://{address}"),
+            None,
+            tokio::runtime::Handle::current(),
+        );
+        accepted_rx.await.unwrap();
+        client.request_reconnect();
+        release_tx.send(()).unwrap();
+        let mut connection = client.subscribe_connection();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if *connection.borrow_and_update() == ConnectionState::Connected {
+                    break;
+                }
+                connection.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("gated handshake did not complete");
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                client.request(SessionCommand::GetProjects),
+            )
+            .await
+            .expect("pending request did not complete"),
+            Ok(CommandResponse::Ack)
+        ));
+        assert!(client.is_connected());
         server.await.unwrap();
     }
 

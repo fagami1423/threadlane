@@ -313,7 +313,10 @@ impl PairingServer {
         let _registry_guard = registry_lock().lock().await;
         let path = path.into();
         let existing = read_config(&path)?;
-        let requested_port = existing.as_ref().map_or(0, |config| config.port);
+        let requested_port = existing
+            .as_ref()
+            .filter(|config| config.enabled)
+            .map_or(0, |config| config.port);
         let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, requested_port))
             .await
             .map_err(|error| format!("could not bind pairing listener: {error}"))?;
@@ -380,8 +383,16 @@ impl PairingServer {
     /// Disable persisted sharing even when the listener could not be
     /// restored (for example, because its saved port is occupied).
     pub async fn remove_all_saved() -> Result<(), String> {
+        Self::remove_all_saved_with_config_path(default_config_path()).await
+    }
+
+    /// Test/support variant that disables persisted sharing at `path`
+    /// without requiring a live listener.
+    pub async fn remove_all_saved_with_config_path(
+        path: impl Into<PathBuf>,
+    ) -> Result<(), String> {
         let _registry_guard = registry_lock().lock().await;
-        let path = default_config_path();
+        let path = path.into();
         let Some(mut config) = read_config(&path)? else {
             return Ok(());
         };
@@ -694,7 +705,7 @@ fn primary_ipv4() -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use threadlane_protocol::daemon::SessionEvent;
+    use threadlane_protocol::daemon::{CommandRequest, SessionEvent};
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -856,6 +867,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revoking_nonreading_backpressured_client_releases_saved_port() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONFIG_FILENAME);
+        let core = DaemonCore::new().unwrap();
+        let server = PairingServer::start_with_config_path(
+            core.clone(),
+            &path,
+            Some("127.0.0.1".to_string()),
+        )
+        .await
+        .unwrap();
+        let invitation = server.pending_invitation().unwrap();
+        let port = invitation.port;
+        let mut socket = connect(port, &invitation.token, "Test phone").await.unwrap();
+
+        let request = CommandRequest {
+            request_id: 1,
+            command: threadlane_protocol::daemon::SessionCommand::GetProjects,
+        };
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&request).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+
+        // Keep the authenticated peer open without reading while enough
+        // frames to exceed both the bounded queue and normal TCP buffers are
+        // broadcast. The pending request makes the request worker exercise
+        // the same reply path that shutdown must unblock.
+        let payload = "x".repeat(64 * 1024);
+        let sender = core.event_sender();
+        for index in 0..300 {
+            sender
+                .send(SessionEvent::DaemonError {
+                    session_id: None,
+                    message: format!("{index}:{payload}"),
+                })
+                .unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if core.journal_tail().len() >= 300 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("backpressure events did not reach the journal");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            server
+                .remove_all()
+                .await
+                .expect("offline revoke should persist");
+        })
+        .await
+        .expect("revoking a non-reading client did not finish");
+        drop(socket);
+
+        let rebound = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
+            .await
+            .expect("revoked listener should release its saved port");
+        drop(rebound);
+        let restarted = PairingServer::start_with_config_path(
+            DaemonCore::new().unwrap(),
+            &path,
+            Some("127.0.0.1".to_string()),
+        )
+        .await
+        .expect("fresh start should recover after offline revoke");
+        assert_ne!(restarted.info().port, port);
+        restarted.stop().await;
+    }
+
+    #[tokio::test]
     async fn pending_invitation_is_not_persisted_or_restored() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join(CONFIG_FILENAME);
@@ -886,7 +974,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn occupied_saved_port_fails_restore_without_disabling_registry() {
+    async fn occupied_saved_port_can_be_recovered_by_offline_remove_all() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join(CONFIG_FILENAME);
         let server = PairingServer::start_with_config_path(
@@ -896,7 +984,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let port = server.info().port;
+        let invitation = server.pending_invitation().unwrap();
+        let port = invitation.port;
+        drop(connect(port, &invitation.token, "Test phone").await.unwrap());
         server.stop().await;
 
         let occupied = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
@@ -912,6 +1002,25 @@ mod tests {
         let config = read_config(&path).unwrap().unwrap();
         assert!(config.enabled);
         assert_eq!(config.port, port);
+        assert_eq!(config.devices.len(), 1);
+
+        PairingServer::remove_all_saved_with_config_path(&path)
+            .await
+            .unwrap();
+        let revoked = read_config(&path).unwrap().unwrap();
+        assert!(!revoked.enabled);
+        assert!(revoked.devices.is_empty());
+        assert_eq!(revoked.port, port);
+
+        let restarted = PairingServer::start_with_config_path(
+            DaemonCore::new().unwrap(),
+            &path,
+            Some("127.0.0.1".to_string()),
+        )
+        .await
+        .expect("disabled registry should bind a fresh available port");
+        assert_ne!(restarted.info().port, port);
+        restarted.stop().await;
         drop(occupied);
     }
 

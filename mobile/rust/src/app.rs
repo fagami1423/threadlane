@@ -78,6 +78,40 @@ const PREF_PORT: &str = "threadlane.pair.port";
 const PREF_TOKEN: &str = "threadlane.pair.token";
 const PREF_DEVICES: &str = "threadlane.pair.devices.v1";
 
+#[cfg(target_os = "ios")]
+fn local_device_name() -> String {
+    use std::ffi::CStr;
+
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+
+    unsafe {
+        let device: *mut AnyObject = msg_send![class!(UIDevice), currentDevice];
+        if device.is_null() {
+            return "iPhone".to_string();
+        }
+        let name: *mut AnyObject = msg_send![device, name];
+        if name.is_null() {
+            return "iPhone".to_string();
+        }
+        let utf8: *const std::ffi::c_char = msg_send![name, UTF8String];
+        if utf8.is_null() {
+            return "iPhone".to_string();
+        }
+        let value = CStr::from_ptr(utf8).to_string_lossy().trim().to_string();
+        if value.is_empty() {
+            "iPhone".to_string()
+        } else {
+            value
+        }
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+fn local_device_name() -> String {
+    "Mobile device".to_string()
+}
+
 fn restore_saved_devices() -> Result<SavedDeviceList, String> {
     if let Some(value) = preferences::get_string(PREF_DEVICES) {
         return SavedDeviceList::from_json(&value);
@@ -369,7 +403,11 @@ impl MobileApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let host = cx.new(|cx| InputState::new(window, cx).placeholder("192.168.x.x"));
         let port = cx.new(|cx| InputState::new(window, cx).placeholder("port"));
-        let token = cx.new(|cx| InputState::new(window, cx).placeholder("pairing token"));
+        let token = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("pairing token")
+                .masked(true)
+        });
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search chats"));
         let git_message = cx.new(|cx| {
             gpui_kit::component::input::TextareaState::new(window, cx)
@@ -827,7 +865,11 @@ impl MobileApp {
             return;
         }
         let url = format!("ws://{}:{}", snapshot.host, snapshot.port);
-        let daemon = match MobileDaemon::connect(url, Some(snapshot.token.clone())) {
+        let daemon = match MobileDaemon::connect_named(
+            url,
+            Some(snapshot.token.clone()),
+            Some(local_device_name()),
+        ) {
             Ok(daemon) => daemon,
             Err(error) => {
                 self.connect_error = Some(error);

@@ -146,6 +146,7 @@ impl Render for PairingDialogView {
         let pairing = state.pending_pairing_invitation();
         let devices = state.paired_devices();
         let pairing_error = state.pairing_error.clone();
+        let recovery = !sharing && pairing_error.is_some();
         let starting = state.pairing_starting;
 
         let mut content = v_flex()
@@ -189,6 +190,10 @@ impl Render for PairingDialogView {
         }
         if let Some(error) = pairing_error {
             content = content.child(div().text_xs().text_color(theme.danger).child(error));
+        }
+        if recovery {
+            content = content.child(div().text_xs().text_color(theme.muted_foreground)
+                .child("Retry after resolving the error, or remove saved access and set up sharing again."));
         }
         if let Some(info) = pairing {
             let uri = info.uri();
@@ -239,7 +244,7 @@ impl Render for PairingDialogView {
                     .on_click(cx.listener(|this, _, window, cx| this.start(window, cx))),
             );
         }
-        if sharing {
+        if sharing || (recovery && !starting) {
             if self.remove_all_confirmation {
                 content = content
                     .child(div().text_color(theme.muted_foreground)
@@ -254,7 +259,7 @@ impl Render for PairingDialogView {
                             .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))));
             } else {
                 content = content.child(Button::new("pairing-stop").ghost().small()
-                    .label(if devices.is_empty() { "Turn off sharing…" } else { "Remove all devices…" })
+                    .label(if recovery { "Remove saved devices…" } else if devices.is_empty() { "Turn off sharing…" } else { "Remove all devices…" })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.remove_all_confirmation = true;
                         this.remove_confirmation = None;

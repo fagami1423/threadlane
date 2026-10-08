@@ -362,25 +362,29 @@ async fn serve_connection(
         core.subscribe_with_tail(since.load(Ordering::SeqCst));
 
     let (mut write, mut read) = socket.split();
+    let writer_revoked = paired_connection
+        .as_ref()
+        .map(|(_, receiver)| receiver.clone());
+    let writer_shutdown = shutdown.clone();
     let (close_connection, close_connection_rx) = oneshot::channel();
+    let mut close_connection = Some(close_connection);
     let write_task = tokio::spawn(async move {
-        tokio::pin!(close_connection_rx);
-        loop {
-            tokio::select! {
-                biased;
-                _ = &mut close_connection_rx => {
-                    let _ = write.send(Message::Close(None)).await;
-                    return;
-                }
-                message = out_rx.recv() => {
-                    let Some(message) = message else {
+        let mut revoked = writer_revoked;
+        let mut shutdown = writer_shutdown;
+        tokio::select! {
+            _ = async {
+                loop {
+                    let Some(message) = out_rx.recv().await else {
                         return;
                     };
                     if write.send(message).await.is_err() {
                         return;
                     }
                 }
-            }
+            } => {}
+            _ = wait_for_signal(&mut revoked) => {}
+            _ = wait_for_signal(&mut shutdown) => {}
+            _ = close_connection_rx => {}
         }
     });
 
@@ -463,11 +467,9 @@ async fn serve_connection(
     loop {
         let message = tokio::select! {
             _ = wait_for_signal(&mut revoked) => {
-                let _ = close_connection.send(());
                 break;
             },
             _ = wait_for_signal(&mut shutdown) => {
-                let _ = close_connection.send(());
                 break;
             },
             message = read.next() => message,
@@ -484,14 +486,17 @@ async fn serve_connection(
                 if let Ok(CommandRequest { request_id, command }) =
                     serde_json::from_str::<CommandRequest>(&text)
                 {
+                    let permit = tokio::select! {
+                        _ = wait_for_signal(&mut revoked) => break,
+                        _ = wait_for_signal(&mut shutdown) => break,
+                        permit = request_tx.reserve() => permit,
+                    };
+                    let Ok(permit) = permit else {
+                        break;
+                    };
                     note_terminal(&command, &mut owned_terminals);
                     note_watch(&command, &mut owned_watches);
-                    // Bounded: awaiting capacity here is the backpressure
-                    // that throttles a client queuing faster than the
-                    // worker can dispatch.
-                    if request_tx.send((request_id, command)).await.is_err() {
-                        break;
-                    }
+                    permit.send((request_id, command));
                     continue;
                 }
                 match serde_json::from_str::<SessionCommand>(&text) {
@@ -518,13 +523,15 @@ async fn serve_connection(
             }
             Ok(Message::Close(_)) | Err(_) => break,
             Ok(Message::Ping(payload)) => {
-                if error_tx.send(Message::Pong(payload)).await.is_err() {
-                    break;
-                }
+                let _ = error_tx.try_send(Message::Pong(payload));
             }
             Ok(_) => {}
         }
     }
+    if let Some(close_connection) = close_connection.take() {
+        let _ = close_connection.send(());
+    }
+    broadcast_task.abort();
     for terminal_id in owned_terminals {
         core.close_terminal(&terminal_id);
     }
@@ -545,7 +552,6 @@ async fn serve_connection(
     }
     drop(request_tx);
     let _ = request_task.await;
-    broadcast_task.abort();
     drop(error_tx);
     drop(reply_tx);
     let _ = write_task.await;
