@@ -227,7 +227,7 @@ pub fn chat_payload_to_messages_request(payload: &Value) -> Value {
                             .or_else(|| call.get("thought_signature"))
                     })
                     .and_then(Value::as_str)
-                    .and_then(decode_thinking_blocks)
+                    .and_then(|signature| decode_thinking_blocks(signature, model))
                     .unwrap_or_default();
                 blocks.extend(content_blocks(content));
                 for call in message
@@ -365,19 +365,27 @@ impl PendingThinking {
     }
 }
 
-/// Serializes captured thinking blocks into the string stored in the first
-/// tool call's `thought_signature`. `None` when there is nothing to replay.
-fn encode_thinking_blocks(blocks: Vec<Value>) -> Option<String> {
-    (!blocks.is_empty()).then(|| Value::Array(blocks).to_string())
+/// Serializes captured thinking blocks, tagged with the (bare) model that
+/// produced them, into the string stored in the first tool call's
+/// `thought_signature`. `None` when there is nothing to replay.
+fn encode_thinking_blocks(model: &str, blocks: Vec<Value>) -> Option<String> {
+    (!blocks.is_empty()).then(|| json!({"anthropic_model": model, "blocks": blocks}).to_string())
 }
 
-/// Parses a `thought_signature` written by [`encode_thinking_blocks`]. Anything
-/// else (e.g. a Gemini signature left over from a model switch) is ignored.
-fn decode_thinking_blocks(signature: &str) -> Option<Vec<Value>> {
-    if !signature.trim_start().starts_with('[') {
+/// Parses a `thought_signature` written by [`encode_thinking_blocks`] and
+/// returns its blocks only when they came from `model`: signatures are not
+/// portable across models, so a mid-loop model switch drops them silently.
+/// Anything else (a Gemini signature, the unreleased plain-array shape,
+/// malformed JSON) is ignored too.
+fn decode_thinking_blocks(signature: &str, model: &str) -> Option<Vec<Value>> {
+    if !signature.trim_start().starts_with('{') {
         return None;
     }
-    let blocks = serde_json::from_str::<Vec<Value>>(signature).ok()?;
+    let stored = serde_json::from_str::<Value>(signature).ok()?;
+    if stored.get("anthropic_model").and_then(Value::as_str)? != model {
+        return None;
+    }
+    let blocks = stored.get("blocks")?.as_array()?.clone();
     let valid = !blocks.is_empty()
         && blocks.iter().all(|block| {
             let text = |key: &str| block.get(key).is_some_and(Value::is_string);
@@ -395,6 +403,8 @@ fn decode_thinking_blocks(signature: &str) -> Option<Vec<Value>> {
 /// state is reached on `message_stop` or an `error` event.
 #[derive(Default)]
 pub struct SseParser {
+    /// Bare model id of the request, recorded with captured thinking blocks.
+    model: String,
     buffer: String,
     /// Content block index -> in-flight tool call.
     tool_blocks: std::collections::BTreeMap<u64, PendingToolCall>,
@@ -407,6 +417,13 @@ pub struct SseParser {
 }
 
 impl SseParser {
+    pub fn new(model: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            ..Self::default()
+        }
+    }
+
     pub fn is_done(&self) -> bool {
         self.done
     }
@@ -551,7 +568,7 @@ impl SseParser {
                     .into_values()
                     .map(PendingThinking::into_block)
                     .collect::<Vec<_>>();
-                let mut thinking_signature = encode_thinking_blocks(thinking);
+                let mut thinking_signature = encode_thinking_blocks(&self.model, thinking);
                 let mut tool_calls: Vec<ToolCall> = calls
                     .into_iter()
                     .filter(|(_, call)| !call.name.is_empty())
@@ -737,7 +754,11 @@ impl ModelProvider for AnthropicClient {
             return;
         }
 
-        let mut parser = SseParser::default();
+        let mut parser = SseParser::new(
+            body.get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
         let mut stream = response.bytes_stream();
         // Chunks can split a multi-byte character; decode only complete prefixes.
         let mut pending_bytes: Vec<u8> = Vec::new();
@@ -1114,7 +1135,7 @@ mod tests {
 
     #[test]
     fn captures_thinking_blocks_on_the_first_tool_call_in_order() {
-        let mut parser = SseParser::default();
+        let mut parser = SseParser::new("m");
         let events = parser.push(&thinking_stream());
         let reasoning: Vec<_> = events
             .iter()
@@ -1129,7 +1150,7 @@ mod tests {
         };
         assert_eq!(tool_calls.len(), 2);
         assert_eq!(
-            decode_thinking_blocks(tool_calls[0].thought_signature.as_deref().unwrap()),
+            decode_thinking_blocks(tool_calls[0].thought_signature.as_deref().unwrap(), "m"),
             Some(vec![
                 json!({"type": "thinking", "thinking": "Let me check.", "signature": "EuYBsig=="}),
                 json!({"type": "redacted_thinking", "data": "OPAQUE"}),
@@ -1157,8 +1178,12 @@ mod tests {
     }
 
     fn assistant_with_signature(signature: Value) -> Value {
+        assistant_for_model("anthropic/m", signature)
+    }
+
+    fn assistant_for_model(model: &str, signature: Value) -> Value {
         json!({
-            "model": "anthropic/m",
+            "model": model,
             "messages": [
                 {"role": "user", "content": "go"},
                 {"role": "assistant", "content": "Looking.", "tool_calls": [
@@ -1171,12 +1196,14 @@ mod tests {
 
     #[test]
     fn conversion_replays_thinking_blocks_first_and_unmodified() {
-        let mut parser = SseParser::default();
+        let mut parser = SseParser::new("m");
         let events = parser.push(&thinking_stream());
         let StreamEvent::Finished { tool_calls, .. } = events.last().unwrap() else {
             panic!("expected Finished");
         };
         let signature = tool_calls[0].thought_signature.clone().unwrap();
+        let stored: Value = serde_json::from_str(&signature).unwrap();
+        assert_eq!(stored["anthropic_model"], "m");
         let request = chat_payload_to_messages_request(&assistant_with_signature(json!(signature)));
         assert_eq!(
             request["messages"][1]["content"],
@@ -1190,10 +1217,55 @@ mod tests {
     }
 
     #[test]
+    fn thinking_is_dropped_when_the_request_model_differs() {
+        let signature = SseParser::new("claude-opus-5-5")
+            .push(&thinking_stream())
+            .into_iter()
+            .find_map(|event| match event {
+                StreamEvent::Finished { tool_calls, .. } => tool_calls[0].thought_signature.clone(),
+                _ => None,
+            })
+            .unwrap();
+        let replayed = |model: &str| {
+            chat_payload_to_messages_request(&assistant_for_model(model, json!(signature)))
+                ["messages"][1]["content"]
+                .clone()
+        };
+        // Same model: replayed first.
+        assert_eq!(replayed("anthropic/claude-opus-5-5")[0]["type"], "thinking");
+        assert_eq!(
+            replayed("anthropic/claude-opus-5-5")
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        // Different Anthropic model: dropped silently, request still valid.
+        assert_eq!(
+            replayed("anthropic/claude-sonnet-5-5"),
+            json!([
+                {"type": "text", "text": "Looking."},
+                {"type": "tool_use", "id": "c1", "name": "a", "input": {}},
+            ])
+        );
+    }
+
+    #[test]
+    fn legacy_plain_array_signatures_are_ignored() {
+        let legacy = json!([{"type": "thinking", "thinking": "x", "signature": "S"}]).to_string();
+        let request = chat_payload_to_messages_request(&assistant_with_signature(json!(legacy)));
+        assert_eq!(request["messages"][1]["content"][0]["type"], "text");
+    }
+
+    #[test]
     fn foreign_or_malformed_signatures_are_ignored() {
         for signature in [
             json!("CiQBjz1rX-gemini-style-opaque"),
             json!("[1, 2]"),
+            json!("{\"anthropic_model\":\"m\",\"blocks\":[]}"),
+            json!("{\"anthropic_model\":\"m\",\"blocks\":[1]}"),
+            json!("{\"anthropic_model\":\"m\"}"),
+            json!("{\"blocks\":[{\"type\":\"redacted_thinking\",\"data\":\"d\"}]}"),
             json!("[]"),
             json!("[{\"type\":\"thinking\",\"thinking\":\"x\"}]"),
             json!("[{\"type\":\"text\",\"text\":\"x\"}]"),
@@ -1347,7 +1419,10 @@ mod tests {
                 assert_eq!(tool_calls[0].function.arguments, "{\"path\":\".\"}");
                 // Omitted-display thinking: empty text, signature preserved.
                 assert_eq!(
-                    decode_thinking_blocks(tool_calls[0].thought_signature.as_deref().unwrap()),
+                    decode_thinking_blocks(
+                        tool_calls[0].thought_signature.as_deref().unwrap(),
+                        "claude-test"
+                    ),
                     Some(vec![
                         json!({"type": "thinking", "thinking": "", "signature": "EqQBsig"})
                     ])
@@ -1383,9 +1458,11 @@ mod tests {
                 {"role": "user", "content": "list the files"},
                 {"role": "assistant", "content": "Checking.", "tool_calls": [
                     {"id": "call_a", "type": "function",
-                     "thoughtSignature": json!([
-                         {"type": "thinking", "thinking": "plan", "signature": "SIG1"},
-                         {"type": "redacted_thinking", "data": "ENC"}]).to_string(),
+                     "thoughtSignature": json!({
+                         "anthropic_model": "claude-sonnet-5-5",
+                         "blocks": [
+                             {"type": "thinking", "thinking": "plan", "signature": "SIG1"},
+                             {"type": "redacted_thinking", "data": "ENC"}]}).to_string(),
                      "function": {"name": "list_dir", "arguments": "{\"path\":\".\"}"}},
                     {"id": "call_b", "type": "function",
                      "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}}]},
