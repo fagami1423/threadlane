@@ -448,6 +448,11 @@ impl DaemonCore {
     /// Drop a runtime so the next access rebuilds it with current config
     /// (model/effort/mode switching works by invalidation).
     pub fn drop_runtime(&self, session_file: &Path) -> Option<Arc<SessionRuntime>> {
+        // Invalidation also ends the prepared handoff; otherwise the next
+        // prompt could resurrect the old model from the mailbox.
+        if let Some(session_id) = Self::session_id_for_file(session_file) {
+            let _ = crate::runtimes::take_prepared_runtime(&session_id);
+        }
         self.runtimes
             .lock()
             .expect("runtimes poisoned")
@@ -1829,6 +1834,13 @@ mod composer_tests {
         core.release_cancelled_runtime(&file, &runtime);
         assert!(core.runtime_for_file(&file).is_none());
         assert!(crate::runtimes::take_prepared_runtime("cancelled-owner").is_none());
+        core.register_runtime("cancelled-owner", work_dir.clone(), file.clone(), runtime.clone());
+        let active = AtomicBool::new(false);
+        assert!(crate::runtimes::park_prepared_runtime_if_active(
+            "cancelled-owner".into(), runtime.clone(), &active));
+        core.drop_runtime(&file);
+        assert!(crate::runtimes::take_prepared_runtime("cancelled-owner").is_none());
+
     }
 
     #[test]
