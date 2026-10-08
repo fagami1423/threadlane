@@ -5,8 +5,8 @@ use super::harness::{
 };
 use super::runtime::CodingAgent;
 use super::subagents::{
-    run_subagent_task, subagent_workspace, SubagentLaneStatus, SubagentRunContext,
-    NEXT_SUBAGENT_UI_RUN_ID,
+    LaneContractMode, NEXT_SUBAGENT_UI_RUN_ID, SubagentLaneStatus, SubagentRunContext,
+    run_subagent_task, subagent_workspace,
 };
 use crate::commands::{execute_slash_command, parse_slash_command};
 use log::warn;
@@ -1527,6 +1527,8 @@ impl CodingAgent {
                     child_tool_observer: None,
                     #[cfg(test)]
                     child_run_override: None,
+                    #[cfg(test)]
+                    child_execution_observer: self.subagent_execution_observer.clone(),
                     semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
                     hub: self.hub.clone(),
                 },
@@ -1536,6 +1538,10 @@ impl CodingAgent {
                 Some(accepted),
                 resume_messages.clone(),
                 None,
+                LaneContractMode::Restore {
+                    expected_agent: None,
+                    required: false,
+                },
             )
             .await;
             let (status, outcome, error, resumed_messages) = match result {

@@ -1,6 +1,220 @@
 use super::*;
+use serde::{Deserialize, Serialize};
+
+const FUSION_LANE_CONTRACT_VERSION: u32 = 2;
+const MAX_PERSISTED_PEER_ROLES: usize = 8;
+const MAX_PERSISTED_PEER_ROLE_BYTES: usize = 256;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+struct RequiredToolScope(Option<Vec<String>>);
+
+impl<'de> Deserialize<'de> for RequiredToolScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Option::<Vec<String>>::deserialize(deserializer).map(Self)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+struct RequiredPeerMetadata(Option<FusionPeerMetadata>);
+
+impl<'de> Deserialize<'de> for RequiredPeerMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Option::<FusionPeerMetadata>::deserialize(deserializer).map(Self)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FusionPeerMetadata {
+    siblings: Vec<String>,
+    own_role: String,
+}
+
+impl FusionPeerMetadata {
+    fn from_peer_info(peer_info: Option<&(Vec<String>, String)>) -> Result<Self, String> {
+        let Some((siblings, own_role)) = peer_info else {
+            return Err("peer metadata is absent".into());
+        };
+        let metadata = Self {
+            siblings: siblings.clone(),
+            own_role: own_role.clone(),
+        };
+        metadata.validate()?;
+        Ok(metadata)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.siblings.len() > MAX_PERSISTED_PEER_ROLES {
+            return Err(format!(
+                "Fusion lane peer metadata has too many sibling roles (maximum {MAX_PERSISTED_PEER_ROLES})"
+            ));
+        }
+        for role in self.siblings.iter().chain(std::iter::once(&self.own_role)) {
+            if role.trim().is_empty() || role.len() > MAX_PERSISTED_PEER_ROLE_BYTES {
+                return Err(format!(
+                    "Fusion lane peer role is empty or exceeds {MAX_PERSISTED_PEER_ROLE_BYTES} bytes"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct FusionLaneContract {
+    version: u32,
+    agent: String,
+    tools: RequiredToolScope,
+    system_prompt: PromptSnapshot,
+    peer: RequiredPeerMetadata,
+}
+
+#[derive(Debug, Deserialize)]
+struct FusionLaneContractFields {
+    version: u32,
+    agent: String,
+    tools: RequiredToolScope,
+    system_prompt: PromptSnapshot,
+    peer: RequiredPeerMetadata,
+}
+
+impl<'de> Deserialize<'de> for FusionLaneContract {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("Fusion lane contract must be an object"))?;
+        if !object.contains_key("tools") {
+            return Err(serde::de::Error::custom(
+                "Fusion lane contract is missing the tools field",
+            ));
+        }
+        if !object.contains_key("peer") {
+            return Err(serde::de::Error::custom(
+                "Fusion lane contract is missing the peer field",
+            ));
+        }
+        let fields = serde_json::from_value::<FusionLaneContractFields>(value)
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            version: fields.version,
+            agent: fields.agent,
+            tools: fields.tools,
+            system_prompt: fields.system_prompt,
+            peer: fields.peer,
+        })
+    }
+}
+
+impl FusionLaneContract {
+    pub(crate) fn restore_into(
+        &self,
+        config: &mut threadlane_skills::agents::AgentDefinition,
+    ) -> Result<(), String> {
+        let PromptSnapshot::Full { content, .. } = &self.system_prompt else {
+            return Err("Fusion lane contract has no restorable system prompt".into());
+        };
+        config.name = self.agent.clone();
+        config.tools = self.tools.0.clone();
+        config.system_prompt = content.as_str().to_owned();
+        Ok(())
+    }
+
+    pub(crate) fn peer_info(&self) -> Option<(Vec<String>, String)> {
+        self.peer
+            .0
+            .as_ref()
+            .map(|peer| (peer.siblings.clone(), peer.own_role.clone()))
+    }
+}
+
+fn fusion_lane_contract_key(lane: &str) -> String {
+    format!("fusion_lane_contract:{lane}")
+}
 
 impl CodingSessionHarness {
+    pub(crate) fn capture_fusion_lane_contract(
+        &mut self,
+        lane: &str,
+        agent: &str,
+        tools: Option<Vec<String>>,
+        system_prompt: &str,
+        peer_info: Option<&(Vec<String>, String)>,
+    ) -> Result<(), String> {
+        let tools = tools.map(|mut tools| {
+            tools.sort_unstable();
+            tools.dedup();
+            tools
+        });
+        let system_prompt = crate::durable::durable_prompt_snapshot(system_prompt);
+        let peer = peer_info
+            .map(|peer_info| FusionPeerMetadata::from_peer_info(Some(peer_info)))
+            .transpose()?;
+        let contract = FusionLaneContract {
+            version: FUSION_LANE_CONTRACT_VERSION,
+            agent: agent.to_owned(),
+            tools: RequiredToolScope(tools),
+            system_prompt,
+            peer: RequiredPeerMetadata(peer),
+        };
+        let value = serde_json::to_string(&contract)
+            .map_err(|error| format!("Failed to encode Fusion lane contract: {error}"))?;
+        self.set_fact(lane, &fusion_lane_contract_key(lane), value)?;
+        Ok(())
+    }
+
+    pub(crate) fn load_fusion_lane_contract(
+        &mut self,
+        lane: &str,
+        expected_agent: Option<&str>,
+    ) -> Result<Option<FusionLaneContract>, String> {
+        self.ensure_fresh()?;
+        let facts = self.store.facts();
+        let Some(value) = facts.get(&fusion_lane_contract_key(lane)) else {
+            return Ok(None);
+        };
+        let contract = serde_json::from_str::<FusionLaneContract>(value).map_err(|_| {
+            format!("Fusion lane contract for {lane} is invalid; start a new child")
+        })?;
+        if contract.version != FUSION_LANE_CONTRACT_VERSION
+            || expected_agent.is_some_and(|agent| contract.agent != agent)
+            || contract.agent.is_empty()
+        {
+            return Err(format!(
+                "Fusion lane contract for {lane} does not match this agent; start a new child"
+            ));
+        }
+        if let Some(peer) = contract.peer.0.as_ref() {
+            peer.validate().map_err(|error| {
+                format!(
+                    "Fusion lane contract for {lane} has invalid peer metadata ({error}); start a new child"
+                )
+            })?;
+        }
+        let PromptSnapshot::Full { content, sha256 } = &contract.system_prompt else {
+            return Err(format!(
+                "Fusion lane contract for {lane} has no restorable system prompt; start a new child"
+            ));
+        };
+        let expected_sha256 = crate::durable::sha256_hex(content.as_str().as_bytes());
+        if sha256.as_str() != expected_sha256 {
+            return Err(format!(
+                "Fusion lane contract for {lane} has a corrupted system prompt; start a new child"
+            ));
+        }
+        Ok(Some(contract))
+    }
+
     pub(crate) fn start_subagent_lane(
         &mut self,
         lane_hint: &str,
@@ -452,5 +666,169 @@ impl CodingSessionHarness {
         self.store
             .drive_to_completion()
             .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod fusion_contract_tests {
+    use super::*;
+
+    #[test]
+    fn fusion_contract_restores_prompt_and_tool_scope_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let original_prompt = "Use the custom project workflow.";
+        let original_tools = Some(vec!["grep".into(), "read_file".into()]);
+        let original_peers = Some((vec!["worker".into(), "sibling".into()], "worker".into()));
+        let mut harness = CodingSessionHarness::open(&path).unwrap();
+        harness
+            .capture_fusion_lane_contract(
+                "worker-lane",
+                "worker",
+                original_tools.clone(),
+                original_prompt,
+                original_peers.as_ref(),
+            )
+            .unwrap();
+        drop(harness);
+
+        let mut harness = CodingSessionHarness::open(&path).unwrap();
+        let contract = harness
+            .load_fusion_lane_contract("worker-lane", Some("worker"))
+            .unwrap()
+            .unwrap();
+        let mut changed_definition = threadlane_skills::agents::AgentDefinition {
+            name: "worker".into(),
+            description: "Changed agent file".into(),
+            tools: None,
+            model: None,
+            system_prompt: "New definition prompt".into(),
+            source: threadlane_skills::agents::AgentSource::Project,
+            file_path: dir.path().to_path_buf(),
+        };
+        contract.restore_into(&mut changed_definition).unwrap();
+
+        assert_eq!(changed_definition.system_prompt, original_prompt);
+        assert_eq!(changed_definition.tools, original_tools);
+        assert_eq!(contract.peer_info(), original_peers);
+    }
+
+    #[test]
+    fn invalid_mismatched_and_redacted_fusion_contracts_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+
+        let mut harness = CodingSessionHarness::open(&path).unwrap();
+        harness
+            .set_fact("bad", "fusion_lane_contract:bad", "not-json".into())
+            .unwrap();
+        let error = harness
+            .load_fusion_lane_contract("bad", Some("worker"))
+            .unwrap_err();
+        assert!(error.contains("start a new child"), "{error}");
+
+        harness
+            .capture_fusion_lane_contract("mismatch", "worker", None, "custom prompt", None)
+            .unwrap();
+        let error = harness
+            .load_fusion_lane_contract("mismatch", Some("other-agent"))
+            .unwrap_err();
+        assert!(error.contains("does not match"), "{error}");
+        assert!(harness
+            .load_fusion_lane_contract("mismatch", Some("worker"))
+            .unwrap()
+            .is_some());
+
+        let oversized_prompt = "x".repeat(crate::durable::MAX_PERSISTED_SYSTEM_PROMPT_BYTES + 1);
+        harness
+            .capture_fusion_lane_contract(
+                "redacted-new",
+                "worker",
+                None,
+                &oversized_prompt,
+                None,
+            )
+            .unwrap();
+        let redacted_prompt = crate::durable::durable_prompt_snapshot(&oversized_prompt);
+        let redacted_contract = FusionLaneContract {
+            version: FUSION_LANE_CONTRACT_VERSION,
+            agent: "worker".into(),
+            tools: RequiredToolScope(Some(vec!["read_file".into()])),
+            system_prompt: redacted_prompt,
+            peer: RequiredPeerMetadata(None),
+        };
+        harness
+            .set_fact(
+                "redacted",
+                "fusion_lane_contract:redacted",
+                serde_json::to_string(&redacted_contract).unwrap(),
+            )
+            .unwrap();
+        let error = harness
+            .load_fusion_lane_contract("redacted", Some("worker"))
+            .unwrap_err();
+        assert!(error.contains("restorable system prompt"), "{error}");
+        assert!(error.contains("start a new child"), "{error}");
+
+        let missing_tools = serde_json::json!({
+            "version": FUSION_LANE_CONTRACT_VERSION,
+            "agent": "worker",
+            "system_prompt": crate::durable::durable_prompt_snapshot("prompt"),
+            "peer": null,
+        });
+        harness
+            .set_fact(
+                "missing-tools",
+                "fusion_lane_contract:missing-tools",
+                missing_tools.to_string(),
+            )
+            .unwrap();
+        let error = harness
+            .load_fusion_lane_contract("missing-tools", Some("worker"))
+            .unwrap_err();
+        assert!(error.contains("invalid"), "{error}");
+
+        let mut unknown_version = serde_json::to_value(FusionLaneContract {
+            version: FUSION_LANE_CONTRACT_VERSION + 1,
+            agent: "worker".into(),
+            tools: RequiredToolScope(None),
+            system_prompt: crate::durable::durable_prompt_snapshot("prompt"),
+            peer: RequiredPeerMetadata(None),
+        })
+        .unwrap();
+        unknown_version["version"] = serde_json::json!(FUSION_LANE_CONTRACT_VERSION + 1);
+        harness
+            .set_fact(
+                "unknown-version",
+                "fusion_lane_contract:unknown-version",
+                unknown_version.to_string(),
+            )
+            .unwrap();
+        let error = harness
+            .load_fusion_lane_contract("unknown-version", Some("worker"))
+            .unwrap_err();
+        assert!(error.contains("start a new child"), "{error}");
+
+        let corrupted = FusionLaneContract {
+            version: FUSION_LANE_CONTRACT_VERSION,
+            agent: "worker".into(),
+            tools: RequiredToolScope(None),
+            system_prompt: PromptSnapshot::Full {
+                content: threadlane_runtime::harness::BoundedPromptText::new("prompt").unwrap(),
+                sha256: threadlane_runtime::harness::TraceString::new("0".repeat(64)).unwrap(),
+            },
+            peer: RequiredPeerMetadata(None),
+        };
+        harness
+            .set_fact(
+                "corrupted",
+                "fusion_lane_contract:corrupted",
+                serde_json::to_string(&corrupted).unwrap(),
+            )
+            .unwrap();
+        let error = harness
+            .load_fusion_lane_contract("corrupted", Some("worker"))
+            .unwrap_err();
+        assert!(error.contains("corrupted system prompt"), "{error}");
     }
 }
