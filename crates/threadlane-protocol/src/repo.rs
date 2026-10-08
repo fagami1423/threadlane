@@ -113,6 +113,8 @@ pub struct PrConversationComment {
     pub body: String,
     pub created_at: String,
     pub url: String,
+    #[serde(default)]
+    pub viewer_did_author: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

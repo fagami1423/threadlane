@@ -2496,10 +2496,7 @@ impl RightPanelView {
                 ReviewPrAction::Toggle => this.pr_expanded = !this.pr_expanded,
                 ReviewPrAction::Open => cx.open_url(&pr.url),
                 ReviewPrAction::FixCi => {
-                    let failed = pr.checks.iter().filter(|check| matches!(check.conclusion.as_deref().unwrap_or("").to_uppercase().as_str(),
-                        "FAILURE" | "TIMED_OUT" | "ACTION_REQUIRED" | "CANCELLED" | "ERROR"))
-                        .map(|check| check.name.clone()).collect::<Vec<_>>().join(", ");
-                    let prompt = format!("Please inspect and fix the failing CI check on PR #{} ({}): {failed}", pr.number, pr.title);
+                    let prompt = threadlane_git::build_fix_ci_prompt(&pr);
                     this.model.update(cx, |state, _| state.request_composer_prompt(prompt));
                 }
                 ReviewPrAction::AddressComments => {

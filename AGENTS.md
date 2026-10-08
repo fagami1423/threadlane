@@ -32,7 +32,7 @@ Threadlane is a Rust workspace centered on a native GPUI desktop application (`c
 - `crates/threadlane-tools/` — tool implementations and capability support.
 - `crates/threadlane-auth/` — authentication helpers.
 - `crates/threadlane-computer/` — native computer-use tools (macOS window listing, screenshots, input) behind the `ComputerApproval` trait; the coding-agent engine implements approval with its permission manager.
-- `crates/threadlane-git/` — git repository integration and PR review feedback (forge types, actionable-feedback extraction, tracking store, auto-address prompts).
+- `crates/threadlane-git/` — git repository integration and PR review feedback (forge types, actionable-feedback extraction, tracking store, auto-address prompts). Agent-owned PR lifecycle instructions are shared from `threadlane-prompt::git_workflow`; native Git sessions expose credential-aware `github_pr` operations through `github::agent`. Keep read-only versus mutating tool-policy classification synchronized when adding actions; never turn local-only tasks or reply drafts into publication/merge authorization.
 - `crates/threadlane-updater/` — signed update checks, downloads, installation, and relaunch.
 - `crates/threadlane-wasi/` — WASI extension runner.
 - `extensions/` — WASI extensions built for `wasm32-wasip1`.

@@ -1155,7 +1155,7 @@ impl CodingAgent {
                 work_dir: options.work_dir.clone(),
             }));
         }
-        if github_issue_work {
+        if github_issue_work || threadlane_git::is_git_repo(&options.work_dir) {
             registry.register(Box::new(GitHubCapability {
                 work_dir: options.work_dir.clone(),
             }));

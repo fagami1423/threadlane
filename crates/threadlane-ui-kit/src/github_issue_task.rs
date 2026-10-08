@@ -7,7 +7,7 @@ use gpui_component::{ActiveTheme, Disableable, WindowExt};
 use std::rc::Rc;
 use threadlane_protocol::{OrchestratorMode, ReasoningEffort};
 
-pub const ISSUE_TASK_DESCRIPTION: &str = "The agent works in an isolated worktree, verifies and commits its changes, then pushes to origin and creates a draft PR on GitHub.";
+pub const ISSUE_TASK_DESCRIPTION: &str = "The agent works in an isolated worktree, pushes a PR, marks it ready after local checks, then monitors CI and replies to reviews until mergeable or blocked. It does not merge.";
 pub const ISSUE_TASK_BRANCH_DISCLOSURE: &str =
     "A unique six-character suffix is assigned when the task starts.";
 const MODE_HELP: &str = "Agent runs directly on the selected model; Fusion delegates work to the configured Fusion model.";

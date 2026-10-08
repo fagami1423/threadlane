@@ -5,6 +5,8 @@ use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 mod cache;
+mod agent;
+pub use agent::{execute_pr_workflow, PrWorkflowRequest};
 use cache::ResponseCache;
 
 use crate::error::GitError;
@@ -363,6 +365,7 @@ fn parse_pr_conversation_comments(
             body: comment["body"].as_str().unwrap_or("").to_owned(),
             created_at: comment["createdAt"].as_str().unwrap_or("").to_owned(),
             url: comment["url"].as_str().unwrap_or("").to_owned(),
+            viewer_did_author: comment["viewerDidAuthor"].as_bool().unwrap_or(false),
         })
         .collect()
 }

@@ -245,6 +245,15 @@ pub fn build_system_prompt(options: SystemPromptBuildOptions<'_>) -> String {
             ""
         };
 
+        let git_workflow = if available_tool_names.contains("run_command")
+            || available_tool_names.contains("github_pr")
+            || available_tool_names.contains("create_draft_pull_request")
+        {
+            format!("\n\n{}", crate::git_workflow::PR_COMPLETION_POLICY)
+        } else {
+            String::new()
+        };
+
         format!(
             "You are an expert coding assistant operating inside threadlane. Use the tools exposed by the runtime when relevant.\n\n\
             ## Execution Guidelines\n\
@@ -261,7 +270,7 @@ pub fn build_system_prompt(options: SystemPromptBuildOptions<'_>) -> String {
             - If a tool fails, adapt to its error rather than retrying verbatim. Run independent calls in parallel when useful.\n\
             - Cite code as `file_path:line_number` when relevant.\n\n\
             ## Tool-Specific Guidance\
-            {formatted_tool_guidelines}{extension_note}"
+            {formatted_tool_guidelines}{extension_note}{git_workflow}"
         )
     };
 
@@ -297,6 +306,26 @@ mod tests {
 
     fn tool(name: &str, description: &str) -> AgentToolDefinition {
         AgentToolDefinition::new(name, description, json!({"type": "object"}))
+    }
+
+    #[test]
+    fn git_completion_policy_is_shared_and_custom_prompts_remain_authoritative() {
+        let tools = vec![tool("github_pr", "PR lifecycle")];
+        for (config, expected) in [
+            (SystemPromptConfig::default(), true),
+            (SystemPromptConfig { custom_prompt: Some("Custom identity".into()), ..Default::default() }, false),
+        ] {
+            let prompt = build_system_prompt(SystemPromptBuildOptions {
+                config: &config,
+                work_dir: Path::new("/workspace"),
+                tools: &tools,
+                project_context: &ProjectContext::default(),
+                skill_catalog: None,
+                agent_catalog: None,
+                loaded_extension_count: 0,
+            });
+            assert_eq!(prompt.contains(crate::git_workflow::PR_COMPLETION_POLICY), expected);
+        }
     }
 
     #[test]
