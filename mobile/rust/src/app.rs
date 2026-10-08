@@ -21,7 +21,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState, Textarea},
     marker::{Marker, MarkerContent, MarkerLoadingStyle},
-    ActiveTheme, Disableable, Icon, Sizable,
+    ActiveTheme, Disableable, Icon, Placement, Sizable, WindowExt,
 };
 use gpui_kit_assets::__private as kit_icons;
 use threadlane_protocol::automation::{
@@ -223,11 +223,6 @@ impl ActiveSession {
     }
 }
 
-enum MobileSessionRow {
-    Project(threadlane_protocol::daemon::ProjectInfo),
-    Session(SessionInfo),
-}
-
 /// Root view. One `MobileDaemon` drives all traffic; `screen` picks the
 /// layout and `projects`/`active` hold the rendered projection.
 pub struct MobileApp {
@@ -257,7 +252,7 @@ pub struct MobileApp {
         HashMap<(SharedString, String), threadlane_ui_kit::markdown::MarkdownRenderState>,
     active: Option<ActiveSession>,
     sessions_list: ListState,
-    session_rows: Vec<MobileSessionRow>,
+    session_rows: Vec<SessionInfo>,
     project_git: HashMap<std::path::PathBuf, GitStatus>,
     /// Which tab the main screen shows.
     tab: Tab,
@@ -392,8 +387,8 @@ impl MobileApp {
         });
         let composer = cx.new(|cx| {
             gpui_kit::component::input::TextareaState::new(window, cx)
-                .placeholder("Message")
-                .auto_grow(1, 8)
+                .placeholder("Ask Threadlane to build or fix something")
+                .auto_grow(1, 6)
                 .submit_on_enter(true)
                 .soft_wrap(true)
         });
@@ -788,7 +783,13 @@ impl MobileApp {
             .client
             .sidebar_project_filter
             .clone()
-            .or_else(|| self.client.active_work_dir.clone());
+            .or_else(|| self.client.active_work_dir.clone())
+            .or_else(|| {
+                self.client
+                    .projects
+                    .first()
+                    .map(|project| project.work_dir.clone())
+            });
         if let (Some(work_dir), Some(daemon)) = (project, &self.daemon) {
             daemon.request(SessionCommand::BeginSession { work_dir });
             self.sending = true;
@@ -810,6 +811,18 @@ impl MobileApp {
                 self.models.clear();
                 self.selected_model = None;
                 self.effort = None;
+                let project_draft = self.client.composer_drafts.remove(&(Some(session.work_dir.clone()), None));
+                // Changing a draft's project replaces its temporary session, keeping the prompt.
+                if project_draft.is_some() {
+                    if let Some(active) = &self.active {
+                        if self.session_drafts.iter().any(|draft| draft.id == active.id) {
+                            self.session_drafts.retain(|draft| draft.id != active.id);
+                            for project in &mut self.client.projects {
+                                project.sessions.retain(|draft| draft.id != active.id);
+                            }
+                        }
+                    }
+                }
                 // A draft has no transcript until its first accepted prompt.
                 self.session_drafts.push(session.clone());
                 if let Some(project) = self
@@ -823,8 +836,9 @@ impl MobileApp {
                 self.refresh_session_rows();
                 self.client.select_session(&session);
                 self.client.messages = Default::default();
+                let draft = project_draft.unwrap_or_default();
                 self.composer
-                    .update(cx, |input, cx| input.set_value("", window, cx));
+                    .update(cx, |input, cx| input.set_value(draft.text, window, cx));
                 self.active = Some(ActiveSession::new(&session, window));
                 self.tab = Tab::Chats;
                 self.request_composer(SessionCommand::GetComposerOptions {
@@ -1096,20 +1110,132 @@ impl MobileApp {
             .is_some_and(|id| self.pending_composer.get(id).copied().unwrap_or_default() > 0)
     }
 
+    fn composer_project(&self, cx: &mut Context<Self>) -> AnyElement {
+        let selected = self.client.active_work_dir.clone();
+        let label = self
+            .client
+            .projects
+            .iter()
+            .find(|project| Some(&project.work_dir) == selected.as_ref())
+            .map(|project| project.name.clone())
+            .unwrap_or_else(|| "Project".into());
+        let draft = self.active.as_ref().is_some_and(|active| {
+            self.session_drafts
+                .iter()
+                .any(|draft| draft.id == active.id)
+        });
+        let projects = self.client.projects.clone();
+        let entity = cx.entity();
+        Button::new("composer-project")
+            .ghost()
+            .h_11()
+            .w_full()
+            .min_w_0()
+            .child(div().flex().items_center().gap_1().min_w_0().text_sm()
+                .child(div().min_w_0().truncate().child(label.clone()))
+                .when(draft, |this| this.child(div().flex_none().child("▾"))))
+            .accessibility_label(format!("Project: {label}"))
+            .disabled(
+                !draft
+                    || self.sending
+                    || !self
+                        .daemon
+                        .as_ref()
+                        .is_some_and(|daemon| daemon.is_connected()),
+            )
+            .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
+                projects
+                    .iter()
+                    .fold(menu.scrollable(true), |menu, project| {
+                        let entity = entity.clone();
+                        let work_dir = project.work_dir.clone();
+                        let current = Some(&work_dir) == selected.as_ref();
+                        menu.item(
+                            PopupMenuItem::new(format!(
+                                "{}{}",
+                                if current { "✓ " } else { "" },
+                                project.name
+                            ))
+                            .checked(current)
+                            .on_click(move |_, _, cx| {
+                                entity.update(cx, |this, cx| {
+                                    let draft = this.active.as_ref().is_some_and(|active| {
+                                        this.session_drafts
+                                            .iter()
+                                            .any(|draft| draft.id == active.id)
+                                    });
+                                    if current || !draft || this.sending {
+                                        return;
+                                    }
+                                    if let Some(daemon) = &this.daemon {
+                                        this.client.composer_drafts.insert(
+                                            (Some(work_dir.clone()), None),
+                                            threadlane_client::ComposerDraft {
+                                                text: this.composer.read(cx).value().to_string(),
+                                                images: Vec::new(),
+                                            },
+                                        );
+                                        daemon.request(SessionCommand::BeginSession {
+                                            work_dir: work_dir.clone(),
+                                        });
+                                        this.sending = true;
+                                        cx.notify();
+                                    }
+                                });
+                            }),
+                        )
+                    })
+            })
+            .into_any_element()
+    }
+
+    fn composer_model_label(&self) -> String {
+        self.models
+            .iter()
+            .find(|model| Some(&model.id) == self.selected_model.as_ref())
+            .map(|model| model.label.clone())
+            .or_else(|| {
+                self.selected_model
+                    .clone()
+                    .filter(|model| !model.is_empty())
+            })
+            .unwrap_or_else(|| "No model available".into())
+    }
+
+    fn open_configuration(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entity = cx.entity();
+        let session_id = self.client.active_session_id.clone();
+        window.open_sheet_at(Placement::Bottom, cx, move |sheet, _, cx| {
+            let content = entity.update(cx, |this, cx| {
+                if this.client.active_session_id == session_id {
+                    this.composer_options(cx)
+                } else {
+                    div()
+                        .child("Chat changed. Close configuration to continue.")
+                        .into_any_element()
+                }
+            });
+            sheet
+                .title("Configuration")
+                .size(rems(26.0))
+                .max_h_full()
+                .resizable(false)
+                .child(content)
+                .footer(
+                    Button::new("configuration-done")
+                        .ghost()
+                        .h_11()
+                        .label("Done")
+                        .on_click(|_, window, cx| window.close_sheet(cx)),
+                )
+        });
+    }
+
     fn composer_options(&self, cx: &mut Context<Self>) -> AnyElement {
         let entity = cx.entity();
         let models = self.models.clone();
         let selected = self.selected_model.clone();
-        let model_label = models
-            .iter()
-            .find(|m| Some(&m.id) == selected.as_ref())
-            .map(|m| m.label.clone())
-            .unwrap_or_else(|| {
-                selected
-                    .clone()
-                    .filter(|model| !model.is_empty())
-                    .unwrap_or_else(|| "Connect a provider on desktop".into())
-            });
+        let model_label = self.composer_model_label();
         let efforts = models
             .iter()
             .find(|m| Some(&m.id) == selected.as_ref())
@@ -1117,12 +1243,17 @@ impl MobileApp {
             .unwrap_or_default();
         let effort = self.effort;
         let mode = self.mode;
-        let enabled =
-            self.daemon.as_ref().is_some_and(|d| d.is_connected()) && !self.client.is_generating && !self.composer_pending();
+        let enabled = self.daemon.as_ref().is_some_and(|d| d.is_connected())
+            && !self.client.is_generating
+            && !self.composer_pending();
         let model_entity = entity.clone();
         let effort_entity = entity.clone();
-        div().flex().flex_col().w_full().gap_1()
-            .child(Button::new("mobile-model").ghost().h_11().w_full().label(format!("{model_label} ▾"))
+        // iOS has no path-based icon source; text indicators keep choices visible.
+        div().flex().flex_col().w_full().gap_3()
+            .when(models.is_empty(), |this| this.child(div().text_sm().text_color(cx.theme().muted_foreground)
+                .child("Connect a provider in desktop Settings to choose a model.")))
+            .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Model"))
+            .child(Button::new("mobile-model").ghost().h_11().w_full().child(div().min_w_0().truncate().child(format!("{model_label} ▾")))
                 .accessibility_label("Select model").dropdown_caret(true).disabled(!enabled || models.is_empty())
                 .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
                     models.iter().fold(menu.scrollable(true), |menu, model| {
@@ -1138,9 +1269,11 @@ impl MobileApp {
                             }); }))
                     })
                 }))
-            .child(div().flex().items_center().gap_1()
-                .when(!efforts.is_empty(), |this| this.child(
-                    Button::new("mobile-effort").ghost().h_11().label(format!("{} ▾", effort.map(|e| e.label()).unwrap_or("Effort")))
+            .child(div().flex().flex_col().gap_3()
+                .when(!efforts.is_empty(), |this| this
+                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Reasoning effort"))
+                    .child(
+                    Button::new("mobile-effort").ghost().h_11().w_full().label(format!("{} ▾", effort.map(|e| e.label()).unwrap_or("Effort")))
                         .accessibility_label("Reasoning effort").dropdown_caret(true).disabled(!enabled)
                         .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
                             efforts.iter().fold(menu, |menu, value| {
@@ -1156,7 +1289,8 @@ impl MobileApp {
                                     }); }))
                             })
                         })))
-                .child(Button::new("mobile-mode").ghost().h_11().label(format!("{} ▾", mode.label())).accessibility_label("Agent mode")
+                .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Mode"))
+                .child(Button::new("mobile-mode").ghost().h_11().w_full().label(format!("{} ▾", mode.label())).accessibility_label("Agent mode")
                     .dropdown_caret(true).disabled(!enabled)
                     .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
                         [OrchestratorMode::Normal, OrchestratorMode::Fusion].into_iter().fold(menu, |menu, value| {
@@ -1303,6 +1437,9 @@ impl MobileApp {
                     }
                 }
                 Err(error) => {
+                    if let SessionCommand::BeginSession { work_dir } = &command {
+                        self.client.composer_drafts.remove(&(Some(work_dir.clone()), None));
+                    }
                     if matches!(
                         command,
                         SessionCommand::SubmitPrompt { .. } | SessionCommand::BeginSession { .. }
@@ -2047,7 +2184,7 @@ impl MobileApp {
                     .items_center()
                     .gap_2()
                     .px_3()
-                    .py_3()
+                    .py_2()
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(
@@ -2063,6 +2200,8 @@ impl MobileApp {
                     )
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .flex()
                             .flex_col()
                             .child(
@@ -2070,39 +2209,28 @@ impl MobileApp {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(div().font_bold().child("Projects & chats"))
+                                    .child(div().font_bold().child("Chats"))
                                     .child(self.link_dot(cx)),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(self.link_state.clone()),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .px_3()
-                    .py_2()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Choose a project"),
+                            .when(self.link_state != "Live", |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(self.link_state.clone()),
+                                )
+                            }),
                     )
                     .child(
                         Button::new("new-session")
                             .ghost()
-                            .h_11()
-                            .label("New chat")
+                            .size_11()
+                            .icon(icon(kit_icons::SquarePen.1))
+                            .tooltip("New chat")
+                            .accessibility_label("New chat")
                             .disabled(
                                 self.sending
-                                    || self.client.sidebar_project_filter.is_none()
+                                    || self.client.projects.is_empty()
                                     || !self.daemon.as_ref().is_some_and(|d| d.is_connected()),
                             )
                             .on_click(cx.listener(|this, _, _, cx| this.begin_session(cx))),
@@ -2111,7 +2239,7 @@ impl MobileApp {
             .child(
                 div()
                     .px_3()
-                    .pb_2()
+                    .py_2()
                     .child(Input::new(&self.search).aria_label("Search chats").h_11()),
             )
             .when_some(self.connect_error.clone(), |this, error| {
@@ -2133,6 +2261,10 @@ impl MobileApp {
                         .child("Attach a project on desktop to start a chat."),
                 )
             })
+            .when(self.session_rows.is_empty() && !self.client.projects.is_empty(), |this| {
+                this.child(div().px_4().py_4().text_sm().text_color(cx.theme().muted_foreground)
+                    .child(if self.client.search_query.is_empty() { "Start a new chat to get going." } else { "No chats match your search." }))
+            })
             .child(div().id("sessions").flex_1().min_h_0().w_full().child(
                 threadlane_ui_kit::session_list(
                     self.sessions_list.clone(),
@@ -2142,29 +2274,20 @@ impl MobileApp {
     }
 
     fn refresh_session_rows(&mut self) {
+        let query = self.client.search_query.to_lowercase();
         self.session_rows = self
             .client
             .projects
             .iter()
-            .flat_map(|project| {
-                std::iter::once(MobileSessionRow::Project(project.clone())).chain(
-                    project
-                        .sessions
-                        .iter()
-                        .filter(|session| {
-                            (self.client.sidebar_project_filter.as_ref() == Some(&project.work_dir)
-                                || !self.client.search_query.is_empty())
-                                && (self.client.search_query.is_empty()
-                                    || session
-                                        .title
-                                        .to_lowercase()
-                                        .contains(&self.client.search_query.to_lowercase()))
-                        })
-                        .cloned()
-                        .map(MobileSessionRow::Session),
-                )
-            })
+            .flat_map(|project| &project.sessions)
+            .filter(|session| query.is_empty() || session.title.to_lowercase().contains(&query))
+            .cloned()
             .collect();
+        self.session_rows.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         self.sessions_list.reset(self.session_rows.len());
     }
 
@@ -2175,85 +2298,7 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match self.session_rows.get(ix) {
-            Some(MobileSessionRow::Project(project)) => {
-                let project = project.clone();
-                let work_dir = project.work_dir.clone();
-                let expanded = self.client.sidebar_project_filter.as_ref() == Some(&work_dir);
-                let status = self
-                    .project_git
-                    .get(&work_dir)
-                    .map(|git| {
-                        format!(
-                            "{} · {}{}",
-                            git.branch.as_deref().unwrap_or("Detached"),
-                            if git.has_changes { "Modified" } else { "Clean" },
-                            if git.ahead > 0 || git.behind > 0 {
-                                format!(" · ↑{} ↓{}", git.ahead, git.behind)
-                            } else {
-                                String::new()
-                            }
-                        )
-                    })
-                    .unwrap_or_else(|| "Git status unavailable".into());
-                div()
-                    .px_3()
-                    .pt_3()
-                    .child(
-                        Button::new(format!("project-{}", work_dir.display()))
-                            .ghost()
-                            .w_full()
-                            .h_auto()
-                            .min_h_16()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .items_start()
-                                    .w_full()
-                                    .min_w_0()
-                                    .gap_1()
-                                    .child(div().font_bold().truncate().child(format!(
-                                        "{} {}",
-                                        if expanded { "▾" } else { "▸" },
-                                        project.name
-                                    )))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .w_full()
-                                            .truncate()
-                                            .child(format!(
-                                                "{} {} · {}",
-                                                project.sessions.len(),
-                                                if project.sessions.len() == 1 {
-                                                    "chat"
-                                                } else {
-                                                    "chats"
-                                                },
-                                                status
-                                            )),
-                                    ),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.client.sidebar_project_filter = if expanded {
-                                    None
-                                } else {
-                                    Some(work_dir.clone())
-                                };
-                                if let Some(daemon) = &this.daemon {
-                                    daemon.request(SessionCommand::GitRequest {
-                                        work_dir: work_dir.clone(),
-                                        operation: GitOperation::Inspect { sync_remote: false },
-                                    });
-                                }
-                                this.refresh_session_rows();
-                                cx.notify();
-                            })),
-                    )
-                    .into_any_element()
-            }
-            Some(MobileSessionRow::Session(session)) => {
+            Some(session) => {
                 let info = session.clone();
                 let needs_you = self.client.pending_permissions.contains_key(&session.id)
                     || self.client.pending_questions.contains_key(&session.id);
@@ -2311,7 +2356,8 @@ impl MobileApp {
                                                     .text_color(cx.theme().muted_foreground)
                                                     .truncate()
                                                     .child(format!(
-                                                        "{}{}",
+                                                        "{} · {}{}",
+                                                        self.client.projects.iter().find(|project| project.work_dir == session.work_dir).map(|project| project.name.as_str()).unwrap_or("Project"),
                                                         session
                                                             .git_branch
                                                             .as_deref()
@@ -2389,7 +2435,7 @@ impl MobileApp {
                     .items_center()
                     .gap_2()
                     .px_3()
-                    .py_3()
+                    .py_2()
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(
@@ -2397,7 +2443,8 @@ impl MobileApp {
                             .ghost()
                             .h_11()
                             .icon(icon(kit_icons::ArrowLeft.1))
-                            .label("Back")
+                            .accessibility_label("Back to chats")
+                            .tooltip("Back to chats")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let key = (
                                     this.client.active_work_dir.clone(),
@@ -2433,6 +2480,7 @@ impl MobileApp {
                                     div()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
+                                        .truncate()
                                         .child(status),
                                 )
                             }),
@@ -2473,7 +2521,19 @@ impl MobileApp {
                             .tooltip("Session options")
                             .dropdown_menu_with_anchor(Anchor::TopRight, {
                                 let entity = cx.entity();
+                                let status = self.client.session_status.clone();
                                 move |menu, _, _| {
+                                    let menu = menu.when_some(status.clone(), |menu, status| {
+                                        menu.item(PopupMenuItem::new("Session status…").on_click(move |_, window, cx| {
+                                            let status = status.clone();
+                                            window.open_dialog(cx, move |dialog, _, _| {
+                                                dialog.title("Session status")
+                                                    .child(div().text_sm().child(status.clone()))
+                                                    .footer(Button::new("status-done").ghost().h_11().label("Done")
+                                                        .on_click(|_, window, cx| window.close_dialog(cx)))
+                                            });
+                                        }))
+                                    });
                                     let refresh = entity.clone();
                                     let new = entity.clone();
                                     let archive = entity.clone();
@@ -2584,9 +2644,21 @@ impl MobileApp {
                                         cx.notify();
                                     })))
                         ))
-                        .child(self.composer_options(cx))
                         .child(
-                            div().flex().justify_end().gap_2()
+                            div().flex().items_center().gap_2()
+                                .child(div().flex_1().min_w_0().child(self.composer_project(cx)))
+                                .child(
+                                    Button::new("configuration")
+                                        .ghost()
+                                        .h_11()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .icon(icon(kit_icons::Settings2.1))
+                                        .child(div().min_w_0().truncate().text_sm().child(self.composer_model_label()))
+                                        .tooltip("Configuration…")
+                                        .accessibility_label(format!("Configuration: {}, {}, {}", self.composer_model_label(), self.effort.map(|effort| effort.label()).unwrap_or("Default effort"), self.mode.label()))
+                                        .on_click(cx.listener(|this, _, window, cx| this.open_configuration(window, cx))),
+                                )
                                 .when(working, |this| {
                                     this.child(
                                         Button::new("steer")
@@ -3495,7 +3567,10 @@ impl MobileApp {
                     .flex()
                     .flex_col()
                     .child(div().flex_1().min_h_0().w_full().child(content))
-                    .child(self.render_tab_bar(cx)),
+                    // Chat owns the phone's work area; Back restores all destinations.
+                    .when(self.tab != Tab::Chats || self.active.is_none(), |this| {
+                        this.child(self.render_tab_bar(cx))
+                    }),
             )
             .when(self.sidebar_open, |this| {
                 this.child(self.render_sidebar(window, cx))
