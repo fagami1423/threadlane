@@ -4,6 +4,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # Must stay on the version lb-wry uses; a newer webview2-com fails to
+      # compile against wry's WebViewExtWindows types.
+      - dependency-name: "webview2-com"
 
   - package-ecosystem: github-actions
     directory: /
