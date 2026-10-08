@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.1.48](https://github.com/wheregmis/threadlane/compare/v0.1.47...v0.1.48) (2026-10-08)
+
+
+### Features
+
+* **agents:** require plan-first worker handoffs ([ed20d29](https://github.com/wheregmis/threadlane/commit/ed20d29c1969544a68e1fb87456a23d216db37ef))
+
+
+### Bug Fixes
+
+* **agents:** deduplicate Fusion handoff contract ([81a24c7](https://github.com/wheregmis/threadlane/commit/81a24c7bcf94cdf7b304a80e576027726b212958))
+* coordinate worktree runtime ownership per session ([e4cb7a3](https://github.com/wheregmis/threadlane/commit/e4cb7a3a45f1e3d15305be473329ad4821de2133))
+* discard prepared handoff when invalidating session runtime ([0b0e65d](https://github.com/wheregmis/threadlane/commit/0b0e65d026e74b8f89e2e810086accafeaa78e06))
+* preserve shared owners across model changes and setup cancellation ([dfc92e9](https://github.com/wheregmis/threadlane/commit/dfc92e931e0355d1c67daabcb23462b42c3523bc))
+* release cancelled preparation owners and bound construction gates ([0208606](https://github.com/wheregmis/threadlane/commit/020860638ad961eecfea96b68c8eb67bf284ec61))
+* share session runtime ownership across desktop and mobile ([d8bf9cc](https://github.com/wheregmis/threadlane/commit/d8bf9ccb65a8de08e129d4c42ad621ad043701d2))
+
+
+### CI
+
+* add verified merge release note cleanup ([0a6a2d7](https://github.com/wheregmis/threadlane/commit/0a6a2d778b6a4d3bb95ca6e1eb32b536ae09b277))
+* add verified merge release note cleanup ([a99c28d](https://github.com/wheregmis/threadlane/commit/a99c28d852d40d0141e02ec280dbd25e41ce27e5))
+* prevent duplicate merge entries in release notes ([d3c54a7](https://github.com/wheregmis/threadlane/commit/d3c54a7bdbf50a3df3d413a7162a4e63e987b8f5))
+* prevent verified merge duplicates in release notes ([2cc9a48](https://github.com/wheregmis/threadlane/commit/2cc9a484ea80228e127dbb5c5254543be0a1cf79))
+* prevent verified merge duplicates in release notes ([6676ef8](https://github.com/wheregmis/threadlane/commit/6676ef834b590deafdd35af0183270eb6b08eaf3))
+* prevent verified merge duplicates in release notes ([e7b3de9](https://github.com/wheregmis/threadlane/commit/e7b3de9dba1efc38352a05478d3ec95c76e42f58))
+
 ## [0.1.47](https://github.com/wheregmis/threadlane/compare/v0.1.46...v0.1.47) (2026-10-08)
 
 

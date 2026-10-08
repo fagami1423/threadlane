@@ -54,6 +54,8 @@ impl DaemonClient for LocalDaemon {
 
     fn supports_file_search(&self) -> bool { true }
 
+    fn supports_guarded_saves(&self) -> bool { true }
+
     fn supports_project_io(&self) -> bool {
         true
     }

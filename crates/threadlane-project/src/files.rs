@@ -5,8 +5,14 @@
 //! needs to serve `ReadProjectFile`/`WriteProjectFile`/`ProjectFileExists`
 //! without letting a client-supplied relative path escape `work_dir`.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
+use sha2::{Digest, Sha256};
+use threadlane_protocol::daemon::{ProjectFileError, VersionedFile};
 use threadlane_protocol::repo::ProjectFileNode;
 
 /// Maximum depth `scan_project_tree` descends from the project root.
@@ -73,10 +79,187 @@ pub fn read_project_file(root: &Path, relative: &str) -> Result<String, String> 
     std::fs::read_to_string(&path).map_err(|error| error.to_string())
 }
 
+/// Read an existing regular project file as UTF-8, preserving its exact byte
+/// representation and returning a SHA-256 version of those bytes.
+pub fn read_project_file_versioned(
+    root: &Path,
+    relative: &str,
+) -> Result<VersionedFile, ProjectFileError> {
+    let path = guarded_existing_file(root, relative)?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .map_err(project_file_io_error)?;
+    if !file.metadata().map_err(project_file_io_error)?.is_file() {
+        return Err(ProjectFileError::Io {
+            message: format!("Path {relative:?} is not a regular file"),
+        });
+    }
+    reject_symlink_target(&path, relative)?;
+    let bytes = read_bounded(&mut file)?;
+    let content = String::from_utf8(bytes.clone()).map_err(|error| ProjectFileError::Io {
+        message: format!("File is not valid UTF-8: {error}"),
+    })?;
+    Ok(VersionedFile {
+        content,
+        version: version_for_bytes(&bytes),
+    })
+}
+
 /// Overwrite `relative` under `root` with UTF-8 `content`.
 pub fn write_project_file(root: &Path, relative: &str, content: &str) -> Result<(), String> {
     let path = resolve_project_path(root, relative)?;
+    let lock_path = canonical_write_path(&path);
+    let _guard = target_write_lock(&lock_path);
     std::fs::write(&path, content).map_err(|error| error.to_string())
+}
+
+/// Overwrite an existing regular project file only if its content still has
+/// `expected_version`; the returned version hashes the bytes written. The
+/// target lock serializes daemon writers only, not arbitrary external writers.
+pub fn write_project_file_guarded(
+    root: &Path,
+    relative: &str,
+    content: &str,
+    expected_version: &str,
+) -> Result<String, ProjectFileError> {
+    let path = guarded_existing_file(root, relative)?;
+    let lock_path = path.canonicalize().map_err(project_file_io_error)?;
+    let _guard = target_write_lock(&lock_path);
+    let path = guarded_existing_file(root, relative)?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(project_file_io_error)?;
+    if !file.metadata().map_err(project_file_io_error)?.is_file() {
+        return Err(ProjectFileError::Io {
+            message: format!("Path {relative:?} is not a regular file"),
+        });
+    }
+    reject_symlink_target(&path, relative)?;
+    let current = read_bounded(&mut file)?;
+    if version_for_bytes(&current) != expected_version {
+        return Err(ProjectFileError::Changed);
+    }
+    file.set_len(0).map_err(project_file_io_error)?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(project_file_io_error)?;
+    file.write_all(content.as_bytes())
+        .map_err(project_file_io_error)?;
+    file.flush().map_err(project_file_io_error)?;
+    Ok(version_for_bytes(content.as_bytes()))
+}
+
+fn guarded_existing_file(root: &Path, relative: &str) -> Result<PathBuf, ProjectFileError> {
+    let canonical_root = root.canonicalize().map_err(project_file_io_error)?;
+    let path = resolve_project_path(root, relative).map_err(|message| ProjectFileError::Io {
+        message,
+    })?;
+    let relative_path = Path::new(relative);
+    let mut current = root.to_path_buf();
+    let components = relative_path.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            return Err(ProjectFileError::Io {
+                message: format!("Path {relative:?} escapes the project root"),
+            });
+        };
+        current.push(name);
+        let metadata = std::fs::symlink_metadata(&current).map_err(project_file_io_error)?;
+        if metadata.file_type().is_symlink() {
+            return Err(ProjectFileError::Io {
+                message: format!("Path {relative:?} contains a symbolic link"),
+            });
+        }
+        if index + 1 < components.len() && !metadata.is_dir() {
+            return Err(ProjectFileError::Io {
+                message: format!("Path component in {relative:?} is not a directory"),
+            });
+        }
+        if index + 1 == components.len() && !metadata.is_file() {
+            return Err(ProjectFileError::Io {
+                message: format!("Path {relative:?} is not a regular file"),
+            });
+        }
+    }
+    let canonical_path = path.canonicalize().map_err(project_file_io_error)?;
+    if !canonical_path.starts_with(canonical_root) {
+        return Err(ProjectFileError::Io {
+            message: format!("Path {relative:?} escapes the project root"),
+        });
+    }
+    Ok(path)
+}
+
+fn reject_symlink_target(path: &Path, relative: &str) -> Result<(), ProjectFileError> {
+    if std::fs::symlink_metadata(path)
+        .map_err(project_file_io_error)?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(ProjectFileError::Io {
+            message: format!("Path {relative:?} contains a symbolic link"),
+        });
+    }
+    Ok(())
+}
+
+fn read_bounded(file: &mut std::fs::File) -> Result<Vec<u8>, ProjectFileError> {
+    let mut bytes = Vec::new();
+    file.take(READ_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(project_file_io_error)?;
+    if bytes.len() as u64 > READ_MAX_BYTES {
+        return Err(ProjectFileError::Io {
+            message: format!(
+                "File is larger than the {}-byte limit keeps replies bounded",
+                READ_MAX_BYTES
+            ),
+        });
+    }
+    Ok(bytes)
+}
+
+fn version_for_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut version = String::with_capacity("sha256:".len() + digest.len() * 2);
+    version.push_str("sha256:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(version, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    version
+}
+
+fn project_file_io_error(error: std::io::Error) -> ProjectFileError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        ProjectFileError::Deleted
+    } else {
+        ProjectFileError::Io {
+            message: error.to_string(),
+        }
+    }
+}
+
+fn canonical_write_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    path.parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+fn target_write_lock(path: &Path) -> MutexGuard<'static, ()> {
+    const LOCK_COUNT: usize = 64;
+    static LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| (0..LOCK_COUNT).map(|_| Mutex::new(())).collect());
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    let index = hasher.finish() as usize % LOCK_COUNT;
+    locks[index].lock().expect("project file write lock poisoned")
 }
 
 /// Whether `relative` names an existing file entry under `root`.
@@ -152,7 +335,8 @@ pub fn scan_project_tree(root: &Path, limit: usize) -> Vec<ProjectFileNode> {
 mod tests {
     use super::{
         project_file_exists, read_project_file, resolve_project_path, scan_project_tree,
-        write_project_file,
+        read_project_file_versioned, write_project_file, write_project_file_guarded,
+        ProjectFileError, READ_MAX_BYTES,
     };
     use std::path::Path;
 
@@ -217,6 +401,163 @@ mod tests {
         );
         assert!(project_file_exists(dir.path(), "sub/a.txt").unwrap());
         assert!(!project_file_exists(dir.path(), "sub/missing.txt").unwrap());
+    }
+
+    #[test]
+    fn guarded_versioned_read_preserves_utf8_bytes_and_write_returns_new_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.txt");
+        std::fs::write(&path, "line\r\nλ").unwrap();
+        let original = read_project_file_versioned(dir.path(), "source.txt").unwrap();
+        assert_eq!(original.content, "line\r\nλ");
+
+        let next_version =
+            write_project_file_guarded(dir.path(), "source.txt", "new contents", &original.version)
+                .unwrap();
+        assert_eq!(
+            next_version,
+            read_project_file_versioned(dir.path(), "source.txt")
+                .unwrap()
+                .version
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"new contents",
+            "writes preserve the exact supplied UTF-8 bytes"
+        );
+    }
+
+    #[test]
+    fn guarded_write_detects_external_change_and_preserves_current_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.txt");
+        std::fs::write(&path, "A").unwrap();
+        let original = read_project_file_versioned(dir.path(), "source.txt").unwrap();
+        std::fs::write(&path, "external C").unwrap();
+
+        assert_eq!(
+            write_project_file_guarded(dir.path(), "source.txt", "buffer B", &original.version),
+            Err(ProjectFileError::Changed)
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "external C");
+    }
+
+    #[test]
+    fn guarded_write_rejects_deleted_files_without_recreating_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.txt");
+        std::fs::write(&path, "A").unwrap();
+        let original = read_project_file_versioned(dir.path(), "source.txt").unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(
+            write_project_file_guarded(dir.path(), "source.txt", "replacement", &original.version),
+            Err(ProjectFileError::Deleted)
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn guarded_versioned_reads_reject_escape_binary_and_oversized_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("outside.txt"), "outside").unwrap();
+        std::fs::write(dir.path().join("binary.bin"), [0xff, 0xfe]).unwrap();
+        assert!(matches!(
+            read_project_file_versioned(dir.path(), "../outside.txt"),
+            Err(ProjectFileError::Io { .. })
+        ));
+        assert!(matches!(
+            read_project_file_versioned(dir.path(), "binary.bin"),
+            Err(ProjectFileError::Io { .. })
+        ));
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                outside.path().join("outside.txt"),
+                dir.path().join("link.txt"),
+            )
+            .unwrap();
+            assert!(matches!(
+                read_project_file_versioned(dir.path(), "link.txt"),
+                Err(ProjectFileError::Io { .. })
+            ));
+            assert!(matches!(
+                write_project_file_guarded(
+                    dir.path(),
+                    "link.txt",
+                    "must not write outside",
+                    "sha256:expected"
+                ),
+                Err(ProjectFileError::Io { .. })
+            ));
+            assert_eq!(
+                std::fs::read_to_string(outside.path().join("outside.txt")).unwrap(),
+                "outside"
+            );
+        }
+
+        std::fs::write(
+            dir.path().join("large.txt"),
+            vec![b'x'; READ_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(matches!(
+            read_project_file_versioned(dir.path(), "large.txt"),
+            Err(ProjectFileError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn concurrent_guarded_writes_allow_exactly_one_matching_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.txt");
+        std::fs::write(&path, "original").unwrap();
+        let version = read_project_file_versioned(dir.path(), "source.txt")
+            .unwrap()
+            .version;
+        let root = dir.path().to_path_buf();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+        std::thread::scope(|scope| {
+            let first_barrier = barrier.clone();
+            let first_root = root.clone();
+            let first_version = version.clone();
+            let first = scope.spawn(move || {
+                first_barrier.wait();
+                write_project_file_guarded(
+                    &first_root,
+                    "source.txt",
+                    "first",
+                    &first_version,
+                )
+            });
+            let second_barrier = barrier.clone();
+            let second_root = root.clone();
+            let second_version = version.clone();
+            let second = scope.spawn(move || {
+                second_barrier.wait();
+                write_project_file_guarded(
+                    &second_root,
+                    "source.txt",
+                    "second",
+                    &second_version,
+                )
+            });
+            barrier.wait();
+            let results = [first.join().unwrap(), second.join().unwrap()];
+            assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|result| {
+                        result.as_ref().err() == Some(&ProjectFileError::Changed)
+                    })
+                    .count(),
+                1
+            );
+        });
     }
 
     #[test]

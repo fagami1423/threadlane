@@ -57,10 +57,13 @@ use crate::repo::{GitOperation, GitResponse, ProjectFileNode};
 /// and project-scoped composer options. Version 5 adds the GitHub (forge)
 /// and automation surfaces — `GitHubRequest`/`AutomationRequest` commands
 /// and the journaled [`SessionEvent::AutomationChanged`]. Version 6 adds
-/// ephemeral saved-file search and daemon-host target validation.
-pub const WIRE_PROTOCOL_VERSION: u64 = 6;
+/// ephemeral saved-file search and daemon-host target validation. Version 7
+/// adds versioned file reads and guarded file writes.
+pub const WIRE_PROTOCOL_VERSION: u64 = 7;
 /// Saved-file content search and host-validated navigation.
 pub const FILE_SEARCH_PROTOCOL_VERSION: u64 = 6;
+/// Versioned file reads and writes guarded by a previously read version.
+pub const GUARDED_SAVE_PROTOCOL_VERSION: u64 = 7;
 
 /// Draft creation and composer catalog requests.
 pub const COMPOSER_PROTOCOL_VERSION: u64 = 4;
@@ -250,11 +253,22 @@ pub enum SessionCommand {
     /// Read one project file as UTF-8 text; answered by
     /// `CommandResponse::FileContent`.
     ReadProjectFile { work_dir: PathBuf, path: String },
+    /// Read one existing project file as UTF-8 text with its content hash;
+    /// answered by `CommandResponse::VersionedFile`.
+    ReadProjectFileVersioned { work_dir: PathBuf, path: String },
     /// Write one project file as UTF-8 text; answered by `Ack`/`Err`.
     WriteProjectFile {
         work_dir: PathBuf,
         path: String,
         content: String,
+    },
+    /// Write an existing project file only if its current content hash
+    /// matches `expected_version`; answered by `CommandResponse::GuardedFileWrite`.
+    WriteProjectFileGuarded {
+        work_dir: PathBuf,
+        path: String,
+        content: String,
+        expected_version: String,
     },
     /// Whether `path` names an existing entry under `work_dir`; answered by
     /// `CommandResponse::FileExists`.
@@ -477,6 +491,14 @@ pub enum CommandResponse {
     FileSearch { result: crate::repo::FileSearchResult },
     /// `ReadProjectFile` result: the file's UTF-8 content.
     FileContent { content: String },
+    /// `ReadProjectFileVersioned` result, including typed filesystem errors.
+    VersionedFile {
+        result: Result<VersionedFile, ProjectFileError>,
+    },
+    /// `WriteProjectFileGuarded` result: the new content hash on success.
+    GuardedFileWrite {
+        result: Result<String, ProjectFileError>,
+    },
     /// `ProjectFileExists` result.
     FileExists { exists: bool },
     /// `GitRequest` result: the operation's payload.
@@ -490,6 +512,35 @@ pub enum CommandResponse {
         response: crate::automation::AutomationResponse,
     },
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionedFile {
+    pub content: String,
+    pub version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProjectFileError {
+    Changed,
+    Deleted,
+    Io { message: String },
+    Unsupported,
+    Disconnected,
+}
+
+impl std::fmt::Display for ProjectFileError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Changed => formatter.write_str("file changed since it was read"),
+            Self::Deleted => formatter.write_str("file was deleted"),
+            Self::Io { message } => formatter.write_str(message),
+            Self::Unsupported => formatter.write_str("guarded file saves are unsupported"),
+            Self::Disconnected => formatter.write_str("daemon is disconnected"),
+        }
+    }
+}
+
+impl std::error::Error for ProjectFileError {}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ComposerModel {
@@ -1035,6 +1086,16 @@ mod tests {
             SessionCommand::GetSessionSnapshot {
                 session_id: "sess_1".into(),
             },
+            SessionCommand::ReadProjectFileVersioned {
+                work_dir: PathBuf::from("/repo"),
+                path: "src/main.rs".into(),
+            },
+            SessionCommand::WriteProjectFileGuarded {
+                work_dir: PathBuf::from("/repo"),
+                path: "src/main.rs".into(),
+                content: "updated".into(),
+                expected_version: "sha256:old".into(),
+            },
         ];
         for command in commands {
             let json = serde_json::to_string(&command).expect("command serializes");
@@ -1227,6 +1288,21 @@ mod tests {
                 result: Ok(CommandResponse::Ack),
             },
             CommandReply {
+                request_id: 8,
+                result: Ok(CommandResponse::VersionedFile {
+                    result: Ok(VersionedFile {
+                        content: "λ".into(),
+                        version: "sha256:abc".into(),
+                    }),
+                }),
+            },
+            CommandReply {
+                request_id: 9,
+                result: Ok(CommandResponse::GuardedFileWrite {
+                    result: Err(ProjectFileError::Changed),
+                }),
+            },
+            CommandReply {
                 request_id: 7,
                 result: Ok(CommandResponse::CancelledQueuedMessage {
                     session_id: "sess_1".into(),
@@ -1252,6 +1328,41 @@ mod tests {
     }
 
     #[test]
+    fn guarded_file_types_and_typed_results_round_trip_through_json() {
+        let file = VersionedFile {
+            content: "saved text".into(),
+            version: "sha256:0123".into(),
+        };
+        let errors = [
+            ProjectFileError::Changed,
+            ProjectFileError::Deleted,
+            ProjectFileError::Io {
+                message: "permission denied".into(),
+            },
+            ProjectFileError::Unsupported,
+            ProjectFileError::Disconnected,
+        ];
+        for value in [
+            CommandResponse::VersionedFile {
+                result: Ok(file.clone()),
+            },
+            CommandResponse::VersionedFile {
+                result: Err(errors[0].clone()),
+            },
+            CommandResponse::GuardedFileWrite {
+                result: Ok("sha256:new".into()),
+            },
+            CommandResponse::GuardedFileWrite {
+                result: Err(errors[2].clone()),
+            },
+        ] {
+            let json = serde_json::to_string(&value).unwrap();
+            assert_eq!(serde_json::from_str::<CommandResponse>(&json).unwrap(), value);
+        }
+        assert_eq!(ProjectFileError::Changed.to_string(), "file changed since it was read");
+    }
+
+    #[test]
     fn permission_decision_variants_decode() {
         for (json, expected) in [
             (r#""allow_once""#, PermissionDecision::AllowOnce),
@@ -1262,5 +1373,14 @@ mod tests {
             let back: PermissionDecision = serde_json::from_str(json).expect("decodes");
             assert_eq!(back, expected);
         }
+    }
+
+    #[test]
+    fn guarded_save_protocol_floor_does_not_raise_older_capabilities() {
+        assert_eq!(WIRE_PROTOCOL_VERSION, 7);
+        assert_eq!(GUARDED_SAVE_PROTOCOL_VERSION, 7);
+        assert_eq!(FILE_SEARCH_PROTOCOL_VERSION, 6);
+        assert_eq!(PROJECT_IO_PROTOCOL_VERSION, 3);
+        assert_eq!(COMMAND_REQUEST_PROTOCOL_VERSION, 2);
     }
 }
