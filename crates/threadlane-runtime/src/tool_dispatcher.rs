@@ -95,8 +95,8 @@ struct ToolRunContext {
     intent_recorder: Option<ToolIntentRecorder>,
     execution_trace_recorder: Option<crate::provider::ToolExecutionTraceRecorder>,
     event_tx: broadcast::Sender<AgentEvent>,
-    tool_routes: Vec<ToolExecutorRoute>,
-    allowed_tool_names: Option<HashSet<String>>,
+    tool_routes: Arc<[ToolExecutorRoute]>,
+    allowed_tool_names: Option<Arc<HashSet<String>>>,
     work_dir: Option<PathBuf>,
     skip_before_hook: bool,
     session_id: String,
@@ -666,9 +666,12 @@ impl ToolDispatcher {
         skip_before_hook: bool,
         skip_repetition_cache: bool,
     ) -> Result<Vec<AgentToolResult>, AgentError> {
-        let mut results = Vec::new();
-        let tool_routes = self.tool_execution_routes().await;
-        let allowed_tool_names = self.allowed_tool_names.clone();
+        if tool_calls.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut results = Vec::with_capacity(tool_calls.len());
+        let tool_routes: Arc<[ToolExecutorRoute]> = self.tool_execution_routes().await.into();
+        let allowed_tool_names = self.allowed_tool_names.clone().map(Arc::new);
 
         if self.tool_execution_mode == ToolExecutionMode::Sequential {
             for tc in tool_calls {
@@ -771,8 +774,8 @@ impl ToolDispatcher {
     async fn execute_single_tool(
         &self,
         tc: &ToolCall,
-        tool_routes: Vec<ToolExecutorRoute>,
-        allowed_tool_names: Option<HashSet<String>>,
+        tool_routes: Arc<[ToolExecutorRoute]>,
+        allowed_tool_names: Option<Arc<HashSet<String>>>,
         intent_recorder: Option<ToolIntentRecorder>,
         skip_before_hook: bool,
         skip_repetition_cache: bool,
@@ -1092,7 +1095,7 @@ impl ToolDispatcher {
         } else {
             None
         };
-        for route in &context.tool_routes {
+        for route in context.tool_routes.iter() {
             if execution_result.is_some() {
                 break;
             }
@@ -2683,6 +2686,30 @@ mod tests {
             .configured_tool_definitions()
             .iter()
             .any(|definition| definition.name == "read_file"));
+    }
+
+    #[tokio::test]
+    async fn empty_tool_batches_do_not_enumerate_executors() {
+        struct NoEnumeration;
+        #[async_trait::async_trait]
+        impl ToolExecutor for NoEnumeration {
+            fn executor_id(&self) -> &str {
+                "no-enumeration"
+            }
+            fn tool_definitions(&self) -> Arc<[AgentToolDefinition]> {
+                panic!("empty batches must not enumerate tool schemas")
+            }
+            async fn execute_tool(&self, _: &str, _: &str) -> Option<Result<String, String>> {
+                panic!("empty batches must not execute tools")
+            }
+        }
+        let (event_tx, _) = broadcast::channel(8);
+        let mut dispatcher = ToolDispatcher::new(event_tx, HookRegistry::default());
+        dispatcher.tool_executors = vec![Arc::new(NoEnumeration)];
+        for mode in [ToolExecutionMode::Sequential, ToolExecutionMode::Parallel] {
+            dispatcher.tool_execution_mode = mode;
+            assert!(dispatcher.execute_tools(&[]).await.unwrap().is_empty());
+        }
     }
 
     #[tokio::test]

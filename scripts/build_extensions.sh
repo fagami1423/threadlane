@@ -10,12 +10,11 @@ THREADLANE_PROMPT_DIR="$ROOT_DIR/.threadlane/prompts"
 mkdir -p "$THREADLANE_EXT_DIR" "$THREADLANE_AGENT_DIR" "$THREADLANE_PROMPT_DIR"
 
 echo "Building WASI extensions (--target wasm32-wasip1 --release)..."
-for ext in "$ROOT_DIR/extensions"/*; do
-    if [ -f "$ext/Cargo.toml" ]; then
-        echo "  Compiling WASI extension: $(basename "$ext")..."
-        cargo build --manifest-path "$ext/Cargo.toml" --target wasm32-wasip1 --release
-    fi
-done
+# Select only the extension packages, allowing Cargo to schedule their shared
+# dependency graph once without compiling the native desktop workspace for WASI.
+cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --target wasm32-wasip1 --release \
+    --package broker-smoke-ext --package debug-ext --package goal-ext \
+    --package lsp-ext --package web_ext
 
 echo "Deploying compiled .wasm binaries to $THREADLANE_EXT_DIR..."
 for ext in "$ROOT_DIR"/extensions/*; do

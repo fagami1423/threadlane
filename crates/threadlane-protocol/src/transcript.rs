@@ -90,38 +90,53 @@ pub fn find_conversation_messages(
     generating: bool,
     query: &str,
 ) -> Vec<ConversationMatch> {
+    conversation_matches(messages, generating, query).collect()
+}
+
+/// Return only the first hit without scanning or allocating excerpts for later messages.
+pub fn first_conversation_match(
+    messages: &[ChatMessageInfo],
+    generating: bool,
+    query: &str,
+) -> Option<ConversationMatch> {
+    conversation_matches(messages, generating, query).next()
+}
+
+fn conversation_matches<'a>(
+    messages: &'a [ChatMessageInfo],
+    generating: bool,
+    query: &str,
+) -> impl Iterator<Item = ConversationMatch> + 'a {
     let query = query.to_lowercase();
-    if query.trim().is_empty() {
-        return Vec::new();
-    }
-    build_transcript_rows(messages, generating)
-        .into_iter()
+    let rows = if query.trim().is_empty() {
+        Vec::new()
+    } else {
+        build_transcript_rows(messages, generating)
+    };
+    rows.into_iter()
         .enumerate()
-        .filter_map(|(row_index, row)| {
+        .filter_map(move |(row_index, row)| {
             let TranscriptRow::Message(index) = row else {
                 return None;
             };
             let message = &messages[index];
             if !matches!(message.role, MessageRole::User | MessageRole::Assistant)
                 || message.content.is_empty()
-                || !message.content.to_lowercase().contains(&query)
             {
                 return None;
             }
+            let offset = message.content.to_lowercase().find(&query)?;
             Some(ConversationMatch {
                 message_id: message.id.clone(),
                 row_index,
-                excerpt: matching_excerpt(&message.content, &query),
+                excerpt: matching_excerpt(&message.content, offset),
             })
         })
-        .collect()
 }
 
-fn matching_excerpt(content: &str, query: &str) -> String {
+fn matching_excerpt(content: &str, offset: usize) -> String {
     // Lowercasing can expand a character (İ -> i + combining dot). Map the
     // folded byte offset back to source characters rather than slicing UTF-8.
-    let folded = content.to_lowercase();
-    let offset = folded.find(query).unwrap_or(0);
     let mut folded_bytes = 0;
     let match_char = content
         .chars()
@@ -162,6 +177,56 @@ pub fn next_find_match(selected: Option<usize>, count: usize, previous: bool) ->
         (None, true) => count - 1,
         (None, false) => 0,
     })
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::{find_conversation_messages, first_conversation_match};
+    use crate::daemon::{ChatMessageInfo, MessageRole};
+
+    fn message(id: &str, role: MessageRole, content: &str) -> ChatMessageInfo {
+        ChatMessageInfo {
+            id: id.into(),
+            role,
+            content: content.into(),
+            tool_activities: Vec::new(),
+            streaming: false,
+            reasoning_content: None,
+            reasoning_expanded: false,
+        }
+    }
+
+    #[test]
+    fn first_conversation_hit_preserves_find_semantics() {
+        let messages = vec![
+            message("queued-user-1", MessageRole::User, "needle"),
+            message("user-1", MessageRole::User, "no match"),
+            message("assistant-1", MessageRole::Assistant, "İstanbul NEEDLE"),
+            message("user-2", MessageRole::User, "another needle"),
+        ];
+        let all = find_conversation_messages(&messages, true, "NEEDLE");
+        assert_eq!(all.len(), 2);
+        let first = first_conversation_match(&messages, true, "NEEDLE").unwrap();
+        assert_eq!(first, all[0]);
+        assert_eq!(first.row_index, 1);
+        assert_eq!(first.message_id, "assistant-1");
+        assert_eq!(first.excerpt, "İstanbul NEEDLE");
+        for query in ["", "  ", "missing"] {
+            assert!(first_conversation_match(&messages, true, query).is_none());
+            assert!(find_conversation_messages(&messages, true, query).is_empty());
+        }
+    }
+
+    #[test]
+    fn excerpts_map_folded_offsets_back_to_unicode_source() {
+        let content = format!("{}İstanbul NEEDLE{}", "é".repeat(80), "λ".repeat(180));
+        let messages = vec![message("user", MessageRole::User, &content)];
+        let hit = first_conversation_match(&messages, false, "needle").unwrap();
+        assert_eq!(
+            hit.excerpt,
+            format!("…{}İstanbul NEEDLE{}…", "é".repeat(31), "λ".repeat(114))
+        );
+    }
 }
 
 const PROMPT_EXCERPT_CHARS: usize = 96;
