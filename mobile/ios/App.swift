@@ -31,6 +31,7 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
     func sceneDidBecomeActive(_ scene: UIScene) {
         gpui_ios_did_become_active(nil)
+        threadlane_mobile_did_become_active()
     }
 
     func sceneWillResignActive(_ scene: UIScene) {

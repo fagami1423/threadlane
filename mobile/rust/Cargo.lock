@@ -6974,6 +6974,8 @@ dependencies = [
  "gpui-pre-mobile",
  "log",
  "objc2 0.6.4",
+ "serde",
+ "serde_json",
  "threadlane-client",
  "threadlane-protocol",
  "threadlane-ui-kit",

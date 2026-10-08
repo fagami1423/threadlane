@@ -12,6 +12,7 @@ extern crate gpui_mobile;
 pub mod app;
 pub mod client;
 pub mod preferences;
+pub mod saved_devices;
 
 #[cfg(target_os = "ios")]
 use gpui::{prelude::*, App, WindowOptions};
@@ -85,4 +86,11 @@ pub extern "C" fn gpui_ios_register_app() {
         })
         .expect("open Threadlane mobile view");
     }));
+}
+
+/// Forward scene foreground activation to the active reconnect driver.
+#[cfg(target_os = "ios")]
+#[unsafe(no_mangle)]
+pub extern "C" fn threadlane_mobile_did_become_active() {
+    app::request_foreground_reconnect();
 }

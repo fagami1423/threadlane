@@ -16,5 +16,6 @@ void gpui_ios_request_frame(void *window);
 void gpui_ios_did_become_active(void *app);
 void gpui_ios_will_resign_active(void *app);
 void gpui_ios_handle_open_url(void *url_ptr);
+void threadlane_mobile_did_become_active(void);
 
 #endif /* EMBEDDING_H */

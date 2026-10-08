@@ -575,6 +575,22 @@ impl WorkspaceView {
 
     pub fn build(state: AppState, window: &mut Window, cx: &mut App) -> Entity<Self> {
         let model = cx.new(|_cx| state);
+        if let Some((generation, task)) =
+            model.update(cx, |state, _cx| state.pairing_restore_task())
+        {
+            let pairing_model = model.clone();
+            cx.spawn(async move |cx| {
+                let result = match task.await {
+                    Ok(result) => result,
+                    Err(error) => Err(format!("pairing restore failed: {error}")),
+                };
+                let _ = pairing_model.update(cx, |state, cx| {
+                    state.finish_pairing_restore(generation, result);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
         let sidebar = cx.new(|cx| SidebarView::new(model.clone(), window, cx));
         let chat_list = cx.new(|cx| ChatListView::new(model.clone(), window, cx));
         let github = cx.new(|cx| GitHubView::new(model.clone(), window, cx));
