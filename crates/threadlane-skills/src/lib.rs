@@ -1,4 +1,5 @@
 pub mod agents;
+mod builtin;
 pub mod frontmatter;
 pub mod prompts;
 pub mod settings;
@@ -25,6 +26,7 @@ const SKILL_SETTINGS_RELATIVE_PATH: &str = ".threadlane/skills.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SkillScope {
+    Builtin,
     GlobalPiPackage,
     GlobalPi,
     GlobalAgents,
@@ -41,6 +43,7 @@ impl SkillScope {
     /// Pi compatibility sources deliberately rank below equivalent native sources.
     fn precedence(self) -> u8 {
         match self {
+            SkillScope::Builtin => 0,
             SkillScope::GlobalPiPackage => 0,
             SkillScope::GlobalPi => 0,
             SkillScope::GlobalAgents => 1,
@@ -55,6 +58,7 @@ impl SkillScope {
 
     pub fn display_name(self) -> &'static str {
         match self {
+            SkillScope::Builtin => "Built-in",
             SkillScope::GlobalPiPackage => "Global Pi Package",
             SkillScope::GlobalPi => "Global Pi (~/.pi)",
             SkillScope::GlobalAgents => "Global (~/.agents)",
@@ -246,6 +250,7 @@ pub struct SkillDiscoveryReport {
 struct SkillRecord {
     metadata: SkillMetadata,
     allowed_root: PathBuf,
+    embedded_instructions: Option<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +299,14 @@ impl SkillRegistry {
 
         if !record.metadata.enabled || !record.metadata.is_valid {
             return Err(format!("Skill '{skill_id}' is disabled or invalid"));
+        }
+
+        if let Some(instructions) = record.embedded_instructions {
+            return Ok(LoadedSkill {
+                id: skill_id.to_string(),
+                instructions: instructions.to_string(),
+                scope: record.metadata.scope,
+            });
         }
 
         let current_root = fs::canonicalize(&record.allowed_root)
@@ -613,6 +626,9 @@ impl Discovery {
     }
 
     fn finish(mut self) -> (Arc<SkillRegistry>, SkillDiscoveryReport) {
+        for record in builtin::records() {
+            self.records.entry(record.metadata.id.clone()).or_insert(record);
+        }
         let settings = self
             .options
             .project_root
@@ -1089,6 +1105,7 @@ impl Discovery {
         self.add_skill_with_precedence(SkillRecord {
             metadata,
             allowed_root: allowed_root.to_path_buf(),
+            embedded_instructions: None,
         });
     }
 
@@ -1119,6 +1136,7 @@ impl Discovery {
                 validation_error: Some(message),
             },
             allowed_root: allowed_root.to_path_buf(),
+            embedded_instructions: None,
         });
     }
 

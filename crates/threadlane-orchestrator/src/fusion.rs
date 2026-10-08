@@ -299,6 +299,7 @@ pub fn select_model_at_compaction(active_model: &str, state: &FusionState) -> Op
 /// absolutely necessary, delegate implementation/verification to the sidekick
 /// via `subagent`, and own the plan, ambiguity, and final review.
 pub fn build_fusion_main_directive(sidekick_model: &str) -> String {
+    let implementation_handoff = threadlane_prompt::workflow::IMPLEMENTATION_HANDOFF;
     format!(
         "\n\n{FUSION_MAIN_HEADER}\n\
          Sidekick model: {sidekick_model}\n\
@@ -306,6 +307,7 @@ pub fn build_fusion_main_directive(sidekick_model: &str) -> String {
          Investigate enough to understand scope and risk before choosing a route. Keep exploration that determines architecture, security, or product intent on main unless the sidekick has demonstrated it can handle that work. Delegate bounded fact-finding and mechanical implementation to `{sidekick_model}`. State a short evidence-based routing reason; keyword hints never override findings.\n\
          Do not delegate tiny tasks or serial debugging whose accumulated context is the work. For bounded implementation, delegate the implementation, focused tests, and repair loop together instead of many micro-handoffs. Do not repeat investigation or checks already supported by trustworthy evidence unless files changed or the evidence is incomplete.\n\
          Every delegation brief must include: objective, constraints, owned files (or read-only scope), acceptance checks, settled findings with relevant paths or context_refs, and a stopping condition. Resolve consequential design decisions before delegating implementation; ask the sidekick to surface missing requirements rather than guess. Pass only the context needed for the task, not your entire transcript or a line-by-line implementation.\n\
+         {implementation_handoff}\n\
          Default to one persistent worker and blocking `subagent` execution. Use `wait=false` only when you have independent work to do; supervise with `hub wait` rather than repeatedly polling `hub read`. Parallelize only independent scopes with explicit ownership, never concurrent writes to the same shared files.\n\
          Reuse the same lane with `hub revive` for related follow-ups; send only the delta, changed assumptions, and plan updates after parent compaction. A running worker receives steering through `hub send`, not a duplicate worker. On user redirection, stop or steer affected work before continuing. Preserve working servers and other useful runtime state instead of restarting setup for every handoff.\n\
          Review the resulting diff and acceptance-check evidence yourself; a completed child run is not an accepted result. If it needs substantial edits, send precise feedback with `hub revive` on the same lane, then review again.\n\
@@ -320,9 +322,11 @@ pub fn build_fusion_main_directive(sidekick_model: &str) -> String {
 /// Sidekick lane directive: mechanical implementation with verification,
 /// escalating ambiguity instead of guessing.
 pub fn build_fusion_sidekick_directive() -> String {
+    let worker_contract = threadlane_prompt::workflow::WORKER_CONTRACT;
     format!(
         "\n\n{FUSION_SIDEKICK_HEADER}\n\
          You are the cost-effective sidekick agent. Own mechanical implementation and verification: read, edit, run tests, and report back.\n\
+         {worker_contract}\n\
          Do not re-plan the task or guess at ambiguous intent — surface questions through your lane output so the frontier main agent decides.\n\
          Follow the delegation brief's objective, constraints, owned files, and acceptance checks. Before editing on a follow-up, revalidate relevant files and flag stale assumptions.\n\
          Run the narrowest acceptance checks first, repair failures, and rerun only failing checks while iterating; run any requested broad gate once after the final edits. Reuse healthy processes and setup from earlier work. Do not independently broaden scope, publish changes, or repeat settled investigation. If blocked after a bounded repair attempt, report the concrete blocker and partial work rather than retrying the same approach indefinitely.\n\
@@ -447,10 +451,12 @@ mod tests {
         assert!(main.contains("hub revive"));
         assert!(main.contains("owned files"));
         assert!(main.contains("acceptance checks"));
+        assert!(main.contains(threadlane_prompt::workflow::IMPLEMENTATION_HANDOFF));
         let side = build_fusion_sidekick_directive();
         assert!(side.contains(FUSION_SIDEKICK_HEADER));
         assert!(side.contains("checks not run"));
         assert!(side.contains("remaining risks"));
+        assert!(side.contains(threadlane_prompt::workflow::WORKER_CONTRACT));
     }
 
     #[test]

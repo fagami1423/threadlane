@@ -7,6 +7,11 @@ same model for both roles is supported, but does not imply a price advantage.
 
 ## Efficient delegation
 
+Before assigning implementation, write an implementation-ready task plan, not
+just progress milestones. Normal delegation and Fusion share the same contract;
+see [built-in agent workflows](agent-workflows.md) for the task-brief fields,
+on-demand workflow skills, and worker reporting rules.
+
 - Keep tiny changes and context-dependent serial debugging on the lead. Hand off
   implementation, focused verification, and repairs as one bounded job when that
   avoids more work than coordination adds.
