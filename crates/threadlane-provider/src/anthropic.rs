@@ -1103,6 +1103,69 @@ mod tests {
         }
     }
 
+    /// Full production path: AgentMessage JSON -> ProviderClient routing ->
+    /// convert_to_llm -> Messages request -> mock server -> StreamEvents.
+    #[tokio::test]
+    async fn provider_client_replays_a_real_tool_history() {
+        use threadlane_protocol::{ProviderPort, RuntimeRequest};
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let body = sse(&[
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 5}}}),
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "text_delta", "text": "Two files."}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}}),
+            json!({"type": "message_stop"}),
+        ]);
+        let (base, server) = serve_once("200 OK", "text/event-stream", vec![body]).await;
+        std::env::set_var("ANTHROPIC_BASE_URL", &base);
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-env-key");
+
+        let request = RuntimeRequest {
+            model: "anthropic/claude-sonnet-5-5".into(),
+            messages: json!([
+                {"role": "system", "content": "You are Threadlane."},
+                {"role": "user", "content": "list the files"},
+                {"role": "assistant", "content": "Checking.", "tool_calls": [
+                    {"id": "call_a", "type": "function",
+                     "function": {"name": "list_dir", "arguments": "{\"path\":\".\"}"}},
+                    {"id": "call_b", "type": "function",
+                     "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}}]},
+                {"role": "tool", "tool_call_id": "call_a", "name": "list_dir", "content": "a.rs\nb.rs"},
+                {"role": "tool", "tool_call_id": "call_b", "name": "read_file", "content": "fn main() {}"},
+            ]),
+            tools: json!([{"type": "function", "function": {
+                "name": "list_dir", "description": "list", "parameters": {"type": "object"}}}]),
+            prompt_cache_key: Some("ignored".into()),
+            reasoning_effort: Some("medium".into()),
+        };
+        let client = crate::router::ProviderClient::new("unused-openai-key".to_string(), None);
+        let (tx, mut rx) = mpsc::channel(64);
+        client.stream_request(request, tx).await;
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        std::env::remove_var("ANTHROPIC_API_KEY");
+
+        let raw = server.await.unwrap();
+        let lower = raw.to_ascii_lowercase();
+        assert!(lower.contains("x-api-key: sk-ant-env-key"));
+        assert!(!lower.contains("authorization:"), "must not send a bearer token");
+        let sent: Value = serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(sent["model"], "claude-sonnet-5-5");
+        assert_eq!(sent["system"], "You are Threadlane.");
+        assert!(sent.get("reasoning_effort").is_none() && sent.get("stream_options").is_none());
+        let messages = sent["messages"].as_array().unwrap();
+        let roles: Vec<_> = messages.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user", "assistant", "user"]);
+        let results = messages[2]["content"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r["type"] == "tool_result"));
+        assert_eq!(messages[1]["content"][1]["type"], "tool_use");
+        assert!(matches!(&events[0], StreamEvent::ContentToken(t) if t == "Two files."));
+        assert!(matches!(events.last().unwrap(), StreamEvent::Finished { .. }));
+    }
+
     #[tokio::test]
     async fn maps_http_401_without_leaking_the_key() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
