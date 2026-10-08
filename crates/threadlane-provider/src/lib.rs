@@ -1,3 +1,4 @@
+pub mod anthropic;
 pub mod antigravity;
 pub mod convert;
 pub mod credentials;
