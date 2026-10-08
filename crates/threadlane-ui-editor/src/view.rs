@@ -1315,6 +1315,7 @@ impl EditorView {
                     "This file has not loaded successfully and cannot be saved yet.".into(),
                     true,
                 );
+                cx.notify();
             }
             return;
         }
@@ -1330,6 +1331,7 @@ impl EditorView {
                     .into(),
                 true,
             );
+            cx.notify();
             return;
         }
 
@@ -1969,6 +1971,9 @@ mod navigation_tests {
 
 #[cfg(test)]
 mod closed_file_host_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     use gpui::AppContext as _;
 
     use crate::closed_files::FileTarget;
@@ -2338,8 +2343,26 @@ mod closed_file_host_tests {
             root.view().clone().downcast::<EditorView>().unwrap()
         });
 
-        view.update(cx, |view, cx| {
+        cx.run_until_parked();
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.update(|window, cx| window.simulate_next_frame(cx));
+            cx.run_until_parked();
+        }
+        view.read_with(cx, |view, _| {
             assert!(!view.tabs[0].baseline_loaded);
+            assert!(view.tabs[1].baseline_loaded);
+        });
+
+        let notifications = Rc::new(Cell::new(0));
+        let observed_notifications = notifications.clone();
+        let _notification_observer = cx.update(|_, cx| {
+            cx.observe(&view, move |_, _| {
+                observed_notifications.set(observed_notifications.get() + 1);
+            })
+        });
+        let before_baseline_rejection = notifications.get();
+        view.update(cx, |view, cx| {
             view.save_tab_at(0, cx);
             assert!(view
                 .status_msg
@@ -2347,17 +2370,40 @@ mod closed_file_host_tests {
                 .is_some_and(|(message, _, _)| message.contains("not loaded successfully")));
         });
         cx.run_until_parked();
-        for _ in 0..4 {
-            cx.update(|window, cx| window.draw(cx).clear(cx));
-            cx.update(|window, cx| window.simulate_next_frame(cx));
-            cx.run_until_parked();
-        }
+        assert!(
+            notifications.get() > before_baseline_rejection,
+            "rejecting a save without a loaded baseline must notify the editor view"
+        );
+        cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(!project.join("missing.rs").exists());
-        view.read_with(cx, |view, _| assert!(view.tabs[1].baseline_loaded));
 
         let sample_editor = view.read_with(cx, |view, _| {
             view.tabs[1].editor_state.clone().unwrap()
         });
+        let original_sample_origin = view.read_with(cx, |view, _| {
+            view.tabs[1].client_origin.clone().unwrap()
+        });
+        let before_origin_rejection = notifications.get();
+        view.update(cx, |view, cx| {
+            view.tabs[1].client_origin = Some(replacement.clone());
+            view.save_tab_at(1, cx);
+            assert!(view.status_msg.as_ref().is_some_and(|(message, _, _)| {
+                message.contains("previous daemon connection")
+            }));
+        });
+        cx.run_until_parked();
+        assert!(
+            notifications.get() > before_origin_rejection,
+            "rejecting a save from a different daemon origin must notify the editor view"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("sample.rs")).unwrap(),
+            "initial bytes\n"
+        );
+        view.update(cx, |view, _| {
+            view.tabs[1].client_origin = Some(original_sample_origin);
+        });
+
         let focus = view.read_with(cx, |view, _| view.focus_handle.clone());
         cx.update(|window, cx| {
             window.focus(&focus, cx);
