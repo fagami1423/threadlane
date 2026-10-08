@@ -28,6 +28,24 @@ jobs:
         id: release-please
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
 
+      - name: Check out release tooling
+        if: ${{ steps.release-please.outputs.prs_created == 'true' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Test release note cleanup
+        if: ${{ steps.release-please.outputs.prs_created == 'true' }}
+        run: node scripts/clean-release-notes.test.cjs
+      - name: Remove verified duplicate merge entries
+        if: ${{ steps.release-please.outputs.prs_created == 'true' }}
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          RELEASE_PRS: ${{ steps.release-please.outputs.prs }}
+        with:
+          script: |
+            const clean = require('./scripts/clean-release-notes.cjs');
+            await clean({github, context, core});
+
   package-release:
     name: Build release packages
     needs: release
