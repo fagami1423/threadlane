@@ -96,7 +96,13 @@ fn inspection_reuses_branch_listing_without_losing_local_refs() {
             "initial",
         ],
     );
-    for branch in ["z-last", "origin/local", "nested/HEAD", "a-first"] {
+    for branch in [
+        "z-last",
+        "origin/local",
+        "origin/main",
+        "nested/HEAD",
+        "a-first",
+    ] {
         run_git(dir.path(), &["branch", branch]);
     }
     run_git(
@@ -107,13 +113,24 @@ fn inspection_reuses_branch_listing_without_losing_local_refs() {
         dir.path(),
         &["update-ref", "refs/remotes/origin/local", "HEAD"],
     );
+    run_git(
+        dir.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
     run_git(dir.path(), &["tag", "a-first"]);
     BRANCH_LIST_RUNS.set(0);
     let status = inspect(dir.path()).unwrap();
     assert_eq!(BRANCH_LIST_RUNS.get(), 1);
     assert_eq!(
         status.branches,
-        ["a-first", "main", "nested/HEAD", "origin/local", "z-last"]
+        [
+            "a-first",
+            "main",
+            "nested/HEAD",
+            "origin/local",
+            "origin/main",
+            "z-last"
+        ]
     );
     assert!(
         status
@@ -132,6 +149,28 @@ fn inspection_reuses_branch_listing_without_losing_local_refs() {
             .branch_details
             .iter()
             .any(|branch| branch.name == "origin/remote-only" && branch.is_remote)
+    );
+    assert!(
+        status
+            .branch_details
+            .iter()
+            .any(|branch| branch.name == "main" && !branch.is_remote && branch.is_default)
+    );
+    assert!(
+        status
+            .branch_details
+            .iter()
+            .any(|branch| {
+                branch.name == "remotes/origin/main" && branch.is_remote && branch.is_default
+            })
+    );
+    assert!(
+        status
+            .branch_details
+            .iter()
+            .any(|branch| {
+                branch.name == "origin/main" && !branch.is_remote && !branch.is_default
+            })
     );
 
     let local_a_first = status

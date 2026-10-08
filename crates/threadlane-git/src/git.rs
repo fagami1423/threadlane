@@ -496,7 +496,8 @@ pub(crate) fn list_branches_detailed(
             .map(|u| u.trim().to_string())
             .filter(|u| !u.is_empty());
         let is_default = def_branch.as_deref().map_or(false, |db| {
-            name == db || name == format!("origin/{db}")
+            full_name == format!("refs/heads/{db}")
+                || full_name == format!("refs/remotes/origin/{db}")
         });
 
         if seen_refs.insert(full_name) {
