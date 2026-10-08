@@ -31,6 +31,7 @@ pub fn branch_name(raw: &str, session_id: &str) -> String {
 }
 
 pub fn start(
+    core: std::sync::Arc<crate::core::DaemonCore>,
     setup: WorktreeSetup,
     mut options: threadlane_coding_agent::CodingAgentOptions,
     tx: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
@@ -126,10 +127,15 @@ pub fn start(
             progress(SetupStage::Starting, branch);
             options.work_dir = setup.worktree.clone();
             options.session_file = Some(setup.session_file.clone());
-            let runtime =
-                threadlane_coding_agent::controller::spawn_session_runtime_construction(options)
-                    .await
-                    .map_err(|e| e.to_string())?;
+            let runtime = core.clone().get_or_create_runtime_async(
+                setup.session_id.clone(),
+                setup.worktree.clone(),
+                setup.session_file.clone(),
+                options,
+                None,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
             let project = setup.project.clone();
             let id = setup.session_id.clone();
             let session = tokio::task::spawn_blocking(move || {

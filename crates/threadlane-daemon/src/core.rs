@@ -56,8 +56,8 @@ pub struct SessionIdentity {
 pub struct DaemonCore {
     /// Live runtimes keyed by session file (the canonical identity path).
     runtimes: Mutex<HashMap<PathBuf, Arc<SessionRuntime>>>,
-    /// Serializes owner creation before WASI acquires its exclusive state lock.
-    runtime_construction: Mutex<()>,
+    /// Per-session gates serialize construction without coupling unrelated sessions.
+    runtime_construction: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
     /// `session_id` → file/work_dir, populated at registration and hydration.
     identities: Mutex<HashMap<String, SessionIdentity>>,
     /// Work dirs the host attached, fed by AppState/`AddProject` so remote
@@ -130,7 +130,7 @@ impl DaemonCore {
         }
         let core = Arc::new(Self {
             runtimes: Mutex::new(HashMap::new()),
-            runtime_construction: Mutex::new(()),
+            runtime_construction: Mutex::new(HashMap::new()),
             identities: Mutex::new(HashMap::new()),
             attached_projects: Mutex::new(BTreeSet::new()),
             worktree_setups: Mutex::new(HashMap::new()),
@@ -342,25 +342,29 @@ impl DaemonCore {
         session_file: PathBuf,
         runtime: Arc<SessionRuntime>,
     ) -> Arc<SessionRuntime> {
-        let _construction = self
-            .runtime_construction
-            .lock()
-            .expect("runtime construction poisoned");
-        {
+        // Registration is publication only: callers may already have performed
+        // expensive construction, so never wait on a construction gate here.
+        let runtime = {
             let mut runtimes = self.runtimes.lock().expect("runtimes poisoned");
-            if let Some(existing) = runtimes.get(&session_file) {
-                return existing.clone();
-            }
-            runtimes.insert(session_file.clone(), runtime.clone());
-        }
+            runtimes
+                .entry(session_file.clone())
+                .or_insert_with(|| runtime.clone())
+                .clone()
+        };
         self.identities.lock().expect("identities poisoned").insert(
             session_id.to_string(),
-            SessionIdentity {
-                session_file,
-                work_dir,
-            },
+            SessionIdentity { session_file, work_dir },
         );
         runtime
+    }
+
+    fn construction_gate(&self, session_file: &Path) -> Arc<Mutex<()>> {
+        self.runtime_construction
+            .lock()
+            .expect("runtime construction registry poisoned")
+            .entry(session_file.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Serialized check-and-create boundary shared by desktop and paired clients.
@@ -373,18 +377,19 @@ impl DaemonCore {
         options: threadlane_coding_agent::CodingAgentOptions,
         prepared: Option<Arc<SessionRuntime>>,
     ) -> Arc<SessionRuntime> {
-        let _construction = self
-            .runtime_construction
-            .lock()
-            .expect("runtime construction poisoned");
+        let gate = self.construction_gate(&session_file);
+        let _construction = gate.lock().expect("runtime construction poisoned");
         if let Some(runtime) = self.runtime_for_file(&session_file) {
             return runtime;
         }
         let runtime = prepared.unwrap_or_else(|| SessionRuntime::new(options));
-        self.runtimes
-            .lock()
-            .expect("runtimes poisoned")
-            .insert(session_file.clone(), runtime.clone());
+        let runtime = {
+            let mut runtimes = self.runtimes.lock().expect("runtimes poisoned");
+            runtimes
+                .entry(session_file.clone())
+                .or_insert_with(|| runtime.clone())
+                .clone()
+        };
         self.identities.lock().expect("identities poisoned").insert(
             session_id.to_string(),
             SessionIdentity {
@@ -1073,7 +1078,7 @@ impl DaemonCore {
                     .lock()
                     .expect("worktree setups poisoned")
                     .insert(setup.session_id.clone(), setup.clone());
-                crate::worktree_setup::start(setup, options, self.ingest_tx.clone())
+                crate::worktree_setup::start(self.clone(), setup, options, self.ingest_tx.clone())
             }
             SessionCommand::CancelWorktreeSetup { session_id } => {
                 if let Some(setup) = self
@@ -1643,22 +1648,44 @@ mod composer_tests {
         let work_dir = project.path().canonicalize().unwrap();
         let session_id = "shared-resume";
         let session_file = canonical_session_file(&work_dir, session_id);
+        let worktree = work_dir.join(".threadlane/worktrees/shared-resume");
+        std::fs::create_dir_all(&worktree).unwrap();
         let core = DaemonCore::new().unwrap();
-        let options = || super::coding_agent_options(
-            work_dir.clone(), session_file.clone(), "test/model".into(),
+        let options = |runtime_work_dir: std::path::PathBuf| super::coding_agent_options(
+            runtime_work_dir, session_file.clone(), "test/model".into(),
             Default::default(), threadlane_protocol::browser::BrowserBridge::unavailable(),
         );
-        // Desktop hydration and mobile lazy resume can overlap before either
-        // has published its runtime. Construction must be single-owner, not
-        // merely deduplicated after both managers acquire extension state.
+        // Worktree preparation and desktop/mobile hydration can overlap before
+        // either publishes its runtime. Construction must be shared at entry.
         let desktop = core.clone().get_or_create_runtime_async(
-            session_id.into(), work_dir.clone(), session_file.clone(), options(), None,
+            session_id.into(),
+            work_dir.clone(),
+            session_file.clone(),
+            options(work_dir.clone()),
+            None,
         );
-        let phone = core.clone().get_or_create_runtime_async(
-            session_id.into(), work_dir.clone(), session_file.clone(), options(), None,
+        let worktree_setup = core.clone().get_or_create_runtime_async(
+            session_id.into(),
+            worktree.clone(),
+            session_file.clone(),
+            options(worktree.clone()),
+            None,
         );
         let desktop = desktop.await.unwrap();
-        let phone = phone.await.unwrap();
+        let worktree_runtime = worktree_setup.await.unwrap();
+        assert!(Arc::ptr_eq(&desktop, &worktree_runtime));
+        assert_eq!(core.identity(session_id).unwrap().work_dir, work_dir);
+        let phone = core
+            .clone()
+            .get_or_create_runtime_async(
+                session_id.into(),
+                worktree.clone(),
+                session_file.clone(),
+                options(worktree),
+                None,
+            )
+            .await
+            .unwrap();
         assert!(Arc::ptr_eq(&desktop, &phone));
         let resumed = core.ensure_runtime(session_id, &work_dir).await.unwrap();
         assert!(Arc::ptr_eq(&desktop, &resumed));
@@ -1670,6 +1697,62 @@ mod composer_tests {
         }).await.unwrap().unwrap();
         assert!(Arc::ptr_eq(&desktop, &hydrated));
         assert_eq!(core.runtimes().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn registration_does_not_wait_for_unrelated_construction() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let project = tempfile::tempdir().unwrap();
+        let work_dir = project.path().canonicalize().unwrap();
+        let core = DaemonCore::new().unwrap();
+        let session_file = work_dir.join("registered.jsonl");
+        let runtime = core
+            .clone()
+            .get_or_create_runtime_async(
+                "constructed".into(),
+                work_dir.clone(),
+                session_file.clone(),
+                super::coding_agent_options(
+                    work_dir.clone(),
+                    session_file,
+                    "test/model".into(),
+                    Default::default(),
+                    threadlane_protocol::browser::BrowserBridge::unavailable(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let gate = core.construction_gate(&work_dir.join("being-built.jsonl"));
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let gate_thread = std::thread::spawn(move || {
+            let _guard = gate.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        locked_rx.recv().unwrap();
+        let (registered_tx, registered_rx) = mpsc::channel();
+        let register_core = core.clone();
+        let registered_runtime = runtime.clone();
+        let registered_file = work_dir.join("unrelated.jsonl");
+        let register_thread = std::thread::spawn(move || {
+            register_core.register_runtime(
+                "unrelated",
+                work_dir.clone(),
+                registered_file,
+                registered_runtime,
+            );
+            registered_tx.send(()).unwrap();
+        });
+        registered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("registration waited for an unrelated construction gate");
+        release_tx.send(()).unwrap();
+        register_thread.join().unwrap();
+        gate_thread.join().unwrap();
     }
 
     #[test]

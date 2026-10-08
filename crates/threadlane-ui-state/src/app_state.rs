@@ -3491,7 +3491,12 @@ impl AppState {
                 self.model_roles.clone(),
                 self.browser_bridge.clone(),
             );
-            crate::worktree_setup::start(setup.clone(), options, self.stream_tx.clone())?;
+            crate::worktree_setup::start(
+                self.daemon_core.clone(),
+                setup.clone(),
+                options,
+                self.stream_tx.clone(),
+            )?;
         }
         if let Some(info) = self.client.projects.iter_mut().find(|p| p.work_dir == project) {
             info.sessions.insert(
@@ -3547,7 +3552,12 @@ impl AppState {
             self.model_roles.clone(),
             self.browser_bridge.clone(),
         );
-        match crate::worktree_setup::start(setup.clone(), options, self.stream_tx.clone()) {
+        match crate::worktree_setup::start(
+                self.daemon_core.clone(),
+                setup.clone(),
+                options,
+                self.stream_tx.clone(),
+            ) {
             Ok(()) => {
                 self.worktree_setups.insert(setup.session_id.clone(), setup);
                 self.client.is_generating = true;
