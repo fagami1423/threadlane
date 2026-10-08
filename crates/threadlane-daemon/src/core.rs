@@ -22,9 +22,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::sync::{broadcast, mpsc};
 
-use threadlane_coding_agent::controller::{
-    spawn_session_runtime_construction, SessionRuntime,
-};
+use threadlane_coding_agent::controller::SessionRuntime;
 use threadlane_protocol::browser::BrowserBridge;
 use threadlane_protocol::daemon::{
     CommandResponse, ProjectInfo, SessionCommand, SessionEvent, SessionHydrationRequest,
@@ -58,6 +56,8 @@ pub struct SessionIdentity {
 pub struct DaemonCore {
     /// Live runtimes keyed by session file (the canonical identity path).
     runtimes: Mutex<HashMap<PathBuf, Arc<SessionRuntime>>>,
+    /// Per-session gates serialize construction without coupling unrelated sessions.
+    runtime_construction: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
     /// `session_id` → file/work_dir, populated at registration and hydration.
     identities: Mutex<HashMap<String, SessionIdentity>>,
     /// Work dirs the host attached, fed by AppState/`AddProject` so remote
@@ -130,6 +130,7 @@ impl DaemonCore {
         }
         let core = Arc::new(Self {
             runtimes: Mutex::new(HashMap::new()),
+            runtime_construction: Mutex::new(HashMap::new()),
             identities: Mutex::new(HashMap::new()),
             attached_projects: Mutex::new(BTreeSet::new()),
             worktree_setups: Mutex::new(HashMap::new()),
@@ -341,18 +342,89 @@ impl DaemonCore {
         session_file: PathBuf,
         runtime: Arc<SessionRuntime>,
     ) -> Arc<SessionRuntime> {
-        {
+        // Registration is publication only: callers may already have performed
+        // expensive construction, so never wait on a construction gate here.
+        let runtime = {
             let mut runtimes = self.runtimes.lock().expect("runtimes poisoned");
-            if let Some(existing) = runtimes.get(&session_file) {
-                return existing.clone();
-            }
-            runtimes.insert(session_file.clone(), runtime.clone());
-        }
-        self.identities
-            .lock()
-            .expect("identities poisoned")
-            .insert(session_id.to_string(), SessionIdentity { session_file, work_dir });
+            runtimes
+                .entry(session_file.clone())
+                .or_insert_with(|| runtime.clone())
+                .clone()
+        };
+        self.identities.lock().expect("identities poisoned").insert(
+            session_id.to_string(),
+            SessionIdentity { session_file, work_dir: Self::project_dir_for(&work_dir) },
+        );
         runtime
+    }
+
+    fn construction_gate(&self, session_file: &Path) -> Arc<Mutex<()>> {
+        self.runtime_construction
+            .lock()
+            .expect("runtime construction registry poisoned")
+            .entry(session_file.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    fn prune_construction_gate(&self, session_file: &Path, gate: &Arc<Mutex<()>>) {
+        let mut gates = self.runtime_construction.lock().expect("runtime construction registry poisoned");
+        if Arc::strong_count(gate) == 2
+            && gates.get(session_file).is_some_and(|current| Arc::ptr_eq(current, gate))
+        {
+            gates.remove(session_file);
+        }
+    }
+
+    /// Serialized check-and-create boundary shared by desktop and paired clients.
+    /// Call on a large-stack worker; construction loads WASI extensions.
+    pub fn get_or_create_runtime(
+        &self,
+        session_id: &str,
+        work_dir: PathBuf,
+        session_file: PathBuf,
+        options: threadlane_coding_agent::CodingAgentOptions,
+        prepared: Option<Arc<SessionRuntime>>,
+    ) -> Arc<SessionRuntime> {
+        let gate = self.construction_gate(&session_file);
+        let _construction = gate.lock().expect("runtime construction poisoned");
+        if let Some(runtime) = self.runtime_for_file(&session_file) {
+            drop(_construction);
+            self.prune_construction_gate(&session_file, &gate);
+            return runtime;
+        }
+        let runtime = prepared.unwrap_or_else(|| SessionRuntime::new(options));
+        let runtime = {
+            let mut runtimes = self.runtimes.lock().expect("runtimes poisoned");
+            runtimes
+                .entry(session_file.clone())
+                .or_insert_with(|| runtime.clone())
+                .clone()
+        };
+        self.identities.lock().expect("identities poisoned").insert(
+            session_id.to_string(),
+            SessionIdentity {
+                session_file: session_file.clone(),
+                work_dir: Self::project_dir_for(&work_dir),
+            },
+        );
+        drop(_construction);
+        self.prune_construction_gate(&session_file, &gate);
+        runtime
+    }
+
+    /// Start construction immediately on the shared large-stack blocking pool.
+    pub fn get_or_create_runtime_async(
+        self: Arc<Self>,
+        session_id: String,
+        work_dir: PathBuf,
+        session_file: PathBuf,
+        options: threadlane_coding_agent::CodingAgentOptions,
+        prepared: Option<Arc<SessionRuntime>>,
+    ) -> tokio::task::JoinHandle<Arc<SessionRuntime>> {
+        threadlane_provider::exec::get_runtime().spawn_blocking(move || {
+            self.get_or_create_runtime(&session_id, work_dir, session_file, options, prepared)
+        })
     }
 
     pub fn runtime_for_file(&self, session_file: &Path) -> Option<Arc<SessionRuntime>> {
@@ -376,10 +448,33 @@ impl DaemonCore {
     /// Drop a runtime so the next access rebuilds it with current config
     /// (model/effort/mode switching works by invalidation).
     pub fn drop_runtime(&self, session_file: &Path) -> Option<Arc<SessionRuntime>> {
+        // Invalidation also ends the prepared handoff; otherwise the next
+        // prompt could resurrect the old model from the mailbox.
+        if let Some(session_id) = Self::session_id_for_file(session_file) {
+            let _ = crate::runtimes::take_prepared_runtime(&session_id);
+        }
         self.runtimes
             .lock()
             .expect("runtimes poisoned")
             .remove(session_file)
+    }
+
+    /// Remove a just-constructed runtime only if it is still the exact idle
+    /// instance returned to the cancelled setup and no other client retained it.
+    pub fn release_cancelled_runtime(
+        &self,
+        session_file: &Path,
+        runtime: &Arc<SessionRuntime>,
+    ) {
+        let mut runtimes = self.runtimes.lock().expect("runtimes poisoned");
+        if runtimes
+            .get(session_file)
+            .is_some_and(|current| Arc::ptr_eq(current, runtime))
+            && !runtime.is_generating()
+            && Arc::strong_count(runtime) == 2
+        {
+            runtimes.remove(session_file);
+        }
     }
 
     /// `session_id` ↔ file: canonical layout is `<work_dir>/.threadlane/
@@ -469,52 +564,54 @@ impl DaemonCore {
     /// session is known but idle. Construction goes through the shared
     /// blocking pool — wasmi needs real stacks.
     pub async fn ensure_runtime(
-        &self,
+        self: &Arc<Self>,
         session_id: &str,
         work_dir: &Path,
     ) -> Result<Arc<SessionRuntime>, String> {
+        // A prepared runtime may already be registered; always drain its
+        // handoff before the fast path so model invalidation cannot resurrect it.
+        let prepared = crate::runtimes::take_prepared_runtime(session_id);
         if let Some(runtime) = self.runtime_for_session(session_id) {
             return Ok(runtime);
-        }
-        // A worktree-prepared session parks its runtime under the session id
-        // before the transcript exists; the first prompt claims it.
-        if let Some(prepared) = crate::runtimes::take_prepared_runtime(session_id) {
-            return Ok(self.register_runtime(
-                session_id,
-                Self::project_dir_for(work_dir),
-                prepared.session_file.clone(),
-                prepared,
-            ));
         }
         let session_file = self
             .identity(session_id)
             .map(|identity| identity.session_file)
+            .or_else(|| {
+                prepared
+                    .as_ref()
+                    .map(|runtime| runtime.session_file.clone())
+            })
             .unwrap_or_else(|| canonical_session_file(work_dir, session_id));
         let options = coding_agent_options(
             work_dir.to_path_buf(),
             session_file.clone(),
             self.model.read().expect("model poisoned").clone(),
-            self.model_roles.read().expect("model roles poisoned").clone(),
+            self.model_roles
+                .read()
+                .expect("model roles poisoned")
+                .clone(),
             self.browser_bridge
                 .read()
                 .expect("browser bridge poisoned")
                 .clone(),
         );
-        let runtime = spawn_session_runtime_construction(options)
+        Arc::clone(self)
+            .get_or_create_runtime_async(
+                session_id.to_owned(),
+                Self::project_dir_for(work_dir),
+                session_file,
+                options,
+                prepared,
+            )
             .await
-            .map_err(|error| format!("session runtime construction failed: {error}"))?;
-        Ok(self.register_runtime(
-            session_id,
-            Self::project_dir_for(work_dir),
-            session_file,
-            runtime,
-        ))
+            .map_err(|error| format!("session runtime construction failed: {error}"))
     }
 
     /// Construct a runtime with explicit hydration options rather than the
     /// core's current selection (hydration pins the session's own model).
     async fn hydrate_runtime(
-        &self,
+        self: &Arc<Self>,
         request: &SessionHydrationRequest,
     ) -> Result<Option<Arc<SessionRuntime>>, String> {
         let Some(options) = &request.runtime_options else {
@@ -525,9 +622,6 @@ impl DaemonCore {
             Self::project_dir_for(&options.work_dir),
             request.session_file.clone(),
         );
-        if let Some(runtime) = self.runtime_for_file(&request.session_file) {
-            return Ok(Some(runtime));
-        }
         let agent_options = coding_agent_options(
             options.work_dir.clone(),
             request.session_file.clone(),
@@ -538,14 +632,17 @@ impl DaemonCore {
                 .expect("browser bridge poisoned")
                 .clone(),
         );
-        let runtime = spawn_session_runtime_construction(agent_options).await
-        .map_err(|error| format!("session runtime construction failed: {error}"))?;
-        Ok(Some(self.register_runtime(
-            &request.session_id,
-            Self::project_dir_for(&options.work_dir),
-            request.session_file.clone(),
-            runtime,
-        )))
+        let runtime = Arc::clone(self)
+            .get_or_create_runtime_async(
+                request.session_id.clone(),
+                Self::project_dir_for(&options.work_dir),
+                request.session_file.clone(),
+                agent_options,
+                None,
+            )
+            .await
+            .map_err(|error| format!("session runtime construction failed: {error}"))?;
+        Ok(Some(runtime))
     }
 
     // -- command surface --------------------------------------------------
@@ -1019,19 +1116,25 @@ impl DaemonCore {
                     .lock()
                     .expect("worktree setups poisoned")
                     .insert(setup.session_id.clone(), setup.clone());
-                crate::worktree_setup::start(setup, options, self.ingest_tx.clone())
+                crate::worktree_setup::start(self.clone(), setup, options, self.ingest_tx.clone())
             }
             SessionCommand::CancelWorktreeSetup { session_id } => {
-                if let Some(setup) = self
+                let setup = self
                     .worktree_setups
                     .lock()
                     .expect("worktree setups poisoned")
-                    .remove(&session_id)
-                {
-                    setup.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+                    .remove(&session_id);
+                if let Some(setup) = setup {
+                    if let Some(runtime) = crate::runtimes::cancel_prepared_runtime(
+                        &session_id,
+                        &setup.cancelled,
+                    ) {
+                        self.release_cancelled_runtime(&setup.session_file, &runtime);
+                    }
+                } else {
+                    // A completed setup may already have left the registry.
+                    let _ = crate::runtimes::take_prepared_runtime(&session_id);
                 }
-                // Release any parked runtime a completed setup left behind.
-                let _ = crate::runtimes::take_prepared_runtime(&session_id);
                 Ok(())
             }
             SessionCommand::DeleteSession {
@@ -1579,6 +1682,166 @@ mod composer_tests {
     use super::{canonical_session_file, DaemonCore};
     use threadlane_protocol::daemon::{CommandResponse, SessionCommand};
     use threadlane_protocol::{OrchestratorMode, ReasoningEffort};
+
+    #[tokio::test]
+    async fn desktop_and_phone_resume_share_one_runtime_owner() {
+        use std::sync::Arc;
+        use threadlane_protocol::daemon::{HydrationRuntimeOptions, SessionHydrationRequest};
+
+        let project = tempfile::tempdir().unwrap();
+        let work_dir = project.path().canonicalize().unwrap();
+        let session_id = "shared-resume";
+        let session_file = canonical_session_file(&work_dir, session_id);
+        let worktree = work_dir.join(".threadlane/worktrees/shared-resume");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let core = DaemonCore::new().unwrap();
+        let options = |runtime_work_dir: std::path::PathBuf| super::coding_agent_options(
+            runtime_work_dir, session_file.clone(), "test/model".into(),
+            Default::default(), threadlane_protocol::browser::BrowserBridge::unavailable(),
+        );
+        // Worktree preparation and desktop/mobile hydration can overlap before
+        // either publishes its runtime. Construction must be shared at entry.
+        let desktop = core.clone().get_or_create_runtime_async(
+            session_id.into(),
+            work_dir.clone(),
+            session_file.clone(),
+            options(work_dir.clone()),
+            None,
+        );
+        let worktree_setup = core.clone().get_or_create_runtime_async(
+            session_id.into(),
+            worktree.clone(),
+            session_file.clone(),
+            options(worktree.clone()),
+            None,
+        );
+        let desktop = desktop.await.unwrap();
+        let worktree_runtime = worktree_setup.await.unwrap();
+        assert!(Arc::ptr_eq(&desktop, &worktree_runtime));
+        assert_eq!(core.identity(session_id).unwrap().work_dir, work_dir);
+        let phone = core
+            .clone()
+            .get_or_create_runtime_async(
+                session_id.into(),
+                worktree.clone(),
+                session_file.clone(),
+                options(worktree),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&desktop, &phone));
+        let active = std::sync::atomic::AtomicBool::new(false);
+        assert!(crate::runtimes::park_prepared_runtime_if_active(
+            session_id.into(), desktop.clone(), &active));
+        let resumed = core.ensure_runtime(session_id, &work_dir).await.unwrap();
+        assert!(crate::runtimes::take_prepared_runtime(session_id).is_none());
+        assert!(Arc::ptr_eq(&desktop, &resumed));
+        let hydrated = core.hydrate_runtime(&SessionHydrationRequest {
+            session_id: session_id.into(), session_file, reload_messages: true,
+            runtime_options: Some(HydrationRuntimeOptions {
+                work_dir, model: "test/model".into(), model_roles: Default::default(),
+            }),
+        }).await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&desktop, &hydrated));
+        assert_eq!(core.runtimes().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn registration_does_not_wait_for_unrelated_construction() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let project = tempfile::tempdir().unwrap();
+        let work_dir = project.path().canonicalize().unwrap();
+        let core = DaemonCore::new().unwrap();
+        let session_file = work_dir.join("registered.jsonl");
+        let runtime = core
+            .clone()
+            .get_or_create_runtime_async(
+                "constructed".into(),
+                work_dir.clone(),
+                session_file.clone(),
+                super::coding_agent_options(
+                    work_dir.clone(),
+                    session_file,
+                    "test/model".into(),
+                    Default::default(),
+                    threadlane_protocol::browser::BrowserBridge::unavailable(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let gate = core.construction_gate(&work_dir.join("being-built.jsonl"));
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let gate_thread = std::thread::spawn(move || {
+            let _guard = gate.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        locked_rx.recv().unwrap();
+        let (registered_tx, registered_rx) = mpsc::channel();
+        let register_core = core.clone();
+        let registered_runtime = runtime.clone();
+        let registered_file = work_dir.join("unrelated.jsonl");
+        let register_thread = std::thread::spawn(move || {
+            register_core.register_runtime(
+                "unrelated",
+                work_dir.clone(),
+                registered_file,
+                registered_runtime,
+            );
+            registered_tx.send(()).unwrap();
+        });
+        registered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("registration waited for an unrelated construction gate");
+        release_tx.send(()).unwrap();
+        register_thread.join().unwrap();
+        gate_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_preparation_releases_only_unshared_owner() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        let project = tempfile::tempdir().unwrap();
+        let work_dir = project.path().canonicalize().unwrap();
+        let file = canonical_session_file(&work_dir, "cancelled-owner");
+        let core = DaemonCore::new().unwrap();
+        let runtime = core.clone().get_or_create_runtime_async(
+            "cancelled-owner".into(), work_dir.clone(), file.clone(),
+            super::coding_agent_options(work_dir.clone(), file.clone(), "test/model".into(),
+                Default::default(), threadlane_protocol::browser::BrowserBridge::unavailable()), None,
+        ).await.unwrap();
+        assert!(core.runtime_construction.lock().unwrap().is_empty());
+        let checkout = work_dir.join(".threadlane/worktrees/cancelled-owner");
+        core.register_runtime("cancelled-owner", checkout, file.clone(), runtime.clone());
+        assert_eq!(core.identity("cancelled-owner").unwrap().work_dir, work_dir);
+        let cancelled = AtomicBool::new(false);
+        assert!(crate::runtimes::park_prepared_runtime_if_active(
+            "cancelled-owner".into(), runtime.clone(), &cancelled));
+        let parked = crate::runtimes::cancel_prepared_runtime("cancelled-owner", &cancelled).unwrap();
+        assert!(Arc::ptr_eq(&runtime, &parked));
+        drop(parked);
+        assert!(!crate::runtimes::park_prepared_runtime_if_active(
+            "cancelled-owner".into(), runtime.clone(), &cancelled));
+        let other_client = runtime.clone();
+        core.release_cancelled_runtime(&file, &runtime);
+        assert!(core.runtime_for_file(&file).is_some());
+        drop(other_client);
+        core.release_cancelled_runtime(&file, &runtime);
+        assert!(core.runtime_for_file(&file).is_none());
+        assert!(crate::runtimes::take_prepared_runtime("cancelled-owner").is_none());
+        core.register_runtime("cancelled-owner", work_dir.clone(), file.clone(), runtime.clone());
+        let active = AtomicBool::new(false);
+        assert!(crate::runtimes::park_prepared_runtime_if_active(
+            "cancelled-owner".into(), runtime.clone(), &active));
+        core.drop_runtime(&file);
+        assert!(crate::runtimes::take_prepared_runtime("cancelled-owner").is_none());
+
+    }
 
     #[test]
     fn automation_bridge_does_not_retain_its_host_core() {

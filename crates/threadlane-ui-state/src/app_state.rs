@@ -171,7 +171,7 @@ pub struct AppState {
     /// lands; the echo row stays until then so the UI never claims a
     /// removal the peer may not have performed.
     pub(crate) pending_queued_cancels: HashMap<u64, PendingQueuedCancel>,
-    scheduler_handles: HashMap<PathBuf, SchedulerSupervisorHandle>,
+    scheduler_handles: HashMap<PathBuf, (std::sync::Weak<SessionRuntime>, SchedulerSupervisorHandle)>,
     scheduler_results:
         HashMap<PathBuf, tokio::sync::mpsc::UnboundedReceiver<SchedulerSupervisorEvent>>,
     deferred_stream_events: HashMap<String, Vec<SessionEvent>>,
@@ -2597,14 +2597,9 @@ impl AppState {
         session_file: PathBuf,
     ) -> Arc<SessionRuntime> {
         if let Some(runtime) = self.daemon_core.runtime_for_file(&session_file) {
-            return runtime;
+            return self.register_session_runtime(work_dir, session_file, runtime);
         }
-        // Build on a dedicated thread with a large stack: CodingAgent loads
-        // WASI extensions through wasmi, which needs more than GPUI's 512
-        // KiB GCD worker stacks provide. A plain spawn (not the Tokio
-        // runtime) keeps this lazy path safe whether or not the caller runs
-        // inside async context; the hydrated path in
-        // threadlane-ui-workspace awaits the same constructor asynchronously.
+        // WASI construction needs a larger stack than GPUI's worker stacks.
         let options = coding_agent_options(
             work_dir.clone(),
             session_file.clone(),
@@ -2612,14 +2607,21 @@ impl AppState {
             self.model_roles.clone(),
             self.browser_bridge.clone(),
         );
+        let session_id = threadlane_daemon::core::DaemonCore::session_id_for_file(&session_file)
+            .unwrap_or_default();
+        let core = self.daemon_core.clone();
+        let runtime_work_dir = work_dir.clone();
+        let runtime_file = session_file.clone();
         let runtime = std::thread::Builder::new()
             .name("session-runtime-construct".into())
             .stack_size(8 * 1024 * 1024)
-            .spawn(move || SessionRuntime::new(options))
+            .spawn(move || core.get_or_create_runtime(
+                &session_id, runtime_work_dir, runtime_file, options, None,
+            ))
             .expect("failed to spawn session runtime constructor")
             .join()
             .expect("session runtime construction panicked");
-        self.register_session_runtime(work_dir.clone(), session_file, runtime)
+        self.register_session_runtime(work_dir, session_file, runtime)
     }
 
     pub fn register_session_runtime(
@@ -2628,17 +2630,22 @@ impl AppState {
         session_file: PathBuf,
         runtime: Arc<SessionRuntime>,
     ) -> Arc<SessionRuntime> {
-        if let Some(existing) = self.daemon_core.runtime_for_file(&session_file) {
-            return existing;
-        }
-        if let Ok((handle, results)) = runtime.start_scheduler_supervisor_with_results() {
-            self.scheduler_handles.insert(session_file.clone(), handle);
-            self.scheduler_results.insert(session_file.clone(), results);
-        }
         let session_id = threadlane_daemon::core::DaemonCore::session_id_for_file(&session_file)
             .unwrap_or_default();
-        self.daemon_core
-            .register_runtime(&session_id, work_dir, session_file, runtime.clone());
+        let runtime = self.daemon_core.register_runtime(
+            &session_id, work_dir, session_file.clone(), runtime,
+        );
+        let same_runtime = self.scheduler_handles.get(&session_file)
+            .and_then(|(owner, _)| owner.upgrade())
+            .is_some_and(|owner| Arc::ptr_eq(&owner, &runtime));
+        if !same_runtime {
+            self.scheduler_handles.remove(&session_file);
+            self.scheduler_results.remove(&session_file);
+            if let Ok((handle, results)) = runtime.start_scheduler_supervisor_with_results() {
+                self.scheduler_handles.insert(session_file.clone(), (Arc::downgrade(&runtime), handle));
+                self.scheduler_results.insert(session_file.clone(), results);
+            }
+        }
         runtime
     }
 
@@ -3489,7 +3496,12 @@ impl AppState {
                 self.model_roles.clone(),
                 self.browser_bridge.clone(),
             );
-            crate::worktree_setup::start(setup.clone(), options, self.stream_tx.clone())?;
+            crate::worktree_setup::start(
+                self.daemon_core.clone(),
+                setup.clone(),
+                options,
+                self.stream_tx.clone(),
+            )?;
         }
         if let Some(info) = self.client.projects.iter_mut().find(|p| p.work_dir == project) {
             info.sessions.insert(
@@ -3545,7 +3557,12 @@ impl AppState {
             self.model_roles.clone(),
             self.browser_bridge.clone(),
         );
-        match crate::worktree_setup::start(setup.clone(), options, self.stream_tx.clone()) {
+        match crate::worktree_setup::start(
+                self.daemon_core.clone(),
+                setup.clone(),
+                options,
+                self.stream_tx.clone(),
+            ) {
             Ok(()) => {
                 self.worktree_setups.insert(setup.session_id.clone(), setup);
                 self.client.is_generating = true;
@@ -3555,7 +3572,17 @@ impl AppState {
     }
 
     fn cleanup_cancelled_worktree(&mut self, setup: &crate::worktree_setup::WorktreeSetup) {
-        self.drop_session_runtime(&setup.session_file);
+        if let Some(runtime) = self.daemon_core.runtime_for_file(&setup.session_file) {
+            self.daemon_core.release_cancelled_runtime(&setup.session_file, &runtime);
+            if self.daemon_core.runtime_for_file(&setup.session_file).is_some() {
+                self.worktree_setups.remove(&setup.session_id);
+                self.client.session_status = Some("Cancelled setup; retained checkout used by another client".into());
+                self.request_session_refresh(&setup.project);
+                return;
+            }
+        }
+        self.scheduler_handles.remove(&setup.session_file);
+        self.scheduler_results.remove(&setup.session_file);
         self.worktree_setups.remove(&setup.session_id);
         match crate::worktree_setup::cleanup_cancelled(setup) {
             Ok(()) => {
@@ -3584,8 +3611,16 @@ impl AppState {
         let active = self.client.active_session_id.as_deref() == Some(id);
         if setup.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             drop(result);
-            // Free the runtime parked by the producer before it was claimed.
-            let _ = crate::runtimes::take_prepared_runtime(id);
+            // Serialize cancellation with producer publication. The returned
+            // handle is the exact prepared runtime and is safe to release only
+            // when no other client has retained it.
+            if let Some(runtime) = crate::runtimes::cancel_prepared_runtime(
+                id,
+                &setup.cancelled,
+            ) {
+                self.daemon_core
+                    .release_cancelled_runtime(&setup.session_file, &runtime);
+            }
             if active {
                 self.client.is_generating = false;
                 self.client.session_status = Some("Worktree setup cancelled".into());

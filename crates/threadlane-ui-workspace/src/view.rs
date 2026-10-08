@@ -47,11 +47,10 @@ use threadlane_ui_sidebar::SidebarView;
 use threadlane_ui_terminal::{
     FindInTerminalOutput, LinkDestination, OpenTerminalLink, SelectionStatus, TerminalView,
 };
-use threadlane_coding_agent::controller::spawn_session_runtime_construction;
 use threadlane_ui_state::updater::{self, UpdaterEvent};
 use threadlane_coding_agent::controller::runtime_status_text;
 use threadlane_ui_state::{
-    AppState, HydrationRuntimeOptions, SessionHydrationRequest, SessionInfo, WorkspacePage,
+    AppState, SessionHydrationRequest, SessionInfo, WorkspacePage,
 };
 use threadlane_ui_state::projection::{
     coding_agent_options, compute_full_session_projection, compute_latest_run_completion,
@@ -467,23 +466,24 @@ impl WorkspaceView {
             // Runtime construction loads WASI extensions through wasmi and must
             // not run on GPUI's 512 KiB GCD worker stacks. The blocking-pool
             // task starts now and overlaps the transcript projection below.
+            let (daemon_core, browser_bridge) = model.update(cx, |state, _cx| {
+                (state.daemon_core.clone(), state.browser_bridge.clone())
+            });
             let runtime_task = request.runtime_options.clone().map(|options| {
-                let HydrationRuntimeOptions {
-                    work_dir,
-                    model: model_id,
-                    model_roles,
-                } = options;
-                let session_file = request.session_file.clone();
-                // The wire request carries ids and paths only; the app-global
-                // browser bridge is resolved daemon-side at construction.
-                let browser = model.update(cx, |state, _cx| state.browser_bridge.clone());
-                spawn_session_runtime_construction(coding_agent_options(
-                    work_dir,
-                    session_file,
-                    model_id,
-                    model_roles,
-                    browser,
-                ))
+                let runtime_options = coding_agent_options(
+                    options.work_dir.clone(),
+                    request.session_file.clone(),
+                    options.model.clone(),
+                    options.model_roles.clone(),
+                    browser_bridge,
+                );
+                daemon_core.get_or_create_runtime_async(
+                    request.session_id.clone(),
+                    options.work_dir,
+                    request.session_file.clone(),
+                    runtime_options,
+                    None,
+                )
             });
             if request.reload_messages {
                 // The completion token is captured strictly before the

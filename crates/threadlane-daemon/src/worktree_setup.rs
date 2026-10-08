@@ -31,6 +31,7 @@ pub fn branch_name(raw: &str, session_id: &str) -> String {
 }
 
 pub fn start(
+    core: std::sync::Arc<crate::core::DaemonCore>,
     setup: WorktreeSetup,
     mut options: threadlane_coding_agent::CodingAgentOptions,
     tx: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
@@ -126,10 +127,22 @@ pub fn start(
             progress(SetupStage::Starting, branch);
             options.work_dir = setup.worktree.clone();
             options.session_file = Some(setup.session_file.clone());
-            let runtime =
-                threadlane_coding_agent::controller::spawn_session_runtime_construction(options)
-                    .await
-                    .map_err(|e| e.to_string())?;
+            let runtime = core.clone().get_or_create_runtime_async(
+                setup.session_id.clone(),
+                setup.worktree.clone(),
+                setup.session_file.clone(),
+                options,
+                None,
+            )
+            .await;
+            let runtime = match runtime {
+                Ok(runtime) => runtime,
+                Err(error) => return Err(error.to_string()),
+            };
+            if let Err(error) = ensure_active() {
+                core.release_cancelled_runtime(&setup.session_file, &runtime);
+                return Err(error);
+            }
             let project = setup.project.clone();
             let id = setup.session_id.clone();
             let session = tokio::task::spawn_blocking(move || {
@@ -139,10 +152,40 @@ pub fn start(
                     .ok_or_else(|| "Could not reload the prepared session".to_string())
             })
             .await
-            .map_err(|e| e.to_string())??;
+            .map_err(|e| e.to_string());
+            if let Err(error) = ensure_active() {
+                core.release_cancelled_runtime(&setup.session_file, &runtime);
+                return Err(error);
+            }
+            let session = match session {
+                Ok(Ok(session)) => session,
+                Ok(Err(error)) => {
+                    core.release_cancelled_runtime(&setup.session_file, &runtime);
+                    return Err(error);
+                }
+                Err(error) => {
+                    core.release_cancelled_runtime(&setup.session_file, &runtime);
+                    return Err(error);
+                }
+            };
             // The event stream stays wire-clean: the runtime handle waits in
             // the daemon-side mailbox until the consumer claims it.
-            crate::runtimes::park_prepared_runtime(setup.session_id.clone(), runtime);
+            if !crate::runtimes::park_prepared_runtime_if_active(
+                setup.session_id.clone(),
+                runtime.clone(),
+                &setup.cancelled,
+            ) {
+                core.release_cancelled_runtime(&setup.session_file, &runtime);
+                return Err("Worktree setup cancelled".into());
+            }
+            if let Err(error) = ensure_active() {
+                let _ = crate::runtimes::cancel_prepared_runtime(
+                    &setup.session_id,
+                    &setup.cancelled,
+                );
+                core.release_cancelled_runtime(&setup.session_file, &runtime);
+                return Err(error);
+            }
             Ok(session)
         }
         .await;
