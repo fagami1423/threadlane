@@ -205,6 +205,14 @@ impl SavedDeviceList {
         }
     }
 
+    pub fn replace_identity(&mut self, previous_id: &str, device: SavedDevice, select: bool) {
+        let selected_previous = self.selected_id.as_deref() == Some(previous_id);
+        if previous_id != device.id {
+            self.remove(previous_id);
+        }
+        self.upsert(device, select || selected_previous);
+    }
+
     pub fn remove(&mut self, id: &str) -> bool {
         let old_len = self.devices.len();
         self.devices.retain(|device| device.id != id);
@@ -274,6 +282,31 @@ mod tests {
         assert_eq!(list.rows().len(), 2);
         assert_eq!(list.rows()[0].name, "Renamed");
         assert_eq!(list.selected_id(), Some("one"));
+    }
+
+    #[test]
+    fn replacing_a_legacy_identity_preserves_unrelated_desktops() {
+        let mut list = SavedDeviceList::default();
+        list.upsert(device("legacy", "192.168.1.1", "token-1"), true);
+        list.upsert(device("other", "192.168.1.2", "token-2"), false);
+        list.replace_identity(
+            "legacy",
+            SavedDevice::new(
+                "canonical".into(),
+                "Desktop".into(),
+                "192.168.1.1".into(),
+                42_000,
+                "token-1".into(),
+            ),
+            true,
+        );
+
+        let rows = list.rows();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.id == "canonical"));
+        assert!(rows.iter().any(|row| row.id == "other"));
+        assert!(!rows.iter().any(|row| row.id == "legacy"));
+        assert_eq!(list.selected_id(), Some("canonical"));
     }
 
     #[test]

@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
@@ -582,9 +584,14 @@ fn write_config(path: &Path, config: &PairingConfig) -> Result<(), String> {
         drop(file);
         fs::rename(&temporary, path)
             .map_err(|error| format!("could not replace pairing registry: {error}"))?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| format!("could not sync pairing registry directory: {error}"))?;
+        #[cfg(unix)]
+        {
+            File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| {
+                    format!("could not sync pairing registry directory: {error}")
+                })?;
+        }
         Ok(())
     })();
     if result.is_err() {
@@ -687,6 +694,7 @@ fn primary_ipv4() -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use threadlane_protocol::daemon::SessionEvent;
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -758,10 +766,93 @@ mod tests {
         assert_eq!(restored.info().port, original_port);
         assert!(restored.pending_invitation().is_none());
         assert_eq!(restored.devices()[0].id, invitation.device_id);
+        let reconnect = connect(original_port, &invitation.token, "Test phone")
+            .await
+            .expect("saved credential should authenticate after restore");
+        drop(reconnect);
         assert!(connect(original_port, "not-a-valid-device-token", "Attacker")
             .await
             .is_err());
         restored.stop().await;
+    }
+
+    #[tokio::test]
+    async fn large_replay_does_not_block_ping_or_revocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONFIG_FILENAME);
+        let core = DaemonCore::new().unwrap();
+        let mut server = PairingServer::start_with_config_path(
+            core.clone(),
+            &path,
+            Some("127.0.0.1".to_string()),
+        )
+        .await
+        .unwrap();
+        let invitation = server.pending_invitation().unwrap();
+        let sender = core.event_sender();
+        for index in 0..300 {
+            sender
+                .send(SessionEvent::DaemonError {
+                    session_id: None,
+                    message: format!("replay {index}"),
+                })
+                .unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if core.journal_tail().len() >= 300 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("journal did not receive test events");
+        let tail = core.journal_tail();
+        assert!(tail.len() > 256);
+
+        let mut socket = connect(invitation.port, &invitation.token, "Test phone")
+            .await
+            .unwrap();
+        for (sequence, _) in &tail {
+            let text = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                socket.next(),
+            )
+            .await
+            .expect("replay stalled")
+            .expect("socket closed during replay")
+            .unwrap()
+            .into_text()
+            .unwrap();
+            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(frame["seq"].as_u64(), Some(*sequence));
+        }
+        socket.send(Message::Ping(Vec::new().into())).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(Message::Pong(_))) => break,
+                    Some(Ok(_)) => continue,
+                    Some(Err(error)) => panic!("paired socket failed: {error}"),
+                    None => panic!("paired socket closed before Pong"),
+                }
+            }
+        })
+        .await
+        .expect("ping/pong should continue after large replay");
+        server.remove_device(&invitation.device_id).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match socket.next().await {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(_)) => continue,
+                }
+            }
+        })
+        .await
+        .expect("revocation should close the replaying client");
+        server.stop().await;
     }
 
     #[tokio::test]
@@ -792,6 +883,65 @@ mod tests {
         .unwrap();
         assert!(restored.pending_invitation().is_none());
         restored.stop().await;
+    }
+
+    #[tokio::test]
+    async fn occupied_saved_port_fails_restore_without_disabling_registry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONFIG_FILENAME);
+        let server = PairingServer::start_with_config_path(
+            DaemonCore::new().unwrap(),
+            &path,
+            Some("127.0.0.1".to_string()),
+        )
+        .await
+        .unwrap();
+        let port = server.info().port;
+        server.stop().await;
+
+        let occupied = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
+            .await
+            .unwrap();
+        assert!(PairingServer::restore_with_config_path(
+            DaemonCore::new().unwrap(),
+            &path,
+            Some("127.0.0.1".to_string()),
+        )
+        .await
+        .is_err());
+        let config = read_config(&path).unwrap().unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.port, port);
+        drop(occupied);
+    }
+
+    #[tokio::test]
+    async fn remove_all_disables_sharing_and_restore() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONFIG_FILENAME);
+        let core = DaemonCore::new().unwrap();
+        let server = PairingServer::start_with_config_path(
+            core.clone(),
+            &path,
+            Some("127.0.0.1".to_string()),
+        )
+        .await
+        .unwrap();
+        let invitation = server.pending_invitation().unwrap();
+        drop(connect(invitation.port, &invitation.token, "Test phone").await.unwrap());
+        server.remove_all().await.unwrap();
+
+        assert!(PairingServer::restore_with_config_path(
+            core,
+            &path,
+            Some("127.0.0.1".to_string()),
+        )
+        .await
+        .unwrap()
+        .is_none());
+        let config = read_config(&path).unwrap().unwrap();
+        assert!(!config.enabled);
+        assert!(config.devices.is_empty());
     }
 
     #[tokio::test]

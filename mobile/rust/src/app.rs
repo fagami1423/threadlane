@@ -262,9 +262,8 @@ pub struct MobileApp {
     /// The keyboard subscription rides along so it drops with the input.
     question_inputs: HashMap<String, (Entity<InputState>, Subscription)>,
     connect_error: Option<String>,
-    /// Whether a persisted pairing exists — drives the Forget button.
-    saved_pairing: bool,
     saved_device_list: SavedDeviceList,
+    remove_device_confirmation: Option<String>,
     selected_device_id: Option<String>,
     active_device_id: Option<String>,
     connection_snapshot: Option<ConnectionSnapshot>,
@@ -536,7 +535,6 @@ impl MobileApp {
             Ok(devices) => (devices, None),
             Err(error) => (SavedDeviceList::default(), Some(error)),
         };
-        let saved_pairing = !saved_device_list.rows().is_empty();
         let selected_device_id = saved_device_list.selected_id().map(str::to_string);
         let mut app = Self {
             screen: Screen::Connect,
@@ -547,8 +545,8 @@ impl MobileApp {
             search,
             question_inputs: HashMap::new(),
             connect_error: saved_devices_error,
-            saved_pairing,
             saved_device_list,
+            remove_device_confirmation: None,
             selected_device_id,
             active_device_id: None,
             connection_snapshot: None,
@@ -782,7 +780,6 @@ impl MobileApp {
         if self.selected_device_id.as_deref() == Some(id) {
             self.selected_device_id = None;
         }
-        self.saved_pairing = !self.saved_device_list.rows().is_empty();
         self.seen_links.retain(|link| {
             let Ok(parsed) = url::Url::parse(link) else {
                 return true;
@@ -804,16 +801,8 @@ impl MobileApp {
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.device_id.as_deref() == Some(id))
         {
-            self.connection_generation = self.connection_generation.wrapping_add(1);
-            self._pump = None;
-            self.daemon = None;
-            self.connection_snapshot = None;
-            self.active_device_id = None;
-            self.active = None;
-            self.client = ClientState::default();
-            self.link_state = "Disconnected".into();
+            self.disconnect(cx);
             self.connect_error = None;
-            self.screen = Screen::Connect;
             self.token.update(cx, |input, cx| input.set_value("", window, cx));
             cx.notify();
         }
@@ -837,11 +826,6 @@ impl MobileApp {
             cx.notify();
             return;
         }
-        if let Some(id) = &snapshot.device_id {
-            self.removed_device_ids.remove(id);
-        }
-        self.connection_generation = self.connection_generation.wrapping_add(1);
-        let generation = self.connection_generation;
         let url = format!("ws://{}:{}", snapshot.host, snapshot.port);
         let daemon = match MobileDaemon::connect(url, Some(snapshot.token.clone())) {
             Ok(daemon) => daemon,
@@ -851,6 +835,11 @@ impl MobileApp {
                 return;
             }
         };
+        if let Some(id) = &snapshot.device_id {
+            self.removed_device_ids.remove(id);
+        }
+        self.connection_generation = self.connection_generation.wrapping_add(1);
+        let generation = self.connection_generation;
         self.link_state = "Connecting…".to_string();
         self.connect_error = None;
         self.active_device_id = None;
@@ -909,6 +898,9 @@ impl MobileApp {
         // driver's reconnect loop.
         self.daemon = None;
         self._pump = None;
+        self.connection_generation = self.connection_generation.wrapping_add(1);
+        self.active_device_id = None;
+        self.connection_snapshot = None;
         self.sending = false;
         self.pending_composer.clear();
         self.client.projects.clear();
@@ -934,30 +926,6 @@ impl MobileApp {
         self.stash_drop_confirm = None;
         self.stash_drop_inflight = None;
         self.screen = Screen::Connect;
-        cx.notify();
-    }
-
-    /// Clear the persisted pairing and the fields — the next launch lands
-    /// on a blank Connect screen instead of auto-reconnecting.
-    fn forget_pairing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let id = self
-            .active_device_id
-            .clone()
-            .or_else(|| self.selected_device_id.clone());
-        if let Some(id) = id {
-            if let Err(error) = self.remove_saved_device(&id, window, cx) {
-                self.connect_error = Some(error);
-            }
-        } else {
-            if !self.saved_device_list.rows().is_empty() {
-                self.connect_error = Some("Select a saved desktop before forgetting it".into());
-            } else {
-                clear_legacy_pairing();
-                for input in [&self.host, &self.port, &self.token] {
-                    input.update(cx, |input, cx| input.set_value("", window, cx));
-                }
-            }
-        }
         cx.notify();
     }
 
@@ -1566,7 +1534,7 @@ impl MobileApp {
                 }
                 self.link_state = "Live".to_string();
                 self.connect_error = None;
-                if let Some(snapshot) = self.connection_snapshot.as_ref() {
+                if let Some(snapshot) = self.connection_snapshot.clone() {
                     let id = self
                         .daemon
                         .as_ref()
@@ -1593,13 +1561,25 @@ impl MobileApp {
                             snapshot.port,
                             snapshot.token.clone(),
                         );
-                        self.saved_device_list.upsert(saved, true);
+                        let previous_id = snapshot.device_id.as_deref().filter(|previous_id| {
+                            self.saved_device_list
+                                .device(previous_id)
+                                .is_some_and(|device| device.token() == snapshot.token.as_str())
+                        });
+                        if let Some(previous_id) = previous_id {
+                            self.saved_device_list
+                                .replace_identity(previous_id, saved, true);
+                        } else {
+                            self.saved_device_list.upsert(saved, true);
+                        }
+                        if let Some(snapshot) = &mut self.connection_snapshot {
+                            snapshot.device_id = Some(id.clone());
+                        }
                         self.selected_device_id = Some(id.clone());
                         self.active_device_id = Some(id);
                         match persist_saved_devices(&self.saved_device_list) {
                             Ok(()) => {
                                 clear_legacy_pairing();
-                                self.saved_pairing = true;
                             }
                             Err(error) => {
                                 self.connect_error =
@@ -2328,6 +2308,59 @@ impl MobileApp {
     }
 
     fn render_connect(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut saved = div().flex_none().flex().flex_col().gap_3();
+        let devices = self.saved_devices();
+        if !devices.is_empty() {
+            saved = saved.child(div().text_sm().font_bold().child("Saved desktops"));
+        }
+        for device in devices {
+            let id = device.id.clone();
+            let remove_id = device.id.clone();
+            let confirming = self.remove_device_confirmation.as_deref() == Some(&id);
+            let selected = self.selected_device_id() == Some(&id);
+            let current = self.current_device_id() == Some(&id);
+            let status = if current { self.link_state.as_str() } else if selected {
+                "Auto-connect on launch"
+            } else { "Saved" };
+            let mut row = div().flex().flex_col().gap_2().p_3().rounded_lg()
+                .border_1().border_color(if selected { cx.theme().primary } else { cx.theme().border })
+                .child(div().font_bold().child(device.name))
+                .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                    .child(format!("{}:{} · {status}", device.host, device.port)))
+                .child(div().flex().gap_2()
+                    .child(Button::new(SharedString::from(format!("connect-{id}")))
+                        .h_11().flex_1().label("Connect")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.remove_device_confirmation = None;
+                            this.connect_saved_device(&id, window, cx);
+                        })))
+                    .child(Button::new(SharedString::from(format!("remove-{remove_id}")))
+                        .ghost().h_11().label("Remove…")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.remove_device_confirmation = Some(remove_id.clone());
+                            cx.notify();
+                        }))));
+            if confirming {
+                let id = device.id;
+                row = row.child(div().text_sm().text_color(cx.theme().muted_foreground)
+                    .child("Forget this desktop on this phone? Reconnecting will require its pairing link. To revoke access, also remove this phone on the desktop."))
+                    .child(div().flex().gap_2()
+                        .child(Button::new("cancel-remove-desktop").h_11().flex_1().label("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.remove_device_confirmation = None;
+                                cx.notify();
+                            })))
+                        .child(Button::new("confirm-remove-desktop").danger().h_11().flex_1().label("Forget desktop")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if let Err(error) = this.remove_saved_device(&id, window, cx) {
+                                    this.connect_error = Some(error);
+                                }
+                                this.remove_device_confirmation = None;
+                                cx.notify();
+                            }))));
+            }
+            saved = saved.child(row);
+        }
         let mut brand = div().flex().items_center().gap_3();
         if let Some(logo) = threadlane_ui_theme::bundled_icon("icons/threadlane.svg") {
             brand = brand.child(logo.large().text_color(cx.theme().foreground));
@@ -2344,9 +2377,8 @@ impl MobileApp {
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child(
-                        "Run your desktop sessions from your phone. Scan the QR code \
-                         in the desktop app (sidebar → Share with mobile) \
-                         or enter the pairing details below.",
+                        "Your selected desktop reconnects automatically. Keep the desktop app \
+                         open and both devices on the same network.",
                     ),
             );
         div()
@@ -2360,6 +2392,23 @@ impl MobileApp {
             .p_4()
             .gap_4()
             .child(header)
+            .when(self.daemon.is_some(), |this| {
+                this.child(Button::new("back-to-sessions").h_11().label("Back to sessions")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.screen = Screen::Main;
+                        cx.notify();
+                    })))
+            })
+            .child(saved)
+            .when_some(self.connect_error.clone(), |this, error| {
+                this.child(div().text_sm().text_color(cx.theme().danger).child(error))
+            })
+            .child(div().flex_none().flex().flex_col().gap_2()
+                .child(div().font_bold().child("Add a desktop"))
+                .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                    .child("On your desktop, open Share with mobile → Add device. Scan the QR with your phone’s camera. You only need to do this once.")))
+            .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                .child("Connection details — enter a pairing manually, or update the address if your desktop moved networks."))
             .child(
                 div()
                     .flex_none()
@@ -2406,9 +2455,6 @@ impl MobileApp {
                             .child(Input::new(&self.token).large().aria_label("Pairing token")),
                     ),
             )
-            .when_some(self.connect_error.clone(), |this, error| {
-                this.child(div().text_sm().text_color(cx.theme().danger).child(error))
-            })
             .child(
                 Button::new("connect")
                     .primary()
@@ -2418,19 +2464,6 @@ impl MobileApp {
                     .disabled(self.link_state == "Connecting…")
                     .on_click(cx.listener(|this, _, window, cx| this.connect_now(window, cx))),
             )
-            .when(self.saved_pairing, |this| {
-                this.child(
-                    Button::new("forget-pairing")
-                        .ghost()
-                        .small()
-                        .h_11()
-                        .label("Forget saved pairing")
-                        .w_full()
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.forget_pairing(window, cx)),
-                        ),
-                )
-            })
     }
 
     fn render_sessions(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3900,8 +3933,6 @@ impl MobileApp {
     /// so project picking and connection controls live behind the scrim.
     fn render_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let width = window.viewport_size().width * 0.82;
-        let saved_pairing = self.saved_pairing;
-        let connected = self.daemon.as_ref().is_some_and(|d| d.is_connected());
         div()
             .id("mobile-sidebar")
             .absolute()
@@ -4008,26 +4039,23 @@ impl MobileApp {
                                     .h_11()
                                     .icon(icon(kit_icons::Unplug.1))
                                     .label("Disconnect")
-                                    .disabled(!connected)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.sidebar_open = false;
                                         this.disconnect(cx);
                                     })),
                             )
-                            .when(saved_pairing, |this| {
-                                this.child(
-                                    Button::new("sidebar-forget")
+                            .child(
+                                    Button::new("sidebar-shared-desktops")
                                         .ghost()
                                         .w_full()
                                         .h_11()
-                                        .icon(icon(kit_icons::Trash.1))
-                                        .label("Forget saved pairing")
-                                        .on_click(cx.listener(|this, _, window, cx| {
+                                        .label("Shared desktops")
+                                        .on_click(cx.listener(|this, _, _, cx| {
                                             this.sidebar_open = false;
-                                            this.forget_pairing(window, cx);
+                                            this.screen = Screen::Connect;
+                                            cx.notify();
                                         })),
-                                )
-                            }),
+                            ),
                     ),
             )
     }

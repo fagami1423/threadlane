@@ -4282,7 +4282,12 @@ impl AppState {
         u64,
         tokio::task::JoinHandle<Result<Option<threadlane_daemon::pairing::PairingServer>, String>>,
     )> {
-        if !self.pairing_restore_allowed || self.daemon_remote || self.pairing.is_some() {
+        if !self.pairing_restore_allowed
+            || self.daemon_remote
+            || self.pairing.is_some()
+            || self.pairing_starting
+            || self.pairing_remove_all_pending
+        {
             return None;
         }
         let executor = match crate::chat::executor() {
@@ -4399,10 +4404,12 @@ impl AppState {
         if self.pairing_remove_all_pending {
             return Err("device sharing removal is already in progress".to_string());
         }
+        if self.pairing_starting {
+            return Err("device pairing is still starting".to_string());
+        }
         let executor = crate::chat::executor()?;
         self.pairing_generation = self.pairing_generation.wrapping_add(1);
         let generation = self.pairing_generation;
-        self.pairing_starting = false;
         self.pairing_error = None;
         self.pairing_remove_all_pending = true;
         let server = self.pairing.take();

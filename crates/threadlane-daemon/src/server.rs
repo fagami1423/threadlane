@@ -360,32 +360,6 @@ async fn serve_connection(
     let reply_tx = out_tx.clone();
     let (tail, mut broadcast_rx) =
         core.subscribe_with_tail(since.load(Ordering::SeqCst));
-    for (seq, event) in tail {
-        let frame = wire_frame(seq, &event).map_err(|error| error.to_string())?;
-        if out_tx.send(frame).await.is_err() {
-            return Ok(());
-        }
-    }
-    let broadcast_task = tokio::spawn(async move {
-        loop {
-            let (seq, event) = match broadcast_rx.recv().await {
-                Ok(pair) => pair,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    (0, SessionEvent::DaemonError {
-                        session_id: None,
-                        message: format!("dropped {skipped} daemon events; refresh the session"),
-                    })
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-            };
-            let Ok(frame) = wire_frame(seq, &event) else {
-                continue;
-            };
-            if out_tx.send(frame).await.is_err() {
-                return;
-            }
-        }
-    });
 
     let (mut write, mut read) = socket.split();
     let (close_connection, close_connection_rx) = oneshot::channel();
@@ -406,6 +380,38 @@ async fn serve_connection(
                         return;
                     }
                 }
+            }
+        }
+    });
+
+    let broadcast_task = tokio::spawn(async move {
+        for (seq, event) in tail {
+            let Ok(frame) = wire_frame(seq, &event) else {
+                continue;
+            };
+            if out_tx.send(frame).await.is_err() {
+                return;
+            }
+        }
+        loop {
+            let (seq, event) = match broadcast_rx.recv().await {
+                Ok(pair) => pair,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => (
+                    0,
+                    SessionEvent::DaemonError {
+                        session_id: None,
+                        message: format!(
+                            "dropped {skipped} daemon events; refresh the session"
+                        ),
+                    },
+                ),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            };
+            let Ok(frame) = wire_frame(seq, &event) else {
+                continue;
+            };
+            if out_tx.send(frame).await.is_err() {
+                return;
             }
         }
     });

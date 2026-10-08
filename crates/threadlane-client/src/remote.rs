@@ -266,6 +266,7 @@ impl RemoteDaemon {
             url,
             token,
             device_name,
+            pairing,
             command_rx,
             subscribers,
             pending_requests,
@@ -386,6 +387,7 @@ impl RemoteDaemon {
         url: String,
         token: Option<String>,
         device_name: Option<String>,
+        pairing: bool,
         mut command_rx: mpsc::UnboundedReceiver<OutboundMessage>,
         subscribers: Arc<Mutex<Vec<mpsc::UnboundedSender<SessionEvent>>>>,
         pending_requests: Arc<Mutex<HashMap<u64, PendingRequest>>>,
@@ -501,11 +503,12 @@ impl RemoteDaemon {
             let (mut socket, response) = match connected_socket {
                 Ok(Ok(pair)) => pair,
                 Ok(Err(error))
-                    if matches!(
-                        &error,
-                        tokio_tungstenite::tungstenite::Error::Http(response)
-                            if response.status() == tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED
-                    ) =>
+                    if pairing
+                        && matches!(
+                            &error,
+                            tokio_tungstenite::tungstenite::Error::Http(response)
+                                if response.status() == tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED
+                        ) =>
                 {
                     let message = "This device is no longer authorized. Remove it and pair again."
                         .to_string();
@@ -904,7 +907,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for attempt in 0..2 {
+            for _ in 0..2 {
                 let (socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
                     .await
                     .expect("client did not reconnect")
@@ -946,11 +949,7 @@ mod tests {
                     serde_json::from_str::<SessionCommand>(&inventory).unwrap(),
                     SessionCommand::GetProjects
                 ));
-                if attempt == 0 {
-                    socket.close(None).await.unwrap();
-                } else {
-                    socket.close(None).await.unwrap();
-                }
+                socket.close(None).await.unwrap();
             }
         });
 
