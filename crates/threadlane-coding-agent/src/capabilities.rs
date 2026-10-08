@@ -312,12 +312,13 @@ impl ToolExecutor for GitHubToolExecutor {
                 "type": "object",
                 "properties": {
                     "action": {"type":"string", "enum":["status", "feedback", "logs", "comment", "reply", "ready"]},
-                    "number": {"type":"integer", "minimum":1, "description":"PR number in the current checkout's GitHub repository."},
+                    "repository": {"type":"string", "description":"Target GitHub repository as OWNER/REPO or HOST/OWNER/REPO. Take this from the intended PR URL; never infer it from an ambiguous GitHub CLI default."},
+                    "number": {"type":"integer", "minimum":1, "description":"PR number in the explicitly selected repository."},
                     "body": {"type":["string", "null"], "description":"Reply body for comment/reply, otherwise null."},
                     "comment_id": {"type":["integer", "null"], "description":"Root inline comment REST id for reply, otherwise null."},
                     "run_id": {"type":["integer", "null"], "description":"GitHub Actions run ID for logs, otherwise null."}
                 },
-                "required": ["action", "number", "body", "comment_id", "run_id"],
+                "required": ["action", "repository", "number", "body", "comment_id", "run_id"],
                 "additionalProperties": false
             }),
             strict: Some(true),
@@ -1828,6 +1829,33 @@ mod github_tests {
         );
     }
 
+    #[test]
+    fn github_pr_tool_requires_an_explicit_target_repository() {
+        let executor = GitHubToolExecutor {
+            work_dir: PathBuf::from("."),
+        };
+        let definitions = executor.tool_definitions();
+        let definition = definitions
+            .iter()
+            .find(|definition| definition.name == GITHUB_PR_TOOL_NAME)
+            .unwrap();
+
+        assert_eq!(
+            definition.parameters["properties"]["repository"]["description"],
+            "Target GitHub repository as OWNER/REPO or HOST/OWNER/REPO. Take this from the intended PR URL; never infer it from an ambiguous GitHub CLI default."
+        );
+        assert_eq!(
+            definition.parameters["properties"]["number"]["description"],
+            "PR number in the explicitly selected repository."
+        );
+        assert!(
+            definition.parameters["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("repository"))
+        );
+    }
+
     #[tokio::test]
     async fn draft_pr_tool_rejects_missing_fields_before_git_operations() {
         let executor = GitHubToolExecutor {
@@ -1855,7 +1883,7 @@ mod read_only_policy_tests {
         assert!(github_tool_mutates("create_draft_pull_request", Some("{}")));
         assert!(github_tool_mutates("github_pr", Some("invalid")));
         for (action, mutates) in [("status", false), ("feedback", false), ("logs", false), ("comment", true), ("reply", true), ("ready", true)] {
-            let args = serde_json::json!({"action":action,"number":1}).to_string();
+            let args = serde_json::json!({"action":action,"repository":"owner/repo","number":1}).to_string();
             assert_eq!(github_tool_mutates("github_pr", Some(&args)), mutates);
         }
     }

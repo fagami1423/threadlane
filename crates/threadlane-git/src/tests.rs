@@ -673,6 +673,7 @@ fn parses_github_pr_json_with_checks_and_comments() {
     let pr = parse_gh_pr_json(sample).unwrap();
     assert_eq!(pr.number, 42);
     assert_eq!(pr.title, "Center editor panel");
+    assert!(!pr.issue_comments[0].viewer_did_author);
     assert_eq!(pr.head_ref, "center_editor_panel");
     assert_eq!(pr.base_ref, "main");
     assert!(!pr.is_draft);
@@ -794,13 +795,18 @@ fn github_issue_keeps_conversation_and_review_comments_separate() {
             r#"{
                 "number": 42,
                 "url": "https://github.com/threadlane/threadlane/pull/42",
-                "comments": [{ "id": "IC_2", "author": { "login": "commenter" }, "body": "Issue comment", "createdAt": "2026-08-30T12:01:00Z", "url": "https://github.com/threadlane/threadlane/pull/42#issuecomment-2" }]
+                "comments": [
+                    { "id": "IC_2", "author": { "login": "agent-bot" }, "body": "Agent reply", "createdAt": "2026-08-30T12:01:00Z", "url": "https://github.com/threadlane/threadlane/pull/42#issuecomment-2", "viewerDidAuthor": true },
+                    { "id": "IC_3", "author": { "login": "reviewer" }, "body": "Reviewer feedback", "createdAt": "2026-08-30T12:02:00Z", "url": "https://github.com/threadlane/threadlane/pull/42#issuecomment-3", "viewerDidAuthor": false }
+                ]
             }"#,
         )
         .unwrap();
 
-    assert_eq!(pr.issue_comments.len(), 1);
-    assert_eq!(pr.comments_count, 1);
+    assert_eq!(pr.issue_comments.len(), 2);
+    assert_eq!(pr.comments_count, 2);
+    assert!(pr.issue_comments[0].viewer_did_author);
+    assert!(!pr.issue_comments[1].viewer_did_author);
     assert!(pr.review_comments.is_empty());
     assert!(!pr.review_comments_complete);
 
@@ -810,8 +816,8 @@ fn github_issue_keeps_conversation_and_review_comments_separate() {
         )
         .unwrap();
 
-    assert_eq!(pr.issue_comments.len(), 1);
-    assert_eq!(pr.comments_count, 1);
+    assert_eq!(pr.issue_comments.len(), 2);
+    assert_eq!(pr.comments_count, 2);
     assert_eq!(pr.review_comments.len(), 1);
     assert_eq!(pr.review_comments[0].remote_id, "99");
     assert_eq!(pr.review_comments[0].in_reply_to_id.as_deref(), Some("41"));

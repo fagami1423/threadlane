@@ -365,6 +365,7 @@ fn parse_pr_conversation_comments(
             body: comment["body"].as_str().unwrap_or("").to_owned(),
             created_at: comment["createdAt"].as_str().unwrap_or("").to_owned(),
             url: comment["url"].as_str().unwrap_or("").to_owned(),
+            viewer_did_author: comment["viewerDidAuthor"].as_bool().unwrap_or(false),
         })
         .collect()
 }

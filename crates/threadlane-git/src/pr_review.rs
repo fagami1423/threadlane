@@ -132,6 +132,11 @@ fn is_review_status_notice(body: &str) -> bool {
     body.contains("<!-- codex-pull-request-review-summary -->")
         || body
             .contains("<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->")
+        || body.contains("<!-- This is an auto-generated comment: summarize by coderabbit.ai -->")
+        || body.contains(
+            "<!-- This is an auto-generated comment: review in progress by coderabbit.ai -->",
+        )
+        || body.contains("<!-- devin-pr-monitoring-controls -->")
         || body.contains("### 💡 Codex Review")
 }
 
@@ -195,7 +200,8 @@ pub fn collect_actionable_pr_feedback(pr: &GitHubPrInfo) -> Vec<PrFeedbackItem> 
 
     for comment in &pr.issue_comments {
         let body = comment.body.trim();
-        if comment.author.eq_ignore_ascii_case(&pr.author)
+        if comment.viewer_did_author
+            || comment.author.eq_ignore_ascii_case(&pr.author)
             || is_ci_or_status_bot(&comment.author)
             || body.is_empty()
             || is_review_status_notice(body)
@@ -318,7 +324,7 @@ pub fn build_fix_ci_prompt(pr: &GitHubPrInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PrReview, PrReviewComment};
+    use crate::{PrConversationComment, PrReview, PrReviewComment};
 
     #[test]
     fn test_is_ci_or_status_bot() {
@@ -333,24 +339,89 @@ mod tests {
     #[test]
     fn conversation_feedback_excludes_self_and_status_notices() {
         let pr = GitHubPrInfo {
-            author: "author".into(),
-            issue_comments: [
-                ("reviewer", "Please add a regression test"),
-                ("author", "Fixed"),
-                ("codecov[bot]", "Coverage changed"),
-                ("coderabbitai[bot]", "<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->"),
-            ].into_iter().enumerate().map(|(id, (author, body))| crate::PrConversationComment {
-                remote_id: id.to_string(), author: author.into(), body: body.into(),
+            author: "alice".into(),
+            review_comments: vec![PrReviewComment {
+                remote_id: "inline".into(),
+                author: "bob".into(),
+                body: "Fix this inline issue".into(),
                 ..Default::default()
-            }).collect(),
+            }],
+            reviews: vec![PrReview {
+                remote_id: "review".into(),
+                author: "carol".into(),
+                body: "Please address this review".into(),
+                state: "COMMENTED".into(),
+                ..Default::default()
+            }],
+            issue_comments: vec![
+                PrConversationComment {
+                    remote_id: "reviewer".into(),
+                    author: "bob".into(),
+                    body: "Please add a regression test".into(),
+                    ..Default::default()
+                },
+                PrConversationComment {
+                    remote_id: "agent-reply".into(),
+                    author: "agent-bot".into(),
+                    body: "Fixed".into(),
+                    viewer_did_author: true,
+                    ..Default::default()
+                },
+                PrConversationComment {
+                    remote_id: "author".into(),
+                    author: "alice".into(),
+                    body: "I am the PR author".into(),
+                    ..Default::default()
+                },
+                PrConversationComment {
+                    remote_id: "codecov".into(),
+                    author: "codecov[bot]".into(),
+                    body: "Coverage changed".into(),
+                    ..Default::default()
+                },
+                PrConversationComment {
+                    remote_id: "rate-limited".into(),
+                    author: "coderabbitai[bot]".into(),
+                    body: "<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->".into(),
+                    ..Default::default()
+                },
+                PrConversationComment {
+                    remote_id: "summary".into(),
+                    author: "coderabbitai[bot]".into(),
+                    body: "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\nProgress summary".into(),
+                    ..Default::default()
+                },
+                PrConversationComment {
+                    remote_id: "progress".into(),
+                    author: "coderabbitai[bot]".into(),
+                    body: "<!-- This is an auto-generated comment: review in progress by coderabbit.ai -->\nProcessing".into(),
+                    ..Default::default()
+                },
+                PrConversationComment {
+                    remote_id: "monitoring".into(),
+                    author: "devin-ai-integration[bot]".into(),
+                    body: "<!-- devin-pr-monitoring-controls -->\nMonitoring controls".into(),
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         };
         let feedback = collect_actionable_pr_feedback(&pr);
-        assert_eq!(feedback.len(), 1);
-        assert_eq!(feedback[0].kind, "conversation_comment");
+        assert_eq!(
+            feedback.iter().map(|item| item.kind).collect::<Vec<_>>(),
+            vec!["inline_comment", "review", "conversation_comment"]
+        );
+        assert_eq!(feedback[2].author, "bob");
+        assert_eq!(feedback[2].body, "Please add a regression test");
         let mut store = PrReviewTrackingStore::default();
-        assert!(matches!(check_and_record_fresh_feedback(&mut store, "branch", &feedback), FeedbackSyncResult::NewFeedback(_)));
-        assert_eq!(check_and_record_fresh_feedback(&mut store, "branch", &feedback), FeedbackSyncResult::UpToDate);
+        assert!(matches!(
+            check_and_record_fresh_feedback(&mut store, "branch", &feedback),
+            FeedbackSyncResult::NewFeedback(_)
+        ));
+        assert_eq!(
+            check_and_record_fresh_feedback(&mut store, "branch", &feedback),
+            FeedbackSyncResult::UpToDate
+        );
     }
 
     #[test]
