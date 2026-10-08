@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use threadlane_client::DaemonClient;
 use threadlane_protocol::daemon::{CommandResponse, SessionCommand};
+pub use threadlane_protocol::daemon::{ProjectFileError, VersionedFile};
 use threadlane_protocol::repo::{
     DiffOptions, GitActionOutcome, GitFile, GitFileInventory, GitHubPrInfo, GitOperation,
     GitResponse, GitStatus, ProjectFileNode,
@@ -24,6 +25,18 @@ use threadlane_protocol::repo::{
 /// cannot answer.
 pub const UNSUPPORTED_PROJECT_IO: &str =
     "the attached daemon does not support project file/git requests (protocol v3)";
+
+fn guarded_request_error(client: &Arc<dyn DaemonClient>, message: String) -> ProjectFileError {
+    if !client.is_connected() || message.contains("not connected") {
+        ProjectFileError::Disconnected
+    } else if message.contains("Guarded file saves require protocol")
+        || message.contains("does not support command requests")
+    {
+        ProjectFileError::Unsupported
+    } else {
+        ProjectFileError::Io { message }
+    }
+}
 
 async fn git_request(
     client: &Arc<dyn DaemonClient>,
@@ -250,6 +263,67 @@ pub async fn read_file(
     {
         CommandResponse::FileContent { content } => Ok(content),
         _ => Err("daemon answered ReadProjectFile with a mismatched response".to_string()),
+    }
+}
+
+/// Read `path` as UTF-8 text with a daemon-owned SHA-256 version.
+pub async fn read_file_versioned(
+    client: &Arc<dyn DaemonClient>,
+    work_dir: &Path,
+    path: String,
+) -> Result<VersionedFile, ProjectFileError> {
+    if !client.is_connected() {
+        return Err(ProjectFileError::Disconnected);
+    }
+    if !client.supports_guarded_saves() {
+        return Err(ProjectFileError::Unsupported);
+    }
+    let response = client
+        .request(SessionCommand::ReadProjectFileVersioned {
+            work_dir: work_dir.to_path_buf(),
+            path,
+        })
+        .await
+        .map_err(|message| guarded_request_error(client, message))?;
+    match response {
+        CommandResponse::VersionedFile { result } => result,
+        _ => Err(ProjectFileError::Io {
+            message: "daemon answered ReadProjectFileVersioned with a mismatched response"
+                .to_string(),
+        }),
+    }
+}
+
+/// Save `content` only if the daemon's current file version matches the
+/// version previously returned by `read_file_versioned`.
+pub async fn write_file_guarded(
+    client: &Arc<dyn DaemonClient>,
+    work_dir: &Path,
+    path: String,
+    content: String,
+    expected_version: String,
+) -> Result<String, ProjectFileError> {
+    if !client.is_connected() {
+        return Err(ProjectFileError::Disconnected);
+    }
+    if !client.supports_guarded_saves() {
+        return Err(ProjectFileError::Unsupported);
+    }
+    let response = client
+        .request(SessionCommand::WriteProjectFileGuarded {
+            work_dir: work_dir.to_path_buf(),
+            path,
+            content,
+            expected_version,
+        })
+        .await
+        .map_err(|message| guarded_request_error(client, message))?;
+    match response {
+        CommandResponse::GuardedFileWrite { result } => result,
+        _ => Err(ProjectFileError::Io {
+            message: "daemon answered WriteProjectFileGuarded with a mismatched response"
+                .to_string(),
+        }),
     }
 }
 

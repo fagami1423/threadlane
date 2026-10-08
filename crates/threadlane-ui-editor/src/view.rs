@@ -10,6 +10,10 @@ use gpui_component::WindowExt;
 use crate::closed_files::{ClosedFileHistory, FileTarget};
 use threadlane_client::DaemonClient;
 use threadlane_ui_state::AppState;
+use threadlane_ui_kit::EditorSaveStatus;
+
+#[path = "guarded_save.rs"]
+mod guarded_save;
 
 actions!(editor, [SaveFile]);
 
@@ -25,6 +29,10 @@ pub struct EditorTab {
     file_name: String,
     _language: &'static str,
     saved_content: String,
+    saved_version: Option<String>,
+    save_status: EditorSaveStatus,
+    save_generation: u64,
+    buffer_revision: u64,
     is_dirty: bool,
     is_diff: bool,
     /// File content loaded off the UI thread, awaiting application to the
@@ -550,6 +558,10 @@ impl EditorView {
             file_name: tab_title,
             _language: "diff",
             saved_content: content.to_string(),
+            saved_version: None,
+            save_status: EditorSaveStatus::Ready,
+            save_generation: 0,
+            buffer_revision: 0,
             is_dirty: false,
             is_diff: true,
             pending_content: None,
@@ -646,6 +658,7 @@ impl EditorView {
                 {
                     // An edit after a read completed must also cancel its queued replacement.
                     tab.pending_content = None;
+                    tab.buffer_revision = tab.buffer_revision.wrapping_add(1);
                     tab.markdown_preview.refresh(current.clone(), cx);
                     let dirty = current.as_str() != tab.saved_content.as_str();
                     if tab.is_dirty != dirty {
@@ -668,6 +681,10 @@ impl EditorView {
             file_name: tab_title,
             _language: lang,
             saved_content: String::new(),
+            saved_version: None,
+            save_status: EditorSaveStatus::Ready,
+            save_generation: 0,
+            buffer_revision: 0,
             is_dirty: false,
             is_diff: false,
             pending_content: None,
@@ -740,8 +757,13 @@ impl EditorView {
         let read_project = load_project.clone();
         let read_path = load_path.clone();
         let read = cx.background_executor().spawn(async move {
-            threadlane_ui_state::project_io::read_file(&read_client, &read_project, read_path)
-                .await
+            if read_client.supports_guarded_saves() {
+                threadlane_ui_state::project_io::read_file_versioned(&read_client, &read_project, read_path)
+                    .await.map(|file| (file.content, Some(file.version))).map_err(|e| e.to_string())
+            } else {
+                threadlane_ui_state::project_io::read_file(&read_client, &read_project, read_path)
+                    .await.map(|content| (content, None))
+            }
         });
         cx.spawn(async move |this, cx| {
             let result = read.await;
@@ -802,7 +824,7 @@ impl EditorView {
             editor,
             request_generation,
             snapshot,
-            result,
+            result.map(|content| (content, None)),
             cx,
         );
     }
@@ -814,7 +836,7 @@ impl EditorView {
         editor: &Entity<EditorState>,
         request_generation: u64,
         snapshot: ClientSnapshot,
-        result: Result<String, String>,
+        result: Result<(String, Option<String>), String>,
         cx: &mut Context<Self>,
     ) {
         let current_client = self.current_client_snapshot(cx);
@@ -856,7 +878,7 @@ impl EditorView {
         }
         tab.loading = false;
         match result {
-            Ok(content) => {
+            Ok((content, version)) => {
                 let current = editor.read(cx).value();
                 if !tab.is_dirty && current.as_str() == tab.saved_content {
                     tab.pending_content = Some(content.clone());
@@ -866,6 +888,12 @@ impl EditorView {
                     tab.is_dirty = current.as_str() != content.as_str();
                 }
                 tab.saved_content = content;
+                tab.saved_version = version;
+                tab.save_status = if snapshot.client.supports_guarded_saves() {
+                    EditorSaveStatus::Ready
+                } else {
+                    EditorSaveStatus::Unsupported
+                };
                 tab.open_error = None;
                 tab.client_invalidated = false;
                 tab.baseline_loaded = true;
@@ -1303,111 +1331,7 @@ impl EditorView {
     }
 
     fn save_tab_at(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.sync_client_context(cx);
-        let current_client = self.current_client_snapshot(cx);
-        let Some(tab) = self.tabs.get(index) else {
-            return;
-        };
-
-        if tab.is_diff || !tab.baseline_loaded || tab.client_invalidated {
-            if !tab.is_diff && !tab.baseline_loaded {
-                self.set_status(
-                    "This file has not loaded successfully and cannot be saved yet.".into(),
-                    true,
-                );
-                cx.notify();
-            }
-            return;
-        }
-
-        let Some(ref editor) = tab.editor_state else {
-            return;
-        };
-        if !tab.client_origin.as_ref().is_some_and(|client| {
-            Arc::ptr_eq(client, &current_client.client)
-        }) {
-            self.set_status(
-                "This file belongs to a previous daemon connection. Close it, then open it from the current checkout before saving."
-                    .into(),
-                true,
-            );
-            cx.notify();
-            return;
-        }
-
-        let project_dir = tab.project_dir.clone();
-        let relative_path = tab.relative_path.clone();
-        let file_path = project_dir.join(&relative_path);
-        let content = editor.read(cx).value().to_string();
-        let file_name = tab.file_name.clone();
-        let editor = editor.clone();
-        let client = current_client.client.clone();
-        let write_client = client.clone();
-        let client_epoch = current_client.epoch;
-        let client_connected = current_client.connected;
-
-        // The file lives on the daemon host; save through project-io and
-        // only settle the tab once the daemon confirms the write.
-        cx.spawn(async move |this, cx| {
-            let write_dir = project_dir.clone();
-            let write_path = relative_path.clone();
-            let write_content = content.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    threadlane_ui_state::project_io::write_file(
-                        &write_client,
-                        &write_dir,
-                        write_path,
-                        write_content,
-                    )
-                    .await
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                let current_client = this.current_client_snapshot(cx);
-                if !Arc::ptr_eq(&client, &current_client.client)
-                    || current_client.epoch != client_epoch
-                    || current_client.connected != client_connected
-                {
-                    this.set_status(
-                        format!(
-                            "The daemon connection changed while saving {file_name}; verify the file before saving again."
-                        ),
-                        true,
-                    );
-                    cx.notify();
-                    return;
-                }
-                match result {
-                    Ok(()) => {
-                        if let Some(tab) = this.tabs.iter_mut().find(|t| {
-                            t.project_dir == project_dir
-                                && t.relative_path == relative_path
-                                && !t.is_diff
-                                && t.editor_state.as_ref() == Some(&editor)
-                                && !t.client_invalidated
-                                && t.client_origin.as_ref().is_some_and(|origin| Arc::ptr_eq(origin, &client))
-                        }) {
-                            let current = editor.read(cx).value();
-                            tab.is_dirty = current.as_str() != content.as_str();
-                            tab.saved_content = content;
-                        }
-                        this.set_status(format!("Saved {file_name}"), false);
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            "Failed to save file {}: {}",
-                            file_path.display(),
-                            err
-                        );
-                        this.set_status(format!("Couldn't save {file_name}: {err}. Your edits are kept — fix the problem and save again."), true);
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        self.save_guarded_tab(index, cx);
     }
 
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1510,7 +1434,7 @@ impl EditorView {
                     })),
                 ),
                 threadlane_ui_kit::editor_save_button(
-                    self.is_active_dirty(),
+                    self.active_tab_index.is_some_and(|index| self.tab_can_save(index, cx)),
                     self.is_active_diff(),
                 )
                 .on_click(cx.listener(|view, _, _, cx| view.save_active_file(cx))),
@@ -1597,6 +1521,7 @@ impl Render for EditorView {
                 view.request_add_selection_to_chat(window, cx)
             }))
             .children(self.has_tabs().then(|| self.render_tab_bar(cx)))
+            .children(self.render_save_recovery(cx))
             .children(self.active_tab_index.and_then(|index| self.tabs.get(index).map(|tab| (index, tab)))
                 .filter(|(_, tab)| tab.loading || tab.open_error.is_some())
                 .map(|(index, tab)| {
@@ -1978,6 +1903,7 @@ mod closed_file_host_tests {
 
     use crate::closed_files::FileTarget;
     use super::{ClientSnapshot, EditorView};
+    use threadlane_ui_kit::EditorSaveStatus;
 
     fn test_state(project: &std::path::Path) -> threadlane_ui_state::AppState {
         let mut state = threadlane_ui_state::AppState::for_tests();
@@ -2299,7 +2225,7 @@ mod closed_file_host_tests {
                 &editor,
                 generation,
                 stale_epoch,
-                Ok("stale epoch bytes".into()),
+                Ok(("stale epoch bytes".into(), Some("stale-version".into()))),
                 cx,
             );
             assert!(!view.tabs[0].loading);
@@ -2383,6 +2309,7 @@ mod closed_file_host_tests {
         let original_sample_origin = view.read_with(cx, |view, _| {
             view.tabs[1].client_origin.clone().unwrap()
         });
+        let original_epoch = view.read_with(cx, |view, _| view.tabs[1].client_epoch);
         let before_origin_rejection = notifications.get();
         view.update(cx, |view, cx| {
             view.tabs[1].client_origin = Some(replacement.clone());
@@ -2412,18 +2339,42 @@ mod closed_file_host_tests {
                     editor.set_value("same client save", window, cx);
                 });
                 view.tabs[1].is_dirty = true;
-                view.tabs[1].client_epoch = view.tabs[1].client_epoch.wrapping_add(1);
+                view.tabs[1].client_epoch = original_epoch.wrapping_add(1);
                 view.save_tab_at(1, cx);
             });
         });
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            assert_eq!(
-                view.status_msg
-                    .as_ref()
-                    .map(|(message, _, _)| message.as_str()),
-                Some("Saved sample.rs")
-            );
+            assert!(matches!(
+                view.tabs[1].save_status,
+                EditorSaveStatus::Failed {
+                    save_blocked: true,
+                    ..
+                }
+            ));
+            assert!(view.tabs[1].is_dirty);
+        });
+        assert_eq!(
+            std::fs::read_to_string(project.join("sample.rs")).unwrap(),
+            "initial bytes\n"
+        );
+
+        view.update(cx, |view, _| {
+            view.tabs[1].client_epoch = original_epoch;
+            view.tabs[1].save_status = EditorSaveStatus::Ready;
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                sample_editor.update(cx, |editor, cx| {
+                    editor.set_value("same client save", window, cx);
+                });
+                view.tabs[1].is_dirty = true;
+                view.save_tab_at(1, cx);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[1].save_status, EditorSaveStatus::Ready);
             assert!(!view.tabs[1].is_dirty);
         });
         assert_eq!(
@@ -2443,9 +2394,13 @@ mod closed_file_host_tests {
         });
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            assert!(view.status_msg.as_ref().is_some_and(|(message, _, _)| {
-                message.contains("daemon connection changed while saving")
-            }));
+            assert!(matches!(
+                view.tabs[1].save_status,
+                EditorSaveStatus::Failed {
+                    save_blocked: true,
+                    ..
+                }
+            ));
             assert!(view.tabs[1].is_dirty);
         });
     }

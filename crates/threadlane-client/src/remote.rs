@@ -25,7 +25,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 use threadlane_protocol::daemon::{
     CommandReply, CommandRequest, CommandResponse, SessionCommand, SessionEvent,
-    COMMAND_REQUEST_PROTOCOL_VERSION, PROJECT_IO_PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
+    COMMAND_REQUEST_PROTOCOL_VERSION, GUARDED_SAVE_PROTOCOL_VERSION,
+    PROJECT_IO_PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
 };
 
 use crate::DaemonClient;
@@ -749,6 +750,16 @@ impl RemoteDaemon {
             && peer_version < threadlane_protocol::daemon::FILE_SEARCH_PROTOCOL_VERSION {
             return Err(format!("Find in files requires protocol v6; attached daemon uses v{peer_version}"));
         }
+        if matches!(
+            request.command,
+            SessionCommand::ReadProjectFileVersioned { .. }
+                | SessionCommand::WriteProjectFileGuarded { .. }
+        ) && peer_version < GUARDED_SAVE_PROTOCOL_VERSION
+        {
+            return Err(format!(
+                "Guarded file saves require protocol v{GUARDED_SAVE_PROTOCOL_VERSION}; attached daemon uses v{peer_version}"
+            ));
+        }
         let request_id = request.request_id;
         let replayable = matches!(request.command, SessionCommand::CancelQueuedMessage { .. });
         let (tx, rx) = oneshot::channel();
@@ -852,6 +863,11 @@ impl DaemonClient for RemoteDaemon {
     fn file_search_connection_epoch(&self) -> u64 { self.connection_epoch.load(Ordering::SeqCst) }
 
     fn supports_file_search(&self) -> bool { self.connected.load(Ordering::SeqCst) && self.protocol_version.load(Ordering::SeqCst) >= threadlane_protocol::daemon::FILE_SEARCH_PROTOCOL_VERSION }
+
+    fn supports_guarded_saves(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
+            && self.protocol_version.load(Ordering::SeqCst) >= GUARDED_SAVE_PROTOCOL_VERSION
+    }
 
     fn supports_project_io(&self) -> bool {
         self.protocol_version.load(Ordering::SeqCst) >= PROJECT_IO_PROTOCOL_VERSION
@@ -1198,6 +1214,121 @@ mod tests {
         assert!(result.unwrap_err().contains("requires protocol v6"));
         assert!(rx.try_recv().is_err());
         assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn guarded_file_requests_are_version_gated_before_enqueue_and_after_reconnect() {
+        let request = || CommandRequest {
+            request_id: 101,
+            command: SessionCommand::WriteProjectFileGuarded {
+                work_dir: "/remote-only".into(),
+                path: "src/main.rs".into(),
+                content: "updated".into(),
+                expected_version: "sha256:old".into(),
+            },
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let connected = Arc::new(AtomicBool::new(true));
+        let version = Arc::new(AtomicU64::new(6));
+        let error = RemoteDaemon::answer_request(
+            &tx,
+            &pending,
+            &connected,
+            &version,
+            request(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("require protocol v7"));
+        assert!(rx.try_recv().is_err());
+        assert!(pending.lock().unwrap().is_empty());
+
+        // A reconnect can roll the peer back to an older daemon. It must
+        // not reuse the previously capable epoch's save permission.
+        version.store(7, Ordering::SeqCst);
+        connected.store(false, Ordering::SeqCst);
+        assert!(RemoteDaemon::answer_request(
+            &tx,
+            &pending,
+            &connected,
+            &version,
+            request(),
+        )
+        .await
+        .unwrap_err()
+        .contains("not connected"));
+        assert!(rx.try_recv().is_err());
+
+        connected.store(true, Ordering::SeqCst);
+        version.store(6, Ordering::SeqCst);
+        assert!(RemoteDaemon::answer_request(
+            &tx,
+            &pending,
+            &connected,
+            &version,
+            request(),
+        )
+        .await
+        .unwrap_err()
+        .contains("require protocol v7"));
+        assert!(rx.try_recv().is_err());
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn guarded_file_requests_are_enqueued_for_protocol_seven() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let connected = Arc::new(AtomicBool::new(true));
+        let version = Arc::new(AtomicU64::new(7));
+        let task = tokio::spawn({
+            let pending = pending.clone();
+            let connected = connected.clone();
+            let version = version.clone();
+            async move {
+                RemoteDaemon::answer_request(
+                    &tx,
+                    &pending,
+                    &connected,
+                    &version,
+                    CommandRequest {
+                        request_id: 102,
+                        command: SessionCommand::ReadProjectFileVersioned {
+                            work_dir: "/remote-only".into(),
+                            path: "src/main.rs".into(),
+                        },
+                    },
+                )
+                .await
+            }
+        });
+        let Some(OutboundMessage::Request(request)) = rx.recv().await else {
+            panic!("protocol 7 request was not enqueued");
+        };
+        assert_eq!(request.request_id, 102);
+        assert!(matches!(
+            request.command,
+            SessionCommand::ReadProjectFileVersioned { .. }
+        ));
+        pending
+            .lock()
+            .unwrap()
+            .remove(&102)
+            .expect("request waiter installed")
+            .waiter
+            .send(Ok(CommandResponse::VersionedFile {
+                result: Ok(threadlane_protocol::daemon::VersionedFile {
+                    content: "contents".into(),
+                    version: "sha256:new".into(),
+                }),
+            }))
+            .unwrap();
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            CommandResponse::VersionedFile { result: Ok(_) }
+        ));
     }
 
     #[test]
