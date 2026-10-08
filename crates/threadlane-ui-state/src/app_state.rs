@@ -171,7 +171,7 @@ pub struct AppState {
     /// lands; the echo row stays until then so the UI never claims a
     /// removal the peer may not have performed.
     pub(crate) pending_queued_cancels: HashMap<u64, PendingQueuedCancel>,
-    scheduler_handles: HashMap<PathBuf, SchedulerSupervisorHandle>,
+    scheduler_handles: HashMap<PathBuf, (std::sync::Weak<SessionRuntime>, SchedulerSupervisorHandle)>,
     scheduler_results:
         HashMap<PathBuf, tokio::sync::mpsc::UnboundedReceiver<SchedulerSupervisorEvent>>,
     deferred_stream_events: HashMap<String, Vec<SessionEvent>>,
@@ -2635,9 +2635,14 @@ impl AppState {
         let runtime = self.daemon_core.register_runtime(
             &session_id, work_dir, session_file.clone(), runtime,
         );
-        if !self.scheduler_handles.contains_key(&session_file) {
+        let same_runtime = self.scheduler_handles.get(&session_file)
+            .and_then(|(owner, _)| owner.upgrade())
+            .is_some_and(|owner| Arc::ptr_eq(&owner, &runtime));
+        if !same_runtime {
+            self.scheduler_handles.remove(&session_file);
+            self.scheduler_results.remove(&session_file);
             if let Ok((handle, results)) = runtime.start_scheduler_supervisor_with_results() {
-                self.scheduler_handles.insert(session_file.clone(), handle);
+                self.scheduler_handles.insert(session_file.clone(), (Arc::downgrade(&runtime), handle));
                 self.scheduler_results.insert(session_file.clone(), results);
             }
         }
@@ -3567,7 +3572,17 @@ impl AppState {
     }
 
     fn cleanup_cancelled_worktree(&mut self, setup: &crate::worktree_setup::WorktreeSetup) {
-        self.drop_session_runtime(&setup.session_file);
+        if let Some(runtime) = self.daemon_core.runtime_for_file(&setup.session_file) {
+            self.daemon_core.release_cancelled_runtime(&setup.session_file, &runtime);
+            if self.daemon_core.runtime_for_file(&setup.session_file).is_some() {
+                self.worktree_setups.remove(&setup.session_id);
+                self.client.session_status = Some("Cancelled setup; retained checkout used by another client".into());
+                self.request_session_refresh(&setup.project);
+                return;
+            }
+        }
+        self.scheduler_handles.remove(&setup.session_file);
+        self.scheduler_results.remove(&setup.session_file);
         self.worktree_setups.remove(&setup.session_id);
         match crate::worktree_setup::cleanup_cancelled(setup) {
             Ok(()) => {

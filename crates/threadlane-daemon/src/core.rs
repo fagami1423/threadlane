@@ -563,10 +563,12 @@ impl DaemonCore {
         session_id: &str,
         work_dir: &Path,
     ) -> Result<Arc<SessionRuntime>, String> {
+        // A prepared runtime may already be registered; always drain its
+        // handoff before the fast path so model invalidation cannot resurrect it.
+        let prepared = crate::runtimes::take_prepared_runtime(session_id);
         if let Some(runtime) = self.runtime_for_session(session_id) {
             return Ok(runtime);
         }
-        let prepared = crate::runtimes::take_prepared_runtime(session_id);
         let session_file = self
             .identity(session_id)
             .map(|identity| identity.session_file)
@@ -1724,7 +1726,11 @@ mod composer_tests {
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&desktop, &phone));
+        let active = std::sync::atomic::AtomicBool::new(false);
+        assert!(crate::runtimes::park_prepared_runtime_if_active(
+            session_id.into(), desktop.clone(), &active));
         let resumed = core.ensure_runtime(session_id, &work_dir).await.unwrap();
+        assert!(crate::runtimes::take_prepared_runtime(session_id).is_none());
         assert!(Arc::ptr_eq(&desktop, &resumed));
         let hydrated = core.hydrate_runtime(&SessionHydrationRequest {
             session_id: session_id.into(), session_file, reload_messages: true,
