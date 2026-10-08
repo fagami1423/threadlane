@@ -70,8 +70,6 @@ pub struct RightPanelView {
     stash_include_untracked: bool,
     collapsed_tree_folders: HashSet<String>,
     review_diff_revision: u64,
-    /// Bumped only on an explicit diff-target open; reloads and background
-    /// refreshes keep it so an in-progress read does not jump back to the top.
     review_diff_options: threadlane_git::DiffOptions,
     review_diff_request: Option<ReviewDiffRequest>,
     review_diff_state: Option<ReviewDiffState>,
@@ -445,7 +443,9 @@ impl RightPanelView {
     fn sync_project(&mut self, cx: &mut Context<Self>) {
         let session_id = self.model.read(cx).active_session_id.clone();
         if self.review_session_id != session_id {
-            self.close_document(cx);
+            if self.review_diff_request.is_some() {
+                self.close_document(cx);
+            }
             self.review_session_id = session_id;
         }
         let (project, worktree_unavailable, project_io_supported) = {
@@ -917,7 +917,9 @@ impl RightPanelView {
         result: Result<String, String>,
         cx: &mut Context<Self>,
     ) {
+        let active_session_id = self.model.read(cx).active_session_id.clone();
         if self.git_checkout_pending
+            || self.review_session_id != active_session_id
             || self.review_diff_request.as_ref() != Some(&request)
             || self.project.as_ref() != Some(&request.project)
             || self.model.read(cx).active_git_work_dir().as_ref() != Some(&request.project)
@@ -3999,7 +4001,7 @@ mod review_diff_tests {
         let (panel, cx) =
             cx.add_window_view(|window, cx| RightPanelView::new(model.clone(), window, cx));
 
-        panel.update(cx, |panel, cx| {
+        panel.update_in(cx, |panel, window, cx| {
             panel.active_surface = Some(Surface::Review);
             let checkout = PathBuf::from("/workspace");
             let initial = seed_review_diff(panel, &checkout, "first session patch", cx);
@@ -4012,6 +4014,15 @@ mod review_diff_tests {
                 state.active_session_id = Some("second".into());
                 cx.notify();
             });
+            panel.apply_review_diff_result(
+                initial.clone(),
+                Err("stale result before observer sync".into()),
+                cx,
+            );
+            assert!(matches!(
+                panel.review_diff_state,
+                Some(ReviewDiffState::Ready { empty: false })
+            ));
             panel.sync_project(cx);
             assert_eq!(
                 panel.project.as_deref(),
@@ -4039,6 +4050,23 @@ mod review_diff_tests {
             );
             assert!(panel.review_diff_request.is_none());
             assert!(panel.review_diff_state.is_none());
+
+            panel.pending_document = Some(("draft.rs".into(), "saved buffer".into()));
+            panel.sync_pending_document(window, cx);
+            let editor = panel.editor_state.clone().expect("editable file editor");
+            panel.is_dirty = true;
+            model.update(cx, |state, cx| {
+                state.active_session_id = Some("first".into());
+                cx.notify();
+            });
+            panel.sync_project(cx);
+            assert_eq!(
+                panel.project.as_deref(),
+                Some(std::path::Path::new("/workspace"))
+            );
+            assert!(panel.is_dirty, "same-checkout session switch keeps dirty state");
+            assert_eq!(panel.saved_content, "saved buffer");
+            assert_eq!(panel.editor_state.as_ref(), Some(&editor));
         });
     }
 

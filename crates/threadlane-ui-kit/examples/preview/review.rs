@@ -177,12 +177,16 @@ impl ReviewPreview {
         cx: &mut Context<Self>,
     ) -> Self {
         let review_document = cx.new(|cx| kit::ReviewDiffDocument::new(window, cx));
-        let review_document_subscription = cx.subscribe(&review_document, |host, _, action, cx| {
-            if *action == kit::ReviewDiffAction::ShowWhitespace {
-                host.ignore_whitespace = false;
-                host.update_diff(cx);
-            }
-        });
+        let review_document_subscription =
+            cx.subscribe_in(&review_document, window, |host, _, action, window, cx| {
+                match *action {
+                    kit::ReviewDiffAction::ShowWhitespace => {
+                        host.ignore_whitespace = false;
+                        host.update_diff(cx);
+                    }
+                    kit::ReviewDiffAction::Retry => Self::notice(window, cx),
+                }
+            });
         let status = snapshot.and_then(|snapshot| snapshot.git_status.clone());
         let selected = status
             .as_ref()

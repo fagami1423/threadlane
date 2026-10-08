@@ -600,26 +600,13 @@ pub(crate) fn review_diff_body_scrolled(
     on_action: impl Fn(&ReviewDiffAction, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
-    // `scroll_id` keys the retained scroll state; callers pass a per-request
-    // identity so an explicit new target starts at the top of its patch.
-    let tracked_scroll = scroll.cloned().unwrap_or_default();
-    let body = div()
-        .id(scroll_id)
-        .flex_1()
-        .min_w_0()
-        .min_h_0()
-        .track_scroll(&tracked_scroll)
-        .overflow_y_scroll()
-        .lock_scroll_axis()
-        .p_3()
-        .scrollbar(&tracked_scroll, ScrollbarAxis::Vertical);
     let callback = std::rc::Rc::new(on_action);
     let request = move |action| {
         let callback = callback.clone();
         move |_: &ClickEvent, window: &mut Window, cx: &mut App| callback(&action, window, cx)
     };
-    match content {
-        ReviewDiffContent::Loading => body
+    let content = match content {
+        ReviewDiffContent::Loading => div()
             .child(
                 div()
                     .flex()
@@ -629,7 +616,7 @@ pub(crate) fn review_diff_body_scrolled(
                     .child("Updating diff…"),
             )
             .into_any_element(),
-        ReviewDiffContent::Failed(error) => body
+        ReviewDiffContent::Failed(error) => div()
             .child(
                 div()
                     .flex()
@@ -652,7 +639,7 @@ pub(crate) fn review_diff_body_scrolled(
                     ),
             )
             .into_any_element(),
-        ReviewDiffContent::Empty => body
+        ReviewDiffContent::Empty => div()
             .child(
                 div()
                     .flex()
@@ -673,11 +660,13 @@ pub(crate) fn review_diff_body_scrolled(
                     })),
             )
             .into_any_element(),
-        ReviewDiffContent::Ready(text) => body
-            .child(crate::diff_text_view(text, cx).when_some(scroll, |view, scroll| {
+        ReviewDiffContent::Ready(text) => crate::diff_text_view(text, cx)
+            .when_some(scroll, |view, scroll| {
                 let scroll = scroll.clone();
                 view.on_reveal(move |line, _, _| {
-                    if !reveal_enabled.get() { return; }
+                    if !reveal_enabled.get() {
+                        return;
+                    }
                     let viewport = scroll.bounds();
                     let mut offset = scroll.offset();
                     if line.bottom() > viewport.bottom() {
@@ -687,8 +676,32 @@ pub(crate) fn review_diff_body_scrolled(
                     }
                     scroll.set_offset(offset);
                 })
-            }))
+            })
             .into_any_element(),
+    };
+    if let Some(scroll) = scroll {
+        div()
+            .id(scroll_id)
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .track_scroll(scroll)
+            .overflow_y_scroll()
+            .lock_scroll_axis()
+            .p_3()
+            .scrollbar(scroll, ScrollbarAxis::Vertical)
+            .child(content)
+            .into_any_element()
+    } else {
+        div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .overflow_y_scrollbar()
+            .id(scroll_id)
+            .p_3()
+            .child(content)
+            .into_any_element()
     }
 }
 
