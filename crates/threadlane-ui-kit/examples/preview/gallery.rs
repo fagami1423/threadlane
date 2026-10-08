@@ -38,6 +38,7 @@ pub struct Gallery {
     recall_samples: Vec<String>,
     _input_subscription: Subscription,
     document_dirty: bool,
+    markdown_preview: kit::MarkdownPreview,
     ignore_whitespace: bool,
     selected_trajectory: Option<usize>,
     review_pr_sample: usize,
@@ -136,6 +137,7 @@ impl Gallery {
             recalled_prompt: None,
             recall_samples,
             document_dirty: true,
+            markdown_preview: kit::MarkdownPreview::new(cx),
             ignore_whitespace: false,
             selected_trajectory: None,
             review_pr_sample: 0,
@@ -807,8 +809,58 @@ impl Render for Gallery {
             ].into_iter().enumerate().map(|(index, (sample, label))| Button::new(SharedString::from(format!("gallery-draft-pr-{index}")))
                 .debug_selector(move || format!("gallery-draft-pr-{index}")).label(label).small().ghost()
                 .on_click(cx.listener(move |host, _, window, cx| { host.draft_pr.update(cx, |this, cx| this.set_sample(sample, cx)); crate::draft_pr::open(host.draft_pr.clone(), window, cx); })))))
+            .child(heading("Markdown document · current buffer sample", cx))
+            .child(
+                div()
+                    .h(rems(24.))
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .on_action(
+                        cx.listener(|host, _: &kit::ToggleMarkdownPreview, window, cx| {
+                            host.markdown_preview
+                                .toggle(MARKDOWN_DOCUMENT_SAMPLE.into(), cx);
+                            host.markdown_preview.focus_control(window, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .child(kit::panel_document_header(
+                        Some(self.markdown_preview.control(false, cx)),
+                        "README.md",
+                        true,
+                        Some("Markdown"),
+                        false,
+                        Some(kit::AddSelectionControl {
+                            enabled: false,
+                            reason: Some(
+                                if self.markdown_preview.is_active() {
+                                    kit::PREVIEW_SELECTION_REASON
+                                } else {
+                                    "Read-only gallery sample"
+                                }
+                                .into(),
+                            ),
+                        }),
+                        |_, window, cx| {
+                            window.push_notification("Read-only sample · no file was changed", cx);
+                        },
+                    ))
+                    .children(
+                        self.markdown_preview
+                            .notice(true)
+                            .map(|notice| kit::markdown_preview_notice(notice, cx)),
+                    )
+                    .child(if self.markdown_preview.is_active() {
+                        self.markdown_preview.body(cx)
+                    } else {
+                        div()
+                            .overflow_y_scrollbar()
+                            .child(MARKDOWN_DOCUMENT_SAMPLE)
+                            .into_any_element()
+                    }),
+            )
             .child(heading("Panel document header · local sample", cx))
-            .child(kit::panel_document_header("example.rs", self.document_dirty, Some("Rust"), true,
+            .child(kit::panel_document_header(None, "example.rs", self.document_dirty, Some("Rust"), true,
                 Some(kit::AddSelectionControl { enabled: false, reason: Some("Select code in the file first".into()) }),
                 cx.listener(|host, action: &kit::PanelDocumentAction, window, cx| {
                     if *action == kit::PanelDocumentAction::Save { host.document_dirty = false; }
@@ -1193,3 +1245,29 @@ fn sample_attachments() -> Vec<String> {
         "density-sample.png".into(),
     ]
 }
+
+const MARKDOWN_DOCUMENT_SAMPLE: &str = r#"# Workspace notes
+
+Current buffer preview includes **unsaved changes**.
+
+> Read-only: task boxes and code never run.
+
+- [x] Review the plan
+- [ ] Save explicitly
+
+| File | Purpose |
+| --- | --- |
+| README.md | Project documentation |
+
+```rust
+fn example() { println!("display only"); }
+```
+
+[External link](https://example.com) · [Blocked local link](../README.md)
+
+![HTTP image](https://example.com/image.png)
+![Local image](file:///tmp/image.png)
+![Data image](data:image/png;base64,AA)
+[![Linked image](https://example.com/linked.png)](https://example.com)
+<img src="file:///tmp/raw.png">
+"#;

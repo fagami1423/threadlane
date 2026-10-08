@@ -111,6 +111,7 @@ pub struct RightPanelView {
     last_fetched_time: Option<std::time::Instant>,
     document_title: Option<String>,
     document_state: Entity<TextViewState>,
+    markdown_preview: threadlane_ui_kit::MarkdownPreview,
     editor_state: Option<Entity<EditorState>>,
     editor_subscription: Option<Subscription>,
     /// Re-renders when the open document buffer notifies; selection moves
@@ -123,6 +124,8 @@ pub struct RightPanelView {
     /// than it are discarded so a slower earlier read can never reopen over a
     /// newer document (or its unsaved edits).
     panel_document_request: u64,
+    document_loading: bool,
+    document_error: Option<String>,
     browser: Option<Entity<BrowserView>>,
     event_tx: tokio::sync::mpsc::UnboundedSender<PanelEvent>,
     _watcher: Option<WorkspaceWatcher>,
@@ -410,6 +413,7 @@ impl RightPanelView {
             last_fetched_time: None,
             document_title: None,
             document_state,
+            markdown_preview: threadlane_ui_kit::MarkdownPreview::new(cx),
             editor_state: None,
             editor_subscription: None,
             editor_observe: None,
@@ -417,6 +421,8 @@ impl RightPanelView {
             is_dirty: false,
             pending_document: None,
             panel_document_request: 0,
+            document_loading: false,
+            document_error: None,
             browser,
             event_tx,
             _watcher: None,
@@ -446,6 +452,7 @@ impl RightPanelView {
         {
             return;
         }
+        self.close_document(cx);
         self.project = project.clone();
         self.worktree_unavailable = worktree_unavailable;
         self.project_io_supported = project_io_supported;
@@ -804,6 +811,7 @@ impl RightPanelView {
         let Some(project) = self.project.clone() else {
             return;
         };
+        self.close_document(cx);
         self.review_diff_revision = self.review_diff_revision.wrapping_add(1);
         let request = ReviewDiffRequest {
             project,
@@ -811,7 +819,6 @@ impl RightPanelView {
             options: self.review_diff_options,
             revision: self.review_diff_revision,
         };
-        self.pending_document = None;
         self.document_title = Some(request.target.title());
         self.review_diff_request = Some(request.clone());
         self.review_diff_state = Some(ReviewDiffState::Loading);
@@ -866,10 +873,14 @@ impl RightPanelView {
     }
 
     fn close_document(&mut self, cx: &mut Context<Self>) {
+        self.panel_document_request = self.panel_document_request.wrapping_add(1);
+        self.document_loading = false;
+        self.document_error = None;
         self.review_diff_revision = self.review_diff_revision.wrapping_add(1);
         self.review_diff_request = None;
         self.review_diff_state = None;
         self.document_title = None;
+        self.markdown_preview = threadlane_ui_kit::MarkdownPreview::new(cx);
         self.editor_state = None;
         self.editor_subscription = None;
         self.editor_observe = None;
@@ -921,7 +932,16 @@ impl RightPanelView {
         relative_path: String,
         cx: &mut Context<Self>,
     ) {
-        self.panel_document_request += 1;
+        if self.is_dirty {
+            self.model.update(cx, |state, _| {
+                state.client.session_status =
+                    Some("Save or close the modified document before opening another file.".into());
+            });
+            return;
+        }
+        self.close_document(cx);
+        self.document_title = Some(relative_path.clone());
+        self.document_loading = true;
         let request_id = self.panel_document_request;
         let read_client = self.model.read(cx).daemon_client.clone();
         let read_project = project.clone();
@@ -939,11 +959,13 @@ impl RightPanelView {
                 {
                     return;
                 }
+                this.document_loading = false;
                 match result {
                     Ok(content) => {
                         this.pending_document = Some((relative_path, content));
                     }
                     Err(error) => {
+                        this.document_error = Some(error.clone());
                         this.model.update(cx, |state, _| {
                             state.client.session_status = Some(error);
                         });
@@ -988,6 +1010,7 @@ impl RightPanelView {
             let subscription = cx.subscribe(&editor, |this, editor, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     let current = editor.read(cx).value();
+                    this.markdown_preview.refresh(current.clone(), cx);
                     let dirty = current.as_str() != this.saved_content.as_str();
                     if this.is_dirty != dirty {
                         this.is_dirty = dirty;
@@ -995,6 +1018,8 @@ impl RightPanelView {
                     }
                 }
             });
+            // Selection-only notifications must not materialize the source Rope.
+            // The Change subscription owns preview refreshes.
             let observe = cx.observe(&editor, |_this, _editor, cx| cx.notify());
             self.editor_state = Some(editor);
             self.editor_subscription = Some(subscription);
@@ -1014,6 +1039,9 @@ impl RightPanelView {
     /// loads, files outside the active checkout, and empty or oversized
     /// selections each carry a textual reason.
     pub fn files_selection_block_reason(&self, cx: &App) -> Option<SharedString> {
+        if self.markdown_preview.is_active() {
+            return Some(threadlane_ui_kit::PREVIEW_SELECTION_REASON.into());
+        }
         if self.document_title.is_none() {
             return Some("Open a file first".into());
         }
@@ -1084,7 +1112,8 @@ impl RightPanelView {
         request: &threadlane_ui_kit::EditorSelectionRequest,
         cx: &App,
     ) -> bool {
-        if self.pending_document.is_some()
+        if self.markdown_preview.is_active()
+            || self.pending_document.is_some()
             || self.document_title.as_ref() != Some(&request.relative_path)
             || self.project.as_ref() != Some(&request.checkout)
         {
@@ -1882,6 +1911,33 @@ impl RightPanelView {
             }), cx)
     }
 
+    fn toggle_markdown_preview(
+        &mut self,
+        _: &threadlane_ui_kit::ToggleMarkdownPreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.markdown_preview.is_active() {
+            self.markdown_preview.show_source();
+            self.markdown_preview.focus_control(window, cx);
+            cx.notify();
+            return;
+        }
+        if self.pending_document.is_some()
+            || !self
+                .document_title
+                .as_deref()
+                .is_some_and(threadlane_ui_kit::markdown_preview_eligible)
+        {
+            return;
+        }
+        if let Some(editor) = &self.editor_state {
+            self.markdown_preview.toggle(editor.read(cx).value(), cx);
+            self.markdown_preview.focus_control(window, cx);
+            cx.notify();
+        }
+    }
+
     fn render_files(&self, cx: &mut Context<Self>) -> AnyElement {
         if let Some(title) = &self.document_title {
             let is_dirty = self.is_dirty;
@@ -1896,7 +1952,16 @@ impl RightPanelView {
                 .on_action(cx.listener(|this, _: &threadlane_ui_kit::AddSelectionToChat, window, cx| {
                     this.request_add_selection_to_chat(window, cx)
                 }))
+                .on_action(cx.listener(Self::toggle_markdown_preview))
                 .child(threadlane_ui_kit::panel_document_header(
+                    (threadlane_ui_kit::markdown_preview_eligible(title)
+                        && !title.starts_with("Review ·"))
+                    .then(|| {
+                        self.markdown_preview.control(
+                            !has_editor || self.document_loading || self.pending_document.is_some(),
+                            cx,
+                        )
+                    }),
                     title,
                     is_dirty,
                     has_editor.then_some(lang),
@@ -1914,6 +1979,11 @@ impl RightPanelView {
                         }
                     }),
                 ))
+                .children(
+                    self.markdown_preview
+                        .notice(is_dirty)
+                        .map(|notice| threadlane_ui_kit::markdown_preview_notice(notice, cx)),
+                )
                 .children(self.review_diff_request.as_ref().map(|_| {
                     threadlane_ui_kit::review_whitespace_control(
                         self.review_diff_options.ignore_whitespace,
@@ -1923,7 +1993,14 @@ impl RightPanelView {
                 }))
                 .children(self.review_diff_nav_row(cx))
                 .child(Separator::horizontal())
-                .child(if let Some(ref editor) = self.editor_state {
+                .child(if self.document_loading {
+                    threadlane_ui_kit::markdown_document_message("Loading file…", cx)
+                        .into_any_element()
+                } else if let Some(error) = &self.document_error {
+                    threadlane_ui_kit::markdown_document_message(error, cx).into_any_element()
+                } else if self.markdown_preview.is_active() {
+                    self.markdown_preview.body(cx)
+                } else if let Some(ref editor) = self.editor_state {
                     threadlane_ui_kit::editor_buffer(editor).into_any_element()
                 } else if let Some(state) = &self.review_diff_state {
                     self.render_review_diff(state, cx)
@@ -4502,6 +4579,80 @@ mod panel_document_tests {
     use super::RightPanelView;
     use gpui::{AppContext, TestAppContext};
     use threadlane_ui_state::AppState;
+
+    #[gpui::test]
+    fn markdown_preview_panel_keeps_buffer_and_resets_on_close(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let model = cx.new(|_| AppState::for_tests());
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let panel = cx.new(|cx| RightPanelView::new(model, window, cx));
+            gpui_component::Root::new(panel, window, cx)
+        });
+        let panel = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<RightPanelView>().unwrap()
+        });
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.active_surface = Some(super::Surface::Files);
+                panel.pending_document = Some(("README.markdown".into(), "# Buffer".into()));
+                panel.sync_pending_document(window, cx);
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let original = panel.read_with(cx, |panel, _| panel.editor_state.clone().unwrap());
+        let bounds = cx.debug_bounds("markdown-preview-mode").unwrap();
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        panel.read_with(cx, |panel, cx| {
+            assert!(panel.markdown_preview.is_active());
+            assert_eq!(panel.editor_state.as_ref(), Some(&original));
+            assert_eq!(
+                panel.files_selection_block_reason(cx).as_deref(),
+                Some(threadlane_ui_kit::PREVIEW_SELECTION_REASON)
+            );
+        });
+        // Programmatic/agent updates notify even while the dirty flag is already true.
+        for text in ["# First edit", "# Second edit"] {
+            cx.update(|window, cx| {
+                original.update(cx, |editor, cx| {
+                    editor.set_value(text, window, cx);
+                    cx.emit(gpui_component::input::InputEvent::Change);
+                })
+            });
+            cx.run_until_parked();
+            panel.read_with(cx, |panel, _| {
+                assert!(panel.markdown_preview.is_active());
+                assert!(panel.is_dirty);
+            });
+        }
+        // Space on the focused Preview control must not flip an already-selected mode.
+        let keystroke = gpui::Keystroke::parse("space").unwrap();
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(gpui::KeyUpEvent { keystroke });
+        panel.read_with(cx, |panel, _| assert!(panel.markdown_preview.is_active()));
+        cx.update(|window, cx| {
+            window.focus_prev(cx);
+            window.draw(cx).clear(cx);
+        });
+        let keystroke = gpui::Keystroke::parse("enter").unwrap();
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(gpui::KeyUpEvent { keystroke });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| assert!(!panel.markdown_preview.is_active()));
+        panel.update(cx, |panel, cx| {
+            panel.close_document(cx);
+            assert!(!panel.markdown_preview.is_active());
+            assert!(panel.editor_state.is_none());
+        });
+    }
 
     /// `request_open_panel_file` must produce a live editable document —
     /// the Files host Codex flagged as unreachable when only tests wrote

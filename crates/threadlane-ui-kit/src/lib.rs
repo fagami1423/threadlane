@@ -66,6 +66,8 @@ pub use draft::*;
 mod picker;
 pub use picker::*;
 mod editor;
+mod editor_markdown;
+pub use editor_markdown::*;
 #[cfg(test)]
 mod editor_tests;
 pub use editor::*;

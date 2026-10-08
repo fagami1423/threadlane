@@ -773,6 +773,7 @@ impl Render for ReviewPreview {
             return kit::review_panel_surface()
                 .child(context)
                 .child(kit::panel_document_header(
+                    None,
                     &title,
                     false,
                     None,

@@ -118,3 +118,47 @@ impl gpui::Render for TestHost {
         gpui::div()
     }
 }
+
+#[test]
+fn markdown_preview_eligibility_and_utf8_limit() {
+    for path in ["README.md", "notes.MARKDOWN", "docs/Plan.Md"] {
+        assert!(crate::markdown_preview_eligible(path));
+    }
+    for path in ["note.mdx", "main.rs", "README", "diff:README.md"] {
+        assert!(!crate::markdown_preview_eligible(path));
+    }
+    assert!(crate::markdown_preview_size_allowed(
+        &"a".repeat(512 * 1024)
+    ));
+    assert!(!crate::markdown_preview_size_allowed(
+        &"a".repeat(512 * 1024 + 1)
+    ));
+    assert!(!crate::markdown_preview_size_allowed(
+        &"é".repeat(256 * 1024 + 1)
+    ));
+}
+
+#[test]
+fn markdown_preview_external_links_are_explicit_http_only() {
+    for url in [
+        "https://example.com/doc#part",
+        "http://localhost:3000",
+        "HTTPS://example.com",
+    ] {
+        assert!(crate::markdown_preview_external_url(url));
+    }
+    for url in [
+        "file:///etc/passwd",
+        "data:image/png;base64,AA",
+        "javascript:alert(1)",
+        "mailto:a@b.com",
+        "../README.md",
+        "#part",
+        "//example.com",
+        "https:",
+        "https:///etc/passwd",
+        "https://example.com\n",
+    ] {
+        assert!(!crate::markdown_preview_external_url(url), "{url}");
+    }
+}
