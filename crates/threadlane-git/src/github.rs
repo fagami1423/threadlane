@@ -5,6 +5,8 @@ use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 mod cache;
+mod agent;
+pub use agent::{execute_pr_workflow, PrWorkflowRequest};
 use cache::ResponseCache;
 
 use crate::error::GitError;

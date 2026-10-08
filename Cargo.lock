@@ -8447,6 +8447,7 @@ dependencies = [
  "tempfile",
  "threadlane-auth",
  "threadlane-project",
+ "threadlane-prompt",
  "threadlane-protocol",
  "tracing",
 ]

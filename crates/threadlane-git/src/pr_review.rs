@@ -193,6 +193,25 @@ pub fn collect_actionable_pr_feedback(pr: &GitHubPrInfo) -> Vec<PrFeedbackItem> 
         });
     }
 
+    for comment in &pr.issue_comments {
+        let body = comment.body.trim();
+        if comment.author.eq_ignore_ascii_case(&pr.author)
+            || is_ci_or_status_bot(&comment.author)
+            || body.is_empty()
+            || is_review_status_notice(body)
+        {
+            continue;
+        }
+        items.push(PrFeedbackItem {
+            remote_id: comment.remote_id.clone(),
+            author: comment.author.clone(),
+            body: body.to_owned(),
+            path: None,
+            line: None,
+            kind: "conversation_comment",
+        });
+    }
+
     items
 }
 
@@ -281,8 +300,18 @@ pub fn build_auto_address_prompt(pr_number: u64, branch: &str, items: &[PrFeedba
         - Preserve existing uncommitted changes: inspect them, do not overwrite or discard them, and stage only your review fixes (use patch staging when files overlap). Never include unrelated user changes in your commit.\n\
         - Verify that your changes compile and tests pass before committing.\n\
         - Commit only your review fixes and push to the PR branch `{branch}`. Fetch and integrate upstream changes safely before pushing; never force-push or reset user work. If you cannot safely push, explain the blocker and what remains local.\n\
-        - Reply with a summary of what was fixed and pushed, or explain why no code change was needed.",
+        - Post replies on GitHub for each item, not only in this chat; summarize what was fixed and pushed, or explain why no code change was needed.\n\n\
+        {completion}",
+        completion = threadlane_prompt::git_workflow::PR_COMPLETION_POLICY,
         feedback = formatted_items.join("\n\n")
+    )
+}
+
+pub fn build_fix_ci_prompt(pr: &GitHubPrInfo) -> String {
+    format!(
+        "Inspect and fix CI for PR #{} ({}) on branch `{}`. Confirm the repository and latest head SHA before editing; use fresh check status and job logs rather than relying on the UI snapshot. Keep fixes scoped, preserve unrelated work, push to this PR, address and reply to review feedback, and continue watching until ready or explicitly blocked.\n\n{}",
+        pr.number, pr.url, pr.head_ref,
+        threadlane_prompt::git_workflow::PR_COMPLETION_POLICY
     )
 }
 
@@ -299,6 +328,29 @@ mod tests {
         assert!(is_ci_or_status_bot("dependabot[bot]"));
         assert!(!is_ci_or_status_bot("alice"));
         assert!(!is_ci_or_status_bot("coderabbitai[bot]"));
+    }
+
+    #[test]
+    fn conversation_feedback_excludes_self_and_status_notices() {
+        let pr = GitHubPrInfo {
+            author: "author".into(),
+            issue_comments: [
+                ("reviewer", "Please add a regression test"),
+                ("author", "Fixed"),
+                ("codecov[bot]", "Coverage changed"),
+                ("coderabbitai[bot]", "<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->"),
+            ].into_iter().enumerate().map(|(id, (author, body))| crate::PrConversationComment {
+                remote_id: id.to_string(), author: author.into(), body: body.into(),
+                ..Default::default()
+            }).collect(),
+            ..Default::default()
+        };
+        let feedback = collect_actionable_pr_feedback(&pr);
+        assert_eq!(feedback.len(), 1);
+        assert_eq!(feedback[0].kind, "conversation_comment");
+        let mut store = PrReviewTrackingStore::default();
+        assert!(matches!(check_and_record_fresh_feedback(&mut store, "branch", &feedback), FeedbackSyncResult::NewFeedback(_)));
+        assert_eq!(check_and_record_fresh_feedback(&mut store, "branch", &feedback), FeedbackSyncResult::UpToDate);
     }
 
     #[test]
@@ -490,5 +542,22 @@ mod tests {
         assert!(prompt.contains("only your review fixes"));
         assert!(prompt.contains("upstream"));
         assert!(prompt.contains("cannot safely push"));
+        assert!(prompt.ends_with(threadlane_prompt::git_workflow::PR_COMPLETION_POLICY));
+        assert!(prompt.contains("Post replies on GitHub for each item"));
+    }
+
+    #[test]
+    fn fix_ci_prompt_targets_pr_and_requires_follow_through() {
+        let pr = crate::GitHubPrInfo {
+            number: 42,
+            url: "https://github.com/acme/app/pull/42".into(),
+            head_ref: "fix/parser".into(),
+            ..Default::default()
+        };
+        let prompt = super::build_fix_ci_prompt(&pr);
+        assert!(prompt.contains(&pr.url));
+        assert!(prompt.contains(&pr.head_ref));
+        assert!(prompt.contains("latest head SHA"));
+        assert!(prompt.ends_with(threadlane_prompt::git_workflow::PR_COMPLETION_POLICY));
     }
 }

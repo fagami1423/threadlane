@@ -80,6 +80,29 @@ category, capped scans say so, and the last row offers a retry. Scans stop at
 100 conversation results, 32 MiB per session file, 256 MiB total reads, or five
 seconds of work.
 
+## Agent-owned GitHub work
+
+**GitHub → Issue → Start Task** asks the agent to implement and verify the issue
+in an isolated worktree, publish a draft PR with a closing issue reference, then
+mark it ready for review after local checks. **Fix CI** and **Address reviews**
+use the same follow-through policy: refresh checks and feedback after every push,
+fix valid findings, reply on GitHub, and keep monitoring until the latest head is
+green and mergeable or an explicit blocker needs attention. Auto-addressing also
+picks up PR conversation comments, excluding self-replies and CI/status notices.
+
+Native Git sessions expose the credential-aware `github_pr` tool for fresh status,
+paginated feedback, failed Actions logs, replies, and ready-for-review transitions.
+It uses Threadlane's configured GitHub credentials through the GitHub CLI; external
+agents use their own available GitHub tools/authentication. Missing permissions,
+required human approvals, and stalled checks must be reported as blocked, not ready.
+
+These are agent instructions and tools, not an autonomous merge service or a
+guarantee that CI will succeed. Agents must not merge without an explicit request.
+Manual Git buttons, local-only tasks, read-only reviews, and editable reply drafts
+retain their narrower scope. Custom system prompts remain authoritative; scheduled
+tasks using the default native coding-agent prompt inherit the same policy when
+their requested work involves publishing a PR.
+
 ## Quick Start
 
 ### Prerequisites

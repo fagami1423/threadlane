@@ -6,6 +6,7 @@
 //! CLIs, and tests can build prompts without the session crate.
 
 pub mod context;
+pub mod git_workflow;
 pub mod system_prompt;
 
 pub use context::ProjectContext;

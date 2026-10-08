@@ -2114,6 +2114,8 @@ fn issue_work_session_persists_link_and_uses_isolated_worktree() {
                 assert_eq!(state.reasoning_effort, ReasoningEffort::High);
                 assert!(prompt.contains("create_draft_pull_request"));
                 assert!(prompt.contains("verify the resulting PR URL"));
+                assert!(prompt.ends_with(threadlane_prompt::git_workflow::PR_COMPLETION_POLICY));
+                assert!(prompt.contains("authorizes marking the PR ready"));
                 Ok(())
             },
         )
@@ -2252,7 +2254,7 @@ fn issue_work_prompt_failure_rolls_back_artifacts_and_selection() {
             threadlane_protocol::OrchestratorMode::Fusion,
             |_, prompt| {
                 assert!(prompt.contains("create_draft_pull_request"));
-                assert!(prompt.contains("publish the issue branch to origin"));
+                assert!(prompt.contains("publish the issue branch"));
                 assert!(prompt.contains("credential-aware tool"));
                 assert!(!prompt.contains("Do not push or publish anything"));
                 Err("prompt acceptance failed".into())
