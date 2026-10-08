@@ -835,7 +835,12 @@ impl AppState {
         #[cfg(not(test))]
         registry_projects.retain(|project| is_attachable_project_root(&project.path));
         #[cfg(not(test))]
-        if load_host_state && registry_projects.is_empty() {
+        if load_host_state
+            && registry_projects.is_empty()
+            && !threadlane_project::global_threadlane_dir()
+                .join("projects.json")
+                .exists()
+        {
             if let Ok(curr) = std::env::current_dir().and_then(std::fs::canonicalize) {
                 if is_attachable_project_root(&curr) {
                     let project = AttachedProject::from_path(curr);
@@ -3260,6 +3265,92 @@ impl AppState {
         }
     }
 
+    pub fn project_removal_disabled_reason(&self, work_dir: &Path) -> Option<String> {
+        if self.daemon_remote {
+            return Some("Remove projects from the computer hosting this workspace.".into());
+        }
+        let project = self
+            .client
+            .projects
+            .iter()
+            .find(|project| project.work_dir == work_dir)?;
+        // Runtime files retain their canonical project ownership even when a
+        // discovery refresh temporarily drops all sidebar session rows.
+        let live_runtime = self.daemon_core.runtimes().iter().any(|(file, runtime)| {
+            let belongs = file.starts_with(work_dir.join(".threadlane"))
+                || project
+                    .sessions
+                    .iter()
+                    .any(|session| session.session_file == *file);
+            let id = threadlane_daemon::core::DaemonCore::session_id_for_file(file);
+            belongs
+                && (runtime.is_generating()
+                    || runtime.scheduled_work_active()
+                    || matches!(
+                        runtime.status(),
+                        threadlane_coding_agent::controller::SessionStatus::Working
+                    )
+                    || id.as_ref().is_some_and(|id| {
+                        self.client.pending_permissions.contains_key(id)
+                            || self.client.pending_questions.contains_key(id)
+                    }))
+        });
+        if live_runtime
+            || self
+                .worktree_setups
+                .values()
+                .any(|setup| setup.project == work_dir && setup.error.is_none())
+            || self.automations.snapshot.runs.iter().any(|run| {
+                run.definition.project == work_dir && active_automation_status(run.status).is_some()
+            })
+        {
+            return Some("Finish or stop active work before removing this project.".into());
+        }
+        None
+    }
+
+    /// Persist first: a failed registry write must leave the workspace unchanged.
+    pub fn remove_project(&mut self, work_dir: &Path) -> Result<(), String> {
+        if let Some(reason) = self.project_removal_disabled_reason(work_dir) {
+            return Err(reason);
+        }
+        let Some(project) = self
+            .client
+            .projects
+            .iter()
+            .find(|project| project.work_dir == work_dir)
+        else {
+            return Ok(());
+        };
+        let removing_active = self.client.active_work_dir.as_deref() == Some(work_dir)
+            || project
+                .sessions
+                .iter()
+                .any(|session| self.client.active_session_id.as_ref() == Some(&session.id));
+        threadlane_project::unregister_project(work_dir)?;
+        self.pending_hydrations.retain(|pending| {
+            !project
+                .sessions
+                .iter()
+                .any(|session| session.session_file == pending.session_file)
+        });
+        self.daemon_core.detach_project(work_dir);
+        self.client
+            .projects
+            .retain(|project| project.work_dir != work_dir);
+        if self.client.sidebar_project_filter.as_deref() == Some(work_dir) {
+            self.client.sidebar_project_filter = None;
+        }
+        if removing_active {
+            self.client.active_work_dir = None;
+            self.client.active_session_id = None;
+            let page = self.workspace_page;
+            self.begin_new_task();
+            self.workspace_page = page;
+            self.refresh_available_models();
+        }
+        Ok(())
+    }
     pub(crate) fn attach_project(&mut self, raw_path: PathBuf) -> Result<(), String> {
         let canonical = std::fs::canonicalize(&raw_path).map_err(|e| e.to_string())?;
         if !canonical.is_dir() {

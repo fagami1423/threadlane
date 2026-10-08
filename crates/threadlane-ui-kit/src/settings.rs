@@ -7,6 +7,9 @@ use gpui_component::tag::{Tag, TagVariant};
 use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable};
 use std::rc::Rc;
 
+#[path = "settings_projects.rs"]
+mod projects;
+pub use projects::{project_removal_dialog, settings_projects, SettingsProject};
 #[path = "settings_agent.rs"]
 mod agent;
 pub use agent::{settings_agent, SettingsAgent, SettingsAgentAction, SettingsAgentModel};

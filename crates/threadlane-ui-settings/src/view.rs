@@ -466,17 +466,90 @@ impl SettingsView {
             update: cfg!(target_os = "macos").then(|| SettingsUpdate { status: status.into(), action: action.into(), busy }),
         };
         let owner = cx.entity().downgrade();
-        kit_settings::settings_general(&general, move |action, window, cx| match action {
-            SettingsAction::Update => window.dispatch_action(Box::new(crate::ActivateUpdate), cx),
-            SettingsAction::AutoAddressReviews(enabled) => {
-                let _ = owner.update(cx, |this, cx| {
-                    let result = this.model.update(cx, |state, _| state.set_auto_address_pr_reviews_enabled(enabled));
-                    if let Err(error) = result { this.capability_status = Some(error); }
-                    cx.notify();
+        let projects = state
+            .projects
+            .iter()
+            .map(|project| kit_settings::SettingsProject {
+                path: project.work_dir.clone(),
+                name: project.name.clone(),
+                active: state.active_work_dir.as_ref() == Some(&project.work_dir)
+                    || project
+                        .sessions
+                        .iter()
+                        .any(|session| state.active_session_id.as_ref() == Some(&session.id)),
+                disabled_reason: state.project_removal_disabled_reason(&project.work_dir),
+            })
+            .collect();
+        let general = kit_settings::settings_general(
+            &general,
+            move |action, window, cx| match action {
+                SettingsAction::Update => {
+                    window.dispatch_action(Box::new(crate::ActivateUpdate), cx)
+                }
+                SettingsAction::AutoAddressReviews(enabled) => {
+                    let _ = owner.update(cx, |this, cx| {
+                        let result = this.model.update(cx, |state, _| {
+                            state.set_auto_address_pr_reviews_enabled(enabled)
+                        });
+                        if let Err(error) = result {
+                            this.capability_status = Some(error);
+                        }
+                        cx.notify();
+                    });
+                }
+                _ => {}
+            },
+            cx,
+        );
+        let owner = cx.entity().downgrade();
+        let projects = kit_settings::settings_projects(
+            projects,
+            self.capability_status.clone(),
+            move |path, window, cx| {
+                use gpui_component::WindowExt;
+                let owner = owner.clone();
+                let name = owner
+                    .upgrade()
+                    .and_then(|view| {
+                        view.read(cx)
+                            .model
+                            .read(cx)
+                            .projects
+                            .iter()
+                            .find(|project| project.work_dir == path)
+                            .map(|project| project.name.clone())
+                    })
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                window.open_alert_dialog(cx, move |alert, _, _| {
+                    let owner = owner.clone();
+                    let path_to_remove = path.clone();
+                    kit_settings::project_removal_dialog(alert, &name, &path.to_string_lossy())
+                        .on_ok(move |_, _, cx| {
+                            let _ = owner.update(cx, |this, cx| {
+                                let result = this.model.update(cx, |state, cx| {
+                                    let result = state.remove_project(&path_to_remove);
+                                    cx.notify();
+                                    result
+                                });
+                                this.capability_status = result
+                                    .err()
+                                    .map(|error| format!("Could not remove project: {error}"));
+                                cx.notify();
+                            });
+                            true
+                        },
+                    )
                 });
-            }
-            _ => {}
-        }, cx)
+            },
+            cx,
+        );
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(general)
+            .child(projects)
+            .into_any_element()
     }
 
     fn render_appearance(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
