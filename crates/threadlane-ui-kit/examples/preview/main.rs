@@ -23,6 +23,7 @@ actions!(ui_kit_preview, [QuitPreview]);
 
 fn open_gallery(cx: &mut App) {
     gpui_component::init(cx);
+    threadlane_ui_kit::init_editor(cx);
     #[cfg(target_family = "wasm")]
     threadlane_ui_kit::init_web_input_shortcuts(cx);
     threadlane_ui_kit::init_terminal_find(cx);

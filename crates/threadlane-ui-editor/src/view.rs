@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use gpui::*;
 use gpui_component::input::{EditorState, InputEvent, TabSize};
@@ -6,6 +7,8 @@ use gpui_component::menu::ContextMenuExt;
 use gpui_component::text::TextViewState;
 use gpui_component::WindowExt;
 
+use crate::closed_files::{ClosedFileHistory, FileTarget};
+use threadlane_client::DaemonClient;
 use threadlane_ui_state::AppState;
 
 actions!(editor, [SaveFile]);
@@ -30,6 +33,13 @@ pub struct EditorTab {
     pending_content: Option<String>,
     pending_line: Option<usize>,
     loading: bool,
+    open_error: Option<String>,
+    client_origin: Option<Arc<dyn DaemonClient>>,
+    client_epoch: u64,
+    client_connected: bool,
+    client_invalidated: bool,
+    request_generation: u64,
+    baseline_loaded: bool,
     editor_state: Option<Entity<EditorState>>,
     text_view_state: Option<Entity<TextViewState>>,
     markdown_preview: threadlane_ui_kit::MarkdownPreview,
@@ -38,6 +48,30 @@ pub struct EditorTab {
     /// included — the editor emits no `InputEvent` for selection-only
     /// changes, and the add-selection control must track them).
     _observe: Option<Subscription>,
+}
+
+#[derive(Clone)]
+struct ClientSnapshot {
+    client: Arc<dyn DaemonClient>,
+    epoch: u64,
+    connected: bool,
+}
+
+#[derive(Clone)]
+struct CloseSnapshot {
+    original_index: usize,
+    was_active: bool,
+    project: PathBuf,
+    path: String,
+    file_name: String,
+    editor: Option<Entity<EditorState>>,
+    contents: String,
+    is_dirty: bool,
+    is_diff: bool,
+    loading: bool,
+    has_pending_content: bool,
+    saved_content: String,
+    client: ClientSnapshot,
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +90,12 @@ pub struct EditorView {
     active_tab_index: Option<usize>,
     pending_open: Option<PendingOpen>,
     status_msg: Option<(String, bool, std::time::Instant)>,
+    closed_files: ClosedFileHistory,
+    client_context: Option<ClientSnapshot>,
+    next_request_generation: u64,
+    reopen_request: Option<(Entity<EditorState>, u64)>,
+    focus_handle: FocusHandle,
+    focus_restore_pending: Option<FocusHandle>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -67,8 +107,16 @@ impl EditorView {
     ) -> Self {
         let model_clone = model.clone();
         let sub = cx.observe(&model_clone, |_this, _model, cx| {
+            _this.sync_client_context(cx);
             cx.notify();
         });
+        let state = model.read(cx);
+        let client = state.daemon_client.clone();
+        let client_context = ClientSnapshot {
+            epoch: client.file_search_connection_epoch(),
+            connected: client.is_connected(),
+            client,
+        };
 
         Self {
             model,
@@ -76,12 +124,109 @@ impl EditorView {
             active_tab_index: None,
             pending_open: None,
             status_msg: None,
+            closed_files: ClosedFileHistory::default(),
+            client_context: Some(client_context),
+            next_request_generation: 0,
+            reopen_request: None,
+            focus_handle: cx.focus_handle(),
+            focus_restore_pending: None,
             _subscriptions: vec![sub],
         }
     }
 
     fn has_tabs(&self) -> bool {
         !self.tabs.is_empty()
+    }
+
+    fn set_active_tab_index(&mut self, index: Option<usize>) {
+        if self.active_tab_index != index {
+            self.focus_restore_pending = None;
+        }
+        self.active_tab_index = index;
+    }
+
+    fn focused_editor_handle(&self, window: &Window, cx: &App) -> Option<FocusHandle> {
+        let focused = window.focused(cx)?;
+        self.focus_handle.contains(&focused, window).then_some(focused)
+    }
+
+    fn current_client_snapshot(&self, cx: &App) -> ClientSnapshot {
+        let client = self.model.read(cx).daemon_client.clone();
+        ClientSnapshot {
+            epoch: client.file_search_connection_epoch(),
+            connected: client.is_connected(),
+            client,
+        }
+    }
+
+    /// Reconciles the daemon identity used by file reads and saves.
+    ///
+    /// Replacing the client invalidates both pending reads and this window's
+    /// closed-file history. A reconnect on the same client preserves history,
+    /// but any in-flight read belongs to the previous connection epoch.
+    fn sync_client_context(&mut self, cx: &mut Context<Self>) {
+        let current = self.current_client_snapshot(cx);
+        let Some(previous) = self.client_context.as_ref() else {
+            self.client_context = Some(current);
+            return;
+        };
+        let replaced = !Arc::ptr_eq(&previous.client, &current.client);
+        let epoch_changed = previous.epoch != current.epoch;
+        let connection_changed = previous.connected != current.connected;
+
+        if replaced {
+            self.focus_restore_pending = None;
+            self.closed_files.clear();
+            for tab in self.tabs.iter_mut().filter(|tab| !tab.is_diff) {
+                tab.client_invalidated = true;
+                tab.loading = false;
+                tab.pending_content = None;
+                tab.open_error = Some(
+                    "This file belongs to a previous daemon connection. Close it, then open it from the current checkout."
+                        .into(),
+                );
+            }
+            self.reopen_request = None;
+        } else if epoch_changed || connection_changed {
+            self.focus_restore_pending = None;
+            for tab in self.tabs.iter_mut().filter(|tab| !tab.is_diff) {
+                if tab.loading || tab.pending_content.is_some() {
+                    tab.loading = false;
+                    tab.pending_content = None;
+                    tab.open_error = Some(
+                        "The daemon connection changed while this file was loading. Retry."
+                            .into(),
+                    );
+                }
+            }
+            self.reopen_request = None;
+        }
+
+        self.client_context = Some(current);
+    }
+
+    fn reopen_control(
+        &self,
+        _cx: &App,
+    ) -> threadlane_ui_kit::ReopenClosedFileControl {
+        let in_flight = self.reopen_request.as_ref().and_then(|(editor, generation)| {
+            self.tabs.iter().find(|tab| {
+                tab.editor_state.as_ref() == Some(editor)
+                    && tab.request_generation == *generation
+            })
+        });
+        let loading = in_flight.is_some_and(|tab| tab.loading);
+        let target = if loading {
+            in_flight.map(|tab| format!("{} / {}", tab.project_dir.display(), tab.relative_path))
+        } else {
+            self.closed_files
+                .targets()
+                .next()
+                .map(|target| format!("{} / {}", target.project.display(), target.path))
+        };
+        threadlane_ui_kit::ReopenClosedFileControl::default()
+            .with_target(target)
+            .with_loading(loading)
     }
 
     pub fn tab_count(&self) -> usize {
@@ -269,6 +414,96 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Reopens the newest closed ordinary file in this window.
+    ///
+    /// History is consumed when the request is accepted. An already-open
+    /// non-diff tab is selected without refreshing or changing its buffer.
+    fn reopen_closed_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_client_context(cx);
+        if window.has_active_dialog(cx)
+            || window.has_active_sheet(cx)
+            || !self.focus_handle.contains_focused(window, cx)
+        {
+            return;
+        }
+        let reopen_is_loading = self.reopen_request.as_ref().is_some_and(|(editor, generation)| {
+            self.tabs.iter().any(|tab| {
+                tab.editor_state.as_ref() == Some(editor)
+                    && tab.request_generation == *generation
+                    && tab.loading
+            })
+        });
+        if reopen_is_loading {
+            return;
+        }
+        let Some(target) = self.closed_files.pop() else {
+            return;
+        };
+
+        if let Some(index) = self.tabs.iter().position(|tab| {
+            !tab.is_diff && tab.project_dir == target.project && tab.relative_path == target.path
+        }) {
+            self.set_active_tab_index(Some(index));
+            self.reopen_request = if self.tabs[index].loading {
+                self.tabs[index]
+                    .editor_state
+                    .clone()
+                    .map(|editor| (editor, self.tabs[index].request_generation))
+            } else {
+                None
+            };
+            if let Some(editor) = self.tabs[index].editor_state.clone() {
+                editor.update(cx, |editor, cx| editor.focus(window, cx));
+            }
+            self.status_msg = None;
+            cx.notify();
+            return;
+        }
+
+        self.open_file_internal(&target.project, &target.path, window, cx);
+        if let Some(index) = self.tabs.iter().position(|tab| {
+            !tab.is_diff && tab.project_dir == target.project && tab.relative_path == target.path
+        }) {
+            self.reopen_request = if self.tabs[index].loading {
+                self.tabs[index]
+                    .editor_state
+                    .clone()
+                    .map(|editor| (editor, self.tabs[index].request_generation))
+            } else {
+                None
+            };
+            if let Some(editor) = self.tabs[index].editor_state.clone() {
+                editor.update(cx, |editor, cx| editor.focus(window, cx));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Retries reading the saved file into the existing tab.
+    ///
+    /// The editor entity and any edits remain intact. Tabs invalidated by a
+    /// daemon replacement cannot be retried against the replacement client.
+    fn retry_file(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.sync_client_context(cx);
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if tab.is_diff || tab.loading {
+            return;
+        }
+        if tab.client_invalidated {
+            self.set_status(
+                "This file belongs to a previous daemon connection. Close it, then open it from the current checkout."
+                    .into(),
+                true,
+            );
+            cx.notify();
+            return;
+        }
+        self.start_file_read(index, cx);
+        cx.notify();
+    }
+
     pub fn open_diff(&mut self, relative_path: &str, content: &str, cx: &mut Context<Self>) {
         self.pending_open = Some(PendingOpen::Diff {
             path: relative_path.to_string(),
@@ -296,7 +531,7 @@ impl EditorView {
                     });
                 }
             }
-            self.active_tab_index = Some(existing_idx);
+            self.set_active_tab_index(Some(existing_idx));
             cx.notify();
             return;
         }
@@ -320,6 +555,13 @@ impl EditorView {
             pending_content: None,
             pending_line: None,
             loading: false,
+            open_error: None,
+            client_origin: None,
+            client_epoch: 0,
+            client_connected: false,
+            client_invalidated: false,
+            request_generation: 0,
+            baseline_loaded: true,
             editor_state: None,
             markdown_preview: threadlane_ui_kit::MarkdownPreview::new(cx),
             text_view_state: Some(markdown_state),
@@ -327,7 +569,7 @@ impl EditorView {
             _observe: None,
         });
 
-        self.active_tab_index = Some(self.tabs.len() - 1);
+        self.set_active_tab_index(Some(self.tabs.len() - 1));
         self.status_msg = None;
         cx.notify();
     }
@@ -345,16 +587,33 @@ impl EditorView {
             .iter()
             .position(|t| t.project_dir == project_dir && t.relative_path == relative_path)
         {
-            self.active_tab_index = Some(existing_idx);
-            if self.tabs[existing_idx].is_dirty {
-                self.set_status("Unsaved buffer preserved; saved-file line numbers may differ.".into(), false);
-            } else if !self.tabs[existing_idx].loading
-                && self.tabs[existing_idx].pending_content.is_none()
-            {
-                self.start_file_read(existing_idx, cx);
+            if self.tabs[existing_idx].client_invalidated {
+                if self.tabs[existing_idx].is_dirty {
+                    self.set_active_tab_index(Some(existing_idx));
+                    self.set_status(
+                        "This buffer has unsaved edits from a previous daemon. Discard or copy them before reopening from the current checkout."
+                            .into(),
+                        true,
+                    );
+                    cx.notify();
+                    return;
+                }
+                self.remove_tab_at(existing_idx, cx);
+            } else {
+                self.set_active_tab_index(Some(existing_idx));
+                if self.tabs[existing_idx].is_dirty {
+                    self.set_status(
+                        "Unsaved buffer preserved; saved-file line numbers may differ.".into(),
+                        false,
+                    );
+                } else if !self.tabs[existing_idx].loading
+                    && self.tabs[existing_idx].pending_content.is_none()
+                {
+                    self.start_file_read(existing_idx, cx);
+                }
+                cx.notify();
+                return;
             }
-            cx.notify();
-            return;
         }
 
         let lang = detect_language(relative_path);
@@ -372,7 +631,7 @@ impl EditorView {
                     tab_size: 4,
                     hard_tabs: false,
                 })
-                .default_value("Loading…")
+                .default_value("")
         });
 
         let target_path = relative_path.to_string();
@@ -414,6 +673,13 @@ impl EditorView {
             pending_content: None,
             pending_line: None,
             loading: false,
+            open_error: None,
+            client_origin: None,
+            client_epoch: 0,
+            client_connected: false,
+            client_invalidated: false,
+            request_generation: 0,
+            baseline_loaded: false,
             editor_state: Some(editor.clone()),
             markdown_preview: threadlane_ui_kit::MarkdownPreview::new(cx),
             text_view_state: None,
@@ -421,7 +687,7 @@ impl EditorView {
             _observe: Some(observe),
         });
 
-        self.active_tab_index = Some(self.tabs.len() - 1);
+        self.set_active_tab_index(Some(self.tabs.len() - 1));
         self.status_msg = None;
         cx.notify();
 
@@ -429,13 +695,48 @@ impl EditorView {
     }
 
     fn start_file_read(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if tab.is_diff || tab.loading {
+            return;
+        }
+        self.sync_client_context(cx);
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if tab.client_invalidated {
+            return;
+        }
+        if tab.client_origin.as_ref().is_some_and(|origin| {
+            !Arc::ptr_eq(origin, &self.current_client_snapshot(cx).client)
+        }) {
+            return;
+        }
+        let Some(load_editor) = tab.editor_state.clone() else {
+            return;
+        };
+        let snapshot = self.current_client_snapshot(cx);
+        self.next_request_generation = self.next_request_generation.wrapping_add(1);
+        let request_generation = self.next_request_generation;
         let tab = &mut self.tabs[index];
-        let Some(load_editor) = tab.editor_state.clone() else { return; };
         tab.loading = true;
         tab.pending_content = None;
+        tab.open_error = None;
+        tab.client_origin = Some(snapshot.client.clone());
+        tab.client_epoch = snapshot.epoch;
+        tab.client_connected = snapshot.connected;
+        tab.request_generation = request_generation;
+        if self
+            .reopen_request
+            .as_ref()
+            .is_some_and(|(editor, _)| editor == &load_editor)
+        {
+            self.reopen_request = Some((load_editor.clone(), request_generation));
+        }
         let load_project = tab.project_dir.clone();
         let load_path = tab.relative_path.clone();
-        let read_client = self.model.read(cx).daemon_client.clone();
+        let read_client = snapshot.client.clone();
         let read_project = load_project.clone();
         let read_path = load_path.clone();
         let read = cx.background_executor().spawn(async move {
@@ -445,7 +746,15 @@ impl EditorView {
         cx.spawn(async move |this, cx| {
             let result = read.await;
             let _ = this.update(cx, |this, cx| {
-                this.finish_file_open(&load_project, &load_path, &load_editor, result, cx);
+                this.finish_file_open_for_request(
+                    &load_project,
+                    &load_path,
+                    &load_editor,
+                    request_generation,
+                    snapshot,
+                    result,
+                    cx,
+                );
             });
         })
         .detach();
@@ -461,6 +770,7 @@ impl EditorView {
     /// Never clobbers user input: if the user typed into the loading tab
     /// while the read was in flight, their text stays and the file content
     /// becomes the saved baseline (marking the tab dirty, correctly).
+    #[cfg(test)]
     fn finish_file_open(
         &mut self,
         project_dir: &Path,
@@ -469,19 +779,86 @@ impl EditorView {
         result: Result<String, String>,
         cx: &mut Context<Self>,
     ) {
+        let Some(tab) = self.tabs.iter().find(|tab| {
+            tab.project_dir == project_dir
+                && tab.relative_path == relative_path
+                && tab.editor_state.as_ref() == Some(editor)
+        }) else {
+            return;
+        };
+        let snapshot = tab
+            .client_origin
+            .clone()
+            .map(|client| ClientSnapshot {
+                epoch: tab.client_epoch,
+                connected: client.is_connected(),
+                client,
+            })
+            .unwrap_or_else(|| self.current_client_snapshot(cx));
+        let request_generation = tab.request_generation;
+        self.finish_file_open_for_request(
+            project_dir,
+            relative_path,
+            editor,
+            request_generation,
+            snapshot,
+            result,
+            cx,
+        );
+    }
+
+    fn finish_file_open_for_request(
+        &mut self,
+        project_dir: &Path,
+        relative_path: &str,
+        editor: &Entity<EditorState>,
+        request_generation: u64,
+        snapshot: ClientSnapshot,
+        result: Result<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let current_client = self.current_client_snapshot(cx);
+        let context_matches = Arc::ptr_eq(&snapshot.client, &current_client.client)
+            && snapshot.epoch == current_client.epoch
+            && snapshot.connected == current_client.connected;
+        let replaced = !Arc::ptr_eq(&snapshot.client, &current_client.client);
         let Some(tab) = self.tabs.iter_mut().find(|t| {
             t.project_dir == project_dir
                 && t.relative_path == relative_path
                 && !t.is_diff
                 && t.editor_state.as_ref() == Some(editor)
+                && t.request_generation == request_generation
         }) else {
             return;
         };
+        let is_reopen_request = self
+            .reopen_request
+            .as_ref()
+            .is_some_and(|(reopen_editor, generation)| {
+                reopen_editor == editor && *generation == request_generation
+            });
+        if is_reopen_request {
+            self.reopen_request = None;
+        }
+        if !context_matches {
+            tab.loading = false;
+            tab.pending_content = None;
+            tab.pending_line = None;
+            tab.open_error = Some(if replaced {
+                "This file belongs to a previous daemon connection. Close it, then open it from the current checkout."
+                    .into()
+            } else {
+                "The daemon connection changed while this file was loading. Retry.".into()
+            });
+            tab.client_invalidated = replaced;
+            cx.notify();
+            return;
+        }
         tab.loading = false;
         match result {
             Ok(content) => {
                 let current = editor.read(cx).value();
-                if !tab.is_dirty && (current.as_str() == tab.saved_content || current.as_str() == "Loading…") {
+                if !tab.is_dirty && current.as_str() == tab.saved_content {
                     tab.pending_content = Some(content.clone());
                     // Matches once `sync_pending_content` applies it.
                     tab.is_dirty = false;
@@ -489,6 +866,9 @@ impl EditorView {
                     tab.is_dirty = current.as_str() != content.as_str();
                 }
                 tab.saved_content = content;
+                tab.open_error = None;
+                tab.client_invalidated = false;
+                tab.baseline_loaded = true;
             }
             Err(error) => {
                 tab.pending_line = None;
@@ -497,7 +877,15 @@ impl EditorView {
                     project_dir.join(relative_path).display(),
                     error
                 );
-                self.set_status(format!("Couldn't open {relative_path}: {error}. Check that the file still exists and is readable, then open it again from Files."), true);
+                tab.open_error = Some(format!(
+                    "Couldn't open {relative_path}: {error}. Retry after checking the file."
+                ));
+                self.set_status(
+                    format!(
+                        "Couldn't open {relative_path}: {error}. Check that the file still exists and is readable, then retry."
+                    ),
+                    true,
+                );
             }
         }
         cx.notify();
@@ -508,6 +896,7 @@ impl EditorView {
     /// Each tab applies at most once: content is taken, never re-read.
     fn sync_pending_content(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut applied = false;
+        let current_client = self.current_client_snapshot(cx);
         for (ix, tab) in self
             .tabs
             .iter_mut()
@@ -515,6 +904,31 @@ impl EditorView {
             .filter(|(_, tab)| !tab.is_diff)
         {
             if let Some(editor) = tab.editor_state.clone() {
+                if tab.pending_content.is_some()
+                    && (!tab
+                        .client_origin
+                        .as_ref()
+                        .is_some_and(|client| Arc::ptr_eq(client, &current_client.client))
+                        || tab.client_epoch != current_client.epoch
+                        || tab.client_connected != current_client.connected
+                        || tab.client_invalidated)
+                {
+                    let replaced = tab
+                        .client_origin
+                        .as_ref()
+                        .is_none_or(|client| !Arc::ptr_eq(client, &current_client.client));
+                    tab.pending_content = None;
+                    tab.loading = false;
+                    tab.open_error = Some(if replaced {
+                        "This file belongs to a previous daemon connection. Close it, then open it from the current checkout."
+                            .into()
+                    } else {
+                        "The daemon connection changed while this file was loading. Retry."
+                            .into()
+                    });
+                    tab.client_invalidated = replaced;
+                    continue;
+                }
                 if let Some(content) = tab.pending_content.take() {
                     let content: SharedString = content.into();
                     tab.markdown_preview.refresh(content.clone(), cx);
@@ -578,39 +992,171 @@ impl EditorView {
 
     fn select_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.tabs.len() {
-            self.active_tab_index = Some(index);
+            self.set_active_tab_index(Some(index));
             self.status_msg = None;
             cx.notify();
         }
     }
 
-    fn remove_tab_at(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn close_snapshot(&self, index: usize, cx: &App) -> Option<CloseSnapshot> {
+        let tab = self.tabs.get(index)?;
+        let contents = tab
+            .editor_state
+            .as_ref()
+            .map(|editor| editor.read(cx).value().to_string())
+            .unwrap_or_default();
+        Some(CloseSnapshot {
+            original_index: index,
+            was_active: self.active_tab_index == Some(index),
+            project: tab.project_dir.clone(),
+            path: tab.relative_path.clone(),
+            file_name: tab.file_name.clone(),
+            editor: tab.editor_state.clone(),
+            contents,
+            is_dirty: tab.is_dirty,
+            is_diff: tab.is_diff,
+            loading: tab.loading,
+            has_pending_content: tab.pending_content.is_some(),
+            saved_content: tab.saved_content.clone(),
+            client: self.current_client_snapshot(cx),
+        })
+    }
+
+    fn close_snapshot_matches(&self, snapshot: &CloseSnapshot, cx: &App) -> bool {
+        let current_client = self.current_client_snapshot(cx);
+        let Some(tab) = self.tabs.iter().find(|tab| {
+            tab.project_dir == snapshot.project
+                && tab.relative_path == snapshot.path
+                && tab.editor_state == snapshot.editor
+        }) else {
+            return false;
+        };
+        let contents = tab
+            .editor_state
+            .as_ref()
+            .map(|editor| editor.read(cx).value().to_string())
+            .unwrap_or_default();
+        Arc::ptr_eq(&snapshot.client.client, &current_client.client)
+            && snapshot.client.epoch == current_client.epoch
+            && snapshot.client.connected == current_client.connected
+            && tab.is_dirty == snapshot.is_dirty
+            && tab.is_diff == snapshot.is_diff
+            && tab.loading == snapshot.loading
+            && tab.pending_content.is_some() == snapshot.has_pending_content
+            && tab.saved_content == snapshot.saved_content
+            && contents == snapshot.contents
+    }
+
+    fn remove_confirmed_tabs(
+        &mut self,
+        snapshots: &[CloseSnapshot],
+        retained: Option<&CloseSnapshot>,
+        restore_focus: Option<FocusHandle>,
+        cx: &mut Context<Self>,
+    ) {
+        if snapshots
+            .iter()
+            .any(|snapshot| !self.close_snapshot_matches(snapshot, cx))
+            || retained.is_some_and(|snapshot| !self.close_snapshot_matches(snapshot, cx))
+        {
+            return;
+        }
+
+        let active_original_index = snapshots
+            .iter()
+            .find(|snapshot| snapshot.was_active)
+            .map(|snapshot| snapshot.original_index);
+        let mut ordered = snapshots.to_vec();
+        ordered.sort_by_key(|snapshot| std::cmp::Reverse(snapshot.original_index));
+        if let Some(active) = active_original_index {
+            ordered.sort_by(|left, right| {
+                match (
+                    left.original_index == active,
+                    right.original_index == active,
+                ) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => right.original_index.cmp(&left.original_index),
+                }
+            });
+        }
+        let current_client = self.current_client_snapshot(cx);
+        let mut removed = Vec::new();
+        let mut removed_active = false;
+        for snapshot in ordered {
+            if let Some(index) = self.tabs.iter().position(|tab| {
+                tab.project_dir == snapshot.project
+                    && tab.relative_path == snapshot.path
+                    && tab.editor_state == snapshot.editor
+            }) {
+                removed_active |= snapshot.was_active;
+                if let Some(tab) = self.remove_tab_at(index, cx) {
+                    if !tab.is_diff
+                        && tab.client_origin.as_ref().is_some_and(|client| {
+                            Arc::ptr_eq(client, &current_client.client)
+                        })
+                    {
+                        removed.push(FileTarget::new(tab.project_dir, tab.relative_path));
+                    }
+                }
+            }
+        }
+        for target in removed.into_iter().rev() {
+            self.closed_files.record(target);
+        }
+        if let Some(retained) = retained {
+            self.active_tab_index = self.tabs.iter().position(|tab| {
+                tab.project_dir == retained.project
+                    && tab.relative_path == retained.path
+                && tab.editor_state == retained.editor
+            });
+        }
+        if removed_active {
+            self.focus_restore_pending = restore_focus;
+        }
+        self.status_msg = None;
+        cx.notify();
+    }
+
+    fn remove_tab_at(&mut self, index: usize, cx: &mut Context<Self>) -> Option<EditorTab> {
         if index < self.tabs.len() {
-            self.tabs.remove(index);
+            let removed = self.tabs.remove(index);
+            self.focus_restore_pending = None;
+            if self
+                .reopen_request
+                .as_ref()
+                .is_some_and(|(editor, _)| removed.editor_state.as_ref() == Some(editor))
+            {
+                self.reopen_request = None;
+            }
             if self.tabs.is_empty() {
-                self.active_tab_index = None;
+                self.set_active_tab_index(None);
             } else if let Some(active) = self.active_tab_index {
                 if active >= self.tabs.len() {
-                    self.active_tab_index = Some(self.tabs.len() - 1);
+                    self.set_active_tab_index(Some(self.tabs.len() - 1));
                 } else if active > index {
-                    self.active_tab_index = Some(active - 1);
+                    self.set_active_tab_index(Some(active - 1));
                 }
             }
             self.status_msg = None;
             cx.notify();
+            Some(removed)
+        } else {
+            None
         }
     }
 
-    fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.tabs.len() {
             return;
         }
 
-        let tab = &self.tabs[index];
-        if tab.is_dirty && !tab.is_diff {
-            let file_name = tab.file_name.clone();
-            let target_path = tab.relative_path.clone();
-            let target_project = tab.project_dir.clone();
+        let restore_focus = self.focused_editor_handle(window, cx);
+        let Some(snapshot) = self.close_snapshot(index, cx) else {
+            return;
+        };
+        if snapshot.is_dirty && !snapshot.is_diff {
+            let file_name = snapshot.file_name.clone();
 
             cx.spawn(async move |this, cx| {
                 let result = rfd::AsyncMessageDialog::new()
@@ -623,42 +1169,46 @@ impl EditorView {
                     .await;
                 if matches!(result, rfd::MessageDialogResult::Yes) {
                     let _ = this.update(cx, |this, cx| {
-                        if let Some(pos) = this.tabs.iter().position(|t| {
-                            t.project_dir == target_project && t.relative_path == target_path
-                        }) {
-                            this.remove_tab_at(pos, cx);
-                        }
+                        this.remove_confirmed_tabs(&[snapshot], None, restore_focus, cx);
                     });
                 }
             })
             .detach();
         } else {
-            self.remove_tab_at(index, cx);
+            self.remove_confirmed_tabs(&[snapshot], None, restore_focus, cx);
         }
     }
 
-    fn close_other_tabs(&mut self, keep_index: usize, cx: &mut Context<Self>) {
+    fn close_other_tabs(
+        &mut self,
+        keep_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if keep_index >= self.tabs.len() {
             return;
         }
 
-        let dirty_names: Vec<String> = self
+        let restore_focus = self.focused_editor_handle(window, cx);
+        let Some(retained) = self.close_snapshot(keep_index, cx) else {
+            return;
+        };
+        let snapshots: Vec<CloseSnapshot> = self
             .tabs
             .iter()
             .enumerate()
-            .filter(|(i, t)| *i != keep_index && t.is_dirty && !t.is_diff)
-            .map(|(_, t)| t.file_name.clone())
+            .filter(|(index, _)| *index != keep_index)
+            .filter_map(|(index, _)| self.close_snapshot(index, cx))
+            .collect();
+        let dirty_names: Vec<String> = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.is_dirty && !snapshot.is_diff)
+            .map(|snapshot| snapshot.file_name.clone())
             .collect();
 
         if dirty_names.is_empty() {
-            let kept = self.tabs.remove(keep_index);
-            self.tabs = vec![kept];
-            self.active_tab_index = Some(0);
-            self.status_msg = None;
-            cx.notify();
+            self.remove_confirmed_tabs(&snapshots, Some(&retained), restore_focus, cx);
         } else {
-            let keep_path = self.tabs[keep_index].relative_path.clone();
-            let keep_project = self.tabs[keep_index].project_dir.clone();
             let description = if dirty_names.len() == 1 {
                 format!(
                     "Do you want to discard unsaved changes to \"{}\"?",
@@ -681,15 +1231,12 @@ impl EditorView {
                     .await;
                 if matches!(result, rfd::MessageDialogResult::Yes) {
                     let _ = this.update(cx, |this, cx| {
-                        if let Some(pos) = this.tabs.iter().position(|t| {
-                            t.project_dir == keep_project && t.relative_path == keep_path
-                        }) {
-                            let kept = this.tabs.remove(pos);
-                            this.tabs = vec![kept];
-                            this.active_tab_index = Some(0);
-                            this.status_msg = None;
-                            cx.notify();
-                        }
+                        this.remove_confirmed_tabs(
+                            &snapshots,
+                            Some(&retained),
+                            restore_focus,
+                            cx,
+                        );
                     });
                 }
             })
@@ -697,19 +1244,22 @@ impl EditorView {
         }
     }
 
-    fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
-        let dirty_names: Vec<String> = self
+    fn close_all_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let restore_focus = self.focused_editor_handle(window, cx);
+        let snapshots: Vec<CloseSnapshot> = self
             .tabs
             .iter()
-            .filter(|t| t.is_dirty && !t.is_diff)
-            .map(|t| t.file_name.clone())
+            .enumerate()
+            .filter_map(|(index, _)| self.close_snapshot(index, cx))
+            .collect();
+        let dirty_names: Vec<String> = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.is_dirty && !snapshot.is_diff)
+            .map(|snapshot| snapshot.file_name.clone())
             .collect();
 
         if dirty_names.is_empty() {
-            self.tabs.clear();
-            self.active_tab_index = None;
-            self.status_msg = None;
-            cx.notify();
+            self.remove_confirmed_tabs(&snapshots, None, restore_focus, cx);
         } else {
             let description = if dirty_names.len() == 1 {
                 format!(
@@ -733,10 +1283,7 @@ impl EditorView {
                     .await;
                 if matches!(result, rfd::MessageDialogResult::Yes) {
                     let _ = this.update(cx, |this, cx| {
-                        this.tabs.clear();
-                        this.active_tab_index = None;
-                        this.status_msg = None;
-                        cx.notify();
+                        this.remove_confirmed_tabs(&snapshots, None, restore_focus, cx);
                     });
                 }
             })
@@ -756,17 +1303,35 @@ impl EditorView {
     }
 
     fn save_tab_at(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get_mut(index) else {
+        self.sync_client_context(cx);
+        let current_client = self.current_client_snapshot(cx);
+        let Some(tab) = self.tabs.get(index) else {
             return;
         };
 
-        if tab.is_diff {
+        if tab.is_diff || !tab.baseline_loaded || tab.client_invalidated {
+            if !tab.is_diff && !tab.baseline_loaded {
+                self.set_status(
+                    "This file has not loaded successfully and cannot be saved yet.".into(),
+                    true,
+                );
+            }
             return;
         }
 
         let Some(ref editor) = tab.editor_state else {
             return;
         };
+        if !tab.client_origin.as_ref().is_some_and(|client| {
+            Arc::ptr_eq(client, &current_client.client)
+        }) {
+            self.set_status(
+                "This file belongs to a previous daemon connection. Close it, then open it from the current checkout before saving."
+                    .into(),
+                true,
+            );
+            return;
+        }
 
         let project_dir = tab.project_dir.clone();
         let relative_path = tab.relative_path.clone();
@@ -774,7 +1339,10 @@ impl EditorView {
         let content = editor.read(cx).value().to_string();
         let file_name = tab.file_name.clone();
         let editor = editor.clone();
-        let client = self.model.read(cx).daemon_client.clone();
+        let client = current_client.client.clone();
+        let write_client = client.clone();
+        let client_epoch = current_client.epoch;
+        let client_connected = current_client.connected;
 
         // The file lives on the daemon host; save through project-io and
         // only settle the tab once the daemon confirms the write.
@@ -786,7 +1354,7 @@ impl EditorView {
                 .background_executor()
                 .spawn(async move {
                     threadlane_ui_state::project_io::write_file(
-                        &client,
+                        &write_client,
                         &write_dir,
                         write_path,
                         write_content,
@@ -795,12 +1363,29 @@ impl EditorView {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                let current_client = this.current_client_snapshot(cx);
+                if !Arc::ptr_eq(&client, &current_client.client)
+                    || current_client.epoch != client_epoch
+                    || current_client.connected != client_connected
+                {
+                    this.set_status(
+                        format!(
+                            "The daemon connection changed while saving {file_name}; verify the file before saving again."
+                        ),
+                        true,
+                    );
+                    cx.notify();
+                    return;
+                }
                 match result {
                     Ok(()) => {
                         if let Some(tab) = this.tabs.iter_mut().find(|t| {
                             t.project_dir == project_dir
                                 && t.relative_path == relative_path
                                 && !t.is_diff
+                                && t.editor_state.as_ref() == Some(&editor)
+                                && !t.client_invalidated
+                                && t.client_origin.as_ref().is_some_and(|origin| Arc::ptr_eq(origin, &client))
                         }) {
                             let current = editor.read(cx).value();
                             tab.is_dirty = current.as_str() != content.as_str();
@@ -857,13 +1442,13 @@ impl EditorView {
                                     }
                                 });
                             },
-                            move |_, _, cx| {
+                            move |_, window, cx| {
                                 close_owner.update(cx, |view, cx| {
                                     if let Some(index) = view.tabs.iter().position(|tab| {
                                         tab.project_dir == close_project
                                             && tab.relative_path == close_path
                                     }) {
-                                        view.close_tab(index, cx);
+                                        view.close_tab(index, window, cx);
                                     }
                                 });
                             },
@@ -873,7 +1458,7 @@ impl EditorView {
                             let owner = menu_owner.clone();
                             let project = project.clone();
                             let path = path.clone();
-                            threadlane_ui_kit::editor_tab_menu(menu, move |action, _, cx| {
+                            threadlane_ui_kit::editor_tab_menu(menu, move |action, window, cx| {
                                 owner.update(cx, |view, cx| {
                                     let Some(index) = view.tabs.iter().position(|tab| {
                                         tab.project_dir == project && tab.relative_path == path
@@ -882,13 +1467,13 @@ impl EditorView {
                                     };
                                     match action {
                                         threadlane_ui_kit::EditorTabAction::Close => {
-                                            view.close_tab(index, cx)
+                                            view.close_tab(index, window, cx)
                                         }
                                         threadlane_ui_kit::EditorTabAction::CloseOthers => {
-                                            view.close_other_tabs(index, cx)
+                                            view.close_other_tabs(index, window, cx)
                                         }
                                         threadlane_ui_kit::EditorTabAction::CloseAll => {
-                                            view.close_all_tabs(cx)
+                                            view.close_all_tabs(window, cx)
                                         }
                                     }
                                 });
@@ -909,6 +1494,7 @@ impl EditorView {
                             .control(tab.loading || tab.pending_content.is_some(), cx)
                     }),
                 self.visible_status(),
+                self.reopen_button(cx),
                 Some(
                     threadlane_ui_kit::editor_add_selection_button(
                         "editor-add-selection",
@@ -960,7 +1546,19 @@ impl EditorView {
     }
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        threadlane_ui_kit::editor_empty_state(cx)
+        threadlane_ui_kit::editor_empty_state(
+            self.reopen_button(cx),
+            cx,
+        )
+    }
+
+    fn reopen_button(&self, cx: &Context<Self>) -> gpui_component::button::Button {
+        let focus = self.focus_handle.clone();
+        threadlane_ui_kit::editor_reopen_button(&self.reopen_control(cx))
+            .on_click(move |_, window, cx| {
+                window.focus(&focus, cx);
+                window.dispatch_action(Box::new(threadlane_ui_kit::ReopenClosedFile), cx);
+            })
     }
 
 }
@@ -969,15 +1567,51 @@ impl EventEmitter<threadlane_ui_kit::EditorSelectionRequest> for EditorView {}
 
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_client_context(cx);
+        if let Some(original_focus) = self.focus_restore_pending.take() {
+            let focus_unchanged = window
+                .focused(cx)
+                .is_none_or(|current| current == original_focus);
+            if focus_unchanged
+                && !window.has_active_dialog(cx)
+                && !window.has_active_sheet(cx)
+            {
+                window.focus(&self.focus_handle, cx);
+            }
+        }
         self.sync_pending_file(window, cx);
         self.sync_pending_content(window, cx);
         threadlane_ui_kit::editor_surface(cx)
+            .id("central-editor")
+            .role(Role::Group)
+            .track_focus(&self.focus_handle)
+            .key_context("CentralEditor")
+            .on_action(cx.listener(|view, _: &threadlane_ui_kit::ReopenClosedFile, window, cx| {
+                view.reopen_closed_file(window, cx)
+            }))
             .on_action(cx.listener(Self::save_file_action))
             .on_action(cx.listener(Self::toggle_markdown_preview))
             .on_action(cx.listener(|view, _: &threadlane_ui_kit::AddSelectionToChat, window, cx| {
                 view.request_add_selection_to_chat(window, cx)
             }))
             .children(self.has_tabs().then(|| self.render_tab_bar(cx)))
+            .children(self.active_tab_index.and_then(|index| self.tabs.get(index).map(|tab| (index, tab)))
+                .filter(|(_, tab)| tab.loading || tab.open_error.is_some())
+                .map(|(index, tab)| {
+                    let target = format!("{} / {}", tab.project_dir.display(), tab.relative_path);
+                    let editor = tab.editor_state.clone();
+                    threadlane_ui_kit::editor_file_status(
+                        target.clone(),
+                        tab.open_error.clone(),
+                        threadlane_ui_kit::editor_retry_button(&target, tab.loading)
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                if view.tabs.get(index).is_some_and(|tab| tab.editor_state == editor) {
+                                    view.retry_file(index, cx);
+                                }
+                            })),
+                        cx,
+                    )
+                }))
             .children(
                 self.active_tab_index
                     .and_then(|ix| self.tabs.get(ix))
@@ -1200,7 +1834,9 @@ mod navigation_tests {
                 Some("Diffs can't be added to chat — open the file itself")
             );
         });
-        editor.update(cx, |view, cx| view.close_tab(0, cx));
+        cx.update(|window, cx| {
+            editor.update(cx, |view, cx| view.close_tab(0, window, cx))
+        });
         // No open file at all.
         editor.read_with(cx, |view, cx| {
             assert_eq!(
@@ -1216,7 +1852,9 @@ mod navigation_tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("sample.rs"), "fn sample() {}\n".repeat(400)).unwrap();
         let project = dir.path().to_path_buf();
-        let model = cx.new(|_| threadlane_ui_state::AppState::default());
+        let mut app_state = threadlane_ui_state::AppState::for_tests();
+        app_state.active_work_dir = Some(project.clone());
+        let model = cx.new(|_| app_state);
         let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
         let holder_clone = holder.clone();
         let project_clone = project.clone();
@@ -1325,6 +1963,642 @@ mod navigation_tests {
             assert!(!editor.tabs[0].loading);
             assert!(editor.tabs[0].pending_line.is_none());
             assert_eq!(input.read(cx).value().as_str(), unsaved);
+        });
+    }
+}
+
+#[cfg(test)]
+mod closed_file_host_tests {
+    use gpui::AppContext as _;
+
+    use crate::closed_files::FileTarget;
+    use super::{ClientSnapshot, EditorView};
+
+    fn test_state(project: &std::path::Path) -> threadlane_ui_state::AppState {
+        let mut state = threadlane_ui_state::AppState::for_tests();
+        state.active_session_id = None;
+        state.active_work_dir = Some(project.to_path_buf());
+        state
+    }
+
+    #[gpui::test]
+    fn bulk_close_history_reopens_active_first_and_excludes_diffs(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        for path in ["one.rs", "two.rs"] {
+            std::fs::write(dir.path().join(path), path).unwrap();
+        }
+        let project = dir.path().to_path_buf();
+        let model = cx.new(|_| test_state(&project));
+        let project_for_view = project.clone();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = EditorView::new(model, window, cx);
+                view.open_file_internal(&project_for_view, "one.rs", window, cx);
+                view.open_file_internal(&project_for_view, "two.rs", window, cx);
+                view.open_diff_internal("review.diff", "+new", window, cx);
+                view.select_tab(0, cx);
+                view.close_all_tabs(window, cx);
+                view
+            });
+            gpui_component::Root::new(view, window, cx)
+        });
+        let view = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<EditorView>().unwrap()
+        });
+
+        view.read_with(cx, |view, _| {
+            assert!(view.tabs.is_empty());
+            assert_eq!(
+                view.closed_files.targets().cloned().collect::<Vec<_>>(),
+                vec![
+                    FileTarget::new(project.clone(), "one.rs"),
+                    FileTarget::new(project.clone(), "two.rs"),
+                ]
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn reopen_reads_current_bytes_but_selecting_open_dirty_file_does_not_refresh(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sample.rs"), "initial bytes\n").unwrap();
+        let project = dir.path().to_path_buf();
+        let model = cx.new(|_| test_state(&project));
+        let project_for_view = project.clone();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = EditorView::new(model, window, cx);
+                view.open_file_internal(&project_for_view, "sample.rs", window, cx);
+                view
+            });
+            gpui_component::Root::new(view, window, cx)
+        });
+        let view = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<EditorView>().unwrap()
+        });
+
+        cx.run_until_parked();
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.update(|window, cx| window.simulate_next_frame(cx));
+            cx.run_until_parked();
+        }
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.tabs[0]
+                    .editor_state
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .value()
+                    .as_str(),
+                "initial bytes\n"
+            );
+        });
+
+        cx.update(|window, cx| {
+            let focus = view.read_with(cx, |view, _| view.focus_handle.clone());
+            window.focus(&focus, cx);
+            view.update(cx, |view, cx| view.close_tab(0, window, cx));
+        });
+        std::fs::write(dir.path().join("sample.rs"), "updated disk bytes\n").unwrap();
+        cx.update(|window, cx| {
+            let focus = view.read_with(cx, |view, _| view.focus_handle.clone());
+            window.focus(&focus, cx);
+            view.update(cx, |view, cx| view.reopen_closed_file(window, cx));
+        });
+        cx.run_until_parked();
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.update(|window, cx| window.simulate_next_frame(cx));
+            cx.run_until_parked();
+        }
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.tabs[0]
+                    .editor_state
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .value()
+                    .as_str(),
+                "updated disk bytes\n"
+            );
+        });
+
+        std::fs::write(dir.path().join("sample.rs"), "external change\n").unwrap();
+        cx.update(|window, cx| {
+            let focus = view.read_with(cx, |view, _| view.focus_handle.clone());
+            window.focus(&focus, cx);
+            view.update(cx, |view, cx| {
+                view.open_diff_internal("review.diff", "+diff", window, cx);
+                let file_index = view
+                    .tabs
+                    .iter()
+                    .position(|tab| tab.relative_path == "sample.rs")
+                    .unwrap();
+                let editor = view.tabs[file_index].editor_state.clone().unwrap();
+                editor.update(cx, |editor, cx| {
+                    editor.set_value("typed edits", window, cx);
+                });
+                view.tabs[file_index].is_dirty = true;
+                view.closed_files
+                    .record(FileTarget::new(project.clone(), "sample.rs"));
+                view.reopen_closed_file(window, cx);
+            });
+        });
+        view.read_with(cx, |view, cx| {
+            let active = view.active_tab_index.unwrap();
+            assert_eq!(view.tabs[active].relative_path, "sample.rs");
+            assert!(view.tabs[active].is_dirty);
+            assert_eq!(
+                view.tabs[active]
+                    .editor_state
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .value()
+                    .as_str(),
+                "typed edits"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn stale_bulk_confirmation_preserves_edits_and_new_tabs(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sample.rs"), "saved\n").unwrap();
+        let project = dir.path().to_path_buf();
+        let model = cx.new(|_| test_state(&project));
+        let project_for_view = project.clone();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = EditorView::new(model, window, cx);
+                view.open_file_internal(&project_for_view, "sample.rs", window, cx);
+                view
+            });
+            gpui_component::Root::new(view, window, cx)
+        });
+        let view = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<EditorView>().unwrap()
+        });
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let stale = view.close_snapshot(0, cx).unwrap();
+                let editor = view.tabs[0].editor_state.clone().unwrap();
+                editor.update(cx, |editor, cx| editor.set_value("new edits", window, cx));
+                view.tabs[0].is_dirty = true;
+                view.remove_confirmed_tabs(std::slice::from_ref(&stale), None, None, cx);
+                assert_eq!(view.tabs.len(), 1);
+                assert!(view.closed_files.is_empty());
+
+                let current = view.close_snapshot(0, cx).unwrap();
+                view.open_diff_internal("new.diff", "+new", window, cx);
+                view.remove_confirmed_tabs(std::slice::from_ref(&current), None, None, cx);
+                assert_eq!(view.tabs.len(), 1);
+                assert!(view.tabs[0].is_diff);
+                assert_eq!(
+                    view.closed_files.targets().next(),
+                    Some(&FileTarget::new(project.clone(), "sample.rs"))
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn replacement_tab_rejects_old_read_and_old_client_history(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sample.rs"), "disk bytes\n").unwrap();
+        let project = dir.path().to_path_buf();
+        let model = cx.new(|_| test_state(&project));
+        let model_for_view = model.clone();
+        let replacement = threadlane_ui_state::AppState::for_tests()
+            .daemon_client
+            .clone();
+        let project_for_view = project.clone();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = EditorView::new(model_for_view, window, cx);
+                view.open_file_internal(&project_for_view, "sample.rs", window, cx);
+                view
+            });
+            gpui_component::Root::new(view, window, cx)
+        });
+        let view = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<EditorView>().unwrap()
+        });
+        let old_editor = view.read_with(cx, |view, _| {
+            view.tabs[0].editor_state.clone().unwrap()
+        });
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.closed_files
+                    .record(FileTarget::new(project.clone(), "sample.rs"));
+                let old_index = view.tabs.iter().position(|tab| tab.editor_state.as_ref() == Some(&old_editor)).unwrap();
+                view.remove_tab_at(old_index, cx);
+                view.open_file_internal(&project, "sample.rs", window, cx);
+                let replacement_editor = view.tabs[0].editor_state.clone().unwrap();
+                view.finish_file_open(
+                    &project,
+                    "sample.rs",
+                    &old_editor,
+                    Ok("stale bytes".into()),
+                    cx,
+                );
+                assert_ne!(replacement_editor, old_editor);
+                assert!(view.tabs[0].pending_content.is_none());
+            });
+        });
+
+        cx.update(|_, cx| {
+            model.update(cx, |state, _| state.daemon_client = replacement);
+            view.update(cx, |view, cx| view.sync_client_context(cx));
+        });
+        view.read_with(cx, |view, _| {
+            assert!(view.closed_files.is_empty());
+            assert!(view.tabs[0].client_invalidated);
+            assert!(view.tabs[0]
+                .open_error
+                .as_deref()
+                .is_some_and(|message| message.contains("previous daemon")));
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.close_tab(0, window, cx));
+        });
+        view.read_with(cx, |view, _| assert!(view.closed_files.is_empty()));
+    }
+
+    #[gpui::test]
+    fn stale_epoch_read_is_rejected_and_same_client_retry_uses_current_epoch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sample.rs"), "disk bytes\n").unwrap();
+        let project = dir.path().to_path_buf();
+        let model = cx.new(|_| test_state(&project));
+        let project_for_view = project.clone();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = EditorView::new(model, window, cx);
+                view.open_file_internal(&project_for_view, "sample.rs", window, cx);
+                view
+            });
+            gpui_component::Root::new(view, window, cx)
+        });
+        let view = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<EditorView>().unwrap()
+        });
+
+        view.update(cx, |view, cx| {
+            let current = view.current_client_snapshot(cx);
+            let editor = view.tabs[0].editor_state.clone().unwrap();
+            let generation = view.tabs[0].request_generation;
+            view.tabs[0].loading = true;
+            view.tabs[0].pending_content = None;
+            view.tabs[0].client_origin = Some(current.client.clone());
+            view.tabs[0].client_epoch = current.epoch.wrapping_add(1);
+            view.client_context = Some(ClientSnapshot {
+                epoch: current.epoch.wrapping_add(1),
+                ..current.clone()
+            });
+            view.closed_files
+                .record(FileTarget::new(project.clone(), "closed.rs"));
+            view.sync_client_context(cx);
+            assert!(!view.tabs[0].loading);
+            assert!(view.tabs[0]
+                .open_error
+                .as_deref()
+                .is_some_and(|message| message.contains("connection changed")));
+            let stale_epoch = ClientSnapshot {
+                epoch: current.epoch.wrapping_add(1),
+                ..current.clone()
+            };
+            view.finish_file_open_for_request(
+                &project,
+                "sample.rs",
+                &editor,
+                generation,
+                stale_epoch,
+                Ok("stale epoch bytes".into()),
+                cx,
+            );
+            assert!(!view.tabs[0].loading);
+            assert!(view.tabs[0]
+                .open_error
+                .as_deref()
+                .is_some_and(|message| message.contains("connection changed")));
+            assert_eq!(view.closed_files.targets().count(), 1);
+
+            view.retry_file(0, cx);
+            assert!(view.tabs[0].loading);
+            assert_eq!(view.tabs[0].client_epoch, current.epoch);
+            assert!(!view.tabs[0].client_invalidated);
+        });
+    }
+
+    #[gpui::test]
+    fn save_requires_a_baseline_and_rejects_stale_client_completion(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sample.rs"), "initial bytes\n").unwrap();
+        let project = dir.path().to_path_buf();
+        let model = cx.new(|_| test_state(&project));
+        let model_for_view = model.clone();
+        let replacement = threadlane_ui_state::AppState::for_tests()
+            .daemon_client
+            .clone();
+        let project_for_view = project.clone();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = EditorView::new(model_for_view, window, cx);
+                view.open_file_internal(&project_for_view, "missing.rs", window, cx);
+                view.open_file_internal(&project_for_view, "sample.rs", window, cx);
+                view
+            });
+            gpui_component::Root::new(view, window, cx)
+        });
+        let view = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<EditorView>().unwrap()
+        });
+
+        view.update(cx, |view, cx| {
+            assert!(!view.tabs[0].baseline_loaded);
+            view.save_tab_at(0, cx);
+            assert!(view
+                .status_msg
+                .as_ref()
+                .is_some_and(|(message, _, _)| message.contains("not loaded successfully")));
+        });
+        cx.run_until_parked();
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.update(|window, cx| window.simulate_next_frame(cx));
+            cx.run_until_parked();
+        }
+        assert!(!project.join("missing.rs").exists());
+        view.read_with(cx, |view, _| assert!(view.tabs[1].baseline_loaded));
+
+        let sample_editor = view.read_with(cx, |view, _| {
+            view.tabs[1].editor_state.clone().unwrap()
+        });
+        let focus = view.read_with(cx, |view, _| view.focus_handle.clone());
+        cx.update(|window, cx| {
+            window.focus(&focus, cx);
+            view.update(cx, |view, cx| {
+                sample_editor.update(cx, |editor, cx| {
+                    editor.set_value("same client save", window, cx);
+                });
+                view.tabs[1].is_dirty = true;
+                view.tabs[1].client_epoch = view.tabs[1].client_epoch.wrapping_add(1);
+                view.save_tab_at(1, cx);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status_msg
+                    .as_ref()
+                    .map(|(message, _, _)| message.as_str()),
+                Some("Saved sample.rs")
+            );
+            assert!(!view.tabs[1].is_dirty);
+        });
+        assert_eq!(
+            std::fs::read_to_string(project.join("sample.rs")).unwrap(),
+            "same client save"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                sample_editor.update(cx, |editor, cx| {
+                    editor.set_value("stale completion".to_string(), window, cx);
+                });
+                view.tabs[1].is_dirty = true;
+                view.save_tab_at(1, cx);
+            });
+            model.update(cx, |state, _| state.daemon_client = replacement);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.status_msg.as_ref().is_some_and(|(message, _, _)| {
+                message.contains("daemon connection changed while saving")
+            }));
+            assert!(view.tabs[1].is_dirty);
+        });
+    }
+
+    #[gpui::test]
+    fn stale_close_completion_does_not_steal_focus_and_last_tab_keeps_reopen_shortcut(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        cx.update(threadlane_ui_kit::init_editor);
+        let dir = tempfile::tempdir().unwrap();
+        for path in ["sample.rs", "second.rs"] {
+            std::fs::write(dir.path().join(path), path).unwrap();
+        }
+        let project = dir.path().to_path_buf();
+        let model = cx.new(|_| test_state(&project));
+        let project_for_view = project.clone();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = EditorView::new(model, window, cx);
+                view.open_file_internal(&project_for_view, "sample.rs", window, cx);
+                view
+            });
+            gpui_component::Root::new(view, window, cx)
+        });
+        let view = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<EditorView>().unwrap()
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let editor_focus = view.read_with(cx, |view, _| view.focus_handle.clone());
+        let outsider_focus = cx.update(|_, cx| cx.focus_handle());
+        cx.update(|window, cx| {
+            window.focus(&editor_focus, cx);
+            view.update(cx, |view, cx| view.close_tab(0, window, cx));
+            window.focus(&outsider_focus, cx);
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(
+            cx.update(|window, cx| window.focused(cx)),
+            Some(outsider_focus.clone())
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_file_internal(&project, "second.rs", window, cx);
+            });
+            window.draw(cx).clear(cx);
+            window.focus(&editor_focus, cx);
+            view.update(cx, |view, cx| view.close_tab(0, window, cx));
+            window.blur(cx);
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(
+            cx.update(|window, cx| window.focused(cx)),
+            Some(editor_focus.clone())
+        );
+
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-shift-t"
+        } else {
+            "ctrl-shift-t"
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 1);
+            assert_eq!(view.tabs[0].relative_path, "second.rs");
+        });
+    }
+
+    #[gpui::test]
+    fn reopen_action_is_single_flight_and_reports_its_in_flight_target(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        cx.update(threadlane_ui_kit::init_editor);
+        let dir = tempfile::tempdir().unwrap();
+        for path in ["one.rs", "two.rs", "other.rs"] {
+            std::fs::write(dir.path().join(path), path).unwrap();
+        }
+        let project = dir.path().to_path_buf();
+        let model = cx.new(|_| test_state(&project));
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| EditorView::new(model, window, cx));
+            gpui_component::Root::new(view, window, cx)
+        });
+        let view = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<EditorView>().unwrap()
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let editor_focus = view.read_with(cx, |view, _| view.focus_handle.clone());
+        cx.update(|window, cx| {
+            window.focus(&editor_focus, cx);
+            view.update(cx, |view, _cx| {
+                view.closed_files
+                    .record(FileTarget::new(project.clone(), "two.rs"));
+                view.closed_files
+                    .record(FileTarget::new(project.clone(), "one.rs"));
+            });
+        });
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-shift-t"
+        } else {
+            "ctrl-shift-t"
+        });
+        view.update(cx, |view, _| {
+            let (editor, generation) = {
+                let tab = &mut view.tabs[0];
+                let generation = tab.request_generation.wrapping_add(1);
+                tab.request_generation = generation;
+                tab.loading = true;
+                (tab.editor_state.clone().unwrap(), generation)
+            };
+            view.reopen_request = Some((editor, generation));
+        });
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.tabs.len(), 1);
+            assert!(view.tabs[0].loading);
+            assert!(view
+                .reopen_control(cx)
+                .description()
+                .starts_with("Reopening "));
+            assert!(view.reopen_control(cx).description().contains("one.rs"));
+        });
+
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-shift-t"
+        } else {
+            "ctrl-shift-t"
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 1);
+            assert_eq!(view.closed_files.targets().count(), 1);
+        });
+
+        let reopened_editor = view.read_with(cx, |view, _| {
+            view.tabs
+                .iter()
+                .find(|tab| tab.relative_path == "one.rs")
+                .unwrap()
+                .editor_state
+                .clone()
+                .unwrap()
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_file_internal(&project, "other.rs", window, cx);
+                let other_editor = view
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.relative_path == "other.rs")
+                    .unwrap()
+                    .editor_state
+                    .clone()
+                    .unwrap();
+                view.finish_file_open(
+                    &project,
+                    "other.rs",
+                    &other_editor,
+                    Ok("other.rs".into()),
+                    cx,
+                );
+            });
+        });
+        view.read_with(cx, |view, cx| {
+            assert!(view.tabs.iter().any(|tab| tab.relative_path == "other.rs"));
+            assert!(view
+                .reopen_control(cx)
+                .description()
+                .starts_with("Reopening "));
+            assert!(view.reopen_control(cx).description().contains("one.rs"));
+        });
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.finish_file_open(
+                    &project,
+                    "one.rs",
+                    &reopened_editor,
+                    Ok("one.rs".into()),
+                    cx,
+                );
+            });
+        });
+        view.read_with(cx, |view, cx| {
+            assert!(view.reopen_control(cx).description().starts_with("Reopen "));
+            assert!(view.reopen_control(cx).description().contains("two.rs"));
+        });
+
+        let outsider_focus = cx.update(|_, cx| cx.focus_handle());
+        cx.update(|window, cx| window.focus(&outsider_focus, cx));
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-shift-t"
+        } else {
+            "ctrl-shift-t"
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.closed_files.targets().count(), 1);
+            assert_eq!(view.tabs.len(), 2);
         });
     }
 }

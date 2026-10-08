@@ -11,7 +11,101 @@ use gpui_component::tag::Tag;
 use gpui_component::text::TextViewState;
 use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Sizable};
 
-actions!(editor, [AddSelectionToChat]);
+actions!(editor, [AddSelectionToChat, ReopenClosedFile]);
+
+pub fn init_editor(cx: &mut App) {
+    cx.bind_keys([
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-t", ReopenClosedFile, Some("CentralEditor")),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-t", ReopenClosedFile, Some("CentralEditor")),
+        #[cfg(target_family = "wasm")]
+        KeyBinding::new("cmd-shift-t", ReopenClosedFile, Some("CentralEditor")),
+    ]);
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ReopenClosedFileControl {
+    target: Option<String>,
+    loading: bool,
+}
+
+impl ReopenClosedFileControl {
+    pub fn with_target(mut self, target: Option<String>) -> Self {
+        self.target = target;
+        self
+    }
+
+    pub fn with_loading(mut self, loading: bool) -> Self {
+        self.loading = loading;
+        self
+    }
+
+    pub fn description(&self) -> String {
+        match (&self.target, self.loading) {
+            (Some(target), loading) => format!(
+                "{} {target}. Reopens the saved file; discarded edits are not restored.",
+                if loading { "Reopening" } else { "Reopen" },
+            ),
+            (None, true) => "Reopening saved file; discarded edits are not restored.".into(),
+            (None, false) => "No closed files in this window.".into(),
+        }
+    }
+}
+
+pub fn editor_reopen_button(control: &ReopenClosedFileControl) -> Button {
+    let description = control.description();
+    Button::new("editor-reopen-closed-file")
+        .debug_selector(|| "editor-reopen-closed-file".into())
+        .ghost()
+        .xsmall()
+        .label(if control.loading { "Reopening…" } else { "Reopen closed file" })
+        .disabled(control.loading || control.target.is_none())
+        .accessibility_label(description.clone())
+        .tooltip(description)
+        .on_click(|_, window, cx| window.dispatch_action(Box::new(ReopenClosedFile), cx))
+}
+
+pub fn editor_file_status(
+    target: String,
+    error: Option<String>,
+    retry: Button,
+    cx: &App,
+) -> Div {
+    let failed = error.is_some();
+    let message = error.unwrap_or_else(|| "Reading saved file…".into());
+    div()
+        .flex_none()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_2()
+        .p_3()
+        .border_b_1()
+        .border_color(cx.theme().border)
+        .child(div()
+            .id("editor-file-status")
+            .role(if failed { Role::Alert } else { Role::Status })
+            .flex_1()
+            .min_w_0()
+            .text_xs()
+            .whitespace_normal()
+            .text_color(if failed { cx.theme().danger } else { cx.theme().muted_foreground })
+            .child(format!("{target}: {message}")))
+        .children(failed.then_some(retry))
+}
+
+pub fn editor_retry_button(target: &str, loading: bool) -> Button {
+    let label = format!("Retry reading saved file {target}. Edits in this buffer are preserved.");
+    Button::new("editor-retry-file")
+        .debug_selector(|| "editor-retry-file".into())
+        .outline()
+        .xsmall()
+        .label("Retry")
+        .disabled(loading)
+        .accessibility_label(label.clone())
+        .tooltip(label)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PanelDocumentAction {
@@ -486,14 +580,15 @@ pub fn editor_save_button(dirty: bool, diff: bool) -> Button {
 pub fn editor_actions(
     mode: Option<AnyElement>,
     status: Option<(String, bool)>,
+    reopen: Button,
     add_selection: Option<Button>,
     save: Button,
     cx: &App,
 ) -> Div {
-    let has_mode = mode.is_some();
     div()
         .flex_none()
-        .when(has_mode, |actions| actions.flex_wrap().max_w_full())
+        .flex_wrap()
+        .max_w_full()
         .flex()
         .items_center()
         .gap_1()
@@ -512,6 +607,7 @@ pub fn editor_actions(
                 .child(message)
         }))
         .children(mode)
+        .child(reopen)
         .children(add_selection)
         .child(save)
 }
@@ -564,7 +660,7 @@ pub fn editor_diff(text: &Entity<TextViewState>, cx: &App) -> Scrollable<Div> {
         .child(crate::diff_text_view(text, cx))
 }
 
-pub fn editor_empty_state(cx: &App) -> Div {
+pub fn editor_empty_state(reopen: Button, cx: &App) -> Div {
     div().flex_1().min_h_0().flex().flex_col().items_center().justify_center().gap_3().p_6()
         .child(div().size_12().rounded_full().bg(cx.theme().muted.opacity(0.5))
             .flex().items_center().justify_center().text_2xl().text_color(cx.theme().muted_foreground)
@@ -573,4 +669,5 @@ pub fn editor_empty_state(cx: &App) -> Div {
             .child("No files open in Editor"))
         .child(div().max_w(rems(23.75)).text_center().text_xs().text_color(cx.theme().muted_foreground)
             .child("Click a file in the Files panel or a changed file in Review to open and view here."))
+        .child(reopen)
 }
