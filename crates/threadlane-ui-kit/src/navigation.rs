@@ -218,43 +218,33 @@ pub fn session_signal_row() -> Div {
 }
 
 pub fn sidebar_project_filter_row() -> Div {
-    div().flex().items_center().gap_1().px_3().pt_1().pb_1()
+    div().flex().items_center().gap_1().pl_4().pr_3().pt_2().pb_1()
 }
 
 pub fn sidebar_project_filter_button(label: &str, selected: bool, cx: &App) -> Button {
     let theme = cx.theme().colors;
+    // A quiet filter control, not a destination: it scopes the task list
+    // below and must not look like Automations/Issues/PRs above it.
     Button::new("sidebar-project-filter")
         .debug_selector(|| "sidebar-project-filter".into())
-        .accessibility_label(format!("Filter sessions by project: {label}"))
-        .tooltip("Filter sessions by project")
+        .accessibility_label(format!("Filter tasks by project: {label}"))
+        .tooltip("Filter tasks by project")
         .dropdown_caret(true)
         .selected(selected)
         .ghost()
-        .small()
-        .w_full()
-        .justify_start()
+        .xsmall()
         .child(
             div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .w_full()
                 .min_w_0()
-                .child(
-                    Icon::new(IconName::Folder)
-                        .size_3p5()
-                        .text_color(theme.foreground),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .truncate()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.foreground)
-                        .child(label.to_owned()),
-                ),
+                .max_w(rems(9.0))
+                .truncate()
+                .text_xs()
+                .text_color(if selected {
+                    theme.foreground
+                } else {
+                    theme.muted_foreground
+                })
+                .child(label.to_owned()),
         )
 }
 
@@ -269,8 +259,17 @@ pub fn sidebar_project_filter(
     sidebar_project_filter_row()
         .child(
             div()
-                .min_w_0()
                 .flex_1()
+                .min_w_0()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(cx.theme().muted_foreground)
+                .child("Projects"),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_none()
                 .child(sidebar_project_filter_button(label, selected, cx).dropdown_menu(menu)),
         )
         .child(attach)
@@ -282,12 +281,14 @@ pub fn sidebar_project_filter_item(label: &str, sessions: usize, selected: bool)
 }
 
 pub fn sidebar_attach_project_button() -> Button {
+    // A folder-plus, not a bare plus: a lone plus in the sidebar reads as
+    // "new task", which is the separate button above.
     Button::new("attach-project-btn")
-        .icon(IconName::Plus)
-        .accessibility_label("Attach project")
-        .tooltip("Attach project…")
+        .icon(Icon::default().path("icons/folder-plus.svg"))
+        .accessibility_label("Attach project folder")
+        .tooltip("Attach a project folder…")
         .ghost()
-        .small()
+        .xsmall()
 }
 
 pub fn session_project_label(project: impl Into<SharedString>, cx: &App) -> Div {

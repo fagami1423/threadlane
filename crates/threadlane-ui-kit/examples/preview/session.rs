@@ -1081,6 +1081,7 @@ impl SessionPreview {
         let card = kit::sidebar_session_card(
             &self.session,
             kit::SidebarSessionCardState {
+                show_project: true,
                 project: project.clone(),
                 attention: SessionAttention::Idle,
                 selected,

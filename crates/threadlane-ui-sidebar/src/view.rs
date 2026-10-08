@@ -1053,6 +1053,7 @@ impl SidebarView {
             .unwrap_or_else(|| "Project".into());
         let card_state = threadlane_ui_kit::SidebarSessionCardState {
             project,
+            show_project: state.projects.len() > 1,
             attention,
             selected: is_active,
             pinned: state.is_session_pinned(&session.work_dir, &session.id),

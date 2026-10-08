@@ -9,6 +9,9 @@ use threadlane_protocol::repo::{GitHubPrInfo, GitStatus};
 
 pub struct SidebarSessionCardState {
     pub project: String,
+    /// False when only one project is attached: the label would repeat on
+    /// every card. The tooltip and accessible label still name it.
+    pub show_project: bool,
     pub attention: SessionAttention,
     pub selected: bool,
     pub pinned: bool,
@@ -36,6 +39,7 @@ pub fn sidebar_session_card(
     let session_title = session_identity.title;
     let time_ago = session_time_ago(session.updated_at, state.now);
     let project = state.project;
+    let state_show_project = state.show_project;
     // Rich hover card (Synara ThreadHoverCardContent pattern): keep the
     // row to title + status, move project path, branch/worktree, recency,
     // and attention detail into the tooltip.
@@ -239,7 +243,9 @@ pub fn sidebar_session_card(
                 .into_any_element(),
         );
     }
-    context_items.push(crate::session_project_label(project, cx).into_any_element());
+    if state_show_project {
+        context_items.push(crate::session_project_label(project, cx).into_any_element());
+    }
 
     if let Some(pr_chips) = pr_meta {
         signal_items.push(pr_chips.into_any_element());
