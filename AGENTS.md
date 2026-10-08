@@ -215,6 +215,7 @@ A normal `cargo run` may be unsuitable for testing installation: update installa
 ### Project-Scoped Skill Enable/Disable
 
 - Skills are toggled per project, not globally. `SkillSettings` persists disabled skill IDs in `<project>/.threadlane/skills.json`; skill discovery (`Discovery::finish`) applies those overrides so a disabled skill stays visible in the settings list with `enabled: false` but is excluded from the model catalog and rejected by `load_skill`.
+- Built-in workflow skills are embedded in `threadlane-skills/src/workflows` and enter discovery as fallbacks behind all filesystem sources; they honor the same project toggles. Keep plan-first delegation and worker contracts shared through `threadlane-prompt::workflow` across normal subagents and Fusion. Progress milestones are not implementation briefs; see `docs/agent-workflows.md`. Restored Fusion prompts remain verbatim.
 - A toggle must clear `capability_cache`, refresh the capabilities chip / slash commands via `refresh_project_capabilities`, and call `refresh_live_session_skills` so running sessions re-discover skills. `CodingAgent::refresh_skills` swaps the shared `SkillRegistry` `Arc`; note the already-registered `LoadSkillToolExecutor` holds the previous `Arc`, so an in-flight session keeps the catalog from its creation and a fresh session fully reflects the toggle.
 
 ### Native Computer Use

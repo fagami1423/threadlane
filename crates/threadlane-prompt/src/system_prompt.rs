@@ -162,6 +162,7 @@ pub fn build_system_prompt(options: SystemPromptBuildOptions<'_>) -> String {
             );
         }
         if available_tool_names.contains("subagent") {
+            add_tool_guideline(crate::workflow::IMPLEMENTATION_HANDOFF);
             add_tool_guideline(
                 "SUBAGENT DELEGATION RULES: Use `subagent` judiciously and only when necessary.",
             );
@@ -209,7 +210,12 @@ pub fn build_system_prompt(options: SystemPromptBuildOptions<'_>) -> String {
                 "Update the plan throughout the work, not only at the end: mark a step in_progress when you start it, mark it completed immediately after it succeeds, and update the next step before continuing. Keep the plan statuses accurate after every meaningful milestone.",
             );
             add_tool_guideline(
-                "Plan like a lazy senior developer: identify existing codebase helpers/types and find the root cause first; keep plans strictly to 2–5 minimal milestones aimed at the shortest working diff; never plan speculative scaffolding or unrequested abstractions.",
+                "Keep the visible progress plan to 2–5 minimal milestones. For implementation handoffs, write the detailed task plan separately before delegating; milestone titles alone are not sufficient. Reuse existing helpers and avoid speculative scaffolding or unrequested abstractions.",
+            );
+        }
+        if available_tool_names.contains("load_skill") {
+            add_tool_guideline(
+                "Use applicable enabled workflow skills from the catalog when entering a phase: planning before nontrivial implementation or worker handoff, systematic debugging before a bug fix, executing a plan during implementation, and verification/review before claiming completion. Load only relevant skills, not the entire catalog; honor project instructions and disabled skills. A worker follows its assigned plan rather than restarting design. If no matching skill is available, follow the same evidence-first discipline without trying unavailable IDs.",
             );
         }
 
@@ -286,7 +292,7 @@ pub fn build_system_prompt(options: SystemPromptBuildOptions<'_>) -> String {
     }
 
     append_project_context(&mut prompt, options.project_context);
-    if available_tool_names.contains("read_file") {
+    if available_tool_names.contains("load_skill") {
         append_catalog(&mut prompt, options.skill_catalog);
     }
     if available_tool_names.contains("subagent") {
@@ -411,8 +417,38 @@ mod tests {
 
         assert!(!build(&[]).contains("SKILLS"));
         assert!(!build(&[]).contains("AGENTS"));
-        assert!(build(&[tool("read_file", "read")]).contains("SKILLS"));
+        assert!(!build(&[tool("read_file", "read")]).contains("SKILLS"));
+        assert!(build(&[tool("load_skill", "load")]).contains("SKILLS"));
         assert!(build(&[tool("subagent", "delegate")]).contains("AGENTS"));
+    }
+
+    #[test]
+    fn workflow_guidance_is_capability_gated_and_preserves_custom_prompts() {
+        let build = |config: &SystemPromptConfig, tools: &[AgentToolDefinition]| {
+            build_system_prompt(SystemPromptBuildOptions {
+                config,
+                work_dir: Path::new("/workspace"),
+                tools,
+                project_context: &ProjectContext::default(),
+                skill_catalog: None,
+                agent_catalog: None,
+                loaded_extension_count: 0,
+            })
+        };
+        let config = SystemPromptConfig::default();
+        let tools = [tool("subagent", "delegate"), tool("load_skill", "load")];
+        let prompt = build(&config, &tools);
+        assert!(prompt.contains(crate::workflow::IMPLEMENTATION_HANDOFF));
+        assert!(prompt.contains("Use applicable enabled workflow skills"));
+        assert!(!build(&config, &[]).contains(crate::workflow::IMPLEMENTATION_HANDOFF));
+        assert!(!build(&config, &[]).contains("Use applicable enabled workflow skills"));
+        let custom = SystemPromptConfig {
+            custom_prompt: Some("Custom workflow".into()),
+            ..Default::default()
+        };
+        let prompt = build(&custom, &tools);
+        assert!(!prompt.contains(crate::workflow::IMPLEMENTATION_HANDOFF));
+        assert!(!prompt.contains("Use applicable enabled workflow skills"));
     }
 
     #[test]

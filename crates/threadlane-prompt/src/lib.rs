@@ -8,6 +8,7 @@
 pub mod context;
 pub mod git_workflow;
 pub mod system_prompt;
+pub mod workflow;
 
 pub use context::ProjectContext;
 pub use system_prompt::{build_system_prompt, SystemPromptBuildOptions, SystemPromptConfig};

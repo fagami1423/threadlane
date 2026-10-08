@@ -223,6 +223,9 @@ Type `/` in the composer to open command completion.
 
 Discovered skills and WASI extension commands are included in command completion.
 
+Threadlane also bundles on-demand [agent workflow skills](docs/agent-workflows.md)
+for planning before worker handoffs, debugging, implementation, and verification.
+
 ## Project layout
 
 The workspace is organized as focused crates. Key entry points include:

@@ -2135,6 +2135,11 @@ impl CodingAgent {
                 .system_prompt
                 .contains(threadlane_orchestrator::FUSION_MAIN_HEADER)
             {
+                let directive = if turn.system_prompt.contains(threadlane_prompt::workflow::IMPLEMENTATION_HANDOFF) {
+                    directive.replace(threadlane_prompt::workflow::IMPLEMENTATION_HANDOFF, "")
+                } else {
+                    directive
+                };
                 turn.system_prompt.push_str(&directive);
             }
         }
@@ -3202,6 +3207,38 @@ mod compaction_sync_tests {
     }
 
     #[tokio::test]
+    async fn fusion_handoff_contract_is_added_once_to_a_custom_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = threadlane_runtime::AgentConfig::default();
+        config.orchestrator_mode = OrchestratorMode::Fusion;
+        config.model_roles.fast = Some("side".into());
+        let provider = Arc::new(RecordingProvider::default());
+        let mut agent = CodingAgent::new_with_provider(
+            CodingAgentOptions {
+                api_key: "test".into(),
+                account_id: None,
+                model: "main".into(),
+                work_dir: dir.path().to_path_buf(),
+                session_file: Some(dir.path().join("custom-fusion.jsonl")),
+                system_prompt: SystemPromptConfig::default(),
+                agent_config: Some(config),
+                coding_config: None,
+                browser: BrowserBridge::unavailable(),
+            },
+            provider.clone(),
+        );
+        agent.agent.turn.lock().await.system_prompt = "Custom base without default guidelines".into();
+        for _ in 0..2 {
+            assert!(agent.handle_input_with_images("Inspect the helper.", vec![]).await.is_none());
+        }
+        let prompts = provider.system_prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0], prompts[1]);
+        assert!(prompts[0].starts_with("Custom base without default guidelines"));
+        assert_eq!(prompts[0].matches(threadlane_prompt::workflow::IMPLEMENTATION_HANDOFF).count(), 1);
+    }
+
+    #[tokio::test]
     async fn fusion_directive_stays_stable_while_route_audit_tracks_each_prompt() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fusion-stable-directive.jsonl");
@@ -3235,6 +3272,10 @@ mod compaction_sync_tests {
         let system_prompts = provider.system_prompts.lock().unwrap().clone();
         assert_eq!(system_prompts.len(), 2);
         assert_eq!(system_prompts[0].as_bytes(), system_prompts[1].as_bytes());
+        assert_eq!(
+            system_prompts[0].matches(threadlane_prompt::workflow::IMPLEMENTATION_HANDOFF).count(),
+            1
+        );
         assert_eq!(
             system_prompts[0]
                 .matches(threadlane_orchestrator::FUSION_MAIN_HEADER)

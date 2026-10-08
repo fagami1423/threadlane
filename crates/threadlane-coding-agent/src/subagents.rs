@@ -1432,6 +1432,13 @@ pub(crate) async fn run_subagent_task(
             context.work_dir.display(),
         )
     };
+    let system_prompt = if restored_contract
+        || system_prompt.contains(threadlane_prompt::workflow::WORKER_CONTRACT)
+    {
+        system_prompt
+    } else {
+        format!("{system_prompt}\n\n{}", threadlane_prompt::workflow::WORKER_CONTRACT)
+    };
     agent.set_system_prompt(system_prompt.clone()).await;
     #[cfg(test)]
     if let Some(observer) = context.child_execution_observer.as_ref() {
@@ -2153,6 +2160,51 @@ mod result_tests {
     }
 
     #[tokio::test]
+    async fn normal_worker_receives_plan_first_contract_without_fusion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let snapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = snapshots.clone();
+        let mut context = test_context(dir.path().into(), path, None);
+        context.child_execution_observer = Some(Arc::new(move |snapshot| {
+            observed.lock().unwrap().push(snapshot);
+        }));
+        context.child_run_override = Some((
+            Duration::from_secs(1),
+            Arc::new(|_| Box::pin(async { Ok(success("inspected")) })),
+        ));
+        run_subagent_task(
+            AgentDefinition {
+                name: "worker".into(),
+                description: "normal worker".into(),
+                tools: Some(vec!["read_file".into()]),
+                model: None,
+                system_prompt: "Follow the assigned scope.".into(),
+                source: threadlane_skills::agents::AgentSource::Project,
+                file_path: dir.path().into(),
+            },
+            "Read-only investigation; do not edit files.".into(),
+            context,
+            1,
+            0,
+            SubagentLaneIdentity {
+                lane_name: "normal-worker".into(),
+                run_id: "normal-run".into(),
+                source_leaf_id: None,
+                started_seq: 0,
+            },
+            None,
+            Vec::new(),
+            None,
+            LaneContractMode::CaptureIfFusion,
+        ).await.unwrap();
+        let snapshot = &snapshots.lock().unwrap()[0];
+        assert!(snapshot.system_prompt.contains("Follow the assigned scope."));
+        assert_eq!(snapshot.system_prompt.matches(threadlane_prompt::workflow::WORKER_CONTRACT).count(), 1);
+        assert!(!snapshot.system_prompt.contains(threadlane_orchestrator::fusion::FUSION_SIDEKICK_HEADER));
+    }
+
+    #[tokio::test]
     async fn fusion_execution_contract_round_trips_effective_prompt_tools_and_peers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
@@ -2208,6 +2260,7 @@ mod result_tests {
         .unwrap();
         let initial = initial_snapshots.lock().unwrap()[0].clone();
         assert!(initial.system_prompt.contains("Current dynamic instructions."));
+        assert_eq!(initial.system_prompt.matches(threadlane_prompt::workflow::WORKER_CONTRACT).count(), 1);
         assert!(initial
             .system_prompt
             .contains("Sibling subagents in this parallel batch: sibling."));
