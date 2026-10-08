@@ -216,7 +216,20 @@ pub fn chat_payload_to_messages_request(payload: &Value) -> Value {
             }
             Some("user") => push_message(&mut messages, "user", content_blocks(content)),
             Some("assistant") => {
-                let mut blocks = content_blocks(content);
+                // Replay the turn's thinking blocks unmodified, ahead of text and
+                // tool_use, when the first tool call carries them.
+                let mut blocks = message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .and_then(|calls| calls.first())
+                    .and_then(|call| {
+                        call.get("thoughtSignature")
+                            .or_else(|| call.get("thought_signature"))
+                    })
+                    .and_then(Value::as_str)
+                    .and_then(decode_thinking_blocks)
+                    .unwrap_or_default();
+                blocks.extend(content_blocks(content));
                 for call in message
                     .get("tool_calls")
                     .and_then(Value::as_array)
@@ -333,6 +346,50 @@ struct PendingToolCall {
     arguments: String,
 }
 
+/// A `thinking` or `redacted_thinking` block being assembled from the stream.
+struct PendingThinking {
+    redacted: bool,
+    thinking: String,
+    signature: String,
+    data: String,
+}
+
+impl PendingThinking {
+    /// The block exactly as the API requires it back in a tool loop.
+    fn into_block(self) -> Value {
+        if self.redacted {
+            json!({"type": "redacted_thinking", "data": self.data})
+        } else {
+            json!({"type": "thinking", "thinking": self.thinking, "signature": self.signature})
+        }
+    }
+}
+
+/// Serializes captured thinking blocks into the string stored in the first
+/// tool call's `thought_signature`. `None` when there is nothing to replay.
+fn encode_thinking_blocks(blocks: Vec<Value>) -> Option<String> {
+    (!blocks.is_empty()).then(|| Value::Array(blocks).to_string())
+}
+
+/// Parses a `thought_signature` written by [`encode_thinking_blocks`]. Anything
+/// else (e.g. a Gemini signature left over from a model switch) is ignored.
+fn decode_thinking_blocks(signature: &str) -> Option<Vec<Value>> {
+    if !signature.trim_start().starts_with('[') {
+        return None;
+    }
+    let blocks = serde_json::from_str::<Vec<Value>>(signature).ok()?;
+    let valid = !blocks.is_empty()
+        && blocks.iter().all(|block| {
+            let text = |key: &str| block.get(key).is_some_and(Value::is_string);
+            match block.get("type").and_then(Value::as_str) {
+                Some("thinking") => text("thinking") && text("signature"),
+                Some("redacted_thinking") => text("data"),
+                _ => false,
+            }
+        });
+    valid.then_some(blocks)
+}
+
 /// Incremental parser for the Messages SSE stream. Feed raw text with
 /// [`SseParser::push`]; each call returns the events ready to emit. Terminal
 /// state is reached on `message_stop` or an `error` event.
@@ -342,6 +399,9 @@ pub struct SseParser {
     /// Content block index -> in-flight tool call.
     tool_blocks: std::collections::BTreeMap<u64, PendingToolCall>,
     finished_calls: Vec<(u64, PendingToolCall)>,
+    /// Thinking blocks in flight / completed, keyed by content block index so
+    /// they replay in the order the model produced them.
+    thinking_blocks: std::collections::BTreeMap<u64, PendingThinking>,
     usage: ProviderUsage,
     done: bool,
 }
@@ -382,7 +442,29 @@ impl SseParser {
             }
             Some("content_block_start") => {
                 let block = event.get("content_block").unwrap_or(&Value::Null);
-                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                let text = |key: &str| {
+                    block
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                if let kind @ ("thinking" | "redacted_thinking") = block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                {
+                    let pending = PendingThinking {
+                        redacted: kind == "redacted_thinking",
+                        thinking: text("thinking"),
+                        signature: text("signature"),
+                        data: text("data"),
+                    };
+                    if !pending.thinking.is_empty() {
+                        out.push(StreamEvent::ReasoningToken(pending.thinking.clone()));
+                    }
+                    self.thinking_blocks.insert(index, pending);
+                } else if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                     let name = block.get("name").and_then(Value::as_str).unwrap_or("");
                     self.tool_blocks.insert(
                         index,
@@ -423,7 +505,25 @@ impl SseParser {
                             }
                         }
                     }
-                    // thinking / signature deltas arrive with extended thinking (PR 3).
+                    Some("thinking_delta") => {
+                        if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
+                            if let Some(block) = self.thinking_blocks.get_mut(&index) {
+                                block.thinking.push_str(text);
+                            }
+                            // Display "omitted" streams empty thinking; skip those.
+                            if !text.is_empty() {
+                                out.push(StreamEvent::ReasoningToken(text.to_string()));
+                            }
+                        }
+                    }
+                    Some("signature_delta") => {
+                        if let (Some(signature), Some(block)) = (
+                            delta.get("signature").and_then(Value::as_str),
+                            self.thinking_blocks.get_mut(&index),
+                        ) {
+                            block.signature.push_str(signature);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -444,7 +544,15 @@ impl SseParser {
                 self.finished_calls.extend(open);
                 let mut calls = std::mem::take(&mut self.finished_calls);
                 calls.sort_by_key(|(index, _)| *index);
-                let tool_calls = calls
+                // Thinking blocks must be returned complete and unmodified when
+                // tool results are sent back, so they ride on the first tool
+                // call's `thought_signature` through persistence and replay.
+                let thinking = std::mem::take(&mut self.thinking_blocks)
+                    .into_values()
+                    .map(PendingThinking::into_block)
+                    .collect::<Vec<_>>();
+                let mut thinking_signature = encode_thinking_blocks(thinking);
+                let mut tool_calls: Vec<ToolCall> = calls
                     .into_iter()
                     .filter(|(_, call)| !call.name.is_empty())
                     .map(|(_, call)| ToolCall {
@@ -461,6 +569,9 @@ impl SseParser {
                         thought_signature: None,
                     })
                     .collect();
+                if let Some(first) = tool_calls.first_mut() {
+                    first.thought_signature = thinking_signature.take();
+                }
                 let mut usage = self.usage;
                 usage.total_tokens = usage
                     .input_tokens
@@ -967,6 +1078,139 @@ mod tests {
         assert!(msg.contains("400") && msg.contains("bad"));
     }
 
+    // ---- thinking ----
+
+    fn thinking_stream() -> String {
+        sse(&[
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 4}}}),
+            json!({"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "thinking_delta", "thinking": "Let me "}}),
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "thinking_delta", "thinking": "check."}}),
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "signature_delta", "signature": "EuYB"}}),
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "signature_delta", "signature": "sig=="}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1,
+                   "content_block": {"type": "redacted_thinking", "data": "OPAQUE"}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "content_block_start", "index": 2,
+                   "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 2,
+                   "delta": {"type": "text_delta", "text": "Looking."}}),
+            json!({"type": "content_block_stop", "index": 2}),
+            json!({"type": "content_block_start", "index": 3,
+                   "content_block": {"type": "tool_use", "id": "toolu_t", "name": "a", "input": {}}}),
+            json!({"type": "content_block_stop", "index": 3}),
+            json!({"type": "content_block_start", "index": 4,
+                   "content_block": {"type": "tool_use", "id": "toolu_u", "name": "b", "input": {}}}),
+            json!({"type": "content_block_stop", "index": 4}),
+            json!({"type": "message_stop"}),
+        ])
+    }
+
+    #[test]
+    fn captures_thinking_blocks_on_the_first_tool_call_in_order() {
+        let mut parser = SseParser::default();
+        let events = parser.push(&thinking_stream());
+        let reasoning: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ReasoningToken(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, ["Let me ", "check."]);
+        let StreamEvent::Finished { tool_calls, .. } = events.last().unwrap() else {
+            panic!("expected Finished");
+        };
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(
+            decode_thinking_blocks(tool_calls[0].thought_signature.as_deref().unwrap()),
+            Some(vec![
+                json!({"type": "thinking", "thinking": "Let me check.", "signature": "EuYBsig=="}),
+                json!({"type": "redacted_thinking", "data": "OPAQUE"}),
+            ])
+        );
+        assert!(tool_calls[1].thought_signature.is_none());
+    }
+
+    #[test]
+    fn thinking_without_tool_calls_is_not_stored() {
+        let raw = sse(&[
+            json!({"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "signature_delta", "signature": "S"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_stop"}),
+        ]);
+        let events = SseParser::default().push(&raw);
+        // Omitted display: no reasoning text to stream.
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], StreamEvent::Finished { tool_calls, .. } if tool_calls.is_empty())
+        );
+    }
+
+    fn assistant_with_signature(signature: Value) -> Value {
+        json!({
+            "model": "anthropic/m",
+            "messages": [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "Looking.", "tool_calls": [
+                    {"id": "c1", "type": "function", "thoughtSignature": signature,
+                     "function": {"name": "a", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "name": "a", "content": "ok"},
+            ],
+        })
+    }
+
+    #[test]
+    fn conversion_replays_thinking_blocks_first_and_unmodified() {
+        let mut parser = SseParser::default();
+        let events = parser.push(&thinking_stream());
+        let StreamEvent::Finished { tool_calls, .. } = events.last().unwrap() else {
+            panic!("expected Finished");
+        };
+        let signature = tool_calls[0].thought_signature.clone().unwrap();
+        let request = chat_payload_to_messages_request(&assistant_with_signature(json!(signature)));
+        assert_eq!(
+            request["messages"][1]["content"],
+            json!([
+                {"type": "thinking", "thinking": "Let me check.", "signature": "EuYBsig=="},
+                {"type": "redacted_thinking", "data": "OPAQUE"},
+                {"type": "text", "text": "Looking."},
+                {"type": "tool_use", "id": "c1", "name": "a", "input": {}},
+            ])
+        );
+    }
+
+    #[test]
+    fn foreign_or_malformed_signatures_are_ignored() {
+        for signature in [
+            json!("CiQBjz1rX-gemini-style-opaque"),
+            json!("[1, 2]"),
+            json!("[]"),
+            json!("[{\"type\":\"thinking\",\"thinking\":\"x\"}]"),
+            json!("[{\"type\":\"text\",\"text\":\"x\"}]"),
+            json!("{\"type\":\"thinking\"}"),
+            json!(42),
+        ] {
+            let request = chat_payload_to_messages_request(&assistant_with_signature(signature));
+            assert_eq!(
+                request["messages"][1]["content"],
+                json!([
+                    {"type": "text", "text": "Looking."},
+                    {"type": "tool_use", "id": "c1", "name": "a", "input": {}},
+                ])
+            );
+        }
+    }
+
     // ---- client ----
 
     #[test]
@@ -1060,10 +1304,15 @@ mod tests {
         let body = sse(&[
             json!({"type": "message_start", "message": {"usage": {"input_tokens": 9}}}),
             json!({"type": "content_block_start", "index": 0,
-                   "content_block": {"type": "tool_use", "id": "toolu_9", "name": "list_dir", "input": {}}}),
+                   "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
             json!({"type": "content_block_delta", "index": 0,
-                   "delta": {"type": "input_json_delta", "partial_json": "{\"path\":\".\"}"}}),
+                   "delta": {"type": "signature_delta", "signature": "EqQBsig"}}),
             json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1,
+                   "content_block": {"type": "tool_use", "id": "toolu_9", "name": "list_dir", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 1,
+                   "delta": {"type": "input_json_delta", "partial_json": "{\"path\":\".\"}"}}),
+            json!({"type": "content_block_stop", "index": 1}),
             json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 2}}),
             json!({"type": "message_stop"}),
         ]);
@@ -1096,6 +1345,13 @@ mod tests {
             StreamEvent::Finished { tool_calls, usage } => {
                 assert_eq!(tool_calls[0].id, "toolu_9");
                 assert_eq!(tool_calls[0].function.arguments, "{\"path\":\".\"}");
+                // Omitted-display thinking: empty text, signature preserved.
+                assert_eq!(
+                    decode_thinking_blocks(tool_calls[0].thought_signature.as_deref().unwrap()),
+                    Some(vec![
+                        json!({"type": "thinking", "thinking": "", "signature": "EqQBsig"})
+                    ])
+                );
                 assert_eq!(usage.input_tokens, 9);
                 assert_eq!(usage.output_tokens, 2);
             }
@@ -1127,6 +1383,9 @@ mod tests {
                 {"role": "user", "content": "list the files"},
                 {"role": "assistant", "content": "Checking.", "tool_calls": [
                     {"id": "call_a", "type": "function",
+                     "thoughtSignature": json!([
+                         {"type": "thinking", "thinking": "plan", "signature": "SIG1"},
+                         {"type": "redacted_thinking", "data": "ENC"}]).to_string(),
                      "function": {"name": "list_dir", "arguments": "{\"path\":\".\"}"}},
                     {"id": "call_b", "type": "function",
                      "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}}]},
@@ -1167,7 +1426,18 @@ mod tests {
         let results = messages[2]["content"].as_array().unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r["type"] == "tool_result"));
-        assert_eq!(messages[1]["content"][1]["type"], "tool_use");
+        // Thinking blocks come back first and unmodified, then text, then tool_use.
+        assert_eq!(
+            messages[1]["content"][0],
+            json!({"type": "thinking", "thinking": "plan", "signature": "SIG1"})
+        );
+        assert_eq!(
+            messages[1]["content"][1],
+            json!({"type": "redacted_thinking", "data": "ENC"})
+        );
+        assert_eq!(messages[1]["content"][2]["type"], "text");
+        assert_eq!(messages[1]["content"][3]["type"], "tool_use");
+        assert_eq!(messages[1]["content"][4]["type"], "tool_use");
         assert!(matches!(&events[0], StreamEvent::ContentToken(t) if t == "Two files."));
         assert!(matches!(
             events.last().unwrap(),
