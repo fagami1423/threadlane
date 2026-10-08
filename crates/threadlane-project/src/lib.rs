@@ -63,6 +63,23 @@ pub fn save_project_registry(projects: &[ProjectRecord]) -> Result<(), String> {
     save_project_registry_to(&global_threadlane_dir(), projects)
 }
 
+/// Detach a registry entry without touching its directory or saved sessions.
+pub fn unregister_project(path: &Path) -> Result<(), String> {
+    unregister_project_from(&global_threadlane_dir(), path)
+}
+
+fn unregister_project_from(global_dir: &Path, path: &Path) -> Result<(), String> {
+    let _guard = registry_lock().lock().map_err(|error| error.to_string())?;
+    let registry = global_dir.join("projects.json");
+    let mut projects = match fs::read(&registry) {
+        Ok(bytes) => serde_json::from_slice::<Vec<ProjectRecord>>(&bytes)
+            .map_err(|error| format!("Could not read project registry: {error}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(format!("Could not read project registry: {error}")),
+    };
+    projects.retain(|project| !same_path(&project.path, path));
+    save_project_registry_to(global_dir, &projects)
+}
 pub fn register_project(raw_path: &Path) -> Result<ProjectRecord, String> {
     let _guard = registry_lock().lock().map_err(|error| error.to_string())?;
     let canonical = raw_path.canonicalize().map_err(|error| {
@@ -368,5 +385,55 @@ mod registry_merge_tests {
         );
         assert_eq!(projects[0].name, "Renamed");
         assert_eq!(projects[0].id, durable.id);
+    }
+}
+
+#[cfg(test)]
+mod removal_tests {
+    use super::*;
+
+    #[test]
+    fn removal_preserves_files_other_projects_and_empty_registry() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("saved-session.jsonl"), "history").unwrap();
+        save_project_registry_to(
+            root.path(),
+            &[
+                ProjectRecord::from_path(first.clone()),
+                ProjectRecord::from_path(second.clone()),
+            ],
+        )
+        .unwrap();
+        unregister_project_from(root.path(), &first).unwrap();
+        let records = load_project_registry_from(root.path());
+        assert_eq!(records.len(), 1);
+        assert!(same_path(&records[0].path, &second));
+        assert_eq!(
+            fs::read_to_string(first.join("saved-session.jsonl")).unwrap(),
+            "history"
+        );
+        unregister_project_from(root.path(), &second).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.path().join("projects.json")).unwrap(),
+            "[]"
+        );
+        unregister_project_from(root.path(), &second).unwrap();
+    }
+
+    #[test]
+    fn removal_of_missing_directory_and_invalid_registry_are_safe() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        save_project_registry_to(root.path(), &[ProjectRecord::from_path(missing.clone())])
+            .unwrap();
+        unregister_project_from(root.path(), &missing).unwrap();
+        let registry = root.path().join("projects.json");
+        fs::write(&registry, "invalid json").unwrap();
+        assert!(unregister_project_from(root.path(), &missing).is_err());
+        assert_eq!(fs::read_to_string(registry).unwrap(), "invalid json");
     }
 }
