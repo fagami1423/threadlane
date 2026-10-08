@@ -4647,7 +4647,10 @@ impl ChatListView {
             } else {
                 None
             };
-            threadlane_ui_kit::save_draft_button(stash_unavailable_reason)
+            // Offered only once there is a task and something to save; the
+            // remaining reasons are transient and keep it visible but disabled.
+            let stash_offered = active_session_id.is_some() && has_composer_text;
+            stash_offered.then(|| threadlane_ui_kit::save_draft_button(stash_unavailable_reason)
                 .on_click(move |_event, window, cx| {
                     if let Some(session_id) = &do_stash_session_id {
                         let text = do_stash_input.read(cx).value().to_string();
@@ -4668,7 +4671,7 @@ impl ChatListView {
                             });
                         }
                     }
-                })
+                }))
         };
 
         // The composer-level "Recall previous prompt" command: same gates as
@@ -4679,11 +4682,17 @@ impl ChatListView {
             } else {
                 self.prompt_recall_block_reason(has_composer_text, cx)
             };
-            threadlane_ui_kit::recall_prompt_button(recall_unavailable_reason)
+            // Hidden while there is nothing to recall at all; transient
+            // blocks (typing, a running turn) keep it visible but disabled.
+            let recall_offered = self.prompt_recall.is_some() || {
+                let state = self.model.read(cx);
+                !state.is_new_task && state.active_session_id.is_some()
+            } && !self.recallable_prompts(cx).is_empty();
+            recall_offered.then(|| threadlane_ui_kit::recall_prompt_button(recall_unavailable_reason)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.step_prompt_recall(true, window, cx);
                     this.focus_composer(window, cx);
-                }))
+                })))
         };
 
         let setup_card = self
@@ -4914,8 +4923,8 @@ impl ChatListView {
                             .child(div().flex_1().min_w_2())
                             .child(
                                 threadlane_ui_kit::composer_actions_group()
-                                    .child(stash_button)
-                                    .child(prompt_recall_button)
+                                    .children(stash_button)
+                                    .children(prompt_recall_button)
                                     .children(subagent_popover)
                                     .children(context_percent_label.map(|label| {
                                         div()
@@ -4923,7 +4932,8 @@ impl ChatListView {
                                             .text_color(theme.muted_foreground)
                                             .child(label)
                                     }))
-                                    .child(context_meter)
+                                    // Nothing to measure before the first exchange.
+                                    .children((!hero_visible).then_some(context_meter))
                                     .child({
                                         let send_hint = if preparing_worktree {
                                             "Wait for worktree setup to finish before sending"

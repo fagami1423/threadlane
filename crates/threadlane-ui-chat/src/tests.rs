@@ -390,9 +390,13 @@ fn stashing_requires_a_task_and_preserves_existing_stashes_and_images(cx: &mut g
         });
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        let stash = cx.debug_bounds("stash-prompt-btn").unwrap();
-        cx.simulate_click(stash.center(), gpui::Modifiers::default());
-        cx.run_until_parked();
+        // Without a task there is nowhere to save, so the action is not offered.
+        let stash = cx.debug_bounds("stash-prompt-btn");
+        assert_eq!(stash.is_some(), has_task);
+        if let Some(stash) = stash {
+            cx.simulate_click(stash.center(), gpui::Modifiers::default());
+            cx.run_until_parked();
+        }
         let allowed = has_task && !has_stash && !has_image && !generating;
         chat.read_with(cx, |chat, cx| {
             assert_eq!(
