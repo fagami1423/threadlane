@@ -729,19 +729,28 @@ pub fn settings_shortcut_row(keys: &'static str, description: &'static str, cx: 
 pub fn settings_shortcuts(cx: &App) -> AnyElement {
     let theme = cx.theme().colors;
 
+    // Labels follow the bindings actually registered per platform (macOS
+    // `cmd-*`, elsewhere `ctrl-*`; editor redo is `ctrl-y` off macOS).
+    let k = |mac: &'static str, other: &'static str| {
+        if cfg!(target_os = "macos") {
+            mac
+        } else {
+            other
+        }
+    };
     let shortcuts = [
         (
             "Global",
             vec![
-                ("⌘ K", "Open Command Palette"),
-                (if cfg!(target_os = "macos") { "⇧ ⌘ K" } else { "Ctrl Shift K" }, "Switch session"),
-                ("⌘ ,", "Open Settings"),
-                ("⌘ B", "Toggle Left Sidebar"),
-                ("⌘ R", "Toggle Right Panel"),
-                ("⌘ J", "Toggle Terminal Panel"),
-                ("⌘ N", "New task"),
-                ("⌘ L", "Focus composer"),
-                ("⌘ 1 / 2 / 3", "Chat / Trajectory / Editor tab"),
+                (k("⌘ K", "Ctrl K"), "Open Command Palette"),
+                (k("⇧ ⌘ K", "Ctrl Shift K"), "Switch session"),
+                (k("⌘ ,", "Ctrl ,"), "Open Settings"),
+                (k("⌘ B", "Ctrl B"), "Toggle Left Sidebar"),
+                (k("⌘ R", "Ctrl R"), "Toggle Right Panel"),
+                (k("⌘ J", "Ctrl J"), "Toggle Terminal Panel"),
+                (k("⌘ N", "Ctrl N"), "New task"),
+                (k("⌘ L", "Ctrl L"), "Focus composer"),
+                (k("⌘ 1 / 2 / 3", "Ctrl 1 / 2 / 3"), "Chat / Trajectory / Editor tab"),
                 ("Escape", "Cancel active agent turn"),
             ],
         ),
@@ -749,20 +758,20 @@ pub fn settings_shortcuts(cx: &App) -> AnyElement {
             "Composer & Chat",
             vec![
                 (
-                    "⌘ F / Ctrl F",
+                    k("⌘ F", "Ctrl F"),
                     "Find in conversation (Chat or composer focused)",
                 ),
                 (
-                    "Enter / ⇧ Enter",
+                    k("Enter / ⇧ Enter", "Enter / Shift Enter"),
                     "Next / previous matching message (find focused)",
                 ),
                 ("Escape", "Close conversation find before cancelling a turn"),
                 ("Enter", "Send message or queue for the next turn"),
                 (
-                    "⌘ Enter / Ctrl Enter",
+                    k("⌘ Enter / Ctrl Enter", "Ctrl Enter"),
                     "Steer the current turn (built-in agent)",
                 ),
-                ("⇧ Enter", "Insert newline in composer"),
+                (k("⇧ Enter", "Shift Enter"), "Insert newline in composer"),
                 ("↑ / ↓ (empty composer)", "Recall earlier / later prompts"),
                 ("/ (in empty composer)", "Open Slash Commands palette"),
                 (
@@ -774,25 +783,25 @@ pub fn settings_shortcuts(cx: &App) -> AnyElement {
         (
             "Editor & Diff",
             vec![
-                ("⌘ S", "Save active file"),
-                ("⌘ Z", "Undo edit"),
-                ("⌘ ⇧ Z", "Redo edit"),
-                ("⌘ F", "Find in active editor buffer"),
+                (k("⌘ S", "Ctrl S"), "Save active file"),
+                (k("⌘ Z", "Ctrl Z"), "Undo edit"),
+                (k("⌘ ⇧ Z", "Ctrl Y"), "Redo edit"),
+                (k("⌘ F", "Ctrl F"), "Find in active editor buffer"),
             ],
         ),
         (
             "Terminal",
             vec![
                 (
-                    "⌘ F / Ctrl ⇧ F",
+                    k("⌘ F", "Ctrl Shift F"),
                     "Find in terminal output (terminal focused)",
                 ),
                 (
-                    "Enter / ⇧ Enter",
+                    k("Enter / ⇧ Enter", "Enter / Shift Enter"),
                     "Next / previous matching line (find focused)",
                 ),
                 ("Escape", "Close terminal find (find focused)"),
-                ("⇧ Page Up / Page Down", "Scroll retained output"),
+                (k("⇧ Page Up / Page Down", "Shift Page Up / Page Down"), "Scroll retained output"),
             ],
         ),
     ];

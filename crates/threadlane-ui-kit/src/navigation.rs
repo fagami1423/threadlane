@@ -504,13 +504,13 @@ pub fn sidebar_header(
                 .items_center()
                 .child(
                     Button::new("new-task-btn")
-                        .accessibility_label("Start a new task (⌘N)")
+                        .accessibility_label(new_task_tooltip())
                         .ghost()
                         .xsmall()
                         .compact()
                         .w_full()
                         .justify_start()
-                        .tooltip("Start a new task (⌘N)")
+                        .tooltip(new_task_tooltip())
                         .child(
                             div()
                                 .flex()
@@ -541,7 +541,7 @@ pub fn sidebar_header(
                                         .text_xs()
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(theme.muted_foreground.opacity(0.85))
-                                        .child("⌘N"),
+                                        .child(new_task_shortcut()),
                                 ),
                         )
                         .on_click(move |_event, window, cx| {
@@ -828,7 +828,7 @@ pub fn sidebar_history_empty(
                 .outline()
                 .small()
                 .accessibility_label("Start a new task")
-                .tooltip("Start a new task (⌘N)")
+                .tooltip(new_task_tooltip())
                 .on_click(move |_, window, cx| request(SidebarEmptyAction::NewTask, window, cx))
         }))
 }
@@ -855,4 +855,42 @@ pub fn session_history_group(
 /// Shared card inset; group headers own their own alignment spine.
 pub fn session_history_card_row(card: impl IntoElement) -> Div {
     div().px_2().child(card)
+}
+
+
+/// Platform-appropriate label for the `BeginNewTask` binding (cmd-n on macOS,
+/// ctrl-n elsewhere).
+pub fn new_task_shortcut() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "⌘N"
+    } else {
+        "Ctrl+N"
+    }
+}
+
+fn new_task_tooltip() -> String {
+    format!("Start a new task ({})", new_task_shortcut())
+}
+
+/// Path text for display. Strips the Windows verbatim prefix (`\\?\C:\…`)
+/// that canonicalization adds; it is noise to a reader.
+pub fn display_path(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_string(),
+        _ => text,
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::display_path;
+    use std::path::Path;
+
+    #[test]
+    fn display_path_strips_only_drive_verbatim_prefix() {
+        assert_eq!(display_path(Path::new(r"\\?\C:\work\repo")), r"C:\work\repo");
+        assert_eq!(display_path(Path::new(r"\\?\UNC\srv\share")), r"\\?\UNC\srv\share");
+        assert_eq!(display_path(Path::new("/home/me/repo")), "/home/me/repo");
+    }
 }
