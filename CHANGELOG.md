@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.45](https://github.com/wheregmis/threadlane/compare/v0.1.44...v0.1.45) (2026-10-08)
+
+
+### Bug Fixes
+
+* **deps:** pin webview2-com to 0.38.2 to match lb-wry on Windows ([49879d1](https://github.com/wheregmis/threadlane/commit/49879d18b0217a3db138ad94397f38e7796edee4))
+* **deps:** pin webview2-com to 0.38.2 to match lb-wry on Windows ([8fdb01d](https://github.com/wheregmis/threadlane/commit/8fdb01d30c4a12a4b1e28783d06748592e8e3cdd))
+
 ## [0.1.44](https://github.com/wheregmis/threadlane/compare/v0.1.43...v0.1.44) (2026-10-07)
 
 
