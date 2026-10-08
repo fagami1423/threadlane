@@ -1150,20 +1150,29 @@ mod tests {
         let raw = server.await.unwrap();
         let lower = raw.to_ascii_lowercase();
         assert!(lower.contains("x-api-key: sk-ant-env-key"));
-        assert!(!lower.contains("authorization:"), "must not send a bearer token");
+        assert!(
+            !lower.contains("authorization:"),
+            "must not send a bearer token"
+        );
         let sent: Value = serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(sent["model"], "claude-sonnet-5-5");
         assert_eq!(sent["system"], "You are Threadlane.");
         assert!(sent.get("reasoning_effort").is_none() && sent.get("stream_options").is_none());
         let messages = sent["messages"].as_array().unwrap();
-        let roles: Vec<_> = messages.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        let roles: Vec<_> = messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
         assert_eq!(roles, ["user", "assistant", "user"]);
         let results = messages[2]["content"].as_array().unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r["type"] == "tool_result"));
         assert_eq!(messages[1]["content"][1]["type"], "tool_use");
         assert!(matches!(&events[0], StreamEvent::ContentToken(t) if t == "Two files."));
-        assert!(matches!(events.last().unwrap(), StreamEvent::Finished { .. }));
+        assert!(matches!(
+            events.last().unwrap(),
+            StreamEvent::Finished { .. }
+        ));
     }
 
     #[tokio::test]
