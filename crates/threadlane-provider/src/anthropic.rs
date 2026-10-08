@@ -18,8 +18,17 @@ const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub const ANTHROPIC_MODEL_PREFIX: &str = "anthropic/";
 /// `max_tokens` is required by the Messages API. Callers that set their own
-/// limit on the payload win.
-const DEFAULT_MAX_TOKENS: u64 = 8192;
+/// limit on the payload win. Current models think adaptively and thinking
+/// tokens count against this cap, so the default leaves generous room.
+const DEFAULT_MAX_TOKENS: u64 = 32_000;
+
+/// `ANTHROPIC_API_KEY` from the environment, if set and non-blank.
+pub fn api_key_from_env() -> Option<String> {
+    std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+}
 
 pub fn strip_anthropic_prefix(model: &str) -> &str {
     model.strip_prefix(ANTHROPIC_MODEL_PREFIX).unwrap_or(model)
@@ -52,12 +61,7 @@ impl AnthropicClient {
         self.api_key
             .clone()
             .filter(|key| !key.trim().is_empty())
-            .or_else(|| {
-                std::env::var("ANTHROPIC_API_KEY")
-                    .ok()
-                    .map(|key| key.trim().to_string())
-                    .filter(|key| !key.is_empty())
-            })
+            .or_else(api_key_from_env)
     }
 
     fn messages_url() -> String {
