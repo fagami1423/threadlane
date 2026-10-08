@@ -72,6 +72,8 @@ pub struct CodingAgent {
     #[cfg(test)]
     pub(crate) subagent_work_observer: SubagentObserverState,
     #[cfg(test)]
+    pub(crate) subagent_execution_observer: Option<SubagentExecutionObserver>,
+    #[cfg(test)]
     pub(crate) subagent_branch_observer: Option<SubagentBoundaryObserver>,
 }
 
@@ -1279,6 +1281,8 @@ impl CodingAgent {
             acp,
             #[cfg(test)]
             subagent_work_observer,
+            #[cfg(test)]
+            subagent_execution_observer: None,
             #[cfg(test)]
             subagent_branch_observer: None,
         }

@@ -1475,23 +1475,6 @@ impl CodingAgent {
             let accepted = journal
                 .accepted_subagent_run(&identity)
                 .map_err(&retrying)?;
-            let expected_agent = journal
-                .store
-                .records()
-                .iter()
-                .find_map(|record| match record {
-                    HarnessRecord::SubagentLifecycle {
-                        child_run_id,
-                        agent_id,
-                        subagent_lane,
-                        ..
-                    } if child_run_id.as_str() == lane.run_id
-                        && subagent_lane.as_str() == lane.lane =>
-                    {
-                        Some(agent_id.as_str().to_owned())
-                    }
-                    _ => None,
-                });
             let recovery_work_dir = threadlane_git::primary_worktree_root(&self.work_dir)
                 .ok()
                 .map(|root| subagent_workspace(&root, &lane.run_id).0)
@@ -1545,7 +1528,7 @@ impl CodingAgent {
                     #[cfg(test)]
                     child_run_override: None,
                     #[cfg(test)]
-                    child_execution_observer: None,
+                    child_execution_observer: self.subagent_execution_observer.clone(),
                     semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
                     hub: self.hub.clone(),
                 },
@@ -1556,7 +1539,7 @@ impl CodingAgent {
                 resume_messages.clone(),
                 None,
                 LaneContractMode::Restore {
-                    expected_agent,
+                    expected_agent: None,
                     required: false,
                 },
             )

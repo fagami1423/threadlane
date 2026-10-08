@@ -307,6 +307,7 @@ pub type SubagentRunOverride = Arc<
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SubagentExecutionSnapshot {
+    pub(crate) agent: String,
     pub(crate) system_prompt: String,
     pub(crate) tools: Option<Vec<String>>,
     pub(crate) peer_info: Option<(Vec<String>, String)>,
@@ -1435,6 +1436,7 @@ pub(crate) async fn run_subagent_task(
     #[cfg(test)]
     if let Some(observer) = context.child_execution_observer.as_ref() {
         observer(SubagentExecutionSnapshot {
+            agent: config.name.clone(),
             system_prompt: system_prompt.clone(),
             tools: effective_tools.clone(),
             peer_info: peer_info.clone(),
@@ -2308,6 +2310,120 @@ mod result_tests {
             .load_fusion_lane_contract("redacted-lane", Some("worker"))
             .unwrap_err();
         assert!(error.contains("no restorable system prompt"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn interrupted_fusion_recovery_uses_saved_contract_not_generated_lane_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut journal = CodingSessionHarness::open(&path).unwrap();
+        let state =
+            threadlane_orchestrator::FusionState::new("main".into(), "test-model".into(), None);
+        journal
+            .set_fact(
+                "main",
+                "fusion_state",
+                serde_json::to_string(&state).unwrap(),
+            )
+            .unwrap();
+        let lane_hint = "subagent-parent-worker:0";
+        let started = journal
+            .start_subagent_lane(lane_hint, "inspect the repository", None)
+            .unwrap();
+        let accepted = journal.accepted_subagent_run(&started.identity).unwrap();
+        drop(journal);
+
+        let initial_snapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let initial_observer = initial_snapshots.clone();
+        let mut initial_context = test_context(dir.path().to_owned(), path.clone(), None);
+        initial_context.child_execution_observer = Some(Arc::new(move |snapshot| {
+            initial_observer.lock().unwrap().push(snapshot);
+        }));
+        run_subagent_task(
+            AgentDefinition {
+                name: "worker".into(),
+                description: "worker role".into(),
+                tools: Some(vec!["read_file".into(), "run_command".into()]),
+                model: None,
+                system_prompt: "Saved worker instructions.".into(),
+                source: threadlane_skills::agents::AgentSource::Project,
+                file_path: dir.path().to_owned(),
+            },
+            "inspect the repository".into(),
+            initial_context,
+            1,
+            0,
+            started.identity.clone(),
+            Some(accepted),
+            Vec::new(),
+            Some((vec!["worker".into(), "sibling".into()], "worker".into())),
+            LaneContractMode::CaptureIfFusion,
+        )
+        .await
+        .unwrap();
+        let initial = initial_snapshots.lock().unwrap()[0].clone();
+        assert_eq!(initial.agent, "worker");
+        assert!(initial.system_prompt.contains("Saved worker instructions."));
+        assert_eq!(
+            initial.tools,
+            Some(vec![
+                "grep_search".into(),
+                "list_dir".into(),
+                "message_peer".into(),
+                "read_file".into(),
+            ])
+        );
+        assert_eq!(
+            initial.peer_info,
+            Some((vec!["worker".into(), "sibling".into()], "worker".into()))
+        );
+
+        let options = || crate::CodingAgentOptions {
+            api_key: "test".into(),
+            account_id: None,
+            model: "main".into(),
+            work_dir: dir.path().to_owned(),
+            session_file: Some(path.clone()),
+            system_prompt: threadlane_prompt::SystemPromptConfig::default(),
+            agent_config: None,
+            coding_config: None,
+            browser: threadlane_protocol::browser::BrowserBridge::unavailable(),
+        };
+        let mut recovered = crate::runtime::CodingAgent::new(options());
+        let observed_work = Arc::new(std::sync::Mutex::new(Vec::new()));
+        *recovered.subagent_work_observer.lock().unwrap() = Some(observed_work.clone());
+        let restored_snapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let restored_observer = restored_snapshots.clone();
+        recovered.subagent_execution_observer = Some(Arc::new(move |snapshot| {
+            restored_observer.lock().unwrap().push(snapshot);
+        }));
+
+        assert_eq!(recovered.recover_interrupted_subagent_lanes().await.unwrap(), 1);
+        let restored = restored_snapshots.lock().unwrap()[0].clone();
+        assert_eq!(restored, initial);
+        assert!(!observed_work.lock().unwrap().is_empty());
+
+        let store = JsonlStore::open_read_only(&path).unwrap();
+        let lifecycle = store
+            .records()
+            .iter()
+            .filter_map(|record| match record {
+                threadlane_runtime::harness::Record::SubagentLifecycle {
+                    child_run_id,
+                    agent_id,
+                    phase,
+                    ..
+                } if child_run_id.as_str() == started.identity.run_id.as_str() => {
+                    Some((
+                        agent_id.as_str().to_owned(),
+                        phase == &threadlane_runtime::harness::SubagentLifecyclePhase::Completed,
+                    ))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle[0].0, lane_hint);
+        assert_eq!(lifecycle.last().map(|(_, completed)| *completed), Some(true));
     }
 
     #[tokio::test]
