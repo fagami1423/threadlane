@@ -17,12 +17,31 @@ fn prepared() -> &'static Mutex<HashMap<String, Arc<SessionRuntime>>> {
     PREPARED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Parks a runtime built by worktree preparation until the `WorktreePrepared`
-/// event consumer claims it.
-pub fn park_prepared_runtime(session_id: String, runtime: Arc<SessionRuntime>) {
-    if let Ok(mut map) = prepared().lock() {
-        map.insert(session_id, runtime);
+/// Parks a runtime only while setup remains active. Cancellation uses the same
+/// registry lock, so a cancelled runtime can never be published afterward.
+pub fn park_prepared_runtime_if_active(
+    session_id: String,
+    runtime: Arc<SessionRuntime>,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> bool {
+    let Ok(mut map) = prepared().lock() else {
+        return false;
+    };
+    if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
     }
+    map.insert(session_id, runtime);
+    true
+}
+
+/// Mark setup cancelled and remove any runtime it already published.
+pub fn cancel_prepared_runtime(
+    session_id: &str,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Option<Arc<SessionRuntime>> {
+    let mut map = prepared().lock().ok()?;
+    cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+    map.remove(session_id)
 }
 
 /// Claims the parked runtime for `session_id`, if one is still waiting.

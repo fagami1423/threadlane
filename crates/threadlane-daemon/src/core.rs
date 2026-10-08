@@ -353,7 +353,7 @@ impl DaemonCore {
         };
         self.identities.lock().expect("identities poisoned").insert(
             session_id.to_string(),
-            SessionIdentity { session_file, work_dir },
+            SessionIdentity { session_file, work_dir: Self::project_dir_for(&work_dir) },
         );
         runtime
     }
@@ -365,6 +365,15 @@ impl DaemonCore {
             .entry(session_file.to_path_buf())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    fn prune_construction_gate(&self, session_file: &Path, gate: &Arc<Mutex<()>>) {
+        let mut gates = self.runtime_construction.lock().expect("runtime construction registry poisoned");
+        if Arc::strong_count(gate) == 2
+            && gates.get(session_file).is_some_and(|current| Arc::ptr_eq(current, gate))
+        {
+            gates.remove(session_file);
+        }
     }
 
     /// Serialized check-and-create boundary shared by desktop and paired clients.
@@ -380,6 +389,8 @@ impl DaemonCore {
         let gate = self.construction_gate(&session_file);
         let _construction = gate.lock().expect("runtime construction poisoned");
         if let Some(runtime) = self.runtime_for_file(&session_file) {
+            drop(_construction);
+            self.prune_construction_gate(&session_file, &gate);
             return runtime;
         }
         let runtime = prepared.unwrap_or_else(|| SessionRuntime::new(options));
@@ -393,10 +404,12 @@ impl DaemonCore {
         self.identities.lock().expect("identities poisoned").insert(
             session_id.to_string(),
             SessionIdentity {
-                session_file,
+                session_file: session_file.clone(),
                 work_dir: Self::project_dir_for(&work_dir),
             },
         );
+        drop(_construction);
+        self.prune_construction_gate(&session_file, &gate);
         runtime
     }
 
@@ -439,6 +452,24 @@ impl DaemonCore {
             .lock()
             .expect("runtimes poisoned")
             .remove(session_file)
+    }
+
+    /// Remove a just-constructed runtime only if it is still the exact idle
+    /// instance returned to the cancelled setup and no other client retained it.
+    pub fn release_cancelled_runtime(
+        &self,
+        session_file: &Path,
+        runtime: &Arc<SessionRuntime>,
+    ) {
+        let mut runtimes = self.runtimes.lock().expect("runtimes poisoned");
+        if runtimes
+            .get(session_file)
+            .is_some_and(|current| Arc::ptr_eq(current, runtime))
+            && !runtime.is_generating()
+            && Arc::strong_count(runtime) == 2
+        {
+            runtimes.remove(session_file);
+        }
     }
 
     /// `session_id` ↔ file: canonical layout is `<work_dir>/.threadlane/
@@ -1081,16 +1112,22 @@ impl DaemonCore {
                 crate::worktree_setup::start(self.clone(), setup, options, self.ingest_tx.clone())
             }
             SessionCommand::CancelWorktreeSetup { session_id } => {
-                if let Some(setup) = self
+                let setup = self
                     .worktree_setups
                     .lock()
                     .expect("worktree setups poisoned")
-                    .remove(&session_id)
-                {
-                    setup.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+                    .remove(&session_id);
+                if let Some(setup) = setup {
+                    if let Some(runtime) = crate::runtimes::cancel_prepared_runtime(
+                        &session_id,
+                        &setup.cancelled,
+                    ) {
+                        self.release_cancelled_runtime(&setup.session_file, &runtime);
+                    }
+                } else {
+                    // A completed setup may already have left the registry.
+                    let _ = crate::runtimes::take_prepared_runtime(&session_id);
                 }
-                // Release any parked runtime a completed setup left behind.
-                let _ = crate::runtimes::take_prepared_runtime(&session_id);
                 Ok(())
             }
             SessionCommand::DeleteSession {
@@ -1753,6 +1790,39 @@ mod composer_tests {
         release_tx.send(()).unwrap();
         register_thread.join().unwrap();
         gate_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_preparation_releases_only_unshared_owner() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        let project = tempfile::tempdir().unwrap();
+        let work_dir = project.path().canonicalize().unwrap();
+        let file = canonical_session_file(&work_dir, "cancelled-owner");
+        let core = DaemonCore::new().unwrap();
+        let runtime = core.clone().get_or_create_runtime_async(
+            "cancelled-owner".into(), work_dir.clone(), file.clone(),
+            super::coding_agent_options(work_dir.clone(), file.clone(), "test/model".into(),
+                Default::default(), threadlane_protocol::browser::BrowserBridge::unavailable()), None,
+        ).await.unwrap();
+        assert!(core.runtime_construction.lock().unwrap().is_empty());
+        let checkout = work_dir.join(".threadlane/worktrees/cancelled-owner");
+        core.register_runtime("cancelled-owner", checkout, file.clone(), runtime.clone());
+        assert_eq!(core.identity("cancelled-owner").unwrap().work_dir, work_dir);
+        let cancelled = AtomicBool::new(false);
+        assert!(crate::runtimes::park_prepared_runtime_if_active(
+            "cancelled-owner".into(), runtime.clone(), &cancelled));
+        let parked = crate::runtimes::cancel_prepared_runtime("cancelled-owner", &cancelled).unwrap();
+        assert!(Arc::ptr_eq(&runtime, &parked));
+        drop(parked);
+        assert!(!crate::runtimes::park_prepared_runtime_if_active(
+            "cancelled-owner".into(), runtime.clone(), &cancelled));
+        let other_client = runtime.clone();
+        core.release_cancelled_runtime(&file, &runtime);
+        assert!(core.runtime_for_file(&file).is_some());
+        drop(other_client);
+        core.release_cancelled_runtime(&file, &runtime);
+        assert!(core.runtime_for_file(&file).is_none());
+        assert!(crate::runtimes::take_prepared_runtime("cancelled-owner").is_none());
     }
 
     #[test]

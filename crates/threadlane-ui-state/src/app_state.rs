@@ -3596,8 +3596,16 @@ impl AppState {
         let active = self.client.active_session_id.as_deref() == Some(id);
         if setup.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             drop(result);
-            // Free the runtime parked by the producer before it was claimed.
-            let _ = crate::runtimes::take_prepared_runtime(id);
+            // Serialize cancellation with producer publication. The returned
+            // handle is the exact prepared runtime and is safe to release only
+            // when no other client has retained it.
+            if let Some(runtime) = crate::runtimes::cancel_prepared_runtime(
+                id,
+                &setup.cancelled,
+            ) {
+                self.daemon_core
+                    .release_cancelled_runtime(&setup.session_file, &runtime);
+            }
             if active {
                 self.client.is_generating = false;
                 self.client.session_status = Some("Worktree setup cancelled".into());
