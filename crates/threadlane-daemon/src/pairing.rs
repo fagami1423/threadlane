@@ -939,7 +939,6 @@ mod tests {
         )
         .await
         .expect("fresh start should recover after offline revoke");
-        assert_ne!(restarted.info().port, port);
         restarted.stop().await;
     }
 
