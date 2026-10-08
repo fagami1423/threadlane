@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.47](https://github.com/wheregmis/threadlane/compare/v0.1.46...v0.1.47) (2026-10-08)
+
+
+### Bug Fixes
+
+* **windows:** pin windows-core to 0.61 to match lb-wry; add Windows CI ([dfbe4af](https://github.com/wheregmis/threadlane/commit/dfbe4af3ab8b516b70544932a81ddbb52c7e00c5))
+* **windows:** pin windows-core to 0.61 to match lb-wry; add Windows CI ([5fa0ad2](https://github.com/wheregmis/threadlane/commit/5fa0ad263959120ff9572b0163cf91a09113b2f5))
+
 ## [0.1.46](https://github.com/wheregmis/threadlane/compare/v0.1.45...v0.1.46) (2026-10-08)
 
 
