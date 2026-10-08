@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.1.46](https://github.com/wheregmis/threadlane/compare/v0.1.45...v0.1.46) (2026-10-08)
+
+
+### Features
+
+* **editor:** preview Markdown from current document buffers ([2d08244](https://github.com/wheregmis/threadlane/commit/2d08244e44b27621f4562df0a435c31853614f51))
+* **editor:** preview Markdown from retained document buffers ([5c4418f](https://github.com/wheregmis/threadlane/commit/5c4418f226ff36eed0764c2d94b0792c316b03b4))
+* keep agentic Git workflows engaged through PR readiness ([4bca2b3](https://github.com/wheregmis/threadlane/commit/4bca2b3d0329145f5fb4a5a4dfb70ad2bc1b0a85))
+* keep agentic Git workflows engaged through PR readiness ([1bd0391](https://github.com/wheregmis/threadlane/commit/1bd0391417654c9f619590612513ea0309a828e0))
+* **mobile:** improve chat list and composer project selection ([5cd352c](https://github.com/wheregmis/threadlane/commit/5cd352c2d27905aab3683e9f18ae9554442f0c2c))
+* **pairing:** persist paired desktop devices ([c2e2fc3](https://github.com/wheregmis/threadlane/commit/c2e2fc3a18d6eba7f9f3525cd695ad9f29daf98c))
+* **pairing:** remember shared devices and reconnect across restarts ([ab937d3](https://github.com/wheregmis/threadlane/commit/ab937d300e7e4ce879069b14d1a430aa4d75c211))
+* **settings:** add safe project removal without deleting files ([565815e](https://github.com/wheregmis/threadlane/commit/565815e9b21e6585617bb8e6a02806645ea4e271))
+
+
+### Bug Fixes
+
+* canonicalize local git branch refs ([ee27422](https://github.com/wheregmis/threadlane/commit/ee27422ac392162a4a1fe723fbd63aec033b40ae))
+* **editor:** refresh Markdown preview only on content changes ([3340d07](https://github.com/wheregmis/threadlane/commit/3340d07a0ab43edf168b1912a57fdb5df8373fa2))
+* **fusion:** persist lane contracts and monitor child outcomes ([4113391](https://github.com/wheregmis/threadlane/commit/41133915d442d7e40b799d1294cdd60d8d0e25d0))
+* **fusion:** restore effective child lane contracts ([6937b3a](https://github.com/wheregmis/threadlane/commit/6937b3ab3867c923063451cf8858b4650eb6b153))
+* **fusion:** restore interrupted children from saved contracts ([b500ab2](https://github.com/wheregmis/threadlane/commit/b500ab2d00b6e1d7769ca7db84184e7e1053f32a))
+* **fusion:** stabilize delegation and preserve worker contracts ([37d3e02](https://github.com/wheregmis/threadlane/commit/37d3e021421e3ec0517eab0df956722e4ad5faa7))
+* guard editor reopen and focus lifecycle ([3cdd1dc](https://github.com/wheregmis/threadlane/commit/3cdd1dc5ca834f39aa7af7f4c09d7057601a288e))
+* guard PR readiness and filter agent review replies ([4b3e26c](https://github.com/wheregmis/threadlane/commit/4b3e26c3f46e2b8a522bdf361779a5eed38960a7))
+* notify after rejected editor saves ([55f036c](https://github.com/wheregmis/threadlane/commit/55f036c9882bd111c447260c6dd1549c2c9c8467))
+* **pairing:** address durable device correctness review ([a6e49b9](https://github.com/wheregmis/threadlane/commit/a6e49b9d4f97993f29d9fa1e91ba899281f1d45a))
+* **pairing:** recover revoked ports and blocked clients ([386f0c6](https://github.com/wheregmis/threadlane/commit/386f0c6d1e8a7f4960e6bf43715c1d33f3fff208))
+* preserve local branch metadata ([c67efcd](https://github.com/wheregmis/threadlane/commit/c67efcdbd0dd2e275d3d3f88eb45f71d764363f1))
+* **projects:** guard live work and preserve exact removal paths ([433abc5](https://github.com/wheregmis/threadlane/commit/433abc5821cd0431d6278a1b2657caf900747597))
+* reopen recently closed Editor files ([4527523](https://github.com/wheregmis/threadlane/commit/4527523314e4da0150d4fcd25d8ad46fab161e18))
+
+
+### Performance Improvements
+
+* optimize workspace workflows ([e7de212](https://github.com/wheregmis/threadlane/commit/e7de212994e9e3c61a24865ffeadb7e11bb39278))
+* reduce redundant work across workspace workflows ([7eb7f2e](https://github.com/wheregmis/threadlane/commit/7eb7f2eab22cebbb94d44fc9c32c2c807684b4b2))
+
+
+### Build System
+
+* **deps:** bump robius-open from `71966dc` to `aea7a4f` ([e1f5c80](https://github.com/wheregmis/threadlane/commit/e1f5c80f4052cc6be186c28a4731d1d403120662))
+* **deps:** bump robius-open from `71966dc` to `aea7a4f` ([8e322d3](https://github.com/wheregmis/threadlane/commit/8e322d380f714ee88599a482bb844e7129c5d897))
+* **deps:** bump windows-core from 0.61.2 to 0.62.2 ([d84ec7b](https://github.com/wheregmis/threadlane/commit/d84ec7b1a899329bbfdc63f9dce35a4449b382a8))
+* **deps:** bump windows-core from 0.61.2 to 0.62.2 ([bc339e5](https://github.com/wheregmis/threadlane/commit/bc339e5c30e486c133e71d4ad3dc339642fee90d))
+
 ## [0.1.45](https://github.com/wheregmis/threadlane/compare/v0.1.44...v0.1.45) (2026-10-08)
 
 
