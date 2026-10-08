@@ -399,16 +399,9 @@ impl EditorView {
 
         let tab_title = threadlane_ui_kit::editor_tab_title(relative_path, false);
 
-        let observe = cx.observe(&editor, |this, editor, cx| {
-            if let Some(tab) = this
-                .tabs
-                .iter_mut()
-                .find(|tab| tab.editor_state.as_ref() == Some(&editor))
-            {
-                tab.markdown_preview.refresh(editor.read(cx).value(), cx);
-            }
-            cx.notify();
-        });
+        // Cursor/selection notifications only update controls. Content changes
+        // refresh preview in the Change subscription (or explicit reload path).
+        let observe = cx.observe(&editor, |_this, _editor, cx| cx.notify());
 
         self.tabs.push(EditorTab {
             project_dir: project_dir.to_path_buf(),
@@ -523,9 +516,10 @@ impl EditorView {
         {
             if let Some(editor) = tab.editor_state.clone() {
                 if let Some(content) = tab.pending_content.take() {
+                    let content: SharedString = content.into();
+                    tab.markdown_preview.refresh(content.clone(), cx);
                     editor.update(cx, |editor, cx| editor.set_value(content, window, cx));
                     tab.is_dirty = false;
-                    tab.markdown_preview.refresh(editor.read(cx).value(), cx);
                     applied = true;
                 }
                 if Some(ix) == self.active_tab_index

@@ -155,6 +155,9 @@ impl MarkdownPreview {
     /// Called only when the retained source buffer changes, or on entry.
     pub fn refresh(&mut self, text: SharedString, cx: &mut App) {
         if !self.active {
+            if markdown_preview_size_allowed(&text) {
+                self.error = None;
+            }
             return;
         }
         if !markdown_preview_size_allowed(&text) {
@@ -305,6 +308,13 @@ mod tests {
             preview.refresh("x".repeat(MARKDOWN_PREVIEW_LIMIT + 1).into(), cx);
             assert!(!preview.is_active());
             assert!(preview.notice(false).unwrap().contains("512 KiB"));
+            preview.refresh("x".repeat(MARKDOWN_PREVIEW_LIMIT + 1).into(), cx);
+            assert!(preview.notice(false).is_some());
+            preview.refresh("é".repeat(MARKDOWN_PREVIEW_LIMIT / 2).into(), cx);
+            assert!(!preview.is_active());
+            assert!(preview.notice(false).is_none());
+            assert_eq!(preview.state.as_ref().unwrap().entity_id(), id);
+            assert_eq!(preview.text.as_ref(), "# Second edit");
             preview.toggle("".into(), cx);
             assert!(preview.is_active());
             assert!(preview.text.is_empty());

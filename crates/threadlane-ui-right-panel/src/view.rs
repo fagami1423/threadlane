@@ -1018,12 +1018,9 @@ impl RightPanelView {
                     }
                 }
             });
-            let observe = cx.observe(&editor, |this, editor, cx| {
-                if this.editor_state.as_ref() == Some(&editor) {
-                    this.markdown_preview.refresh(editor.read(cx).value(), cx);
-                }
-                cx.notify();
-            });
+            // Selection-only notifications must not materialize the source Rope.
+            // The Change subscription owns preview refreshes.
+            let observe = cx.observe(&editor, |_this, _editor, cx| cx.notify());
             self.editor_state = Some(editor);
             self.editor_subscription = Some(subscription);
             self.editor_observe = Some(observe);
