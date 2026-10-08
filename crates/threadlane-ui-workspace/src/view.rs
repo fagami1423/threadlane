@@ -139,6 +139,7 @@ fn install_window_close_handler(
 }
 
 pub fn init(cx: &mut App) {
+    threadlane_ui_kit::init_editor(cx);
     threadlane_ui_automation::init(cx);
     threadlane_ui_github::view::init(cx);
     threadlane_ui_terminal::init(cx);

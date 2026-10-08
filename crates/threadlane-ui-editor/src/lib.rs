@@ -4,5 +4,6 @@
 //! workspace shell binds `SaveFile` to its save keybindings.
 
 mod view;
+mod closed_files;
 
 pub use view::{detect_language, EditorView, SaveFile};

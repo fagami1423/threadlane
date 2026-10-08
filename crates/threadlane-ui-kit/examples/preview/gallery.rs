@@ -39,6 +39,7 @@ pub struct Gallery {
     _input_subscription: Subscription,
     document_dirty: bool,
     markdown_preview: kit::MarkdownPreview,
+    recovery_sample: usize,
     ignore_whitespace: bool,
     selected_trajectory: Option<usize>,
     review_pr_sample: usize,
@@ -87,6 +88,7 @@ impl Gallery {
         );
         let draft_pr = cx.new(|cx| crate::draft_pr::DraftPrPreview::new(fixture.git_status.as_ref(), window, cx));
         Self {
+            recovery_sample: 0,
             code_samples: cx.new(|_| crate::code_samples::CodeSamples::new()),
             file_picker_samples: cx.new(|_| crate::file_picker_samples::FilePickerSamples::new()),
             fixture, terminal, terminal_visible: true, _terminal_subscription: terminal_subscription,
@@ -809,6 +811,30 @@ impl Render for Gallery {
             ].into_iter().enumerate().map(|(index, (sample, label))| Button::new(SharedString::from(format!("gallery-draft-pr-{index}")))
                 .debug_selector(move || format!("gallery-draft-pr-{index}")).label(label).small().ghost()
                 .on_click(cx.listener(move |host, _, window, cx| { host.draft_pr.update(cx, |this, cx| this.set_sample(sample, cx)); crate::draft_pr::open(host.draft_pr.clone(), window, cx); })))))
+            .child(heading("Reopen closed file · saved-file recovery states", cx))
+            .child(div().flex().flex_wrap().gap_2().children(
+                ["Available", "Empty", "Loading", "Failed"].into_iter().enumerate().map(|(index, label)| {
+                    Button::new(SharedString::from(format!("gallery-recovery-{index}")))
+                        .label(label).small().ghost()
+                        .on_click(cx.listener(move |host, _, _, cx| { host.recovery_sample = index; cx.notify(); }))
+                })
+            ))
+            .child(div().max_w(rems(32.)).flex().flex_col()
+                .child(kit::editor_reopen_button(&kit::ReopenClosedFileControl::default()
+                    .with_target((self.recovery_sample != 1).then(|| "Sample worktree / src/例 example.rs".into()))
+                    .with_loading(self.recovery_sample == 2)
+                ).on_click(cx.listener(|host, _, _, cx| {
+                    host.recovery_sample = 3;
+                    cx.notify();
+                })))
+                .children((self.recovery_sample >= 2).then(|| kit::editor_file_status(
+                    "Sample worktree / src/例 example.rs".into(),
+                    (self.recovery_sample == 3).then(|| "Couldn't read the saved sample. Retry uses captured data only.".into()),
+                    kit::editor_retry_button("Sample worktree / src/例 example.rs", false)
+                        .on_click(cx.listener(|host, _, _, cx| { host.recovery_sample = 0; cx.notify(); })),
+                    cx,
+                )))
+            )
             .child(heading("Markdown document · current buffer sample", cx))
             .child(
                 div()

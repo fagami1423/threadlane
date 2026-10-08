@@ -25,6 +25,8 @@ pub struct EditorPreview {
     tabs: Vec<String>,
     selected: Option<String>,
     status: Option<String>,
+    closed_sample: bool,
+    focus_handle: FocusHandle,
     /// Text appended by the sample **Add selection to chat** control.
     draft: String,
     _subscription: Subscription,
@@ -58,6 +60,8 @@ impl EditorPreview {
             tabs: vec![FILE.into(), DIFF.into()],
             selected: Some(FILE.into()),
             status: None,
+            closed_sample: false,
+            focus_handle: cx.focus_handle(),
             draft: String::new(),
             _subscription: subscription,
         }
@@ -88,6 +92,32 @@ impl EditorPreview {
         cx.notify();
     }
 
+    fn reopen_control(&self) -> kit::ReopenClosedFileControl {
+        kit::ReopenClosedFileControl::default()
+            .with_target(self.closed_sample.then(|| format!("Sample checkout / {FILE}")))
+    }
+
+    fn reopen_button(&self) -> gpui_component::button::Button {
+        let focus = self.focus_handle.clone();
+        kit::editor_reopen_button(&self.reopen_control())
+            .on_click(move |_, window, cx| {
+                window.focus(&focus, cx);
+                window.dispatch_action(Box::new(kit::ReopenClosedFile), cx);
+            })
+    }
+
+    fn reopen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.closed_sample || window.has_active_dialog(cx) || window.has_active_sheet(cx) {
+            return;
+        }
+        if !self.tabs.iter().any(|id| id == FILE) {
+            self.buffer.update(cx, |buffer, cx| buffer.set_value(self.saved.clone(), window, cx));
+        }
+        self.open_sample(cx);
+        self.closed_sample = false;
+        self.buffer.update(cx, |buffer, cx| buffer.focus(window, cx));
+    }
+
     fn save(&mut self, cx: &mut Context<Self>) {
         if self.selected.as_deref() == Some(FILE) && self.dirty(cx) {
             self.saved = self.buffer.read(cx).value().to_string();
@@ -105,6 +135,7 @@ impl EditorPreview {
         self.tabs = vec![FILE.into(), DIFF.into()];
         self.selected = Some(FILE.into());
         self.status = None;
+        self.closed_sample = false;
         cx.notify();
     }
 
@@ -141,22 +172,25 @@ impl EditorPreview {
                             .ok_variant(ButtonVariant::Danger)
                             .show_cancel(true),
                     )
-                    .on_ok(move |_, _, cx| {
+                    .on_ok(move |_, window, cx| {
                         let _ = entity.update(cx, |host, cx| {
                             // Keep any edits made after this confirmation opened.
                             if host.buffer.read(cx).value() == buffer {
-                                host.remove(&targets, cx);
+                                host.remove(&targets, window, cx);
                             }
                         });
                         true
                     })
             });
         } else {
-            self.remove(&targets, cx);
+            self.remove(&targets, window, cx);
         }
     }
 
-    fn remove(&mut self, targets: &[String], cx: &mut Context<Self>) {
+    fn remove(&mut self, targets: &[String], window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.iter().any(|id| id == FILE && targets.contains(id)) {
+            self.closed_sample = true;
+        }
         self.tabs.retain(|id| !targets.contains(id));
         if self
             .selected
@@ -167,6 +201,7 @@ impl EditorPreview {
         }
         self.diffs.retain(|id, _| !targets.contains(id));
         self.status = None;
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 }
@@ -179,7 +214,11 @@ impl Render for EditorPreview {
             .as_ref()
             .is_some_and(|id| self.diffs.contains_key(id));
         kit::editor_surface(cx)
-            .key_context("EditorPreview")
+            .id("sample-central-editor")
+            .role(Role::Group)
+            .track_focus(&self.focus_handle)
+            .key_context("CentralEditor EditorPreview")
+            .on_action(cx.listener(|host, _: &kit::ReopenClosedFile, window, cx| host.reopen(window, cx)))
             .on_action(cx.listener(|host, _: &SaveSampleBuffer, _, cx| host.save(cx)))
             .children((!self.tabs.is_empty()).then(|| {
                 kit::editor_tab_bar(cx)
@@ -223,6 +262,7 @@ impl Render for EditorPreview {
                     .child(kit::editor_actions(
                         None,
                         self.status.clone().map(|message| (message, false)),
+                        self.reopen_button(),
                         (self.selected.as_deref() == Some(FILE)).then(|| {
                             let reason = kit::editor_excerpt_block_reason(
                                 kit::editor_selection_snapshot(self.buffer.read(cx)).as_ref(),
@@ -263,7 +303,7 @@ impl Render for EditorPreview {
             } else if let Some(diff) = self.selected.as_ref().and_then(|id| self.diffs.get(id)) {
                 kit::editor_diff(diff, cx).into_any_element()
             } else {
-                kit::editor_empty_state(cx).into_any_element()
+                kit::editor_empty_state(self.reopen_button(), cx).into_any_element()
             })
             .when(!self.draft.is_empty(), |el| {
                 el.child(

@@ -4,6 +4,16 @@ use crate::{
 };
 use gpui::{AppContext, TestAppContext};
 
+#[test]
+fn reopen_control_describes_identity_availability_and_saved_file_policy() {
+    let mut control = crate::ReopenClosedFileControl::default();
+    assert_eq!(control.description(), "No closed files in this window.");
+    control = control.with_target(Some("/worktrees/第二 / src/a b.rs".into()));
+    assert_eq!(control.description(), "Reopen /worktrees/第二 / src/a b.rs. Reopens the saved file; discarded edits are not restored.");
+    control = control.with_loading(true);
+    assert!(control.description().starts_with("Reopening /worktrees/第二 / src/a b.rs"));
+}
+
 fn snapshot(text: &str, range: std::ops::Range<usize>, start: usize, end: usize) -> EditorSelectionSnapshot {
     EditorSelectionSnapshot {
         text: text.to_string(),

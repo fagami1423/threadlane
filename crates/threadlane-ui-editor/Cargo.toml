@@ -10,6 +10,7 @@ gpui-component.workspace = true
 rfd.workspace = true
 threadlane-ui-state.workspace = true
 threadlane-ui-kit.workspace = true
+threadlane-client.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
