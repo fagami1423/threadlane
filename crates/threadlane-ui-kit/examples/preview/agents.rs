@@ -240,6 +240,9 @@ impl Render for AgentsPreview {
             &kit::RightPanelSurface::ALL,
             None,
             cx.listener(|host, surface: &kit::RightPanelSurface, _, cx| {
+                if *surface != kit::RightPanelSurface::Review {
+                    host.review.update(cx, |review, cx| review.leave_review(cx));
+                }
                 host.surface = *surface;
                 cx.notify();
             }),

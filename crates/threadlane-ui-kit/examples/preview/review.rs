@@ -4,7 +4,6 @@ use gpui_component::input::{InputEvent, InputState};
 use gpui_component::menu::ContextMenuExt;
 use gpui_component::notification::Notification;
 use gpui_component::separator::Separator;
-use gpui_component::text::TextViewState;
 use gpui_component::{ActiveTheme, WindowExt};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use threadlane_protocol::daemon::SessionInfo;
@@ -136,7 +135,7 @@ pub struct ReviewPreview {
     /// Non-tab-stop focus target for the navigation group when the
     /// initiating control becomes disabled at a boundary.
     review_nav_focus: FocusHandle,
-    document_state: Entity<TextViewState>,
+    review_document: Entity<kit::ReviewDiffDocument>,
     ignore_whitespace: bool,
     can_create_pr: bool,
     draft_pr: Entity<crate::draft_pr::DraftPrPreview>,
@@ -162,14 +161,32 @@ pub struct ReviewPreview {
     _filter: Subscription,
     _commit: Subscription,
     _history_filter: Subscription,
+    _review_document: Subscription,
 }
 
 impl ReviewPreview {
+    pub(super) fn leave_review(&mut self, cx: &mut Context<Self>) {
+        self.document = None;
+        self.review_document.update(cx, |document, cx| document.reset(cx));
+        cx.notify();
+    }
+
     pub fn new(
         snapshot: Option<&super::session::Snapshot>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let review_document = cx.new(|cx| kit::ReviewDiffDocument::new(window, cx));
+        let review_document_subscription =
+            cx.subscribe_in(&review_document, window, |host, _, action, window, cx| {
+                match *action {
+                    kit::ReviewDiffAction::ShowWhitespace => {
+                        host.ignore_whitespace = false;
+                        host.update_diff(cx);
+                    }
+                    kit::ReviewDiffAction::Retry => Self::notice(window, cx),
+                }
+            });
         let status = snapshot.and_then(|snapshot| snapshot.git_status.clone());
         let selected = status
             .as_ref()
@@ -220,7 +237,7 @@ impl ReviewPreview {
             document: None,
             document_revision: 0,
             review_nav_focus: cx.focus_handle().tab_stop(false),
-            document_state: cx.new(|cx| TextViewState::markdown("", cx)),
+            review_document,
             ignore_whitespace: false,
             draft_pr,
             can_create_pr: snapshot.is_some_and(|snapshot| snapshot.review_can_create_pr),
@@ -252,6 +269,7 @@ impl ReviewPreview {
             _filter: filter_subscription,
             _commit: commit_subscription,
             _history_filter: history_subscription,
+            _review_document: review_document_subscription,
         }
     }
 
@@ -486,16 +504,26 @@ impl ReviewPreview {
     }
 
     fn open_diff(&mut self, path: String, cx: &mut Context<Self>) {
+        let initial_open = self.document.is_none();
+        self.review_document.update(cx, |document, cx| document.reset(cx));
         self.document_revision += 1;
         self.document = Some(path);
         self.update_diff(cx);
+        if initial_open {
+            self.review_document
+                .update(cx, |document, cx| document.request_focus(cx));
+        }
     }
 
     fn update_diff(&mut self, cx: &mut Context<Self>) {
-        if let Some(text) = self.captured_diff() {
-            let markdown = format!("```diff\n{}\n```", text.replace("```", "` ` `"));
-            self.document_state = cx.new(|cx| TextViewState::markdown(&markdown, cx));
-        }
+        self.review_document.update(cx, |document, cx| {
+            document.loading(self.ignore_whitespace, cx);
+            if let Some(text) = self.captured_diff() {
+                document.set_patch(text, cx);
+            } else {
+                document.failed("This diff is not included in the bounded snapshot. Re-import the session or open desktop Review for live content.".into(), cx);
+            }
+        });
         cx.notify();
     }
 
@@ -763,14 +791,12 @@ impl Render for ReviewPreview {
             } else {
                 format!("Review · {path}")
             };
-            let content = match self.captured_diff() {
-                Some("") => kit::ReviewDiffContent::Empty,
-                Some(_) => kit::ReviewDiffContent::Ready(&self.document_state),
-                None => kit::ReviewDiffContent::Failed(
-                    "This diff is not included in the bounded snapshot. Re-import the session or open desktop Review for live content.",
-                ),
-            };
             return kit::review_panel_surface()
+                .key_context("ReviewDiff")
+                .on_action(cx.listener(|host, _: &kit::FindInDiff, window, cx| {
+                    host.review_document
+                        .update(cx, |document, cx| document.open_find(window, cx));
+                }))
                 .child(context)
                 .child(kit::panel_document_header(
                     None,
@@ -782,6 +808,7 @@ impl Render for ReviewPreview {
                     None,
                     cx.listener(|host, _: &kit::PanelDocumentAction, _, cx| {
                         host.document = None;
+                        host.review_document.update(cx, |document, cx| document.reset(cx));
                         cx.notify();
                     }),
                 ))
@@ -846,23 +873,7 @@ impl Render for ReviewPreview {
                     )
                 }))
                 .child(Separator::horizontal())
-                .child(kit::review_diff_body(
-                    content,
-                    self.ignore_whitespace,
-                    ElementId::Name(SharedString::from(format!(
-                        "preview-review-diff-{}",
-                        self.document_revision
-                    ))),
-                    cx.listener(|host, action: &kit::ReviewDiffAction, window, cx| {
-                        if *action == kit::ReviewDiffAction::ShowWhitespace {
-                            host.ignore_whitespace = false;
-                            host.update_diff(cx);
-                        } else {
-                            Self::notice(window, cx);
-                        }
-                    }),
-                    cx,
-                ));
+                .child(self.review_document.clone());
         }
         let filtered = self.filtered_files(cx);
         if self.list.item_count() != filtered.len() {

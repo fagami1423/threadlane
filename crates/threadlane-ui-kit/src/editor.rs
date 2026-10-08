@@ -525,7 +525,7 @@ pub fn review_whitespace_control(
 ) -> Div {
     div().px_3().py_2().flex().flex_col().gap_2()
         .child(Checkbox::new("review-ignore-whitespace")
-            .debug_selector(|| "review-ignore-whitespace".into()).small().label("Ignore whitespace").checked(ignore)
+            .debug_selector(|| "review-ignore-whitespace".into()).w_full().small().label("Ignore whitespace").checked(ignore)
             .accessibility_label("Ignore whitespace. Ignores whitespace when comparing lines. Whitespace can affect program behavior. File counts and commit selection are unchanged.")
             .tooltip("Ignores whitespace when comparing lines. Whitespace can affect program behavior. File counts and commit selection are unchanged.")
             .on_click(on_change))
