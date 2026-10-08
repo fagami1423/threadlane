@@ -221,6 +221,7 @@ impl Render for EditorPreview {
                         })
                     })))
                     .child(kit::editor_actions(
+                        None,
                         self.status.clone().map(|message| (message, false)),
                         (self.selected.as_deref() == Some(FILE)).then(|| {
                             let reason = kit::editor_excerpt_block_reason(

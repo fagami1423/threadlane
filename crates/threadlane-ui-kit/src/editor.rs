@@ -172,6 +172,7 @@ pub fn editor_add_selection_button(
 
 /// Compact header used by the Files and Review panels. Save/close guards belong to the host.
 pub fn panel_document_header(
+    mode: Option<AnyElement>,
     title: &str,
     dirty: bool,
     language: Option<&str>,
@@ -179,6 +180,7 @@ pub fn panel_document_header(
     add_selection: Option<AddSelectionControl>,
     on_action: impl Fn(&PanelDocumentAction, &mut Window, &mut App) + 'static,
 ) -> Div {
+    let has_mode = mode.is_some();
     let callback = std::rc::Rc::new(on_action);
     let request = move |action| {
         let callback = callback.clone();
@@ -196,7 +198,8 @@ pub fn panel_document_header(
     };
     div()
         .debug_selector(|| "panel-document-header".into())
-        .h(rems(2.375))
+        .min_h(rems(2.375))
+        .when(has_mode, |header| header.flex_wrap().gap_1().py_1())
         .flex_none()
         .min_w_0()
         .px_2()
@@ -244,6 +247,8 @@ pub fn panel_document_header(
                 .flex()
                 .items_center()
                 .gap_1()
+                .when(has_mode, |actions| actions.flex_wrap().max_w_full())
+                .children(mode)
                 .children(add_selection.map(|control| {
                     editor_add_selection_button("panel-add-selection", &control)
                         .on_click(request(PanelDocumentAction::AddSelectionToChat))
@@ -300,7 +305,8 @@ pub fn editor_surface(cx: &App) -> Div {
 
 pub fn editor_tab_bar(cx: &App) -> Div {
     div()
-        .h(rems(2.125))
+        .min_h(rems(2.125))
+        .flex_wrap()
         .w_full()
         .flex_none()
         .flex()
@@ -478,13 +484,16 @@ pub fn editor_save_button(dirty: bool, diff: bool) -> Button {
 }
 
 pub fn editor_actions(
+    mode: Option<AnyElement>,
     status: Option<(String, bool)>,
     add_selection: Option<Button>,
     save: Button,
     cx: &App,
 ) -> Div {
+    let has_mode = mode.is_some();
     div()
         .flex_none()
+        .when(has_mode, |actions| actions.flex_wrap().max_w_full())
         .flex()
         .items_center()
         .gap_1()
@@ -502,6 +511,7 @@ pub fn editor_actions(
                 .px_2()
                 .child(message)
         }))
+        .children(mode)
         .children(add_selection)
         .child(save)
 }

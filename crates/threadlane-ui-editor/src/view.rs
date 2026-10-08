@@ -32,6 +32,7 @@ pub struct EditorTab {
     loading: bool,
     editor_state: Option<Entity<EditorState>>,
     text_view_state: Option<Entity<TextViewState>>,
+    markdown_preview: threadlane_ui_kit::MarkdownPreview,
     _subscription: Option<Subscription>,
     /// Re-renders the host whenever the buffer notifies (selection moves
     /// included — the editor emits no `InputEvent` for selection-only
@@ -121,6 +122,9 @@ impl EditorView {
         else {
             return Some("Open a file first".into());
         };
+        if tab.markdown_preview.is_active() {
+            return Some(threadlane_ui_kit::PREVIEW_SELECTION_REASON.into());
+        }
         if tab.is_diff {
             return Some("Diffs can't be added to chat — open the file itself".into());
         }
@@ -196,7 +200,8 @@ impl EditorView {
         else {
             return false;
         };
-        if tab.is_diff
+        if tab.markdown_preview.is_active()
+            || tab.is_diff
             || tab.loading
             || tab.pending_content.is_some()
             || tab.project_dir != request.checkout
@@ -228,7 +233,13 @@ impl EditorView {
                     .find(|tab| tab.project_dir == project && tab.relative_path == path)
                 {
                     tab.pending_line = line;
+                    if line.is_some() {
+                        tab.markdown_preview.show_source();
+                    }
                     if let Some(editor) = &tab.editor_state {
+                        if tab.markdown_preview.is_active() {
+                            return;
+                        }
                         editor.update(cx, |editor, cx| editor.focus(window, cx));
                     }
                 }
@@ -310,6 +321,7 @@ impl EditorView {
             pending_line: None,
             loading: false,
             editor_state: None,
+            markdown_preview: threadlane_ui_kit::MarkdownPreview::new(cx),
             text_view_state: Some(markdown_state),
             _subscription: None,
             _observe: None,
@@ -375,6 +387,7 @@ impl EditorView {
                 {
                     // An edit after a read completed must also cancel its queued replacement.
                     tab.pending_content = None;
+                    tab.markdown_preview.refresh(current.clone(), cx);
                     let dirty = current.as_str() != tab.saved_content.as_str();
                     if tab.is_dirty != dirty {
                         tab.is_dirty = dirty;
@@ -386,7 +399,16 @@ impl EditorView {
 
         let tab_title = threadlane_ui_kit::editor_tab_title(relative_path, false);
 
-        let observe = cx.observe(&editor, |_this, _editor, cx| cx.notify());
+        let observe = cx.observe(&editor, |this, editor, cx| {
+            if let Some(tab) = this
+                .tabs
+                .iter_mut()
+                .find(|tab| tab.editor_state.as_ref() == Some(&editor))
+            {
+                tab.markdown_preview.refresh(editor.read(cx).value(), cx);
+            }
+            cx.notify();
+        });
 
         self.tabs.push(EditorTab {
             project_dir: project_dir.to_path_buf(),
@@ -400,6 +422,7 @@ impl EditorView {
             pending_line: None,
             loading: false,
             editor_state: Some(editor.clone()),
+            markdown_preview: threadlane_ui_kit::MarkdownPreview::new(cx),
             text_view_state: None,
             _subscription: Some(subscription),
             _observe: Some(observe),
@@ -502,6 +525,7 @@ impl EditorView {
                 if let Some(content) = tab.pending_content.take() {
                     editor.update(cx, |editor, cx| editor.set_value(content, window, cx));
                     tab.is_dirty = false;
+                    tab.markdown_preview.refresh(editor.read(cx).value(), cx);
                     applied = true;
                 }
                 if Some(ix) == self.active_tab_index
@@ -880,6 +904,16 @@ impl EditorView {
                 )),
             )
             .child(threadlane_ui_kit::editor_actions(
+                self.active_tab_index
+                    .and_then(|ix| self.tabs.get(ix))
+                    .filter(|tab| {
+                        !tab.is_diff
+                            && threadlane_ui_kit::markdown_preview_eligible(&tab.relative_path)
+                    })
+                    .map(|tab| {
+                        tab.markdown_preview
+                            .control(tab.loading || tab.pending_content.is_some(), cx)
+                    }),
                 self.visible_status(),
                 Some(
                     threadlane_ui_kit::editor_add_selection_button(
@@ -902,6 +936,35 @@ impl EditorView {
             ))
     }
 
+    fn toggle_markdown_preview(
+        &mut self,
+        _: &threadlane_ui_kit::ToggleMarkdownPreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.active_tab_index.and_then(|ix| self.tabs.get_mut(ix)) else {
+            return;
+        };
+        if tab.markdown_preview.is_active() {
+            tab.markdown_preview.show_source();
+            tab.markdown_preview.focus_control(window, cx);
+            cx.notify();
+            return;
+        }
+        if tab.is_diff
+            || tab.loading
+            || tab.pending_content.is_some()
+            || !threadlane_ui_kit::markdown_preview_eligible(&tab.relative_path)
+        {
+            return;
+        }
+        if let Some(editor) = &tab.editor_state {
+            tab.markdown_preview.toggle(editor.read(cx).value(), cx);
+            tab.markdown_preview.focus_control(window, cx);
+            cx.notify();
+        }
+    }
+
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
         threadlane_ui_kit::editor_empty_state(cx)
     }
@@ -916,10 +979,17 @@ impl Render for EditorView {
         self.sync_pending_content(window, cx);
         threadlane_ui_kit::editor_surface(cx)
             .on_action(cx.listener(Self::save_file_action))
+            .on_action(cx.listener(Self::toggle_markdown_preview))
             .on_action(cx.listener(|view, _: &threadlane_ui_kit::AddSelectionToChat, window, cx| {
                 view.request_add_selection_to_chat(window, cx)
             }))
             .children(self.has_tabs().then(|| self.render_tab_bar(cx)))
+            .children(
+                self.active_tab_index
+                    .and_then(|ix| self.tabs.get(ix))
+                    .and_then(|tab| tab.markdown_preview.notice(tab.is_dirty))
+                    .map(|notice| threadlane_ui_kit::markdown_preview_notice(notice, cx)),
+            )
             .child(if let Some(idx) = self.active_tab_index {
                 if let Some(active_tab) = self.tabs.get(idx) {
                     if active_tab.is_diff {
@@ -929,6 +999,8 @@ impl Render for EditorView {
                         } else {
                             self.render_empty_state(cx).into_any_element()
                         }
+                    } else if active_tab.markdown_preview.is_active() {
+                        active_tab.markdown_preview.body(cx)
                     } else if let Some(ref editor) = active_tab.editor_state {
                         threadlane_ui_kit::editor_buffer(editor)
                             .into_any_element()
@@ -948,6 +1020,77 @@ impl Render for EditorView {
 mod navigation_tests {
     use super::EditorView;
     use gpui::AppContext as _;
+
+    #[gpui::test]
+    fn markdown_preview_preserves_buffer_and_forces_source_for_line(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let model = cx.new(|_| threadlane_ui_state::AppState::for_tests());
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| EditorView::new(model, window, cx));
+            gpui_component::Root::new(view, window, cx)
+        });
+        let view = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<EditorView>().unwrap()
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_diff_internal("README.md", "", window, cx);
+                let editor = cx.new(|cx| {
+                    gpui_component::input::EditorState::new(window, cx).default_value("# Unsaved")
+                });
+                let tab = &mut view.tabs[0];
+                tab.is_diff = false;
+                tab.relative_path = "README.md".into();
+                tab.is_dirty = true;
+                tab.editor_state = Some(editor);
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let original = view.read_with(cx, |view, _| view.active_editor().unwrap());
+        original.update(cx, |editor, cx| editor.set_selected_range(2..5, cx));
+        let request = view.read_with(cx, |view, cx| threadlane_ui_kit::EditorSelectionRequest {
+            editor: original.clone(),
+            checkout: view.tabs[0].project_dir.clone(),
+            relative_path: "README.md".into(),
+            dirty: true,
+            snapshot: threadlane_ui_kit::editor_selection_snapshot(original.read(cx)).unwrap(),
+            destination: (None, None),
+        });
+        assert!(view.read_with(cx, |view, cx| view
+            .selection_request_is_current(&request, cx)));
+        let bounds = cx.debug_bounds("markdown-preview-mode").unwrap();
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        view.read_with(cx, |view, cx| {
+            assert!(view.tabs[0].markdown_preview.is_active());
+            assert_eq!(view.active_editor().unwrap(), original);
+            assert!(view.tabs[0].is_dirty);
+            assert_eq!(original.read(cx).selected_range(), 2..5);
+            assert!(!view.selection_request_is_current(&request, cx));
+            assert_eq!(
+                view.selection_block_reason(cx).as_deref(),
+                Some(threadlane_ui_kit::PREVIEW_SELECTION_REASON)
+            );
+        });
+        // The document-scoped action also works from the focused native mode control.
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(threadlane_ui_kit::ToggleMarkdownPreview), cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.tabs[0].markdown_preview.is_active())
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.toggle_markdown_preview(&threadlane_ui_kit::ToggleMarkdownPreview, window, cx);
+                let project = view.tabs[0].project_dir.clone();
+                view.open_file_at_line(project, "README.md", Some(1), cx);
+                view.sync_pending_file(window, cx);
+                assert!(!view.tabs[0].markdown_preview.is_active());
+                assert_eq!(view.active_editor().unwrap(), original);
+            })
+        });
+    }
 
     #[gpui::test]
     fn shared_tabs_support_keyboard_selection_and_close_without_reselecting(
