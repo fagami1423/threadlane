@@ -103,6 +103,11 @@ fn inspection_reuses_branch_listing_without_losing_local_refs() {
         dir.path(),
         &["update-ref", "refs/remotes/origin/remote-only", "HEAD"],
     );
+    run_git(
+        dir.path(),
+        &["update-ref", "refs/remotes/origin/local", "HEAD"],
+    );
+    run_git(dir.path(), &["tag", "a-first"]);
     BRANCH_LIST_RUNS.set(0);
     let status = inspect(dir.path()).unwrap();
     assert_eq!(BRANCH_LIST_RUNS.get(), 1);
@@ -120,7 +125,30 @@ fn inspection_reuses_branch_listing_without_losing_local_refs() {
         status
             .branch_details
             .iter()
+            .any(|branch| branch.name == "remotes/origin/local" && branch.is_remote)
+    );
+    assert!(
+        status
+            .branch_details
+            .iter()
             .any(|branch| branch.name == "origin/remote-only" && branch.is_remote)
+    );
+
+    let local_a_first = status
+        .branches
+        .iter()
+        .find(|branch| branch.as_str() == "a-first")
+        .unwrap();
+    run_git(dir.path(), &["switch", local_a_first.as_str()]);
+    let head = Command::new("git")
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(head.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        "refs/heads/a-first"
     );
 }
 

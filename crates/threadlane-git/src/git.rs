@@ -459,7 +459,7 @@ pub(crate) fn list_branches_detailed(
     )?;
 
     let mut branches = Vec::new();
-    let mut seen_names = std::collections::HashSet::new();
+    let mut seen_refs = HashSet::new();
 
     for line in output.lines() {
         let line = line.trim();
@@ -472,11 +472,19 @@ pub(crate) fn list_branches_detailed(
         }
         let ref_name = parts[0].trim();
         let full_name = parts.get(5).copied().unwrap_or_default();
-        if ref_name.is_empty() || full_name == "refs/remotes/origin/HEAD" {
+        if full_name.is_empty() || full_name == "refs/remotes/origin/HEAD" {
             continue;
         }
 
         let is_remote = full_name.starts_with("refs/remotes/");
+        let name = if is_remote {
+            ref_name
+        } else {
+            full_name.strip_prefix("refs/heads/").unwrap_or(ref_name)
+        };
+        if name.is_empty() {
+            continue;
+        }
         let is_current = parts.get(4).map_or(false, |h| h.trim() == "*");
         let relative_time = parts.get(1).map_or("", |t| t.trim()).to_string();
         let committer_date_unix = parts
@@ -488,12 +496,12 @@ pub(crate) fn list_branches_detailed(
             .map(|u| u.trim().to_string())
             .filter(|u| !u.is_empty());
         let is_default = def_branch.as_deref().map_or(false, |db| {
-            ref_name == db || ref_name == format!("origin/{db}")
+            name == db || name == format!("origin/{db}")
         });
 
-        if seen_names.insert(ref_name.to_string()) {
+        if seen_refs.insert(full_name) {
             branches.push(GitBranchInfo {
-                name: ref_name.to_string(),
+                name: name.to_string(),
                 is_current,
                 is_default,
                 is_remote,
@@ -536,7 +544,11 @@ pub fn inspect(work_dir: &Path) -> Result<GitStatus, GitError> {
         }
         Err(_) => command(
             work_dir,
-            &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+            &[
+                "for-each-ref",
+                "--format=%(refname:lstrip=2)",
+                "refs/heads",
+            ],
         )?
         .lines()
         .map(str::trim)
