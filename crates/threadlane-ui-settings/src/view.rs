@@ -470,7 +470,7 @@ impl SettingsView {
             .projects
             .iter()
             .map(|project| kit_settings::SettingsProject {
-                path: project.work_dir.to_string_lossy().into_owned(),
+                path: project.work_dir.clone(),
                 name: project.name.clone(),
                 active: state.active_work_dir.as_ref() == Some(&project.work_dir)
                     || project
@@ -516,28 +516,18 @@ impl SettingsView {
                             .read(cx)
                             .projects
                             .iter()
-                            .find(|project| project.work_dir.to_string_lossy() == path)
+                            .find(|project| project.work_dir == path)
                             .map(|project| project.name.clone())
                     })
-                    .unwrap_or_else(|| path.clone());
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
                 window.open_alert_dialog(cx, move |alert, _, _| {
                     let owner = owner.clone();
                     let path_to_remove = path.clone();
-                    kit_settings::project_removal_dialog(alert, &name, &path).on_ok(
-                        move |_, _, cx| {
+                    kit_settings::project_removal_dialog(alert, &name, &path.to_string_lossy())
+                        .on_ok(move |_, _, cx| {
                             let _ = owner.update(cx, |this, cx| {
                                 let result = this.model.update(cx, |state, cx| {
-                                    let path = state
-                                        .projects
-                                        .iter()
-                                        .find(|project| {
-                                            project.work_dir.to_string_lossy() == path_to_remove
-                                        })
-                                        .map(|project| project.work_dir.clone());
-                                    let result = match path {
-                                        Some(path) => state.remove_project(&path),
-                                        None => Ok(()),
-                                    };
+                                    let result = state.remove_project(&path_to_remove);
                                     cx.notify();
                                     result
                                 });

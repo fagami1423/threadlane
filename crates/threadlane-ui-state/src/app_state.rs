@@ -3274,16 +3274,32 @@ impl AppState {
             .projects
             .iter()
             .find(|project| project.work_dir == work_dir)?;
-        let active = self.active_close_work();
-        if active.iter().any(|work| {
-            project
-                .sessions
-                .iter()
-                .any(|session| work.identity == session.session_file.display().to_string())
-        }) || self
-            .worktree_setups
-            .values()
-            .any(|setup| setup.project == work_dir && setup.error.is_none())
+        // Runtime files retain their canonical project ownership even when a
+        // discovery refresh temporarily drops all sidebar session rows.
+        let live_runtime = self.daemon_core.runtimes().iter().any(|(file, runtime)| {
+            let belongs = file.starts_with(work_dir.join(".threadlane"))
+                || project
+                    .sessions
+                    .iter()
+                    .any(|session| session.session_file == *file);
+            let id = threadlane_daemon::core::DaemonCore::session_id_for_file(file);
+            belongs
+                && (runtime.is_generating()
+                    || runtime.scheduled_work_active()
+                    || matches!(
+                        runtime.status(),
+                        threadlane_coding_agent::controller::SessionStatus::Working
+                    )
+                    || id.as_ref().is_some_and(|id| {
+                        self.client.pending_permissions.contains_key(id)
+                            || self.client.pending_questions.contains_key(id)
+                    }))
+        });
+        if live_runtime
+            || self
+                .worktree_setups
+                .values()
+                .any(|setup| setup.project == work_dir && setup.error.is_none())
             || self.automations.snapshot.runs.iter().any(|run| {
                 run.definition.project == work_dir && active_automation_status(run.status).is_some()
             })

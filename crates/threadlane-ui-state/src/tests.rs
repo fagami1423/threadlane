@@ -6592,3 +6592,37 @@ fn project_removal_rechecks_active_worktree_setup() {
         .contains("active work"));
     assert_eq!(state.projects.len(), 1);
 }
+
+#[test]
+fn project_removal_blocks_live_runtime_after_discovery_loses_sessions() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().to_path_buf();
+    let file = project.join(".threadlane/sessions/live.jsonl");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let mut state = AppState::load_from_registry(Vec::new());
+    state.projects.push(ProjectInfo {
+        name: "Project".into(),
+        work_dir: project.clone(),
+        sessions: vec![test_session("live", &file)],
+        is_expanded: true,
+    });
+    let runtime = state.ensure_session_runtime(project.clone(), file);
+    runtime.begin_generation().unwrap();
+    state.projects[0].sessions.clear();
+    assert!(state.remove_project(&project).is_err());
+    assert_eq!(state.projects.len(), 1);
+    runtime.finish_generation(None);
+    state
+        .client
+        .pending_permissions
+        .insert("live".into(), permission_request("permission"));
+    assert!(state.remove_project(&project).is_err());
+    state.client.pending_permissions.clear();
+    state
+        .client
+        .pending_questions
+        .insert("live".into(), question_request("question"));
+    assert!(state.remove_project(&project).is_err());
+    state.client.pending_questions.clear();
+    assert!(state.project_removal_disabled_reason(&project).is_none());
+}
