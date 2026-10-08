@@ -14,12 +14,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -49,6 +49,9 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// not speak the request envelope, a dropped frame). Sized for project-io
 /// Git mutations (`fetch`/`pull` over a WAN), not just control traffic.
 const COMMAND_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const CONNECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One outbound frame: a bare fire-and-forget command, or a request
 /// envelope the server answers with a `{"response": ...}` reply.
@@ -115,6 +118,8 @@ pub struct RemoteDaemon {
     /// `CommandRequest` envelope.
     protocol_version: Arc<AtomicU64>,
     connection_epoch: Arc<AtomicU64>,
+    reconnect: Arc<Notify>,
+    paired_device_id: Arc<Mutex<Option<String>>>,
 }
 
 impl RemoteDaemon {
@@ -135,7 +140,7 @@ impl RemoteDaemon {
     pub fn connect(url: impl Into<String>, token: Option<String>) -> Arc<Self> {
         // Preserve the desktop reactor and its startup behavior.
         let executor = threadlane_daemon::chat::executor().map(|runtime| runtime.handle().clone());
-        Self::start(url.into(), token, executor, false)
+        Self::start(url.into(), token, None, executor, false)
     }
 
     pub fn supports_composer_options(&self) -> bool {
@@ -148,7 +153,7 @@ impl RemoteDaemon {
         token: Option<String>,
         executor: tokio::runtime::Handle,
     ) -> Arc<Self> {
-        Self::start(url.into(), token, Ok(executor), false)
+        Self::start(url.into(), token, None, Ok(executor), false)
     }
 
     /// Explicit opt-in for the existing token-protected LAN pairing listener.
@@ -159,9 +164,18 @@ impl RemoteDaemon {
         token: String,
         executor: tokio::runtime::Handle,
     ) -> Result<Arc<Self>, String> {
+        Self::connect_pairing_named(url, token, None, executor)
+    }
+
+    pub fn connect_pairing_named(
+        url: impl Into<String>,
+        token: String,
+        device_name: Option<String>,
+        executor: tokio::runtime::Handle,
+    ) -> Result<Arc<Self>, String> {
         let url = url.into();
         Self::validate_pairing(&url, &token)?;
-        Ok(Self::start(url, Some(token), Ok(executor), true))
+        Ok(Self::start(url, Some(token), device_name, Ok(executor), true))
     }
 
     fn validate_pairing(url: &str, token: &str) -> Result<(), String> {
@@ -199,6 +213,7 @@ impl RemoteDaemon {
     fn start(
         url: String,
         token: Option<String>,
+        device_name: Option<String>,
         executor: Result<tokio::runtime::Handle, String>,
         pairing: bool,
     ) -> Arc<Self> {
@@ -216,6 +231,8 @@ impl RemoteDaemon {
             last_seq: Arc::new(AtomicU64::new(0)),
             protocol_version: Arc::new(AtomicU64::new(0)),
             connection_epoch: Arc::new(AtomicU64::new(0)),
+            reconnect: Arc::new(Notify::new()),
+            paired_device_id: Arc::new(Mutex::new(None)),
         });
         if let Some(error) = (!pairing)
             .then(|| Self::transport_policy_error(&url, &token))
@@ -243,9 +260,12 @@ impl RemoteDaemon {
         let last_seq = client.last_seq.clone();
         let protocol_version = client.protocol_version.clone();
         let connection_epoch = client.connection_epoch.clone();
+        let reconnect = client.reconnect.clone();
+        let paired_device_id = client.paired_device_id.clone();
         let driver = executor.spawn(Self::drive(
             url,
             token,
+            device_name,
             command_rx,
             subscribers,
             pending_requests,
@@ -253,6 +273,8 @@ impl RemoteDaemon {
             last_seq,
             protocol_version,
             connection_epoch,
+            reconnect,
+            paired_device_id,
             client.connection.clone(),
         ));
         *client.driver.lock().expect("connection driver poisoned") = Some(driver.abort_handle());
@@ -273,6 +295,22 @@ impl RemoteDaemon {
     }
     pub fn subscribe_connection(&self) -> tokio::sync::watch::Receiver<ConnectionState> {
         self.connection.subscribe()
+    }
+
+    /// Wake the reconnect driver after a foreground transition. Connected
+    /// sessions are left undisturbed.
+    pub fn request_reconnect(&self) {
+        if !self.connected.load(Ordering::SeqCst) {
+            self.reconnect.notify_one();
+        }
+    }
+
+    /// Stable daemon-side paired-device identity returned by the handshake.
+    pub fn paired_device_id(&self) -> Option<String> {
+        self.paired_device_id
+            .lock()
+            .expect("paired device identity poisoned")
+            .clone()
     }
 
     /// Transport rules enforced before any dial: a token may only cross a
@@ -347,6 +385,7 @@ impl RemoteDaemon {
     async fn drive(
         url: String,
         token: Option<String>,
+        device_name: Option<String>,
         mut command_rx: mpsc::UnboundedReceiver<OutboundMessage>,
         subscribers: Arc<Mutex<Vec<mpsc::UnboundedSender<SessionEvent>>>>,
         pending_requests: Arc<Mutex<HashMap<u64, PendingRequest>>>,
@@ -354,6 +393,8 @@ impl RemoteDaemon {
         last_seq: Arc<AtomicU64>,
         protocol_version: Arc<AtomicU64>,
         connection_epoch: Arc<AtomicU64>,
+        reconnect: Arc<Notify>,
+        paired_device_id: Arc<Mutex<Option<String>>>,
         connection: tokio::sync::watch::Sender<ConnectionState>,
     ) {
         let mut was_connected = false;
@@ -445,16 +486,67 @@ impl RemoteDaemon {
                     }
                 }
             }
-            let (mut socket, response) = match tokio_tungstenite::connect_async(request).await {
-                Ok(pair) => pair,
-                Err(error) => {
+            if let Some(device_name) = &device_name {
+                if let Ok(header) = tokio_tungstenite::tungstenite::http::HeaderValue::from_str(
+                    device_name,
+                ) {
+                    request.headers_mut().insert("x-threadlane-device-name", header);
+                }
+            }
+            let connected_socket = tokio::time::timeout(
+                CONNECT_HANDSHAKE_TIMEOUT,
+                tokio_tungstenite::connect_async(request),
+            )
+            .await;
+            let (mut socket, response) = match connected_socket {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(error))
+                    if matches!(
+                        &error,
+                        tokio_tungstenite::tungstenite::Error::Http(response)
+                            if response.status() == tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED
+                    ) =>
+                {
+                    let message = "This device is no longer authorized. Remove it and pair again."
+                        .to_string();
+                    connection.send_replace(ConnectionState::Failed(message.clone()));
+                    Self::fanout(
+                        &subscribers,
+                        SessionEvent::DaemonError {
+                            session_id: None,
+                            message,
+                        },
+                    );
+                    return;
+                }
+                Ok(Err(error)) => {
                     connection.send_replace(ConnectionState::Reconnecting);
                     tracing::warn!("daemon connect to {dial_url} failed: {error}");
-                    tokio::time::sleep(backoff).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = reconnect.notified() => {}
+                    }
+                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                    continue;
+                }
+                Err(_) => {
+                    connection.send_replace(ConnectionState::Reconnecting);
+                    tracing::warn!("daemon connection handshake to {dial_url} timed out");
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = reconnect.notified() => {}
+                    }
                     backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
                     continue;
                 }
             };
+            *paired_device_id
+                .lock()
+                .expect("paired device identity poisoned") = response
+                .headers()
+                .get("x-threadlane-device-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
             // Capability handshake: the daemon announces its wire protocol
             // version in a response header; absent means a pre-versioned
             // daemon that cannot decode the CommandRequest envelope.
@@ -478,11 +570,30 @@ impl RemoteDaemon {
                 continue;
             }
             let mut connection_seq = 0u64;
+            let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let _ = heartbeat.tick().await;
+            let mut ping_sent_at = None;
             // Server replays the journal tail newer than `?since=` first,
             // then live events — the same attach semantics LocalDaemon's
             // subscribe() exposes.
             loop {
                 tokio::select! {
+                    _ = reconnect.notified() => break,
+                    _ = heartbeat.tick() => {
+                        if ping_sent_at.is_some_and(|sent_at: Instant| {
+                            sent_at.elapsed() >= HEARTBEAT_TIMEOUT
+                        }) {
+                            tracing::warn!("daemon heartbeat timed out for {dial_url}");
+                            break;
+                        }
+                        if ping_sent_at.is_none() {
+                            if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                                break;
+                            }
+                            ping_sent_at = Some(Instant::now());
+                        }
+                    }
                     message = command_rx.recv() => {
                         let Some(message) = message else { return };
                         let text = match &message {
@@ -573,6 +684,14 @@ impl RemoteDaemon {
                                             ),
                                         });
                                     }
+                                }
+                            }
+                            Some(Ok(Message::Pong(_))) => {
+                                ping_sent_at = None;
+                            }
+                            Some(Ok(Message::Ping(payload))) => {
+                                if socket.send(Message::Pong(payload)).await.is_err() {
+                                    break;
                                 }
                             }
                             Some(Ok(Message::Close(_))) | None => break,
@@ -765,10 +884,13 @@ impl DaemonClient for RemoteDaemon {
 
 impl Drop for RemoteDaemon {
     fn drop(&mut self) {
-        if let Ok(driver) = self.driver.get_mut() {
-            if let Some(driver) = driver.take() {
-                driver.abort();
-            }
+        if let Some(driver) = self
+            .driver
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            driver.abort();
         }
     }
 }
@@ -776,6 +898,186 @@ impl Drop for RemoteDaemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn pairing_reconnect_wake_reuses_the_saved_credential_and_identity() {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("client did not reconnect")
+                    .unwrap();
+                let mut socket = tokio_tungstenite::accept_hdr_async(
+                    socket,
+                    move |request: &Request, mut response: Response| {
+                        assert_eq!(
+                            request
+                                .headers()
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("Bearer same-device-token")
+                        );
+                        assert_eq!(
+                            request
+                                .headers()
+                                .get("x-threadlane-device-name")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("Test mobile")
+                        );
+                        response.headers_mut().insert(
+                            "x-threadlane-device-id",
+                            "device-stable-id".parse().unwrap(),
+                        );
+                        Ok(response)
+                    },
+                )
+                .await
+                .unwrap();
+                let inventory = tokio::time::timeout(Duration::from_secs(3), socket.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .into_text()
+                    .unwrap();
+                assert!(matches!(
+                    serde_json::from_str::<SessionCommand>(&inventory).unwrap(),
+                    SessionCommand::GetProjects
+                ));
+                if attempt == 0 {
+                    socket.close(None).await.unwrap();
+                } else {
+                    socket.close(None).await.unwrap();
+                }
+            }
+        });
+
+        let client = RemoteDaemon::connect_pairing_named(
+            format!("ws://{address}"),
+            "same-device-token".into(),
+            Some("Test mobile".into()),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        let mut connection = client.subscribe_connection();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if *connection.borrow_and_update() == ConnectionState::Connected {
+                    break;
+                }
+                connection.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("first authenticated connection did not complete");
+        assert_eq!(client.paired_device_id().as_deref(), Some("device-stable-id"));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if *connection.borrow_and_update() == ConnectionState::Reconnecting {
+                    break;
+                }
+                connection.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("first disconnect did not enter reconnecting state");
+        client.request_reconnect();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if *connection.borrow_and_update() == ConnectionState::Connected {
+                    break;
+                }
+                connection.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("foreground wake did not reconnect");
+        assert_eq!(client.paired_device_id().as_deref(), Some("device-stable-id"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_websocket_handshake_is_bounded_and_retried() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stalled, _) = listener.accept().await.unwrap();
+            let (_retry, _) = tokio::time::timeout(
+                CONNECT_HANDSHAKE_TIMEOUT + Duration::from_secs(5),
+                listener.accept(),
+            )
+            .await
+            .expect("client did not retry after the bounded handshake")
+            .unwrap();
+            drop(stalled);
+        });
+        let client = RemoteDaemon::connect_with_runtime(
+            format!("ws://{address}"),
+            None,
+            tokio::runtime::Handle::current(),
+        );
+        let mut connection = client.subscribe_connection();
+        tokio::time::timeout(
+            CONNECT_HANDSHAKE_TIMEOUT + Duration::from_secs(3),
+            async {
+                loop {
+                    if *connection.borrow_and_update() == ConnectionState::Reconnecting {
+                        break;
+                    }
+                    connection.changed().await.unwrap();
+                }
+            },
+        )
+        .await
+        .expect("stalled handshake did not enter reconnecting state");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unauthorized_pairing_stops_with_repair_guidance() {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let rejected = tokio_tungstenite::accept_hdr_async(
+                socket,
+                |_request: &Request, _response: Response| {
+                    Err(
+                        tokio_tungstenite::tungstenite::http::Response::builder()
+                            .status(401)
+                            .body(Some("unauthorized".to_string()))
+                            .unwrap(),
+                    )
+                },
+            )
+            .await;
+            assert!(rejected.is_err());
+        });
+        let client = RemoteDaemon::connect_pairing(
+            format!("ws://{address}"),
+            "revoked-token".into(),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        let mut connection = client.subscribe_connection();
+        let state = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let state = connection.borrow_and_update().clone();
+                match state {
+                    ConnectionState::Failed(message) => break message,
+                    _ => connection.changed().await.unwrap(),
+                }
+            }
+        })
+        .await
+        .expect("unauthorized pairing was not surfaced");
+        assert!(state.contains("Remove it and pair again"), "{state}");
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn idle_connections_request_inventory_on_every_epoch() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

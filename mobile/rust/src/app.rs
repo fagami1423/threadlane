@@ -9,6 +9,7 @@
 //! the wire types.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -38,6 +39,7 @@ use threadlane_protocol::{OrchestratorMode, ReasoningEffort};
 
 use crate::client::{MobileDaemon, MobileEvent};
 use crate::preferences;
+use crate::saved_devices::{SavedDevice, SavedDeviceInfo, SavedDeviceList};
 use threadlane_client::ClientState;
 use threadlane_protocol::daemon::{
     ChatMessageInfo, GitHubIssueRef, MessageRole, PermissionDecision, SessionCommand, SessionEvent,
@@ -74,31 +76,54 @@ fn composer_command_session(command: &SessionCommand) -> Option<&str> {
 const PREF_HOST: &str = "threadlane.pair.host";
 const PREF_PORT: &str = "threadlane.pair.port";
 const PREF_TOKEN: &str = "threadlane.pair.token";
+const PREF_DEVICES: &str = "threadlane.pair.devices.v1";
 
-fn restore_pairing() -> Option<(String, String, String)> {
-    match (
+fn restore_saved_devices() -> Result<SavedDeviceList, String> {
+    if let Some(value) = preferences::get_string(PREF_DEVICES) {
+        return SavedDeviceList::from_json(&value);
+    }
+    let legacy = match (
         preferences::get_string(PREF_HOST),
         preferences::get_string(PREF_PORT),
+        preferences::get_string(PREF_TOKEN),
     ) {
-        (Some(host), Some(port)) if !host.is_empty() && !port.is_empty() => Some((
-            host,
-            port,
-            preferences::get_string(PREF_TOKEN).unwrap_or_default(),
-        )),
+        (Some(host), Some(port), Some(token)) => {
+            Some(SavedDeviceList::from_legacy(host, port, token)?)
+        }
         _ => None,
+    };
+    let devices = legacy.unwrap_or_default();
+    if !devices.rows().is_empty() {
+        persist_saved_devices(&devices)?;
+        clear_legacy_pairing();
     }
+    Ok(devices)
 }
 
-fn store_pairing(host: &str, port: &str, token: &str) {
-    preferences::set_string(PREF_HOST, host);
-    preferences::set_string(PREF_PORT, port);
-    preferences::set_string(PREF_TOKEN, token);
+fn persist_saved_devices(devices: &SavedDeviceList) -> Result<(), String> {
+    preferences::set_string(PREF_DEVICES, &devices.to_json()?);
+    Ok(())
 }
 
-fn clear_pairing() {
+fn clear_legacy_pairing() {
     preferences::remove(PREF_HOST);
     preferences::remove(PREF_PORT);
     preferences::remove(PREF_TOKEN);
+}
+
+static FOREGROUND_RECONNECT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+pub fn request_foreground_reconnect() {
+    FOREGROUND_RECONNECT_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+#[derive(Clone)]
+struct ConnectionSnapshot {
+    device_id: Option<String>,
+    name: Option<String>,
+    host: String,
+    port: u16,
+    token: String,
 }
 
 /// Kit icons on iOS: there is no installable `AssetSource`, so `Icon::path`
@@ -239,6 +264,12 @@ pub struct MobileApp {
     connect_error: Option<String>,
     /// Whether a persisted pairing exists — drives the Forget button.
     saved_pairing: bool,
+    saved_device_list: SavedDeviceList,
+    selected_device_id: Option<String>,
+    active_device_id: Option<String>,
+    connection_snapshot: Option<ConnectionSnapshot>,
+    connection_generation: u64,
+    removed_device_ids: HashSet<String>,
     sending: bool,
     pending_composer: HashMap<String, usize>,
     uncertain_prompts: HashSet<String>,
@@ -465,17 +496,24 @@ impl MobileApp {
                     .await;
                 tick += 1;
                 let links = take_pending_links();
+                let wake_reconnect =
+                    FOREGROUND_RECONNECT_REQUESTED.swap(false, Ordering::SeqCst);
                 // The daemon only publishes `ProjectChanged` on attach/detach
                 // or when asked, so new sessions and renames inside an
                 // attached project never reach the client — re-ask on a
                 // slow cadence to keep the list current.
                 let refresh_projects = tick % 30 == 0;
-                if links.is_empty() && !refresh_projects {
+                if links.is_empty() && !refresh_projects && !wake_reconnect {
                     continue;
                 }
                 let _ = this.update_in(cx, |this, window, cx| {
                     for url in links {
                         this.apply_pairing_link(&url, window, cx);
+                    }
+                    if wake_reconnect {
+                        if let Some(daemon) = &this.daemon {
+                            daemon.request_reconnect();
+                        }
                     }
                     if refresh_projects {
                         if let Some(daemon) = &this.daemon {
@@ -494,8 +532,12 @@ impl MobileApp {
             }
         });
 
-        let saved = restore_pairing();
-        let saved_pairing = saved.is_some();
+        let (saved_device_list, saved_devices_error) = match restore_saved_devices() {
+            Ok(devices) => (devices, None),
+            Err(error) => (SavedDeviceList::default(), Some(error)),
+        };
+        let saved_pairing = !saved_device_list.rows().is_empty();
+        let selected_device_id = saved_device_list.selected_id().map(str::to_string);
         let mut app = Self {
             screen: Screen::Connect,
             host,
@@ -504,8 +546,14 @@ impl MobileApp {
             composer,
             search,
             question_inputs: HashMap::new(),
-            connect_error: None,
+            connect_error: saved_devices_error,
             saved_pairing,
+            saved_device_list,
+            selected_device_id,
+            active_device_id: None,
+            connection_snapshot: None,
+            connection_generation: 0,
+            removed_device_ids: HashSet::new(),
             sending: false,
             pending_composer: HashMap::new(),
             uncertain_prompts: HashSet::new(),
@@ -566,16 +614,10 @@ impl MobileApp {
             _pump: None,
             _subscriptions: subscriptions,
         };
-        // Restore the saved pairing and reconnect — the fields stay visible
-        // on the Connect screen so a failed attempt can be edited.
-        if let Some((saved_host, saved_port, saved_token)) = saved {
-            app.host
-                .update(cx, |input, cx| input.set_value(saved_host, window, cx));
-            app.port
-                .update(cx, |input, cx| input.set_value(saved_port, window, cx));
-            app.token
-                .update(cx, |input, cx| input.set_value(saved_token, window, cx));
-            app.connect_now(window, cx);
+        // Restore the selected desktop; other saved credentials remain
+        // available but are never tried as fallbacks.
+        if let Some(selected_id) = app.selected_device_id.clone() {
+            app.connect_saved_device(&selected_id, window, cx);
         }
         app
     }
@@ -621,22 +663,187 @@ impl MobileApp {
             self.token
                 .update(cx, |input, cx| input.set_value(token, window, cx));
         }
-        self.connect_now(window, cx);
+        self.start_connection(
+            ConnectionSnapshot {
+                device_id: query("device_id"),
+                name: query("name"),
+                host: self.host.read(cx).value().trim().to_owned(),
+                port: self
+                    .port
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .parse()
+                    .unwrap_or_default(),
+                token: self.token.read(cx).value().trim().to_owned(),
+            },
+            window,
+            cx,
+        );
     }
 
     fn connect_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let host = self.host.read(cx).value().trim().to_owned();
         let port = self.port.read(cx).value().trim().to_owned();
         let token = self.token.read(cx).value().trim().to_owned();
-        if host.is_empty() || port.is_empty() {
+        let Ok(port_number) = port.parse::<u16>() else {
+            self.connect_error =
+                Some("Enter a valid port shown in the desktop QR dialog".into());
+            cx.notify();
+            return;
+        };
+        if host.is_empty() {
+            self.connect_error = Some("Enter the host shown in the desktop QR dialog".into());
+            cx.notify();
+            return;
+        }
+        let existing = self.saved_device_list.rows().into_iter().find_map(|row| {
+            self.saved_device_list.device(&row.id).filter(|device| {
+                device.host == host && device.port == port_number && device.token() == token
+            })
+        });
+        self.start_connection(
+            ConnectionSnapshot {
+                device_id: existing.as_ref().map(|device| device.id.clone()),
+                name: existing.map(|device| device.name),
+                host,
+                port: port_number,
+                token,
+            },
+            window,
+            cx,
+        );
+    }
+
+    pub fn saved_devices(&self) -> Vec<SavedDeviceInfo> {
+        self.saved_device_list.rows()
+    }
+
+    pub fn selected_device_id(&self) -> Option<&str> {
+        self.selected_device_id.as_deref()
+    }
+
+    pub fn current_device_id(&self) -> Option<&str> {
+        self.active_device_id.as_deref()
+    }
+
+    pub fn connect_saved_device(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(device) = self.saved_device_list.device(id) else {
+            self.connect_error = Some("Saved desktop was removed".into());
+            cx.notify();
+            return;
+        };
+        let token = device.token().to_string();
+        self.selected_device_id = Some(id.to_string());
+        self.saved_device_list.select(id);
+        if let Err(error) = persist_saved_devices(&self.saved_device_list) {
+            self.connect_error = Some(error);
+        }
+        self.host
+            .update(cx, |input, cx| input.set_value(device.host.clone(), window, cx));
+        self.port.update(cx, |input, cx| {
+            input.set_value(device.port.to_string(), window, cx)
+        });
+        self.token
+            .update(cx, |input, cx| input.set_value(device.token().to_string(), window, cx));
+        self.start_connection(
+            ConnectionSnapshot {
+                device_id: Some(device.id),
+                name: Some(device.name),
+                host: device.host,
+                port: device.port,
+                token,
+            },
+            window,
+            cx,
+        );
+    }
+
+    pub fn remove_saved_device(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let device = self
+            .saved_device_list
+            .device(id)
+            .ok_or_else(|| "saved desktop not found".to_string())?;
+        let mut updated = self.saved_device_list.clone();
+        updated.remove(id);
+        persist_saved_devices(&updated)?;
+        self.saved_device_list = updated;
+        self.removed_device_ids.insert(id.to_string());
+        if self.selected_device_id.as_deref() == Some(id) {
+            self.selected_device_id = None;
+        }
+        self.saved_pairing = !self.saved_device_list.rows().is_empty();
+        self.seen_links.retain(|link| {
+            let Ok(parsed) = url::Url::parse(link) else {
+                return true;
+            };
+            let value = |key: &str| {
+                parsed
+                    .query_pairs()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value.to_string())
+            };
+            !(value("device_id").as_deref() == Some(id)
+                || (value("host").as_deref() == Some(device.host.as_str())
+                    && value("port").as_deref() == Some(device.port.to_string().as_str())
+                    && value("token").as_deref() == Some(device.token())))
+        });
+        if self.active_device_id.as_deref() == Some(id)
+            || self
+                .connection_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.device_id.as_deref() == Some(id))
+        {
+            self.connection_generation = self.connection_generation.wrapping_add(1);
+            self._pump = None;
+            self.daemon = None;
+            self.connection_snapshot = None;
+            self.active_device_id = None;
+            self.active = None;
+            self.client = ClientState::default();
+            self.link_state = "Disconnected".into();
+            self.connect_error = None;
+            self.screen = Screen::Connect;
+            self.token.update(cx, |input, cx| input.set_value("", window, cx));
+            cx.notify();
+        }
+        Ok(())
+    }
+
+    fn start_connection(
+        &mut self,
+        snapshot: ConnectionSnapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if snapshot.host.is_empty() || snapshot.port == 0 {
             self.connect_error =
                 Some("Enter the host and port shown in the desktop QR dialog".into());
             cx.notify();
             return;
         }
-        let url = format!("ws://{host}:{port}");
-        let token = (!token.is_empty()).then_some(token);
-        let daemon = match MobileDaemon::connect(url, token) {
+        if snapshot.token.is_empty() {
+            self.connect_error = Some("Pairing token is empty; scan a new desktop invitation".into());
+            cx.notify();
+            return;
+        }
+        if let Some(id) = &snapshot.device_id {
+            self.removed_device_ids.remove(id);
+        }
+        self.connection_generation = self.connection_generation.wrapping_add(1);
+        let generation = self.connection_generation;
+        let url = format!("ws://{}:{}", snapshot.host, snapshot.port);
+        let daemon = match MobileDaemon::connect(url, Some(snapshot.token.clone())) {
             Ok(daemon) => daemon,
             Err(error) => {
                 self.connect_error = Some(error);
@@ -646,6 +853,9 @@ impl MobileApp {
         };
         self.link_state = "Connecting…".to_string();
         self.connect_error = None;
+        self.active_device_id = None;
+        self.selected_device_id = snapshot.device_id.clone();
+        self.connection_snapshot = Some(snapshot);
         self.client.projects.clear();
         self.session_drafts.clear();
         self.project_git.clear();
@@ -680,7 +890,11 @@ impl MobileApp {
             };
             while let Some(event) = events.recv().await {
                 if this
-                    .update_in(cx, |this, window, cx| this.apply_event(event, window, cx))
+                    .update_in(cx, |this, window, cx| {
+                        if this.connection_generation == generation {
+                            this.apply_event(event, window, cx);
+                        }
+                    })
                     .is_err()
                 {
                     return;
@@ -726,10 +940,23 @@ impl MobileApp {
     /// Clear the persisted pairing and the fields — the next launch lands
     /// on a blank Connect screen instead of auto-reconnecting.
     fn forget_pairing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        clear_pairing();
-        self.saved_pairing = false;
-        for input in [&self.host, &self.port, &self.token] {
-            input.update(cx, |input, cx| input.set_value("", window, cx));
+        let id = self
+            .active_device_id
+            .clone()
+            .or_else(|| self.selected_device_id.clone());
+        if let Some(id) = id {
+            if let Err(error) = self.remove_saved_device(&id, window, cx) {
+                self.connect_error = Some(error);
+            }
+        } else {
+            if !self.saved_device_list.rows().is_empty() {
+                self.connect_error = Some("Select a saved desktop before forgetting it".into());
+            } else {
+                clear_legacy_pairing();
+                for input in [&self.host, &self.port, &self.token] {
+                    input.update(cx, |input, cx| input.set_value("", window, cx));
+                }
+            }
         }
         cx.notify();
     }
@@ -1339,12 +1566,48 @@ impl MobileApp {
                 }
                 self.link_state = "Live".to_string();
                 self.connect_error = None;
-                // Remember the pairing so the next launch reconnects.
-                let host = self.host.read(cx).value().trim().to_owned();
-                let port = self.port.read(cx).value().trim().to_owned();
-                let token = self.token.read(cx).value().trim().to_owned();
-                store_pairing(&host, &port, &token);
-                self.saved_pairing = true;
+                if let Some(snapshot) = self.connection_snapshot.as_ref() {
+                    let id = self
+                        .daemon
+                        .as_ref()
+                        .and_then(MobileDaemon::paired_device_id)
+                        .or_else(|| snapshot.device_id.clone())
+                        .unwrap_or_else(|| {
+                            format!("desktop-{}-{}", snapshot.host, snapshot.port)
+                        });
+                    if !self.removed_device_ids.contains(&id) {
+                        let name = snapshot
+                            .name
+                            .clone()
+                            .filter(|name| name != "New device")
+                            .or_else(|| {
+                                self.saved_device_list
+                                    .device(&id)
+                                    .map(|device| device.name)
+                            })
+                            .unwrap_or_else(|| format!("Desktop ({})", snapshot.host));
+                        let saved = SavedDevice::new(
+                            id.clone(),
+                            name,
+                            snapshot.host.clone(),
+                            snapshot.port,
+                            snapshot.token.clone(),
+                        );
+                        self.saved_device_list.upsert(saved, true);
+                        self.selected_device_id = Some(id.clone());
+                        self.active_device_id = Some(id);
+                        match persist_saved_devices(&self.saved_device_list) {
+                            Ok(()) => {
+                                clear_legacy_pairing();
+                                self.saved_pairing = true;
+                            }
+                            Err(error) => {
+                                self.connect_error =
+                                    Some(format!("Connected, but could not save this desktop: {error}"));
+                            }
+                        }
+                    }
+                }
             }
             MobileEvent::Connecting => {
                 self.link_state = "Connecting…".into();

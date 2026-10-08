@@ -23,8 +23,6 @@ pub fn open_pairing_dialog(model: Entity<AppState>, window: &mut Window, cx: &mu
 /// the moment the async listener bind resolves.
 struct PairingDialogView {
     model: Entity<AppState>,
-    /// Async bind in flight (token + listener not ready yet).
-    starting: bool,
     _subscription: Subscription,
 }
 
@@ -33,35 +31,26 @@ impl PairingDialogView {
         let subscription = cx.observe(&model, |_, _, cx| cx.notify());
         Self {
             model,
-            starting: false,
             _subscription: subscription,
         }
     }
 
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let pending = self.model.update(cx, |state, _| state.start_pairing());
+        let pending = self.model.update(cx, |state, _| {
+            let task = state.start_pairing()?;
+            Ok((state.pairing_generation(), task))
+        });
         match pending {
-            Ok(task) => {
-                self.starting = true;
-                cx.notify();
+            Ok((generation, task)) => {
                 let model = self.model.clone();
-                cx.spawn_in(window, async move |this, cx| {
-                    let result = task.await;
-                    let _ = this.update(cx, |this, cx| {
-                        this.starting = false;
-                        model.update(cx, |state, cx| {
-                            match result {
-                                Ok(Ok(server)) => state.pairing = Some(server),
-                                Ok(Err(error)) => {
-                                    state.pairing_error = Some(error);
-                                }
-                                Err(error) => {
-                                    state.pairing_error =
-                                        Some(format!("pairing listener failed: {error}"));
-                                }
-                            }
-                            cx.notify();
-                        });
+                cx.spawn_in(window, async move |_, cx| {
+                    let result = match task.await {
+                        Ok(result) => result,
+                        Err(error) => Err(format!("pairing listener failed: {error}")),
+                    };
+                    let _ = model.update(cx, |state, cx| {
+                        state.finish_pairing_start(generation, result);
+                        cx.notify();
                     });
                 })
                 .detach();
@@ -76,10 +65,31 @@ impl PairingDialogView {
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
-        self.model.update(cx, |state, cx| {
-            state.stop_pairing();
-            cx.notify();
-        });
+        let pending = self
+            .model
+            .update(cx, |state, _| state.remove_all_pairing());
+        match pending {
+            Ok((generation, task)) => {
+                let model = self.model.clone();
+                cx.spawn(async move |_, cx| {
+                    let result = match task.await {
+                        Ok(result) => result,
+                        Err(error) => Err(format!("pairing shutdown failed: {error}")),
+                    };
+                    let _ = model.update(cx, |state, cx| {
+                        state.finish_remove_all_pairing(generation, result);
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+            Err(error) => {
+                self.model.update(cx, |state, cx| {
+                    state.pairing_error = Some(error);
+                    cx.notify();
+                });
+            }
+        }
     }
 }
 
@@ -89,7 +99,7 @@ impl Render for PairingDialogView {
         let theme = cx.theme().colors;
         let pairing = state.pairing.as_ref().map(|server| server.info().clone());
         let pairing_error = state.pairing_error.clone();
-        let starting = self.starting;
+        let starting = state.pairing_starting;
 
         let mut content = v_flex().gap_3().text_sm();
         if let Some(info) = pairing {

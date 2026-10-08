@@ -149,6 +149,11 @@ pub struct AppState {
     pub pairing: Option<threadlane_daemon::pairing::PairingServer>,
     /// The last async pairing-start failure, shown by the pairing dialog.
     pub pairing_error: Option<String>,
+    /// Pairing startup/restore in progress, independent of any dialog view.
+    pub pairing_starting: bool,
+    pairing_generation: u64,
+    pairing_restore_allowed: bool,
+    pairing_remove_all_pending: bool,
     /// Ordered channel for `SessionCommand::Terminal*` commands — they must
     /// not reorder relative to each other (TerminalOpen before its Input),
     /// so they go through one forward loop rather than a task per command.
@@ -1077,6 +1082,10 @@ impl AppState {
             daemon_remote,
             pairing: None,
             pairing_error: None,
+            pairing_starting: false,
+            pairing_generation: 0,
+            pairing_restore_allowed: load_host_state,
+            pairing_remove_all_pending: false,
             terminal_command_tx,
             terminal_event_tx,
             pending_remote_deletes: HashMap::new(),
@@ -4224,11 +4233,9 @@ impl AppState {
         }
     }
 
-    /// Begin sharing this daemon with thin clients on the LAN: binds a
-    /// `server::serve_until` listener on every interface behind a fresh
-    /// bearer token. The bind runs on the shared tokio executor, so this
-    /// returns its join handle — the caller awaits it and stores the
-    /// `PairingServer` in `pairing` (or the error in `pairing_error`).
+    /// Begin sharing this embedded daemon with thin clients on the LAN.
+    /// The bind runs on the shared Tokio executor; its result is committed
+    /// through [`finish_pairing_start`](Self::finish_pairing_start).
     pub fn start_pairing(
         &mut self,
     ) -> Result<
@@ -4239,6 +4246,15 @@ impl AppState {
         if self.pairing.is_some() {
             return Err("device pairing is already running".to_string());
         }
+        if self.pairing_starting {
+            return Err("device pairing is already starting".to_string());
+        }
+        if self.pairing_remove_all_pending {
+            return Err("device sharing removal is still in progress".to_string());
+        }
+        if !self.pairing_restore_allowed {
+            return Err("device pairing is unavailable in isolated test state".to_string());
+        }
         if self.daemon_remote {
             // Sessions live in the attached daemon process; re-serving the
             // local empty core would show a paired client nothing.
@@ -4248,13 +4264,176 @@ impl AppState {
             );
         }
         let executor = crate::chat::executor()?;
+        self.pairing_generation = self.pairing_generation.wrapping_add(1);
+        self.pairing_starting = true;
+        self.pairing_remove_all_pending = false;
         Ok(executor.spawn(threadlane_daemon::pairing::PairingServer::start(
             self.daemon_core.clone(),
         )))
     }
 
-    /// Stop sharing: dropping the server disconnects every attached client.
+    pub fn pairing_generation(&self) -> u64 {
+        self.pairing_generation
+    }
+
+    pub fn pairing_restore_task(
+        &mut self,
+    ) -> Option<(
+        u64,
+        tokio::task::JoinHandle<Result<Option<threadlane_daemon::pairing::PairingServer>, String>>,
+    )> {
+        if !self.pairing_restore_allowed || self.daemon_remote || self.pairing.is_some() {
+            return None;
+        }
+        let executor = match crate::chat::executor() {
+            Ok(executor) => executor,
+            Err(error) => {
+                self.pairing_error = Some(error);
+                return None;
+            }
+        };
+        self.pairing_generation = self.pairing_generation.wrapping_add(1);
+        self.pairing_starting = true;
+        self.pairing_error = None;
+        let generation = self.pairing_generation;
+        Some((
+            generation,
+            executor.spawn(threadlane_daemon::pairing::PairingServer::restore(
+                self.daemon_core.clone(),
+            )),
+        ))
+    }
+
+    pub fn finish_pairing_start(
+        &mut self,
+        generation: u64,
+        result: Result<threadlane_daemon::pairing::PairingServer, String>,
+    ) {
+        if generation != self.pairing_generation {
+            if self.pairing_remove_all_pending {
+                if let Ok(server) = result {
+                    if let Ok(executor) = crate::chat::executor() {
+                        executor.spawn(async move {
+                            if let Err(error) = server.remove_all().await {
+                                tracing::error!("could not revoke stale pairing start: {error}");
+                            }
+                        });
+                    }
+                }
+            }
+            return;
+        }
+        self.pairing_starting = false;
+        match result {
+            Ok(server) => self.pairing = Some(server),
+            Err(error) => self.pairing_error = Some(error),
+        }
+    }
+
+    pub fn finish_pairing_restore(
+        &mut self,
+        generation: u64,
+        result: Result<Option<threadlane_daemon::pairing::PairingServer>, String>,
+    ) {
+        if generation != self.pairing_generation {
+            if self.pairing_remove_all_pending {
+                if let Ok(Some(server)) = result {
+                    if let Ok(executor) = crate::chat::executor() {
+                        executor.spawn(async move {
+                            if let Err(error) = server.remove_all().await {
+                                tracing::error!("could not revoke stale pairing restore: {error}");
+                            }
+                        });
+                    }
+                }
+            }
+            return;
+        }
+        self.pairing_starting = false;
+        match result {
+            Ok(Some(server)) => self.pairing = Some(server),
+            Ok(None) => {}
+            Err(error) => self.pairing_error = Some(error),
+        }
+    }
+
+    pub fn pending_pairing_invitation(&self) -> Option<threadlane_daemon::pairing::PairingInfo> {
+        self.pairing
+            .as_ref()
+            .and_then(|server| server.pending_invitation())
+    }
+
+    pub fn paired_devices(&self) -> Vec<threadlane_daemon::pairing::PairedDevice> {
+        self.pairing
+            .as_ref()
+            .map_or_else(Vec::new, |server| server.devices())
+    }
+
+    pub fn begin_pairing(&mut self) -> Result<threadlane_daemon::pairing::PairingInfo, String> {
+        self.pairing
+            .as_mut()
+            .ok_or_else(|| "device sharing is not running".to_string())?
+            .begin_pairing()
+    }
+
+    pub fn remove_paired_device(&mut self, id: &str) -> Result<(), String> {
+        self.pairing
+            .as_mut()
+            .ok_or_else(|| "device sharing is not running".to_string())?
+            .remove_device(id)
+    }
+
+    /// Explicitly stop sharing and revoke all remembered devices.
+    pub fn remove_all_pairing(
+        &mut self,
+    ) -> Result<
+        (
+            u64,
+            tokio::task::JoinHandle<Result<(), String>>,
+        ),
+        String,
+    > {
+        if self.daemon_remote {
+            return Err("device pairing needs the embedded session core".to_string());
+        }
+        if self.pairing_remove_all_pending {
+            return Err("device sharing removal is already in progress".to_string());
+        }
+        let executor = crate::chat::executor()?;
+        self.pairing_generation = self.pairing_generation.wrapping_add(1);
+        let generation = self.pairing_generation;
+        self.pairing_starting = false;
+        self.pairing_error = None;
+        self.pairing_remove_all_pending = true;
+        let server = self.pairing.take();
+        let task = executor.spawn(async move {
+            if let Some(server) = server {
+                server.remove_all().await
+            } else {
+                threadlane_daemon::pairing::PairingServer::remove_all_saved().await
+            }
+        });
+        Ok((generation, task))
+    }
+
+    pub fn finish_remove_all_pairing(
+        &mut self,
+        generation: u64,
+        result: Result<(), String>,
+    ) {
+        if generation != self.pairing_generation {
+            return;
+        }
+        self.pairing_remove_all_pending = false;
+        if let Err(error) = result {
+            self.pairing_error = Some(error);
+        }
+    }
+
+    /// Stop accepting clients while preserving enabled state and trust.
     pub fn stop_pairing(&mut self) {
+        self.pairing_generation = self.pairing_generation.wrapping_add(1);
+        self.pairing_starting = false;
         self.pairing = None;
     }
 

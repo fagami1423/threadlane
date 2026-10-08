@@ -23,9 +23,18 @@ pub struct MobileDaemon {
 }
 impl MobileDaemon {
     pub fn connect(url: String, token: Option<String>) -> Result<Self, String> {
-        let client = RemoteDaemon::connect_pairing(
+        Self::connect_named(url, token, None)
+    }
+
+    pub fn connect_named(
+        url: String,
+        token: Option<String>,
+        device_name: Option<String>,
+    ) -> Result<Self, String> {
+        let client = RemoteDaemon::connect_pairing_named(
             url,
             token.unwrap_or_default(),
+            device_name,
             runtime().handle().clone(),
         )?;
         let mut events = client.subscribe();
@@ -71,6 +80,12 @@ impl MobileDaemon {
     }
     pub fn is_connected(&self) -> bool {
         self.client.is_connected()
+    }
+    pub fn request_reconnect(&self) {
+        self.client.request_reconnect();
+    }
+    pub fn paired_device_id(&self) -> Option<String> {
+        self.client.paired_device_id()
     }
     pub fn send(&self, command: SessionCommand) {
         if let Err(message) = self.client.send(command) {
