@@ -145,6 +145,10 @@ cd threadlane
 cargo run -p threadlane-gpui
 ```
 
+The extension installer builds all bundled extension packages in one Cargo invocation,
+sharing dependency compilation and scheduling. It deploys their binaries, agent presets,
+and prompts without removing user-installed modules or disabled markers.
+
 On macOS, use `./scripts/run-gpui-macos.sh` rather than `cargo run -p threadlane-gpui`. Some framework calls require the application to run from an app bundle. The script creates `target/debug/Threadlane-dev.app`, preserves standard output and `RUST_LOG`, and accepts `--release` for a release build.
 
 ### Inspect token efficiency

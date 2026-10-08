@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use threadlane_protocol::transcript::find_conversation_messages;
+use threadlane_protocol::transcript::first_conversation_match;
 
 use crate::projection::compute_session_messages;
 
@@ -135,9 +135,7 @@ pub fn search_conversations(
                 // First chronologically matching message only: one row per
                 // session. History files are not generating, so no pending
                 // queue or in-flight rows participate.
-                if let Some(hit) =
-                    find_conversation_messages(&messages, false, query).into_iter().next()
-                {
+                if let Some(hit) = first_conversation_match(&messages, false, query) {
                     report.matches.push(ConversationSearchMatch {
                         work_dir: target.work_dir,
                         session_id: target.session_id,

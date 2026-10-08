@@ -52,7 +52,7 @@ pub fn review_branches(status: Option<&GitStatus>, query: &str) -> Vec<GitBranch
         .into_iter()
         .filter(|branch| {
             branch.name != "origin"
-                && !branch.name.ends_with("/HEAD")
+                && !(branch.is_remote && branch.name.ends_with("/HEAD"))
                 && (query.is_empty() || branch.name.to_lowercase().contains(&query))
         })
         .collect()
@@ -1047,5 +1047,34 @@ mod tests {
         assert_eq!(branches[0].upstream.as_deref(), Some("origin/feature"));
         assert_eq!(branches[0].committer_date_unix, 42);
         assert_eq!(branches[0].relative_time, "2 hours ago");
+    }
+
+    #[test]
+    fn recorded_branch_inventory_keeps_local_head_names_only() {
+        let status = GitStatus {
+            branch_details: vec![
+                GitBranchInfo {
+                    name: "nested/HEAD".into(),
+                    ..Default::default()
+                },
+                GitBranchInfo {
+                    name: "origin/HEAD".into(),
+                    ..Default::default()
+                },
+                GitBranchInfo {
+                    name: "origin/HEAD".into(),
+                    is_remote: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let branches = review_branches(Some(&status), "HEAD");
+        let names = branches
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["nested/HEAD", "origin/HEAD"]);
     }
 }

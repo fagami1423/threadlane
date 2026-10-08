@@ -71,6 +71,135 @@ fn inspect_counts_untracked_files_inside_new_directories() {
 }
 
 #[test]
+fn clean_file_inspection_only_runs_status() {
+    let dir = tempdir().unwrap();
+    run_git(dir.path(), &["init", "-q"]);
+    COMMAND_SPAWNS.set(0);
+    assert!(inspect_files(dir.path()).unwrap().is_empty());
+    assert_eq!(COMMAND_SPAWNS.get(), 1);
+}
+
+#[test]
+fn inspection_reuses_branch_listing_without_losing_local_refs() {
+    let dir = tempdir().unwrap();
+    run_git(dir.path(), &["init", "-q", "-b", "main"]);
+    run_git(
+        dir.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "initial",
+        ],
+    );
+    for branch in [
+        "z-last",
+        "origin/local",
+        "origin/main",
+        "nested/HEAD",
+        "a-first",
+    ] {
+        run_git(dir.path(), &["branch", branch]);
+    }
+    run_git(
+        dir.path(),
+        &["update-ref", "refs/remotes/origin/remote-only", "HEAD"],
+    );
+    run_git(
+        dir.path(),
+        &["update-ref", "refs/remotes/origin/local", "HEAD"],
+    );
+    run_git(
+        dir.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    run_git(dir.path(), &["tag", "a-first"]);
+    BRANCH_LIST_RUNS.set(0);
+    let status = inspect(dir.path()).unwrap();
+    assert_eq!(BRANCH_LIST_RUNS.get(), 1);
+    assert_eq!(
+        status.branches,
+        [
+            "a-first",
+            "main",
+            "nested/HEAD",
+            "origin/local",
+            "origin/main",
+            "z-last"
+        ]
+    );
+    assert!(
+        status
+            .branch_details
+            .iter()
+            .any(|branch| branch.name == "origin/local" && !branch.is_remote)
+    );
+    assert!(
+        status
+            .branch_details
+            .iter()
+            .any(|branch| branch.name == "remotes/origin/local" && branch.is_remote)
+    );
+    assert!(
+        status
+            .branch_details
+            .iter()
+            .any(|branch| branch.name == "origin/remote-only" && branch.is_remote)
+    );
+    assert!(
+        status
+            .branch_details
+            .iter()
+            .any(|branch| branch.name == "main" && !branch.is_remote && branch.is_default)
+    );
+    assert!(
+        status
+            .branch_details
+            .iter()
+            .any(|branch| {
+                branch.name == "remotes/origin/main" && branch.is_remote && branch.is_default
+            })
+    );
+    assert!(
+        status
+            .branch_details
+            .iter()
+            .any(|branch| {
+                branch.name == "origin/main" && !branch.is_remote && !branch.is_default
+            })
+    );
+
+    let local_a_first = status
+        .branches
+        .iter()
+        .find(|branch| branch.as_str() == "a-first")
+        .unwrap();
+    run_git(dir.path(), &["switch", local_a_first.as_str()]);
+    let head = Command::new("git")
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(head.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        "refs/heads/a-first"
+    );
+}
+
+#[test]
+fn inspection_preserves_unborn_current_branch() {
+    let dir = tempdir().unwrap();
+    run_git(dir.path(), &["init", "-q", "-b", "new-branch"]);
+    let status = inspect(dir.path()).unwrap();
+    assert_eq!(status.branches, vec![status.branch.unwrap()]);
+}
+
+#[test]
 fn file_inspection_preserves_review_changes_with_two_git_commands() {
     let dir = tempdir().unwrap();
     run_git(dir.path(), &["init", "-q"]);

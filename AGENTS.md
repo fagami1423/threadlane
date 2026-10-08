@@ -210,6 +210,7 @@ A normal `cargo run` may be unsuitable for testing installation: update installa
 - GPUI trajectory completion reconciles from canonical JSONL. Use transcript entry sequence for tool chronology and lifecycle records only to enrich run/lane identity; tool call IDs are not globally unique. Do not project ephemeral provider `TurnStart`/`TurnEnd` events or durable outer `StepAttempt` records as equivalent trajectory turns.
 - Reducer lane leaves advance monotonically by entry sequence; replaying an older `StepAttempt` must not move the leaf behind later reasoning, tool results, or assistant entries. Multi-tool results form a source-ordered parent chain so every result remains on the model-visible branch; recovery may temporarily attach a synthesized result to the assistant when an earlier safe result is still pending replay.
 - Threadlane extensions are compiled WASI modules with an exported `extension_info` manifest. The settings picker installs a `.wasm` into either `~/.threadlane/extensions/` or `<project>/.threadlane/extensions/`; it never runs Cargo or extension build scripts. Native extension executables and trust approvals are unsupported. LSP remains a WASI extension and launches language servers through brokered process capability.
+- `scripts/build_extensions.sh` explicitly selects its WASI Cargo packages so one build avoids compiling the native workspace. When adding an extension package, update that selector and its fixture regression in `scripts/test_build_extensions.py`.
 
 ### Project-Scoped Skill Enable/Disable
 
@@ -330,6 +331,7 @@ A normal `cargo run` may be unsuitable for testing installation: update installa
 - Declare the narrowest capability set that a tool actually needs. `debug_ext` requests only `process` even though it deals in file paths, because the adapter reads sources itself.
 - Brokered network access requires approval for the exact lowercase host. GPUI sessions request approval through the generic session permission handle and can persist exact project-scoped hosts in `.threadlane/permissions.json`; unattended callers default to denial. `THREADLANE_NETWORK_ALLOW_HOSTS` remains a non-interactive preapproval path. HTTPS requests must keep response bodies bounded and redirects disabled; a redirect destination requires its own approval and an explicit follow-up fetch so redirects cannot bypass host policy.
 - The script treats missing binaries and copy failures as fatal and must not clear user-installed modules or disabled markers from the extension root.
+- Workspace watcher callbacks classify changes before enqueueing; ignored paths and `Access` events must not extend a pending debounce. Its worker blocks on the channel while idle, and `Stop` must wake it both idle and during a pending debounce.
 - Bundled agent definitions and prompts are part of a valid extension deployment; do not update only the `.wasm` artifact when associated metadata also changes.
 
 ## Security and Sensitive Files

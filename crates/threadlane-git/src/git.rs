@@ -14,6 +14,7 @@ use crate::types::{
 #[cfg(test)]
 thread_local! {
     pub(crate) static COMMAND_SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static BRANCH_LIST_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static REMOTE_FETCH_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -35,6 +36,10 @@ pub(crate) fn command_bytes(work_dir: &Path, args: &[&str]) -> Result<Vec<u8>, G
         attempts += 1;
         #[cfg(test)]
         COMMAND_SPAWNS.set(COMMAND_SPAWNS.get() + 1);
+        #[cfg(test)]
+        if args.first() == Some(&"for-each-ref") {
+            BRANCH_LIST_RUNS.set(BRANCH_LIST_RUNS.get() + 1);
+        }
         let output = Command::new("git")
             .args(args)
             .current_dir(work_dir)
@@ -179,6 +184,9 @@ pub fn inspect_files(work_dir: &Path) -> Result<Vec<GitFile>, GitError> {
 }
 
 fn apply_numstats(work_dir: &Path, status: &mut GitStatus) {
+    if status.files.is_empty() {
+        return;
+    }
     let numstat_output = command(work_dir, &["diff", "HEAD", "--numstat"])
         .or_else(|_| command(work_dir, &["diff", "--numstat"]));
     let mut numstats = std::collections::HashMap::new();
@@ -444,14 +452,14 @@ pub(crate) fn list_branches_detailed(
         &[
             "for-each-ref",
             "--sort=-committerdate",
-            "--format=%(refname:short)\x1f%(committerdate:relative)\x1f%(committerdate:unix)\x1f%(upstream:short)\x1f%(HEAD)",
+            "--format=%(refname:short)\x1f%(committerdate:relative)\x1f%(committerdate:unix)\x1f%(upstream:short)\x1f%(HEAD)\x1f%(refname)",
             "refs/heads",
             "refs/remotes/origin",
         ],
     )?;
 
     let mut branches = Vec::new();
-    let mut seen_names = std::collections::HashSet::new();
+    let mut seen_refs = HashSet::new();
 
     for line in output.lines() {
         let line = line.trim();
@@ -463,15 +471,20 @@ pub(crate) fn list_branches_detailed(
             continue;
         }
         let ref_name = parts[0].trim();
-        if ref_name.is_empty()
-            || ref_name == "origin"
-            || ref_name == "origin/HEAD"
-            || ref_name.ends_with("/HEAD")
-        {
+        let full_name = parts.get(5).copied().unwrap_or_default();
+        if full_name.is_empty() || full_name == "refs/remotes/origin/HEAD" {
             continue;
         }
 
-        let is_remote = ref_name.starts_with("origin/");
+        let is_remote = full_name.starts_with("refs/remotes/");
+        let name = if is_remote {
+            ref_name
+        } else {
+            full_name.strip_prefix("refs/heads/").unwrap_or(ref_name)
+        };
+        if name.is_empty() {
+            continue;
+        }
         let is_current = parts.get(4).map_or(false, |h| h.trim() == "*");
         let relative_time = parts.get(1).map_or("", |t| t.trim()).to_string();
         let committer_date_unix = parts
@@ -483,12 +496,13 @@ pub(crate) fn list_branches_detailed(
             .map(|u| u.trim().to_string())
             .filter(|u| !u.is_empty());
         let is_default = def_branch.as_deref().map_or(false, |db| {
-            ref_name == db || ref_name == format!("origin/{db}")
+            full_name == format!("refs/heads/{db}")
+                || full_name == format!("refs/remotes/origin/{db}")
         });
 
-        if seen_names.insert(ref_name.to_string()) {
+        if seen_refs.insert(full_name) {
             branches.push(GitBranchInfo {
-                name: ref_name.to_string(),
+                name: name.to_string(),
                 is_current,
                 is_default,
                 is_remote,
@@ -516,15 +530,33 @@ pub fn inspect(work_dir: &Path) -> Result<GitStatus, GitError> {
     )?;
     let mut status = parse_status(work_dir, &porcelain);
     apply_numstats(work_dir, &mut status);
-    status.branches = command(
-        work_dir,
-        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
-    )?
-    .lines()
-    .map(str::trim)
-    .filter(|branch| !branch.is_empty())
-    .map(str::to_owned)
-    .collect();
+    let metadata = repository_metadata(work_dir);
+    status.default_branch = metadata.default_branch.clone();
+    let branch_details = list_branches_detailed(work_dir, status.default_branch.as_deref());
+    status.branches = match &branch_details {
+        Ok(branches) => {
+            let mut names: Vec<_> = branches
+                .iter()
+                .filter(|branch| !branch.is_remote)
+                .map(|branch| branch.name.clone())
+                .collect();
+            names.sort();
+            names
+        }
+        Err(_) => command(
+            work_dir,
+            &[
+                "for-each-ref",
+                "--format=%(refname:lstrip=2)",
+                "refs/heads",
+            ],
+        )?
+        .lines()
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_owned)
+        .collect(),
+    };
     if let Some(current_branch) = status.branch.as_ref() {
         if !status
             .branches
@@ -534,21 +566,18 @@ pub fn inspect(work_dir: &Path) -> Result<GitStatus, GitError> {
             status.branches.push(current_branch.clone());
         }
     }
-    let metadata = repository_metadata(work_dir);
-    status.default_branch = metadata.default_branch.clone();
-    status.branch_details = list_branches_detailed(work_dir, status.default_branch.as_deref())
-        .unwrap_or_else(|_| {
-            status
-                .branches
-                .iter()
-                .map(|name| GitBranchInfo {
-                    name: name.clone(),
-                    is_current: status.branch.as_deref() == Some(name),
-                    is_default: status.default_branch.as_deref() == Some(name),
-                    ..GitBranchInfo::default()
-                })
-                .collect()
-        });
+    status.branch_details = branch_details.unwrap_or_else(|_| {
+        status
+            .branches
+            .iter()
+            .map(|name| GitBranchInfo {
+                name: name.clone(),
+                is_current: status.branch.as_deref() == Some(name),
+                is_default: status.default_branch.as_deref() == Some(name),
+                ..GitBranchInfo::default()
+            })
+            .collect()
+    });
     status.remote = metadata.remote;
     if status.remote.is_some() && status.branch.is_some() {
         if !status.has_upstream && status.ahead == 0 {
