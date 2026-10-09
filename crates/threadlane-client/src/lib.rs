@@ -98,6 +98,10 @@ pub trait DaemonClient: Send + Sync {
     /// their own filesystem, which is not the host's.
     fn supports_project_io(&self) -> bool;
 
+    /// Whether the attached daemon supports ephemeral language services for
+    /// unsaved editor buffers (wire protocol version ≥ 8).
+    fn supports_editor_lsp(&self) -> bool { false }
+
     /// Distinct capability floor: project I/O alone does not imply search.
     fn supports_file_search(&self) -> bool { false }
     /// Versioned reads and writes guarded by a previously read version.

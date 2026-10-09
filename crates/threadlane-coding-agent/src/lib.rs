@@ -17,6 +17,7 @@ pub mod computer;
 pub mod config_dump;
 pub mod context_snapshots;
 pub mod controller;
+pub mod editor_lsp;
 pub mod credentials;
 pub(crate) mod durable;
 pub mod harness;

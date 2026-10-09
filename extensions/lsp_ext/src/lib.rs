@@ -1,3 +1,5 @@
+mod editor;
+
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path};
 
@@ -1538,7 +1540,10 @@ fn extension_manifest() -> WasiExtensionManifest {
                 parameters: serde_json::json!({"type": "object", "properties": {"old_path": {"type": "string"}, "new_path": {"type": "string"}}, "required": ["old_path", "new_path"]}),
             },
         ],
-        commands: vec![],
+        commands: vec![serde_json::json!({
+            "name": "editor_lsp",
+            "description": "Serve ephemeral LSP requests for the active unsaved editor buffer."
+        })],
         hooks: vec!["after_tool_call".into()],
     }
 }
@@ -1665,6 +1670,7 @@ pub extern "C" fn handle_hook(ptr: i32, len: i32) -> u64 {
 
 fn handle_invocation(invocation: &Invocation) -> Response {
     match invocation.name.as_str() {
+        "editor_lsp" => editor::handle(invocation),
         "lsp_definition"
         | "lsp_type_definition"
         | "lsp_implementation"

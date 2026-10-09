@@ -58,8 +58,11 @@ use crate::repo::{GitOperation, GitResponse, ProjectFileNode};
 /// and automation surfaces — `GitHubRequest`/`AutomationRequest` commands
 /// and the journaled [`SessionEvent::AutomationChanged`]. Version 6 adds
 /// ephemeral saved-file search and daemon-host target validation. Version 7
-/// adds versioned file reads and guarded file writes.
-pub const WIRE_PROTOCOL_VERSION: u64 = 7;
+/// adds versioned file reads and guarded file writes. Version 8 adds
+/// ephemeral session-scoped language services for unsaved editor buffers.
+pub const WIRE_PROTOCOL_VERSION: u64 = 8;
+/// Session-scoped language services for unsaved editor buffers.
+pub const EDITOR_LSP_PROTOCOL_VERSION: u64 = 8;
 /// Saved-file content search and host-validated navigation.
 pub const FILE_SEARCH_PROTOCOL_VERSION: u64 = 6;
 /// Versioned file reads and writes guarded by a previously read version.
@@ -249,6 +252,8 @@ pub enum SessionCommand {
     ListProjectFiles { work_dir: PathBuf, limit: usize },
     /// Ephemeral read-only search; never journal the query or results.
     SearchProjectFiles { work_dir: PathBuf, query: String },
+    /// Ephemeral language-server query; never journal unsaved buffer contents.
+    EditorLsp { request: crate::editor_lsp::EditorLspRequest },
     ValidateSearchTarget { work_dir: PathBuf, path: String },
     /// Read one project file as UTF-8 text; answered by
     /// `CommandResponse::FileContent`.
@@ -465,6 +470,7 @@ pub struct CommandRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CommandResponse {
+    EditorLsp { result: Result<crate::editor_lsp::EditorLspResponse, String> },
     SessionDraft {
         session: SessionInfo,
     },
@@ -1409,7 +1415,8 @@ mod tests {
 
     #[test]
     fn guarded_save_protocol_floor_does_not_raise_older_capabilities() {
-        assert_eq!(WIRE_PROTOCOL_VERSION, 7);
+        assert_eq!(WIRE_PROTOCOL_VERSION, 8);
+        assert_eq!(EDITOR_LSP_PROTOCOL_VERSION, 8);
         assert_eq!(GUARDED_SAVE_PROTOCOL_VERSION, 7);
         assert_eq!(FILE_SEARCH_PROTOCOL_VERSION, 6);
         assert_eq!(PROJECT_IO_PROTOCOL_VERSION, 3);

@@ -28,6 +28,9 @@ use threadlane_protocol::daemon::{
     CommandResponse, ProjectInfo, SessionCommand, SessionEvent, SessionHydrationRequest,
     SessionInfo, SessionSnapshot, TerminalEvent, WorktreeSetup,
 };
+use threadlane_protocol::editor_lsp::{
+    EditorLspRequest, EditorLspResponse, MAX_EDITOR_LSP_BYTES,
+};
 use threadlane_protocol::orchestration::ModelRoles;
 use threadlane_protocol::ReasoningEffort;
 use threadlane_runtime::harness::SessionStore;
@@ -682,6 +685,7 @@ impl DaemonCore {
                 | SessionCommand::ReadProjectFileVersioned { .. }
                 | SessionCommand::WriteProjectFileGuarded { .. }
                 | SessionCommand::ProjectFileExists { .. }
+                | SessionCommand::EditorLsp { .. }
                 | SessionCommand::GitRequest { .. }
                 | SessionCommand::GitHubRequest { .. }
                 | SessionCommand::AutomationRequest { .. }
@@ -703,6 +707,11 @@ impl DaemonCore {
         command: SessionCommand,
         request_id: Option<u64>,
     ) -> Result<CommandResponse, String> {
+        if let SessionCommand::EditorLsp { request } = &command {
+            return Ok(CommandResponse::EditorLsp {
+                result: self.execute_editor_lsp_request(request).await,
+            });
+        }
         // The one command with a return payload short-circuits here; the
         // rest are fire-and-forget effects that answer `Ack` to a request.
         if let SessionCommand::CancelQueuedMessage {
@@ -986,6 +995,83 @@ impl DaemonCore {
         self.dispatch_effect(command)
             .await
             .map(|_| CommandResponse::Ack)
+    }
+
+    async fn execute_editor_lsp_request(
+        &self,
+        request: &EditorLspRequest,
+    ) -> Result<EditorLspResponse, String> {
+        if request.text.len() > MAX_EDITOR_LSP_BYTES {
+            return Err("Editor LSP buffer snapshot exceeds the 1 MiB limit".into());
+        }
+        let encoded_request =
+            serde_json::to_vec(request).map_err(|error| error.to_string())?;
+        if encoded_request.len() > MAX_EDITOR_LSP_BYTES {
+            return Err("Editor LSP request exceeds the 1 MiB limit".into());
+        }
+        let runtime = self
+            .runtime_for_session_in(&request.session_id, &request.work_dir)
+            .ok_or_else(|| "activate a session in this checkout".to_string())?;
+        if request
+            .expected_runtime_id
+            .is_some_and(|expected| expected != runtime.instance_id())
+        {
+            return Err("Editor LSP request targets a stale session runtime".into());
+        }
+        let requested_work_dir = request
+            .work_dir
+            .canonicalize()
+            .map_err(|error| format!("Editor LSP checkout does not resolve: {error}"))?;
+        let runtime_work_dir = runtime
+            .editor_lsp_work_dir()
+            .canonicalize()
+            .map_err(|error| format!("Session runtime checkout does not resolve: {error}"))?;
+        if requested_work_dir != runtime_work_dir {
+            return Err("Editor LSP checkout does not match the active session runtime".into());
+        }
+        threadlane_project::files::resolve_project_path(&requested_work_dir, &request.path)?;
+
+        let extension_response = runtime.execute_editor_lsp(request).await?;
+        if serde_json::to_vec(&extension_response)
+            .map_or(true, |bytes| bytes.len() > MAX_EDITOR_LSP_BYTES)
+        {
+            return Err("Editor LSP extension response exceeds the 1 MiB limit".into());
+        }
+        let current_runtime = self.runtime_for_session_in(&request.session_id, &request.work_dir);
+        if !current_runtime
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &runtime))
+        {
+            return Err("Session runtime changed while the editor LSP request was running".into());
+        }
+        let server = extension_response
+            .get("server")
+            .and_then(serde_json::Value::as_str)
+            .filter(|server| !server.is_empty())
+            .ok_or("Editor LSP extension response is missing its server identity")?
+            .to_owned();
+        let result = extension_response
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let diagnostics = extension_response
+            .get("diagnostics")
+            .and_then(serde_json::Value::as_array)
+            .cloned();
+        let response = EditorLspResponse {
+            document_id: request.document_id,
+            version: request.version,
+            runtime_id: runtime.instance_id(),
+            server,
+            result,
+            diagnostics,
+        };
+        if serde_json::to_vec(&response)
+            .map_or(true, |bytes| bytes.len() > MAX_EDITOR_LSP_BYTES)
+        {
+            return Err("Editor LSP response exceeds the 1 MiB limit".into());
+        }
+        Ok(response)
     }
 
     async fn dispatch_effect(self: &Arc<Self>, command: SessionCommand) -> Result<(), String> {
@@ -1370,6 +1456,7 @@ impl DaemonCore {
             SessionCommand::SearchProjectFiles { .. }
             | SessionCommand::ValidateSearchTarget { .. }
             | SessionCommand::ListProjectFiles { .. }
+            | SessionCommand::EditorLsp { .. }
             | SessionCommand::ReadProjectFile { .. }
             | SessionCommand::ReadProjectFileVersioned { .. }
             | SessionCommand::WriteProjectFileGuarded { .. }
@@ -2108,5 +2195,129 @@ mod composer_tests {
             }
         );
         assert!(!path.exists());
+    }
+}
+
+#[cfg(test)]
+mod editor_lsp_tests {
+    use super::DaemonCore;
+    use threadlane_protocol::daemon::{CommandResponse, SessionCommand, SessionEvent};
+    use threadlane_protocol::editor_lsp::{
+        EditorLspOperation, EditorLspPosition, EditorLspRequest, MAX_EDITOR_LSP_BYTES,
+    };
+
+    fn request(session_id: &str, work_dir: std::path::PathBuf) -> EditorLspRequest {
+        EditorLspRequest {
+            session_id: session_id.into(),
+            work_dir,
+            path: "src/main.rs".into(),
+            document_id: 1,
+            version: 1,
+            expected_runtime_id: None,
+            text: "fn main() {}".into(),
+            position: EditorLspPosition::default(),
+            operation: EditorLspOperation::Hover,
+        }
+    }
+
+    #[tokio::test]
+    async fn editor_lsp_errors_are_request_scoped_without_journal_events() {
+        let project = tempfile::tempdir().unwrap();
+        let core = DaemonCore::new().unwrap();
+        let response = core
+            .dispatch(SessionCommand::EditorLsp {
+                request: request("inactive-editor-session", project.path().to_path_buf()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            response,
+            CommandResponse::EditorLsp {
+                result: Err(error)
+            } if error == "activate a session in this checkout"
+        ));
+        assert!(!core.journal_tail().iter().any(|(_, event)| matches!(
+            event,
+            SessionEvent::DaemonError { message, .. }
+                if message == "activate a session in this checkout"
+        )));
+    }
+
+    #[tokio::test]
+    async fn editor_lsp_rejects_oversize_snapshots_before_runtime_lookup() {
+        let project = tempfile::tempdir().unwrap();
+        let mut request = request("inactive-editor-session", project.path().to_path_buf());
+        request.text = "x".repeat(MAX_EDITOR_LSP_BYTES + 1);
+        let core = DaemonCore::new().unwrap();
+        let error = core.execute_editor_lsp_request(&request).await.unwrap_err();
+        assert!(error.contains("1 MiB limit"));
+    }
+
+    #[tokio::test]
+    async fn editor_lsp_rejects_a_project_root_for_a_worktree_runtime() {
+        let project = tempfile::tempdir().unwrap();
+        let work_dir = project.path().canonicalize().unwrap();
+        let worktree = work_dir.join(".threadlane/worktrees/editor-session");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let session_file = super::canonical_session_file(&work_dir, "editor-session");
+        let core = DaemonCore::new().unwrap();
+        let runtime = core
+            .clone()
+            .get_or_create_runtime_async(
+                "editor-session".into(),
+                worktree.clone(),
+                session_file.clone(),
+                super::coding_agent_options(
+                    worktree.clone(),
+                    session_file,
+                    "test/model".into(),
+                    Default::default(),
+                    threadlane_protocol::browser::BrowserBridge::unavailable(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut stale = request("editor-session", worktree.clone());
+        stale.expected_runtime_id = Some(runtime.instance_id().saturating_add(1));
+        let error = core.execute_editor_lsp_request(&stale).await.unwrap_err();
+        assert_eq!(error, "Editor LSP request targets a stale session runtime");
+
+        let error = core
+            .execute_editor_lsp_request(&request("editor-session", work_dir))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "Editor LSP checkout does not match the active session runtime"
+        );
+    }
+
+    #[test]
+    fn editor_lsp_paths_must_be_confined_relative_paths() {
+        let project = tempfile::tempdir().unwrap();
+        assert!(
+            threadlane_project::files::resolve_project_path(project.path(), "src/main.rs")
+                .is_ok()
+        );
+        assert!(
+            threadlane_project::files::resolve_project_path(project.path(), "../outside.rs")
+                .is_err()
+        );
+        assert!(threadlane_project::files::resolve_project_path(project.path(), "").is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let outside = tempfile::tempdir().unwrap();
+            let outside_file = outside.path().join("source.rs");
+            std::fs::write(&outside_file, "fn outside() {}").unwrap();
+            symlink(&outside_file, project.path().join("escape.rs")).unwrap();
+            assert!(
+                threadlane_project::files::resolve_project_path(project.path(), "escape.rs")
+                    .is_err()
+            );
+        }
     }
 }

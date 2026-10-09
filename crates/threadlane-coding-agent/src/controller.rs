@@ -12,12 +12,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::cancellation::CodingAgentCancellation;
+use crate::editor_lsp::EditorLspService;
 use crate::options::CodingAgentOptions;
 use crate::runtime::{CodingAgent, ScheduledWorkExecution};
 use crate::scheduler::CodingAgentWorkHandle;
 use threadlane_acp::AcpConfigOption;
 use threadlane_permission::{PermissionDecision, PermissionHandle};
 use threadlane_protocol::{AgentEvent, ImageAttachment, OrchestratorMode, ReasoningEffort};
+use threadlane_protocol::editor_lsp::EditorLspRequest;
 use threadlane_question::QuestionHandle;
 use threadlane_runtime::harness::{EventError, HarnessEvent, Subscription};
 use threadlane_runtime::ModelRoles;
@@ -143,6 +145,7 @@ pub struct SessionController {
     permission_handle: PermissionHandle,
     question_handle: QuestionHandle,
     pub(crate) prompt_lock: Arc<tokio::sync::Mutex<()>>,
+    editor_lsp: EditorLspService,
     pub session_file: PathBuf,
     pub selected_model: String,
     pub(crate) reasoning_effort: ReasoningEffort,
@@ -214,6 +217,11 @@ impl SessionController {
         let selected_model = agent.model().to_string();
         let reasoning_effort = agent.agent.reasoning_effort();
         let orchestrator_mode = agent.agent.config().orchestrator_mode;
+        let editor_lsp = EditorLspService::new(
+            agent.work_dir.clone(),
+            agent.wasi_extensions.clone(),
+            agent.broker_dispatcher.clone(),
+        );
 
         Arc::new(Self {
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
@@ -222,6 +230,7 @@ impl SessionController {
             permission_handle,
             question_handle,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            editor_lsp,
             session_file,
             selected_model,
             reasoning_effort,
@@ -238,6 +247,17 @@ impl SessionController {
 
     pub fn instance_id(&self) -> u64 {
         self.instance_id
+    }
+
+    pub fn editor_lsp_work_dir(&self) -> &Path {
+        self.editor_lsp.work_dir()
+    }
+
+    pub async fn execute_editor_lsp(
+        &self,
+        request: &EditorLspRequest,
+    ) -> Result<serde_json::Value, String> {
+        self.editor_lsp.execute(request).await
     }
 
     pub fn session_file(&self) -> &Path {

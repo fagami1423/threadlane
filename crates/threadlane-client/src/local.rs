@@ -60,6 +60,10 @@ impl DaemonClient for LocalDaemon {
         true
     }
 
+    fn supports_editor_lsp(&self) -> bool {
+        true
+    }
+
     fn supports_github_automation(&self) -> bool {
         true
     }

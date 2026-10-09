@@ -25,7 +25,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 use threadlane_protocol::daemon::{
     CommandReply, CommandRequest, CommandResponse, SessionCommand, SessionEvent,
-    COMMAND_REQUEST_PROTOCOL_VERSION, GUARDED_SAVE_PROTOCOL_VERSION,
+    COMMAND_REQUEST_PROTOCOL_VERSION, EDITOR_LSP_PROTOCOL_VERSION,
+    GUARDED_SAVE_PROTOCOL_VERSION,
     PROJECT_IO_PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
 };
 
@@ -287,6 +288,14 @@ impl RemoteDaemon {
     pub fn send(&self, command: SessionCommand) -> Result<(), String> {
         if !self.connected.load(Ordering::SeqCst) {
             return Err("daemon is not connected".to_string());
+        }
+        let peer_version = self.protocol_version.load(Ordering::SeqCst);
+        if matches!(&command, SessionCommand::EditorLsp { .. })
+            && peer_version < EDITOR_LSP_PROTOCOL_VERSION
+        {
+            return Err(format!(
+                "Editor LSP requires protocol v{EDITOR_LSP_PROTOCOL_VERSION}; attached daemon uses v{peer_version}"
+            ));
         }
         self.command_tx
             .send(OutboundMessage::Command(command))
@@ -746,6 +755,13 @@ impl RemoteDaemon {
                 "daemon does not support command requests (protocol version {peer_version})"
             ));
         }
+        if matches!(&request.command, SessionCommand::EditorLsp { .. })
+            && peer_version < EDITOR_LSP_PROTOCOL_VERSION
+        {
+            return Err(format!(
+                "Editor LSP requires protocol v{EDITOR_LSP_PROTOCOL_VERSION}; attached daemon uses v{peer_version}"
+            ));
+        }
         if matches!(request.command, SessionCommand::SearchProjectFiles { .. } | SessionCommand::ValidateSearchTarget { .. })
             && peer_version < threadlane_protocol::daemon::FILE_SEARCH_PROTOCOL_VERSION {
             return Err(format!("Find in files requires protocol v6; attached daemon uses v{peer_version}"));
@@ -856,6 +872,11 @@ impl DaemonClient for RemoteDaemon {
 
     fn supports_command_requests(&self) -> bool {
         self.protocol_version.load(Ordering::SeqCst) >= COMMAND_REQUEST_PROTOCOL_VERSION
+    }
+
+    fn supports_editor_lsp(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
+            && self.protocol_version.load(Ordering::SeqCst) >= EDITOR_LSP_PROTOCOL_VERSION
     }
 
     fn is_connected(&self) -> bool { self.connected.load(Ordering::SeqCst) }
@@ -1214,6 +1235,115 @@ mod tests {
         assert!(result.unwrap_err().contains("requires protocol v6"));
         assert!(rx.try_recv().is_err());
         assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn editor_lsp_request_is_version_gated_before_enqueue() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let connected = Arc::new(AtomicBool::new(true));
+        let version = Arc::new(AtomicU64::new(7));
+        let result = RemoteDaemon::answer_request(
+            &tx,
+            &pending,
+            &connected,
+            &version,
+            CommandRequest {
+                request_id: 100,
+                command: SessionCommand::EditorLsp {
+                    request: threadlane_protocol::editor_lsp::EditorLspRequest {
+                        session_id: "session".into(),
+                        work_dir: "/remote-only".into(),
+                        path: "src/main.rs".into(),
+                        document_id: 1,
+                        version: 1,
+                        expected_runtime_id: None,
+                        text: "fn main() {}".into(),
+                        position: threadlane_protocol::editor_lsp::EditorLspPosition::default(),
+                        operation: threadlane_protocol::editor_lsp::EditorLspOperation::Hover,
+                    },
+                },
+            },
+        )
+        .await;
+        assert!(result.unwrap_err().contains("requires protocol v8"));
+        assert!(rx.try_recv().is_err());
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn editor_lsp_bare_command_is_not_sent_to_old_daemon() {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                socket,
+                |_request: &Request, mut response: Response| {
+                    response
+                        .headers_mut()
+                        .insert(PROTOCOL_VERSION_HEADER, "7".parse().unwrap());
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let inventory = tokio::time::timeout(Duration::from_secs(3), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            assert!(matches!(
+                serde_json::from_str::<SessionCommand>(&inventory).unwrap(),
+                SessionCommand::GetProjects
+            ));
+            match tokio::time::timeout(Duration::from_millis(250), socket.next()).await {
+                Err(_) => {}
+                Ok(Some(Ok(message))) => {
+                    panic!("old daemon received an unsupported command: {message:?}")
+                }
+                Ok(Some(Err(error))) => panic!("old daemon closed with error: {error}"),
+                Ok(None) => panic!("old daemon closed the socket"),
+            }
+        });
+        let client = RemoteDaemon::connect_with_runtime(
+            format!("ws://{address}"),
+            None,
+            tokio::runtime::Handle::current(),
+        );
+        let mut connection = client.subscribe_connection();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if *connection.borrow_and_update() == ConnectionState::Connected {
+                    break;
+                }
+                connection.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("handshake did not complete");
+        assert!(!client.supports_editor_lsp());
+        let error = client
+            .send(SessionCommand::EditorLsp {
+                request: threadlane_protocol::editor_lsp::EditorLspRequest {
+                    session_id: "session".into(),
+                    work_dir: "/remote-only".into(),
+                    path: "src/main.rs".into(),
+                    document_id: 1,
+                    version: 1,
+                    expected_runtime_id: None,
+                    text: "fn main() {}".into(),
+                    position: threadlane_protocol::editor_lsp::EditorLspPosition::default(),
+                    operation: threadlane_protocol::editor_lsp::EditorLspOperation::Hover,
+                },
+            })
+            .unwrap_err();
+        assert!(error.contains("requires protocol v8"));
+        server.await.unwrap();
     }
 
     #[tokio::test]

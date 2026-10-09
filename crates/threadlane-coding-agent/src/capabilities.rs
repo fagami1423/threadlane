@@ -30,7 +30,7 @@ use threadlane_runtime::harness::{HookContext, HookEffect, HookHandler, HookKind
 use threadlane_skills::agents::{AgentScope, discover_agents};
 use threadlane_skills::{LoadSkillToolExecutor as SkillLoader, SkillRegistry};
 use threadlane_tools::remove_worktree_cargo_target_dir;
-use threadlane_wasi::WasiExtensionManager;
+use threadlane_wasi::{WasiExtensionManager, WasiExtensionOperation};
 use threadlane_wasi::broker::{
     BROKER_API_VERSION, BrokerError, CapabilityDispatcher, HostBrokerRequest,
 };
@@ -1221,6 +1221,27 @@ impl ToolExecutor for BrokerAwareWasiToolExecutor {
 }
 
 impl BrokerAwareWasiToolExecutor {
+    pub(crate) fn new(
+        extensions: Arc<WasiExtensionManager>,
+        broker_dispatcher: Arc<CapabilityDispatcher>,
+    ) -> Self {
+        Self {
+            extensions,
+            broker_dispatcher,
+        }
+    }
+
+    pub(crate) async fn execute_editor_lsp_command(&self, args: &str) -> Result<String, String> {
+        let mut operation = self
+            .extensions
+            .begin_ephemeral_command_operation("editor_lsp")
+            .ok_or_else(|| "WASI command `editor_lsp` is unavailable; load the lsp_ext extension".to_string())?
+            .map_err(|error| error.to_string())?;
+        self.pump_broker_continuations(&mut operation, "editor_lsp", args, None)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn execute_tool_impl(
         &self,
         name: &str,
@@ -1246,6 +1267,26 @@ impl BrokerAwareWasiToolExecutor {
             Ok(operation) => operation,
             Err(error) => return Some(Err(persistence_error(error))),
         };
+        Some(
+            self.pump_broker_continuations(&mut operation, name, args, identity)
+                .await,
+        )
+    }
+
+    async fn pump_broker_continuations(
+        &self,
+        operation: &mut WasiExtensionOperation<'_>,
+        name: &str,
+        args: &str,
+        identity: Option<&ToolExecutionIdentity>,
+    ) -> Result<String, ToolExecutionError> {
+        let persistence_error = |error| {
+            if identity.is_some() {
+                ToolExecutionError::RecoveryRequired(error)
+            } else {
+                ToolExecutionError::Failed(error)
+            }
+        };
         let mut continuation_rounds = 0;
         loop {
             let invocation = match match identity {
@@ -1253,22 +1294,22 @@ impl BrokerAwareWasiToolExecutor {
                 None => operation.invoke(args),
             } {
                 Ok(invocation) => invocation,
-                Err(error) => return Some(Err(persistence_error(error))),
+                Err(error) => return Err(persistence_error(error)),
             };
             if let Some(error) = invocation.response.error {
-                return Some(Err(ToolExecutionError::Failed(error)));
+                return Err(ToolExecutionError::Failed(error));
             }
             let continue_after_broker = invocation.response.continue_after_broker;
             let immediate_message = invocation.response.message.unwrap_or_default();
             let requests = invocation.host_broker_requests;
             if requests.is_empty() {
                 if continue_after_broker {
-                    return Some(Err(ToolExecutionError::Failed(format!(
+                    return Err(ToolExecutionError::Failed(format!(
                         "WASI tool `{name}` requested a broker continuation without any requests; \
                          check capability grants and clear `continue_after_broker` when finished"
-                    ))));
+                    )));
                 }
-                return Some(Ok(immediate_message));
+                return Ok(immediate_message);
             }
             if continue_after_broker && continuation_rounds >= MAX_BROKER_CONTINUATION_ROUNDS {
                 let message = format!(
@@ -1287,19 +1328,19 @@ impl BrokerAwareWasiToolExecutor {
                     None => self.extensions.enqueue_broker_results(outcomes),
                 };
                 if let Err(error) = persisted {
-                    return Some(Err(persistence_error(error)));
+                    return Err(persistence_error(error));
                 }
-                return Some(Err(ToolExecutionError::Failed(message)));
+                return Err(ToolExecutionError::Failed(message));
             }
 
             let dispatch = match self.broker_dispatcher.dispatch_envelopes(requests).await {
                 Ok(dispatch) => dispatch,
-                Err(error) => return Some(Err(persistence_error(error.message))),
+                Err(error) => return Err(persistence_error(error.message)),
             };
             let operation_results = dispatch.operation_results;
             if continue_after_broker {
                 if let Err(error) = self.extensions.enqueue_broker_results(operation_results) {
-                    return Some(Err(persistence_error(error)));
+                    return Err(persistence_error(error));
                 }
                 continuation_rounds += 1;
                 continue;
@@ -1311,9 +1352,9 @@ impl BrokerAwareWasiToolExecutor {
             {
                 let message = error.message.clone();
                 if let Err(error) = self.extensions.enqueue_broker_results(operation_results) {
-                    return Some(Err(persistence_error(format!("{message}; {error}"))));
+                    return Err(persistence_error(format!("{message}; {error}")));
                 }
-                return Some(Err(ToolExecutionError::Failed(message)));
+                return Err(ToolExecutionError::Failed(message));
             }
 
             let broker_message = operation_results
@@ -1329,11 +1370,11 @@ impl BrokerAwareWasiToolExecutor {
                         .and_then(Value::as_str)
                         .or_else(|| result.value.get("output").and_then(Value::as_str))
                         .map(str::to_owned)
-                });
+            });
             if let Err(error) = self.extensions.enqueue_broker_results(operation_results) {
-                return Some(Err(persistence_error(error)));
+                return Err(persistence_error(error));
             }
-            return Some(Ok(broker_message.unwrap_or(immediate_message)));
+            return Ok(broker_message.unwrap_or(immediate_message));
         }
     }
 }
@@ -1358,6 +1399,7 @@ mod broker_continuation_tests {
     struct RoundCounter {
         manager: Arc<WasiExtensionManager>,
         rounds: AtomicUsize,
+        state_extension: &'static str,
     }
 
     struct FailingOutcomeStorage {
@@ -1462,16 +1504,36 @@ mod broker_continuation_tests {
         fn handle(&self, _: &BrokerRequest) -> Result<serde_json::Value, BrokerError> {
             let round = self.rounds.fetch_add(1, Ordering::SeqCst) + 1;
             self.manager
-                .set_extension_state("rounds", serde_json::json!(round))
+                .set_extension_state(self.state_extension, serde_json::json!(round))
                 .unwrap();
             Ok(serde_json::Value::Null)
         }
     }
 
     fn fixture(finite: bool, emit_request: bool) -> (tempfile::TempDir, Arc<WasiExtensionManager>) {
+        fixture_with_extension_name("rounds", finite, emit_request)
+    }
+
+    fn fixture_with_extension_name(
+        extension_name: &str,
+        finite: bool,
+        emit_request: bool,
+    ) -> (tempfile::TempDir, Arc<WasiExtensionManager>) {
         // Exercise the production WASM invocation, queued broker outcomes,
         // and executor loop. The finite fixture settles after six dispatches.
-        let manifest = serde_json::json!({"api_version":2,"name":"rounds","version":"1","description":"test","capabilities":["tools"],"tools":[{"name":"rounds","description":"test","parameters":{}},{"name":"lsp_diagnostics","description":"test","parameters":{}}]}).to_string();
+        let manifest = serde_json::json!({
+            "api_version":2,
+            "name":extension_name,
+            "version":"1",
+            "description":"test",
+            "capabilities":["tools"],
+            "tools":[
+                {"name":"rounds","description":"test","parameters":{}},
+                {"name":"lsp_diagnostics","description":"test","parameters":{}},
+            ],
+            "commands":[{"name":"editor_lsp","description":"test"}],
+        })
+        .to_string();
         let pending = r#"{"message":"waiting","continue_after_broker":true}"#;
         let done = r#"{"message":"done","state":{}}"#;
         let request =
@@ -1505,11 +1567,13 @@ mod broker_continuation_tests {
           (data (i32.const 3072) "{request}")
           (func (export "extension_info") (result i64) (i64.const {manifest_result}))
           (func (export "alloc") (param i32) (result i32) (i32.const 4096))
-          (func (export "execute_tool") (param $ptr i32) (param $len i32) (result i64)
+          (func $invoke (param $ptr i32) (param $len i32) (result i64)
             (local $end i32)
             {finish}
             {request_call}
-            (i64.const {pending_result})))"#,
+            (i64.const {pending_result}))
+          (export "execute_tool" (func $invoke))
+          (export "execute_command" (func $invoke)))"#,
             manifest = escape(&manifest),
             pending = escape(pending),
             done = escape(done),
@@ -1536,6 +1600,7 @@ mod broker_continuation_tests {
         let counter = Arc::new(RoundCounter {
             manager: manager.clone(),
             rounds: AtomicUsize::new(0),
+            state_extension: "rounds",
         });
         let mut dispatcher = CapabilityDispatcher::new();
         dispatcher.register("tools", counter.clone());
@@ -1653,6 +1718,24 @@ mod broker_continuation_tests {
     }
 
     #[tokio::test]
+    async fn editor_lsp_command_entrypoint_runs_the_broker_continuation_pump() {
+        let (_directory, manager) = fixture_with_extension_name("lsp_ext", true, true);
+        let counter = Arc::new(RoundCounter {
+            manager: manager.clone(),
+            rounds: AtomicUsize::new(0),
+            state_extension: "lsp_ext",
+        });
+        let mut dispatcher = CapabilityDispatcher::new();
+        dispatcher.register("tools", counter.clone());
+        let executor = BrokerAwareWasiToolExecutor::new(manager, Arc::new(dispatcher));
+
+        let result = executor.execute_editor_lsp_command("{}").await.unwrap();
+
+        assert_eq!(result, "done");
+        assert_eq!(counter.rounds.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test]
     async fn durable_broker_protocol_failures_save_terminal_replies_without_replaying_rounds() {
         use threadlane_protocol::{AgentToolCall, ToolExecutionIdentity};
         for emit_request in [false, true] {
@@ -1668,6 +1751,7 @@ mod broker_continuation_tests {
             let counter = Arc::new(RoundCounter {
                 manager: manager.clone(),
                 rounds: AtomicUsize::new(0),
+                state_extension: "rounds",
             });
             let mut dispatcher = CapabilityDispatcher::new();
             dispatcher.register("tools", counter.clone());

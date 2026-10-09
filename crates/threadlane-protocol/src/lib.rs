@@ -4,6 +4,7 @@ pub mod acp;
 pub mod automation;
 pub mod browser;
 pub mod daemon;
+pub mod editor_lsp;
 pub mod events;
 pub mod efficiency;
 pub mod interaction;
