@@ -1,5 +1,62 @@
 # Changelog
 
+## [0.1.49](https://github.com/wheregmis/threadlane/compare/v0.1.48...v0.1.49) (2026-10-09)
+
+
+### Features
+
+* add ephemeral editor LSP backend ([d8fccb7](https://github.com/wheregmis/threadlane/commit/d8fccb738740301c44ace88af0e0017394f090a6))
+* add find in review diffs ([c48b355](https://github.com/wheregmis/threadlane/commit/c48b35588b91bed81b9184b78cd87beb5d1d4d25))
+* add live editor language services ([ce1f0bb](https://github.com/wheregmis/threadlane/commit/ce1f0bbc15a4ad9244138e7e429edf8299db4786))
+* **catalog:** list anthropic/ models when ANTHROPIC_API_KEY is set ([8f2c171](https://github.com/wheregmis/threadlane/commit/8f2c171f9597469846c885dc1e6d394a1e4f7522))
+* enhance editor completion, highlighting, and navigation ([6a7a221](https://github.com/wheregmis/threadlane/commit/6a7a221c7df25ca94ad166268c47525363dd995c))
+* enhance editor completions and workbench controls ([c21ff38](https://github.com/wheregmis/threadlane/commit/c21ff382c8b11823e95f379e2af72a5fa4330285))
+* find text in local Review diffs ([a604e80](https://github.com/wheregmis/threadlane/commit/a604e80368e74d794d342fc9b11994ae9cca7f61))
+* integrate daemon-backed editor language services ([5832877](https://github.com/wheregmis/threadlane/commit/5832877a87ecc78dc2b31220ad5e7ab63e0a61b0))
+* **provider:** add native Anthropic (Claude) provider ([f675ccf](https://github.com/wheregmis/threadlane/commit/f675ccf533c1eb486aec13ab73fdb7dba77e31c6))
+* **provider:** add native Anthropic Messages provider ([0ae53a5](https://github.com/wheregmis/threadlane/commit/0ae53a5ceecdb01773ae5a53afe2c321d7304acb))
+
+
+### Bug Fixes
+
+* **acp:** launch npm-shim agents on Windows and send a plain cwd ([a3ef03f](https://github.com/wheregmis/threadlane/commit/a3ef03f7d89657999824da04bf913ebf19daddd7))
+* **acp:** launch npm-shim agents on Windows and send a plain cwd ([c6b8037](https://github.com/wheregmis/threadlane/commit/c6b80374b58e4ede04d809c02564f80091372671))
+* **acp:** skip unsupported Windows PATHEXT candidates ([a23fcd7](https://github.com/wheregmis/threadlane/commit/a23fcd72f7730b7fa643520c192e546d6e82e008))
+* **acp:** skip unsupported Windows PATHEXT candidates ([8fd22d2](https://github.com/wheregmis/threadlane/commit/8fd22d2f41b2fb753e4922461fc794cf81402e36))
+* allow mobile pairing over Tailscale IPv4 ([a603285](https://github.com/wheregmis/threadlane/commit/a60328559ce224ea7823e5fc42d45b38db9924a1))
+* allow mobile pairing over Tailscale IPv4 ([49c83b0](https://github.com/wheregmis/threadlane/commit/49c83b0e8b6bd949c17d9ee71d92a9ed7e90a2ad))
+* **chat:** deduplicate failures by exact retry payload ([b8a8b70](https://github.com/wheregmis/threadlane/commit/b8a8b7074024978789e3a7743adbca7bbf56a7fa))
+* **chat:** resend exact failed prompts with image attachments ([0ff61af](https://github.com/wheregmis/threadlane/commit/0ff61afa07752fc2e3822b92a68c8b7eef9ad76e))
+* **chat:** resend exact failed prompts with image attachments ([6a60c7f](https://github.com/wheregmis/threadlane/commit/6a60c7ff665c826a11b8d959978c31a9a3c37de2))
+* **chat:** restore rejected credential submissions to scoped drafts ([f4ac16f](https://github.com/wheregmis/threadlane/commit/f4ac16f1d9f3f552fa4f1211ffd8350dbef1ebe6))
+* **chat:** retain retry payload for ACP preflight failures ([05b6403](https://github.com/wheregmis/threadlane/commit/05b64032b1b1659886826fd72b1435d64d580554))
+* **discovery:** avoid caching stale session snapshots ([44e55b1](https://github.com/wheregmis/threadlane/commit/44e55b102e25244ce10cd6d89146c4c1e969a082))
+* **editor:** guard saves against stale file versions ([89727a0](https://github.com/wheregmis/threadlane/commit/89727a074858ae23f50f37b43e02b8248e8b06a9))
+* **editor:** preserve baselines across reload races ([42b7873](https://github.com/wheregmis/threadlane/commit/42b7873e7b6e7f5f5f80ab0b93c6d2feddf3ef19))
+* **editor:** prevent saves from overwriting external changes ([9bf5076](https://github.com/wheregmis/threadlane/commit/9bf507615d69181e05553ed6d081ea0adcb90c92))
+* **editor:** restore initial-load recovery ([29ca55c](https://github.com/wheregmis/threadlane/commit/29ca55c865aee761a762e92061739fb1ca8cad7c))
+* harden editor LSP backend ([bab63f1](https://github.com/wheregmis/threadlane/commit/bab63f1e1770e93c715366060afbf823c6b94136))
+* harden editor LSP concurrency and diagnostics ([56e4c6d](https://github.com/wheregmis/threadlane/commit/56e4c6de3f8ff827007f113a1b2528b02608b1d9))
+* **hub:** durably settle children before allowing revival ([dc52c60](https://github.com/wheregmis/threadlane/commit/dc52c60b5bd391dac0dc61aadc40d55ee9c3f628))
+* **hub:** durably settle subagents before allowing revival ([f3fb3c2](https://github.com/wheregmis/threadlane/commit/f3fb3c2b67498e3c7796e5dcae67c938bc9693ef))
+* **hub:** serialize completion publication and settle retries ([c481a60](https://github.com/wheregmis/threadlane/commit/c481a60873ac824cd0b669939e4d38fe571e8774))
+* keep offline completions visible during LSP polling ([e7964bf](https://github.com/wheregmis/threadlane/commit/e7964bffe225fdb7a481e463f731f90c2a604e0c))
+* keep review whitespace label visible ([00cdcaf](https://github.com/wheregmis/threadlane/commit/00cdcaf8871ec657db32313f499a4c6df790115d))
+* preserve review editor state and scrolling ([830fd4d](https://github.com/wheregmis/threadlane/commit/830fd4d994731eb1bd26481cca7455dc6908470e))
+* preserve review find focus and visibility ([afe8207](https://github.com/wheregmis/threadlane/commit/afe820754ebad4de29e2a6fdddd1a7c10af81d72))
+* prevent editor LSP presentation cancellation ([1c8b390](https://github.com/wheregmis/threadlane/commit/1c8b3901db8ef01911c2ce43a31b2aaf2cde034b))
+* **provider:** keep Anthropic thinking data out of Gemini requests; map effort ([f977db3](https://github.com/wheregmis/threadlane/commit/f977db315da610f3d58a924b6f908ffe72eb9a71))
+* **provider:** raise Anthropic default max_tokens and share env key helper ([b8cb6bd](https://github.com/wheregmis/threadlane/commit/b8cb6bd67c5fa39eb14652f71d16c17d06b43b99))
+* **provider:** round-trip Anthropic thinking blocks through tool loops ([9e9b270](https://github.com/wheregmis/threadlane/commit/9e9b270845bbce6743a20d2ff09fc46472125120))
+* **provider:** scope replayed Anthropic thinking blocks to their model ([74a966f](https://github.com/wheregmis/threadlane/commit/74a966f7b5ef07d88ad4c8d4102caefd727d0059))
+* register editor workbench bindings during init ([45dd78c](https://github.com/wheregmis/threadlane/commit/45dd78ca7effd1cd80e6a5316cd4cf5918ef6bae))
+* restrict editor LSP to global extension ([cdc11e5](https://github.com/wheregmis/threadlane/commit/cdc11e5afd5847dae8e61023347de2a995f5fce6))
+
+
+### Performance Improvements
+
+* **session:** avoid redundant journal scans and clones ([766c394](https://github.com/wheregmis/threadlane/commit/766c39466e6750a838960e83f96255c7b35e8634))
+
 ## [0.1.48](https://github.com/wheregmis/threadlane/compare/v0.1.47...v0.1.48) (2026-10-08)
 
 
