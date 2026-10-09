@@ -125,11 +125,15 @@ pub(super) fn attach(
                     || model.active_git_work_dir().as_ref() != Some(&old.root)
             }) {
                 this.reset(cx);
+                this.cancel_pending_presentation(cx);
             }
         });
         let refresh = cx.subscribe(
             workbench,
-            |this: &mut LanguageService, _, _: &EditorLanguageRefresh, cx| this.reset(cx),
+            |this: &mut LanguageService, _, _: &EditorLanguageRefresh, cx| {
+                this.reset(cx);
+                this.cancel_pending_presentation(cx);
+            },
         );
         cx.on_release(|this: &mut LanguageService, _| {
             let Some(snapshot) = this.snapshot.take() else {
@@ -314,16 +318,23 @@ impl LanguageService {
             if let Some(diagnostics) = editor.diagnostics_mut() {
                 diagnostics.clear();
             }
-            editor.dismiss_lsp_overlays(cx);
-            editor.clear_hover_state(cx);
+            editor.dismiss_completion_overlay(cx);
+            editor.dismiss_code_action_overlay(cx);
             cx.notify();
         });
+    }
+
+    fn cancel_pending_presentation(&mut self, cx: &mut App) {
+        let _ = self
+            .editor
+            .update(cx, |editor, cx| editor.dismiss_lsp_overlays(cx));
     }
 
     pub(super) fn deactivate(&mut self, cx: &mut App) {
         for generation in &mut self.generations {
             *generation = generation.wrapping_add(1);
         }
+        self.cancel_pending_presentation(cx);
         self.clear_presentation(cx);
     }
 
@@ -954,6 +965,38 @@ mod tests {
             model.active_session_id = Some("other-session".into())
         });
         assert!(!service.read_with(cx, |service, cx| service.current(&fresh, cx)));
+    }
+
+    #[gpui::test]
+    fn editor_lsp_unavailable_completion_falls_back_and_accepts(cx: &mut TestAppContext) {
+        let (view, _model, _directory, cx) = fixture(cx);
+        let (_, buffer) = entities(&view, cx);
+        cx.update(|window, cx| {
+            buffer.update(cx, |buffer, cx| {
+                buffer.set_value("alpha_value\nalp_suffix", window, cx);
+                buffer.set_cursor_position(Position::new(1, 3), window, cx);
+                buffer.focus(window, cx);
+            });
+        });
+
+        cx.simulate_keystrokes("h");
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(101));
+        cx.run_until_parked();
+        buffer.read_with(cx, |buffer, _| {
+            assert_eq!(buffer.value().as_str(), "alpha_value\nalph_suffix");
+            let menu = buffer.completion_menu_state();
+            assert!(menu.open);
+            assert_eq!(menu.items[0].label, "alpha_value");
+        });
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.value().to_string()),
+            "alpha_value\nalpha_value"
+        );
     }
 
     #[gpui::test]
