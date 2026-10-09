@@ -262,6 +262,7 @@ pub struct CompletedSubagentLane {
     pub(crate) agent: String,
     pub(crate) model: String,
     pub(crate) status: SubagentLaneStatus,
+    /// Messages not yet checkpointed to the durable lane.
     pub(crate) messages: Vec<AgentMessage>,
     pub(crate) error: Option<String>,
     pub(crate) escalation_reason: Option<String>,
@@ -468,9 +469,9 @@ async fn consume_subagent_turn_checkpoints(
     lane_name: String,
     run_id: String,
     state: Arc<tokio::sync::Mutex<TurnState>>,
-    initial_checkpoint_cursor: usize,
+    checkpoint_progress: Arc<std::sync::atomic::AtomicUsize>,
 ) -> Result<usize, String> {
-    let mut checkpoint_cursor = initial_checkpoint_cursor;
+    let mut checkpoint_cursor = checkpoint_progress.load(Ordering::Relaxed);
     while let Ok(event) = events.recv().await {
         if matches!(&event, AgentEvent::TurnEnd { .. }) {
             checkpoint_new_subagent_messages(
@@ -481,6 +482,7 @@ async fn consume_subagent_turn_checkpoints(
                 &mut checkpoint_cursor,
             )
             .await?;
+            checkpoint_progress.store(checkpoint_cursor, Ordering::Relaxed);
         }
         if let AgentEvent::AgentEnd { usage } = event {
             if let Some(path) = session_file.as_deref() {
@@ -506,12 +508,23 @@ async fn checkpoint_subagent_final_snapshot(
 pub(crate) fn accept_completed_subagent_lanes(
     completed_lanes: &Arc<std::sync::Mutex<Vec<CompletedSubagentLane>>>,
     lanes: Vec<CompletedSubagentLane>,
+    session_file: Option<&Path>,
 ) -> Result<(), String> {
+    // Publish only after the child writer is done; failed commits remain queued for retry.
+    let committed = (|| {
+        if let Some(path) = session_file {
+            let mut journal = CodingSessionHarness::open(path)?;
+            for lane in &lanes {
+                journal.commit_subagent_lane(lane)?;
+            }
+        }
+        Ok(())
+    })();
     completed_lanes
         .lock()
         .map_err(|_| "Completed subagent lane sink is unavailable".to_string())?
         .extend(lanes);
-    Ok(())
+    committed
 }
 
 pub(crate) async fn run_subagents_with_context(
@@ -593,6 +606,7 @@ pub(crate) async fn run_subagents_with_context(
 
         let context = context.clone();
         let completed_lanes = context.completed_lanes.clone();
+        let session_file = context.session_file.clone();
         let event_tx = context.parent_event_tx.clone();
         let lane_task = task.task.clone();
         let lane_agent = task.agent.clone();
@@ -756,8 +770,6 @@ pub(crate) async fn run_subagents_with_context(
                     } else {
                         None
                     };
-                    let hub_for_settle = context.hub.clone();
-                    let settle_lane = identity.lane_name.clone();
                     let result = match workspace {
                         Ok(workspace) => {
                             let parent_work_dir = context.work_dir.clone();
@@ -784,7 +796,6 @@ pub(crate) async fn run_subagents_with_context(
                             .unwrap_or_else(|_| {
                                 Err(subagent_timeout_message(&identity.lane_name, child_timeout))
                             });
-                            hub_for_settle.mark_settled(&settle_lane, false);
                             if let Some((work_dir, branch)) = workspace {
                                 let note = match threadlane_git::remove_worktree(
                                     &parent_work_dir,
@@ -842,17 +853,6 @@ pub(crate) async fn run_subagents_with_context(
                 succeeded,
                 error,
             });
-            // Record the terminal outcome for `hub list`/`hub wait`. A lane
-            // killed via `hub kill` keeps its `killed` outcome instead of
-            // being relabeled by the natural completion path.
-            if hub_for_outcome.is_killed(&identity.lane_name, &lane_agent) {
-                hub_for_outcome.set_outcome(&identity.lane_name, "killed");
-            } else {
-                hub_for_outcome.set_outcome(
-                    &identity.lane_name,
-                    if succeeded { "completed" } else { "failed" },
-                );
-            }
             let lane = CompletedSubagentLane {
                 lane_name: identity.lane_name,
                 run_id: identity.run_id,
@@ -881,8 +881,17 @@ pub(crate) async fn run_subagents_with_context(
             // Completion belongs to the child lifecycle, not batch success.
             // A sibling failure must not strand this lane or discard its work.
             if has_lane {
-                accept_completed_subagent_lanes(&completed_lanes, vec![lane.clone()])?;
+                accept_completed_subagent_lanes(
+                    &completed_lanes,
+                    vec![lane.clone()],
+                    session_file.as_deref(),
+                )?;
             }
+            hub_for_outcome.settle_run(
+                &lane.lane_name,
+                &lane.run_id,
+                if succeeded { "completed" } else { "failed" },
+            );
             Ok((result, lane))
         }
     };
@@ -936,7 +945,7 @@ pub(crate) struct ReviveLaneRequest {
 /// Queued inbox notes (e.g. from `hub send` to the settled lane) are drained
 /// up front and folded into the follow-up prompt. The revived run executes
 /// in the parent workdir without worktree isolation; completion commits
-/// through the shared completed-lane sink on a later parent turn.
+/// to the journal before the hub advertises the lane as settled.
 pub(crate) async fn revive_subagent_lane(
     req: ReviveLaneRequest,
     context: SubagentRunContext,
@@ -1086,6 +1095,7 @@ pub(crate) async fn revive_subagent_lane(
     let hub = context.hub.clone();
     let event_tx = context.parent_event_tx.clone();
     let completed_lanes = context.completed_lanes.clone();
+    let session_file = context.session_file.clone();
     let settle_run_id = identity.run_id.clone();
     let settle_lane = identity.lane_name.clone();
     tokio::spawn(async move {
@@ -1128,12 +1138,6 @@ pub(crate) async fn revive_subagent_lane(
             succeeded,
             error: error.clone(),
         });
-        if hub.is_killed(&settle_lane, &lane_agent) {
-            hub.set_outcome(&settle_lane, "killed");
-        } else {
-            hub.set_outcome(&settle_lane, if succeeded { "completed" } else { "failed" });
-        }
-        hub.mark_settled(&settle_lane, false);
         let lane = CompletedSubagentLane {
             lane_name: settle_lane,
             run_id: settle_run_id,
@@ -1159,7 +1163,22 @@ pub(crate) async fn revive_subagent_lane(
                 .ok()
                 .and_then(|result| result.escalation_reason.clone()),
         };
-        let _ = accept_completed_subagent_lanes(&completed_lanes, vec![lane]);
+        if let Err(error) = accept_completed_subagent_lanes(
+            &completed_lanes,
+            vec![lane.clone()],
+            session_file.as_deref(),
+        ) {
+            log::error!(
+                "Failed to commit revived subagent {}: {error}",
+                lane.lane_name
+            );
+            return;
+        }
+        hub.settle_run(
+            &lane.lane_name,
+            &lane.run_id,
+            if succeeded { "completed" } else { "failed" },
+        );
     });
     Ok(format!(
         "Revived lane {lane_name} with a follow-up turn. Use `hub wait` to block until it settles and `hub read {lane_name}` for output."
@@ -1622,13 +1641,18 @@ pub(crate) async fn run_subagent_task(
     let checkpoint_lane_name = lane_name.clone();
     let checkpoint_run_id = journal_run_id.clone();
     let initial_checkpoint_cursor = agent.turn.lock().await.messages.len();
-    let checkpoint_task = tokio::spawn(consume_subagent_turn_checkpoints(
+    let checkpoint_progress = Arc::new(std::sync::atomic::AtomicUsize::new(
+        initial_checkpoint_cursor,
+    ));
+    // JoinSet aborts the checkpoint worker when timeout drops this child future.
+    let mut checkpoint_tasks = tokio::task::JoinSet::new();
+    checkpoint_tasks.spawn(consume_subagent_turn_checkpoints(
         checkpoint_events,
         checkpoint_session_file,
         checkpoint_lane_name,
         checkpoint_run_id,
         checkpoint_state,
-        initial_checkpoint_cursor,
+        checkpoint_progress.clone(),
     ));
 
     let event_collector = ChildEventCollector::spawn(agent.subscribe());
@@ -1664,7 +1688,17 @@ pub(crate) async fn run_subagent_task(
             _ = context.hub.wait_killed(&lane_name, &config.name) => true,
         };
         if killed {
-            checkpoint_task.abort();
+            checkpoint_tasks.abort_all();
+            let _ = checkpoint_tasks.join_next().await;
+            let mut cursor = checkpoint_progress.load(Ordering::Relaxed);
+            checkpoint_subagent_final_snapshot(
+                session_file_for_checkpoint.as_deref(),
+                &lane_name,
+                &journal_run_id,
+                &agent.turn,
+                &mut cursor,
+            )
+            .await?;
             let state = agent.get_state().await;
             let thinking: Vec<AgentMessage> = state
                 .messages
@@ -1681,6 +1715,11 @@ pub(crate) async fn run_subagent_task(
                 messages: state
                     .messages
                     .into_iter()
+                    .skip(if session_file_for_checkpoint.is_some() {
+                        cursor
+                    } else {
+                        0
+                    })
                     .filter(|message| !matches!(message, AgentMessage::System { .. }))
                     .collect(),
             });
@@ -1732,8 +1771,10 @@ pub(crate) async fn run_subagent_task(
     }
 
     let event_summary = event_collector.finish().await?;
-    let mut checkpoint_cursor = checkpoint_task
+    let mut checkpoint_cursor = checkpoint_tasks
+        .join_next()
         .await
+        .expect("checkpoint worker is present")
         .map_err(|error| format!("Child turn checkpoint task failed: {error}"))??;
     checkpoint_subagent_final_snapshot(
         session_file_for_checkpoint.as_deref(),
@@ -1794,11 +1835,15 @@ pub(crate) async fn run_subagent_task(
         thinking,
         error: completion_error,
         escalation_reason,
-        messages: state
-            .messages
-            .into_iter()
-            .filter(|message| !matches!(message, AgentMessage::System { .. }))
-            .collect(),
+        messages: if session_file_for_checkpoint.is_some() {
+            Vec::new()
+        } else {
+            state
+                .messages
+                .into_iter()
+                .filter(|message| !matches!(message, AgentMessage::System { .. }))
+                .collect()
+        },
     })
 }
 
@@ -2698,6 +2743,301 @@ mod result_tests {
     }
 
     #[tokio::test]
+    async fn cancelled_checkpoint_worker_preserves_cursor_without_replaying_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let child = CodingSessionHarness::open(&path)
+            .unwrap()
+            .start_subagent_lane("worker", "task", None)
+            .unwrap();
+        let report = |text: &str| AgentMessage::Assistant {
+            content: Some(text.into()),
+            tool_calls: None,
+            stop_reason: None,
+            deferred_handle: None,
+        };
+        let state = Arc::new(tokio::sync::Mutex::new(TurnState {
+            system_prompt: String::new(),
+            messages: vec![report("checkpointed")],
+            model: "test-model".into(),
+            reasoning_effort: threadlane_protocol::ReasoningEffort::Low,
+            project_root: None,
+        }));
+        let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (sender, receiver) = broadcast::channel(8);
+        let mut tasks = tokio::task::JoinSet::new();
+        let handle = tasks.spawn(consume_subagent_turn_checkpoints(
+            receiver,
+            Some(path.clone()),
+            child.identity.lane_name.clone(),
+            child.identity.run_id.clone(),
+            state.clone(),
+            progress.clone(),
+        ));
+        sender
+            .send(AgentEvent::TurnEnd {
+                turn_number: 1,
+                tool_results: vec![],
+            })
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            while progress.load(Ordering::Relaxed) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        state.lock().await.messages.push(report("partial result"));
+        drop(tasks);
+        timeout(Duration::from_secs(2), async {
+            while !handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut cursor = progress.load(Ordering::Relaxed);
+        checkpoint_subagent_final_snapshot(
+            Some(&path),
+            &child.identity.lane_name,
+            &child.identity.run_id,
+            &state,
+            &mut cursor,
+        )
+        .await
+        .unwrap();
+        let store = JsonlStore::open_read_only(&path).unwrap();
+        for text in ["checkpointed", "partial result"] {
+            assert_eq!(
+                store
+                    .entries()
+                    .iter()
+                    .filter(|entry| matches!(&entry.message,
+                AgentMessage::Assistant { content: Some(content), .. } if content == text))
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(cursor, 2);
+        assert_eq!(
+            Arc::strong_count(&state),
+            1,
+            "cancelled worker must release child state"
+        );
+    }
+
+    #[test]
+    fn completion_commits_before_waiting_to_publish_to_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let child = CodingSessionHarness::open(&path)
+            .unwrap()
+            .start_subagent_lane("worker", "task", None)
+            .unwrap();
+        let lane = CompletedSubagentLane {
+            lane_name: child.identity.lane_name,
+            run_id: child.identity.run_id,
+            agent: "worker".into(),
+            task: "task".into(),
+            model: "test-model".into(),
+            status: SubagentLaneStatus::Completed,
+            messages: vec![],
+            error: None,
+            escalation_reason: None,
+        };
+        let sink = Arc::new(std::sync::Mutex::new(vec![]));
+        let parent = sink.lock().unwrap();
+        let child_sink = sink.clone();
+        let child_path = path.clone();
+        let run_id = lane.run_id.clone();
+        let child = std::thread::spawn(move || {
+            accept_completed_subagent_lanes(&child_sink, vec![lane], Some(&child_path)).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let committed = loop {
+            let store = JsonlStore::open_read_only(&path).unwrap();
+            if store.records().iter().any(|record| matches!(record,
+                threadlane_runtime::harness::Record::OperationFinished { run_id: id, .. } if id == &run_id)) {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::yield_now();
+        };
+        drop(parent);
+        child.join().unwrap();
+        assert!(
+            committed,
+            "child commit must finish before publication can race a parent drain"
+        );
+        assert_eq!(sink.lock().unwrap().len(), 1);
+        let store = JsonlStore::open_read_only(&path).unwrap();
+        assert_eq!(
+            store
+                .entries()
+                .iter()
+                .filter(|entry| matches!(&entry.message,
+            AgentMessage::Custom { custom_type, .. } if custom_type == "subagent_lane"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_retry_settles_hub_after_child_commit_failure() {
+        use crate::{CodingAgent, CodingAgentOptions};
+        use threadlane_prompt::SystemPromptConfig;
+        use threadlane_runtime::harness::Reducer;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut agent = CodingAgent::new(CodingAgentOptions {
+            api_key: "test-key".into(),
+            account_id: None,
+            model: "test-model".into(),
+            work_dir: dir.path().into(),
+            session_file: Some(path.clone()),
+            system_prompt: SystemPromptConfig::default(),
+            agent_config: None,
+            coding_config: None,
+            browser: BrowserBridge::unavailable(),
+        });
+        agent
+            .begin_harness_run(AgentMessage::user("parent task", vec![]))
+            .await
+            .unwrap();
+        let child = agent
+            .harness
+            .as_mut()
+            .unwrap()
+            .start_subagent_lane("worker", "task", None)
+            .unwrap();
+        let lane = CompletedSubagentLane {
+            lane_name: child.identity.lane_name,
+            run_id: child.identity.run_id,
+            agent: "worker".into(),
+            task: "task".into(),
+            model: "test-model".into(),
+            status: SubagentLaneStatus::Failed,
+            messages: vec![],
+            error: Some("child timed out".into()),
+            escalation_reason: None,
+        };
+        agent.hub.register(
+            lane.lane_name.clone(),
+            lane.run_id.clone(),
+            lane.agent.clone(),
+            lane.task.clone(),
+            lane.model.clone(),
+        );
+        let backup = dir.path().join("session.backup");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let error = accept_completed_subagent_lanes(
+            &agent.completed_subagent_lanes,
+            vec![lane.clone()],
+            Some(&path),
+        )
+        .unwrap_err();
+        assert!(!error.is_empty());
+        assert_eq!(agent.completed_subagent_lanes.lock().unwrap().len(), 1);
+        assert!(agent.hub.resolve_lane(&lane.lane_name).unwrap().live);
+        assert!(agent.commit_completed_subagent_lanes().is_err());
+        assert_eq!(
+            agent.completed_subagent_lanes.lock().unwrap().len(),
+            1,
+            "failed parent retry must retain completion"
+        );
+        assert!(agent.hub.resolve_lane(&lane.lane_name).unwrap().live);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
+        agent.commit_completed_subagent_lanes().unwrap();
+        let roster = agent.hub.resolve_lane(&lane.lane_name).unwrap();
+        assert!(!roster.live, "successful parent retry must settle the hub");
+        assert_eq!(roster.outcome.as_deref(), Some("failed"));
+        let store = JsonlStore::open_read_only(&path).unwrap();
+        assert!(Reducer::reduce(&store)
+            .unwrap()
+            .lane(&lane.lane_name)
+            .unwrap()
+            .open_operation
+            .is_none());
+        CodingSessionHarness::open(&path)
+            .unwrap()
+            .resume_subagent_lane(&lane.lane_name, "recover partial work")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn hub_can_revive_repeatedly_without_parent_completion_drain() {
+        use threadlane_runtime::harness::Reducer;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut context = test_context(dir.path().into(), path.clone(), None);
+        context.child_run_override = Some((
+            Duration::from_secs(1),
+            Arc::new(|task| {
+                Box::pin(async move {
+                    let mut result = success(&task);
+                    result.messages.push(AgentMessage::Assistant {
+                        content: Some(task),
+                        tool_calls: None,
+                        stop_reason: None,
+                        deferred_handle: None,
+                    });
+                    Ok(result)
+                })
+            }),
+        ));
+        run_subagents_with_context(vec![task("worker")], false, None, context.clone())
+            .await
+            .unwrap();
+        let lane = context.hub.resolve_lane("worker").unwrap();
+        for message in ["first follow-up", "second follow-up"] {
+            revive_subagent_lane(
+                ReviveLaneRequest {
+                    lane_name: lane.lane_name.clone(),
+                    agent: lane.agent.clone(),
+                    task: lane.task.clone(),
+                    model: lane.model.clone(),
+                    message: message.into(),
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap();
+            let (_, timed_out) = context
+                .hub
+                .wait_settled(&[lane.lane_name.clone()], Duration::from_secs(2))
+                .await;
+            assert!(!timed_out);
+            let store = JsonlStore::open_read_only(&path).unwrap();
+            assert!(
+                Reducer::reduce(&store)
+                    .unwrap()
+                    .lane(&lane.lane_name)
+                    .unwrap()
+                    .open_operation
+                    .is_none()
+            );
+            assert!(store.entries().iter().any(|entry| matches!(&entry.message,
+                AgentMessage::Assistant { content: Some(content), .. } if content == message)));
+        }
+        let completed = context.completed_lanes.lock().unwrap().clone();
+        assert_eq!(completed.len(), 3);
+        let before = JsonlStore::open_read_only(&path).unwrap().entries().len();
+        let mut journal = CodingSessionHarness::open(&path).unwrap();
+        for lane in &completed {
+            journal.commit_subagent_lane(lane).unwrap();
+        }
+        assert_eq!(
+            journal.store.entries().len(),
+            before,
+            "parent drain must not replay older runs into revived history"
+        );
+    }
+
+    #[tokio::test]
     async fn failed_batches_finalize_every_started_lane_and_keep_successes() {
         use crate::{CodingAgent, CodingAgentOptions};
         use threadlane_prompt::SystemPromptConfig;
@@ -2774,7 +3114,22 @@ mod result_tests {
                 }
                 assert_eq!(finished, 2);
                 assert_eq!(agent.completed_subagent_lanes.lock().unwrap().len(), 2);
+                let before = JsonlStore::open_read_only(&path).unwrap();
+                let before_state = Reducer::reduce(&before).unwrap();
+                assert!(
+                    before_state
+                        .lanes
+                        .iter()
+                        .filter(|lane| lane.name != "main")
+                        .all(|lane| lane.open_operation.is_none()),
+                    "settled hub lanes must be durable before the parent drains"
+                );
+                let entries_before = before.entries().len();
                 agent.commit_completed_subagent_lanes().unwrap();
+                assert_eq!(
+                    JsonlStore::open_read_only(&path).unwrap().entries().len(),
+                    entries_before
+                );
                 drop(agent);
                 let store = JsonlStore::open(&path).unwrap();
                 let state = Reducer::reduce(&store).unwrap();
