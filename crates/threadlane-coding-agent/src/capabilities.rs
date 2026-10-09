@@ -998,6 +998,9 @@ pub(crate) fn extension_before_tool_hook_handler(
                 "tool_name": tool_name,
                 "tool_arguments": context.tool_arguments.as_deref().unwrap_or(""),
             });
+            let _lsp_gate = extensions
+                .lock_lsp_hook_dispatch("before_tool_call")
+                .await;
             for operation in extensions.begin_hook_operations("before_tool_call") {
                 let mut operation = operation
                     .map_err(|error| format!("Extension hook error: {error}"))?;
@@ -1094,6 +1097,9 @@ pub(crate) fn create_after_tool_hook_handler(
                     }
                 }
             }
+            let _lsp_gate = extensions
+                .lock_lsp_hook_dispatch("after_tool_call")
+                .await;
             for operation in extensions.begin_hook_operations("after_tool_call") {
                 let mut operation = match operation {
                     Ok(operation) => operation,
@@ -1232,6 +1238,7 @@ impl BrokerAwareWasiToolExecutor {
     }
 
     pub(crate) async fn execute_editor_lsp_command(&self, args: &str) -> Result<String, String> {
+        let _lsp_gate = self.extensions.lock_lsp_extension().await;
         let mut operation = self
             .extensions
             .begin_ephemeral_command_operation("editor_lsp")
@@ -1265,6 +1272,7 @@ impl BrokerAwareWasiToolExecutor {
             }
         }
 
+        let _lsp_gate = self.extensions.lock_lsp_tool_owner(name).await;
         let mut operation = match self.extensions.begin_tool_operation(name)? {
             Ok(operation) => operation,
             Err(error) => return Some(Err(persistence_error(error))),
@@ -1384,8 +1392,8 @@ impl BrokerAwareWasiToolExecutor {
 #[cfg(test)]
 mod broker_continuation_tests {
     use super::{
-        run_lsp_diagnostics_after_write, BrokerAwareWasiToolExecutor, CapabilityDispatcher,
-        MAX_BROKER_CONTINUATION_ROUNDS,
+        create_after_tool_hook_handler, run_lsp_diagnostics_after_write,
+        BrokerAwareWasiToolExecutor, CapabilityDispatcher, MAX_BROKER_CONTINUATION_ROUNDS,
     };
     use async_trait::async_trait;
     use std::path::Path;
@@ -1394,6 +1402,7 @@ mod broker_continuation_tests {
         Arc,
     };
     use threadlane_protocol::ToolExecutor;
+    use threadlane_runtime::harness::HookContext;
     use threadlane_wasi::{
         broker::{BrokerError, BrokerRequest, CapabilityHandler},
         WasiExtensionManager,
@@ -1612,6 +1621,11 @@ mod broker_continuation_tests {
                 {"name":"lsp_diagnostics","description":"test","parameters":{}},
             ],
             "commands":[{"name":"editor_lsp","description":"test"}],
+            "hooks":if extension_name == "lsp_ext" {
+                vec!["after_tool_call"]
+            } else {
+                vec![]
+            },
         })
         .to_string();
         let pending = r#"{"message":"waiting","continue_after_broker":true}"#;
@@ -1653,7 +1667,8 @@ mod broker_continuation_tests {
             {request_call}
             (i64.const {pending_result}))
           (export "execute_tool" (func $invoke))
-          (export "execute_command" (func $invoke)))"#,
+          (export "execute_command" (func $invoke))
+          (export "after_tool_call" (func $invoke)))"#,
             manifest = escape(&manifest),
             pending = escape(pending),
             done = escape(done),
@@ -1704,6 +1719,8 @@ mod broker_continuation_tests {
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
         calls: AtomicUsize,
+        pause_first: bool,
+        state_extension: Option<(Arc<WasiExtensionManager>, &'static str)>,
     }
 
     #[async_trait]
@@ -1717,9 +1734,21 @@ mod broker_continuation_tests {
             _: &BrokerRequest,
             _: &str,
         ) -> Result<serde_json::Value, BrokerError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some((manager, extension)) = &self.state_extension {
+                let round = manager
+                    .extension_state(extension)
+                    .and_then(|state| state.as_u64())
+                    .unwrap_or_default()
+                    + 1;
+                manager
+                    .set_extension_state(extension, serde_json::json!(round))
+                    .unwrap();
+            }
             self.entered.notify_one();
-            self.release.notified().await;
+            if self.pause_first && call == 0 {
+                self.release.notified().await;
+            }
             Ok(serde_json::Value::Null)
         }
     }
@@ -1735,6 +1764,8 @@ mod broker_continuation_tests {
             entered: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
             calls: AtomicUsize::new(0),
+            pause_first: true,
+            state_extension: None,
         });
         let mut dispatcher = CapabilityDispatcher::new();
         dispatcher.register("tools", handler.clone());
@@ -1767,6 +1798,171 @@ mod broker_continuation_tests {
         let error = recovered.execute_tool_with_broker_requests("rounds", "{}")
             .unwrap().unwrap_err();
         assert!(error.contains("may already have executed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn editor_and_agent_lsp_operations_wait_on_the_shared_gate() {
+        let (_project, _global, manager) = fixture_with_global_lsp_extension(true, true);
+        let handler = Arc::new(PausedBroker {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            calls: AtomicUsize::new(0),
+            pause_first: true,
+            state_extension: Some((manager.clone(), "lsp_ext")),
+        });
+        let mut dispatcher = CapabilityDispatcher::new();
+        dispatcher.register("tools", handler.clone());
+        let executor = Arc::new(BrokerAwareWasiToolExecutor::new(
+            manager.clone(),
+            Arc::new(dispatcher),
+        ));
+
+        let editor_executor = executor.clone();
+        let editor = tokio::spawn(async move {
+            editor_executor.execute_editor_lsp_command("{}").await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handler.entered.notified(),
+        )
+        .await
+        .unwrap();
+        let tool_executor = executor.clone();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let tool = tokio::spawn(async move {
+            started.send(()).unwrap();
+            tool_executor.execute_tool("lsp_diagnostics", "{}").await
+        });
+        entered.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!tool.is_finished(), "agent LSP tool bypassed the shared gate");
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+
+        handler.release.notify_one();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), editor)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            "done"
+        );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), tool)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            "done"
+        );
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test]
+    async fn canceled_editor_lsp_owner_releases_gate_and_extension_claim() {
+        let (_project, _global, manager) = fixture_with_global_lsp_extension(true, true);
+        let handler = Arc::new(PausedBroker {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            calls: AtomicUsize::new(0),
+            pause_first: true,
+            state_extension: Some((manager.clone(), "lsp_ext")),
+        });
+        let mut dispatcher = CapabilityDispatcher::new();
+        dispatcher.register("tools", handler.clone());
+        let executor = Arc::new(BrokerAwareWasiToolExecutor::new(
+            manager.clone(),
+            Arc::new(dispatcher),
+        ));
+
+        let editor_executor = executor.clone();
+        let editor = tokio::spawn(async move {
+            editor_executor.execute_editor_lsp_command("{}").await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handler.entered.notified(),
+        )
+        .await
+        .unwrap();
+        let gate_manager = manager.clone();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            started.send(()).unwrap();
+            let _gate = gate_manager.lock_lsp_extension().await;
+        });
+        entered.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "LSP gate waiter bypassed the owner");
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+
+        editor.abort();
+        assert!(editor.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        let operation = manager
+            .begin_tool_operation("lsp_diagnostics")
+            .unwrap()
+            .unwrap();
+        drop(operation);
+    }
+
+    #[tokio::test]
+    async fn editor_lsp_after_tool_hook_waits_on_the_shared_gate() {
+        let (_project, _global, manager) = fixture_with_global_lsp_extension(true, true);
+        let handler = Arc::new(PausedBroker {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            calls: AtomicUsize::new(0),
+            pause_first: true,
+            state_extension: Some((manager.clone(), "lsp_ext")),
+        });
+        let mut dispatcher = CapabilityDispatcher::new();
+        dispatcher.register("tools", handler.clone());
+        let dispatcher = Arc::new(dispatcher);
+        let executor = Arc::new(BrokerAwareWasiToolExecutor::new(
+            manager.clone(),
+            dispatcher.clone(),
+        ));
+        let hook = create_after_tool_hook_handler(manager, dispatcher);
+
+        let editor_executor = executor.clone();
+        let editor = tokio::spawn(async move {
+            editor_executor.execute_editor_lsp_command("{}").await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handler.entered.notified(),
+        )
+        .await
+        .unwrap();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let hook_task = tokio::spawn(async move {
+            started.send(()).unwrap();
+            hook(HookContext::default()).await
+        });
+        entered.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!hook_task.is_finished(), "after-tool LSP hook bypassed the shared gate");
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+
+        handler.release.notify_one();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), editor)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            "done"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), hook_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

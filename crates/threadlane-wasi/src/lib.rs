@@ -667,6 +667,8 @@ pub struct WasiExtensionManager {
     in_flight_events: Mutex<HashMap<String, Vec<Arc<WasiExtensionEvent>>>>,
     /// Delivery ends at each checkpoint; call ownership spans broker awaits.
     active_operations: Mutex<HashSet<String>>,
+    /// Serializes broker-backed operations owned by the LSP extension.
+    lsp_operation_gate: tokio::sync::Mutex<()>,
     unsettled_broker: Mutex<HashMap<String, Vec<Arc<BrokerIntent>>>>,
     ephemeral_broker_receipts: Mutex<HashMap<String, HashSet<u64>>>,
     ephemeral_state_keys: Mutex<HashMap<String, HashSet<String>>>,
@@ -2460,6 +2462,39 @@ impl WasiExtensionManager {
             .insert("editor".into());
         operation.ephemeral = true;
         Some(Ok(operation))
+    }
+
+    pub async fn lock_lsp_extension(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.lsp_operation_gate.lock().await
+    }
+
+    pub async fn lock_lsp_tool_owner(
+        &self,
+        name: &str,
+    ) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        let is_lsp_owner = self
+            .find_response_extension("tool", name)
+            .is_some_and(|extension| extension.manifest.name == "lsp_ext");
+        if is_lsp_owner {
+            Some(self.lsp_operation_gate.lock().await)
+        } else {
+            None
+        }
+    }
+
+    pub async fn lock_lsp_hook_dispatch(
+        &self,
+        hook_name: &str,
+    ) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        let has_lsp_hook = self
+            .find_hook_extensions(hook_name)
+            .iter()
+            .any(|extension| extension.manifest.name == "lsp_ext");
+        if has_lsp_hook {
+            Some(self.lsp_operation_gate.lock().await)
+        } else {
+            None
+        }
     }
 
     /// Acquire each hook only when visited, preserving name order without

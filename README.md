@@ -75,6 +75,10 @@ operations, confirmation annotations, overlapping edits, and stale versioned edi
 are rejected. Completion snippets, commands, and additional edits (including
 auto-import edits) are not applied.
 
+After diagnostics settle for an unchanged buffer, idle polling backs off for up to
+30 seconds while remaining active. Edits, scope changes, and manual refresh reopen
+the normal cadence; pending or unsupported diagnostics continue polling every second.
+
 ## Find in files
 
 Choose **Find in files…** in Files or the workspace command palette. Type literal,

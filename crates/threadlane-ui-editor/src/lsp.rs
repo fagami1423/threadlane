@@ -31,7 +31,11 @@ use threadlane_ui_kit::{EditorLanguageRefresh, EditorWorkbench};
 use threadlane_ui_state::{AppState, chat, project_io};
 
 use super::EditorView;
-use crate::lsp_mapping::{action_text, completions, relative_uri, scalar_range, wire_position};
+use crate::lsp_mapping::{
+    action_text, completions, map_diagnostics, relative_uri, scalar_range, wire_position,
+};
+
+const SETTLED_DIAGNOSTICS_BACKOFF: Duration = Duration::from_secs(30);
 
 static NEXT_DOCUMENT: LazyLock<AtomicU64> = LazyLock::new(|| {
     AtomicU64::new(
@@ -85,6 +89,7 @@ pub(super) struct LanguageService {
     generations: [u64; 5],
     blocked: Option<String>,
     last_edit: Instant,
+    settled_diagnostics: Option<(Snapshot, Instant)>,
     definition: Option<Snapshot>,
     actions: Vec<(CodeAction, Snapshot, Option<i32>)>,
     _subscriptions: Vec<Subscription>,
@@ -186,6 +191,7 @@ pub(super) fn attach(
             generations: [0; 5],
             blocked: None,
             last_edit: Instant::now(),
+            settled_diagnostics: None,
             definition: None,
             actions: vec![],
             _subscriptions: vec![changed, scope, refresh],
@@ -224,7 +230,16 @@ impl LanguageService {
             return None;
         }
         match self.capture(cx) {
-            Ok(snapshot) => Some(snapshot),
+            Ok(snapshot) => {
+                let diagnostics_are_settled = self.settled_diagnostics.as_ref().is_some_and(
+                    |(settled, completed_at)| {
+                        settled.same_buffer(&snapshot)
+                            && settled.version == snapshot.version
+                            && completed_at.elapsed() < SETTLED_DIAGNOSTICS_BACKOFF
+                    },
+                );
+                (!diagnostics_are_settled).then_some(snapshot)
+            }
             Err(error) => {
                 self.status(
                     "LSP: unavailable",
@@ -335,6 +350,7 @@ impl LanguageService {
         for generation in &mut self.generations {
             *generation = generation.wrapping_add(1);
         }
+        self.settled_diagnostics = None;
         self.cancel_pending_presentation(cx);
         self.clear_presentation(cx);
     }
@@ -361,6 +377,7 @@ impl LanguageService {
         self.runtime = None;
         self.snapshot = None;
         self.version = self.version.wrapping_add(1);
+        self.settled_diagnostics = None;
         self.clear_presentation(cx);
         self.status(
             "LSP: waiting",
@@ -447,11 +464,7 @@ impl LanguageService {
             let diagnostics = if let Some(items) = response.as_ref().ok().and_then(|response| response.diagnostics.clone()) {
                 let source = snapshot.text.clone();
                 Some(cx.background_executor().spawn(async move {
-                    items.into_iter().map(|value| -> Result<lsp_types::Diagnostic> {
-                        let mut diagnostic: lsp_types::Diagnostic = serde_json::from_value(value)?;
-                        diagnostic.range = scalar_range(source.as_str(), diagnostic.range)?;
-                        Ok(diagnostic)
-                    }).collect::<Result<Vec<_>>>()
+                    map_diagnostics(source.as_str(), items)
                 }).await)
             } else { None };
             this.update(cx, |this, cx| -> Result<Option<_>> {
@@ -474,11 +487,18 @@ impl LanguageService {
                 ensure!(response.document_id == this.document_id && response.version == snapshot.version, "Mismatched language-service snapshot");
                 ensure!(this.runtime.is_none_or(|runtime| runtime == response.runtime_id), "Language-service runtime changed");
                 this.runtime = Some(response.runtime_id);
+                match diagnostics.as_ref() {
+                    Some((items, ignored)) if !items.is_empty() || *ignored == 0 => {
+                        this.settled_diagnostics =
+                            Some((snapshot.clone(), Instant::now()));
+                    }
+                    Some(_) | None => this.settled_diagnostics = None,
+                }
+                let diagnostic_summary = diagnostics
+                    .as_ref()
+                    .map(|(items, ignored)| (items.len(), *ignored));
                 let detail = if let Some(diagnostics) = diagnostics {
-                    let diagnostics = diagnostics.inspect_err(|error| {
-                        this.clear_presentation(cx);
-                        this.status("LSP: invalid diagnostics", error.to_string(), cx);
-                    })?;
+                    let (diagnostics, ignored) = diagnostics;
                     let count = diagnostics.len();
                     let _ = this.editor.update(cx, |editor, cx| {
                         let text = editor.text().clone();
@@ -490,11 +510,18 @@ impl LanguageService {
                         }
                         cx.notify();
                     });
-                    format!("{} · {count} diagnostics · unsaved buffer v{}", response.server, snapshot.version)
+                    format!(
+                        "{} · {count} valid diagnostics · {ignored} ignored · unsaved buffer v{}",
+                        response.server, snapshot.version
+                    )
                 } else {
                     format!("{} · diagnostics pending or unsupported · unsaved buffer v{}", response.server, snapshot.version)
                 };
-                let label = response.diagnostics.as_ref().map_or_else(|| "LSP: ready".into(), |items| format!("LSP: {} diagnostics", items.len()));
+                let label = match diagnostic_summary {
+                    Some((0, ignored)) if ignored > 0 => "LSP: diagnostics invalid".into(),
+                    Some((count, _)) => format!("LSP: {count} diagnostics"),
+                    None => "LSP: ready".into(),
+                };
                 this.status(&label, detail, cx);
                 Ok(Some((snapshot, response)))
             })?
@@ -854,6 +881,7 @@ mod tests {
     use lsp_types::{CodeAction, Position, Range, TextEdit, WorkspaceEdit};
     use std::collections::HashMap;
     use threadlane_protocol::daemon::{ProjectInfo, SessionInfo};
+    use threadlane_ui_kit::EditorLanguageRefresh;
     use threadlane_ui_state::AppState;
 
     fn fixture(
@@ -1012,6 +1040,57 @@ mod tests {
             buffer.read_with(cx, |buffer, _| buffer.value().to_string()),
             "alpha_value\nalpha_value"
         );
+    }
+
+    #[gpui::test]
+    fn editor_lsp_settled_diagnostics_backoff_reopens_on_pending_edit_refresh_and_timeout(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, _model, _directory, cx) = fixture(cx);
+        let (service, _) = entities(&view, cx);
+        let settled = capture(&service, cx);
+        service.update(cx, |service, cx| {
+            service.blocked = None;
+            service.last_edit = Instant::now() - Duration::from_secs(1);
+            service.settled_diagnostics = Some((settled.clone(), Instant::now()));
+            assert!(service.poll_snapshot(cx).is_none());
+
+            service.settled_diagnostics = Some((
+                settled.clone(),
+                Instant::now() - Duration::from_secs(30),
+            ));
+            assert!(service.poll_snapshot(cx).is_some());
+
+            service.settled_diagnostics = None;
+            assert!(
+                service.poll_snapshot(cx).is_some(),
+                "pending diagnostics must retain the fast polling cadence"
+            );
+            service.settled_diagnostics = Some((settled.clone(), Instant::now()));
+        });
+
+        view.update(cx, |view, _| view.tabs[0].buffer_revision += 1);
+        service.update(cx, |service, cx| {
+            assert!(
+                service.poll_snapshot(cx).is_some(),
+                "a changed buffer must reopen diagnostics polling"
+            );
+        });
+
+        let workbench = service.read_with(cx, |service, _| {
+            service.workbench.upgrade().unwrap()
+        });
+        service.update(cx, |service, _| {
+            service.settled_diagnostics = Some((settled, Instant::now()));
+        });
+        workbench.update(cx, |_, cx| cx.emit(EditorLanguageRefresh));
+        service.read_with(cx, |service, _| assert!(service.settled_diagnostics.is_none()));
+        service.update(cx, |service, cx| {
+            assert!(
+                service.poll_snapshot(cx).is_some(),
+                "manual refresh must clear settled-diagnostics backoff"
+            );
+        });
     }
 
     #[gpui::test]

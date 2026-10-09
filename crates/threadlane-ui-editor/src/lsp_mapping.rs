@@ -3,8 +3,8 @@ use std::{ops::Range, path::Path};
 
 use anyhow::{Result, anyhow, bail, ensure};
 use lsp_types::{
-    CodeAction, CompletionItem, CompletionResponse, CompletionTextEdit, DocumentChanges,
-    InsertTextFormat, OneOf, Position, TextEdit,
+    CodeAction, CompletionItem, CompletionResponse, CompletionTextEdit, Diagnostic,
+    DocumentChanges, InsertTextFormat, OneOf, Position, TextEdit,
 };
 
 pub(super) fn wire_position(text: &str, offset: usize) -> Result<Position> {
@@ -24,10 +24,10 @@ pub(super) fn wire_position(text: &str, offset: usize) -> Result<Position> {
 pub(super) fn byte_offset(text: &str, position: Position) -> Result<usize> {
     let mut start = 0;
     for _ in 0..position.line {
-        start += text[start..]
-            .find('\n')
-            .ok_or_else(|| anyhow!("LSP line is outside buffer"))?
-            + 1;
+        let Some(next_line) = text[start..].find('\n') else {
+            return Ok(text.len());
+        };
+        start += next_line + 1;
     }
     let line = text[start..]
         .split('\n')
@@ -45,11 +45,11 @@ pub(super) fn byte_offset(text: &str, position: Position) -> Result<usize> {
             "LSP range splits a surrogate pair"
         );
     }
-    ensure!(units == position.character, "LSP column is outside buffer");
     Ok(start + line.len())
 }
 
 pub(super) fn byte_range(text: &str, range: lsp_types::Range) -> Result<Range<usize>> {
+    ensure!(range.start <= range.end, "LSP range is reversed");
     let start = byte_offset(text, range.start)?;
     let end = byte_offset(text, range.end)?;
     ensure!(start <= end, "LSP range is reversed");
@@ -62,6 +62,26 @@ pub(super) fn scalar_range(text: &str, range: lsp_types::Range) -> Result<lsp_ty
         scalar_position(text, byte_offset(text, range.start)?)?,
         scalar_position(text, byte_offset(text, range.end)?)?,
     ))
+}
+
+pub(super) fn map_diagnostics(
+    text: &str,
+    items: Vec<serde_json::Value>,
+) -> (Vec<Diagnostic>, usize) {
+    let total = items.len();
+    let mut diagnostics = Vec::with_capacity(total);
+    for value in items {
+        let Ok(mut diagnostic) = serde_json::from_value::<Diagnostic>(value) else {
+            continue;
+        };
+        let Ok(range) = scalar_range(text, diagnostic.range) else {
+            continue;
+        };
+        diagnostic.range = range;
+        diagnostics.push(diagnostic);
+    }
+    let ignored = total - diagnostics.len();
+    (diagnostics, ignored)
 }
 
 fn scalar_position(text: &str, offset: usize) -> Result<Position> {
@@ -155,6 +175,17 @@ fn completion(mut item: CompletionItem, text: &str, cursor: usize) -> Result<Com
 /// Decode paths lexically, using the daemon's path syntax, not the client OS.
 /// The daemon still validates the target before the editor opens it.
 pub(super) fn relative_uri(uri: &lsp_types::Uri, root: &Path) -> Result<String> {
+    let raw = uri.as_str();
+    let raw_path = raw_file_uri_path(raw)
+        .ok_or_else(|| anyhow!("Only workspace file locations are supported"))?;
+    let decoded_raw_path = percent_encoding::percent_decode_str(raw_path).decode_utf8()?;
+    ensure!(
+        !decoded_raw_path.contains('\\')
+            && decoded_raw_path
+                .split('/')
+                .all(|part| part != "." && part != ".."),
+        "Invalid workspace file location"
+    );
     let uri = url::Url::parse(uri.as_str())?;
     ensure!(
         uri.scheme() == "file" && uri.query().is_none() && uri.fragment().is_none(),
@@ -169,10 +200,11 @@ pub(super) fn relative_uri(uri: &lsp_types::Uri, root: &Path) -> Result<String> 
     {
         path = format!("//{host}{path}");
     }
-    let root = root.to_string_lossy().replace('\\', "/");
-    if root.as_bytes().get(1) == Some(&b':') && path.starts_with('/') {
+    let root = normalize_windows_path(&root.to_string_lossy());
+    if is_windows_drive_path(&root) && path.starts_with('/') {
         path.remove(0);
     }
+    path = normalize_windows_path(&path);
     let prefix = format!("{}/", root.trim_end_matches('/'));
     let relative = path
         .strip_prefix(&prefix)
@@ -186,6 +218,45 @@ pub(super) fn relative_uri(uri: &lsp_types::Uri, root: &Path) -> Result<String> 
         "Invalid workspace file location"
     );
     Ok(relative.into())
+}
+
+fn raw_file_uri_path(uri: &str) -> Option<&str> {
+    let (_, rest) = uri.split_once(':')?;
+    let rest = rest.split(['?', '#']).next()?;
+    let Some(authority_or_path) = rest.strip_prefix("//") else {
+        return Some(rest);
+    };
+    if authority_or_path.starts_with('/') {
+        return Some(authority_or_path);
+    }
+    authority_or_path
+        .find('/')
+        .map(|separator| &authority_or_path[separator..])
+        .or(Some(""))
+}
+
+fn normalize_windows_path(path: &str) -> String {
+    let mut path = path.replace('\\', "/");
+    if let Some(verbatim) = path.strip_prefix("//?/") {
+        if verbatim
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UNC/"))
+        {
+            path = format!("//{}", &verbatim[4..]);
+        } else if is_windows_drive_path(verbatim) {
+            path = verbatim.to_owned();
+        }
+    }
+    if is_windows_drive_path(&path) {
+        let drive_letter = path[..1].to_ascii_uppercase();
+        path.replace_range(..1, &drive_letter);
+    }
+    path
+}
+
+fn is_windows_drive_path(path: &str) -> bool {
+    path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && path.as_bytes().get(1) == Some(&b':')
 }
 
 /// Produce one atomic, undoable buffer replacement. Never perform file I/O.
@@ -264,8 +335,12 @@ pub(super) fn action_text(
 
 #[cfg(test)]
 mod tests {
-    use super::{action_text, byte_offset, completions, relative_uri, scalar_range, wire_position};
-    use lsp_types::{CodeAction, CompletionResponse, CompletionTextEdit, Position, Range};
+    use super::{
+        action_text, byte_offset, byte_range, completions, map_diagnostics, relative_uri,
+        scalar_range, wire_position,
+    };
+    use lsp_types::{CodeAction, CompletionResponse, CompletionTextEdit, Position, Range, TextEdit};
+    use std::collections::HashMap;
     use std::path::Path;
 
     #[test]
@@ -274,12 +349,57 @@ mod tests {
         let offset = "first\r\n中😀".len();
         assert_eq!(wire_position(text, offset).unwrap(), Position::new(1, 3));
         assert_eq!(byte_offset(text, Position::new(1, 3)).unwrap(), offset);
+        let crlf = "first\r\n中😀name\r\n";
+        let line_end = "first\r\n中😀name".len();
+        assert_eq!(byte_offset(crlf, Position::new(1, 100)).unwrap(), line_end);
+        assert_eq!(byte_offset(crlf, Position::new(9, 0)).unwrap(), crlf.len());
+        assert_eq!(
+            scalar_range(
+                crlf,
+                Range::new(Position::new(1, 100), Position::new(9, 0))
+            )
+            .unwrap(),
+            Range::new(Position::new(1, 6), Position::new(2, 0))
+        );
         assert!(byte_offset(text, Position::new(1, 2)).is_err());
-        assert!(byte_offset(text, Position::new(9, 0)).is_err());
         assert_eq!(
             scalar_range(text, Range::new(Position::new(1, 3), Position::new(1, 7))).unwrap(),
             Range::new(Position::new(1, 2), Position::new(1, 6))
         );
+        assert!(byte_range(text, Range::new(Position::new(1, 100), Position::new(1, 2))).is_err());
+        assert!(
+            scalar_range(text, Range::new(Position::new(1, 100), Position::new(1, 2))).is_err()
+        );
+    }
+
+    #[test]
+    fn lsp_mapping_diagnostics_keep_valid_items_and_count_ignored_items() {
+        let (diagnostics, ignored) = map_diagnostics(
+            "a😀b\r\n",
+            vec![
+                serde_json::json!({
+                    "range":{"start":{"line":0,"character":1},"end":{"line":0,"character":3}},
+                    "message":"valid"
+                }),
+                serde_json::json!({
+                    "range":{"start":{"line":0,"character":3},"end":{"line":0,"character":1}},
+                    "message":"reversed"
+                }),
+                serde_json::json!({"message":"malformed"}),
+            ],
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].message, "valid");
+        assert_eq!(
+            diagnostics[0].range,
+            Range::new(Position::new(0, 1), Position::new(0, 2))
+        );
+        assert_eq!(ignored, 2);
+
+        let (diagnostics, ignored) =
+            map_diagnostics("a", vec![serde_json::json!({"message":"malformed"})]);
+        assert!(diagnostics.is_empty());
+        assert_eq!(ignored, 1);
     }
 
     #[test]
@@ -325,10 +445,71 @@ mod tests {
             .unwrap(),
             "src/lib.rs"
         );
+        assert_eq!(
+            relative_uri(
+                &"file:///c:/repo/src/lib.rs".parse().unwrap(),
+                Path::new("C:\\repo")
+            )
+            .unwrap(),
+            "src/lib.rs"
+        );
+        assert_eq!(
+            relative_uri(
+                &"file:///C:/repo/src/lib.rs".parse().unwrap(),
+                Path::new("c:\\repo")
+            )
+            .unwrap(),
+            "src/lib.rs"
+        );
+        assert_eq!(
+            relative_uri(
+                &"file:///C:/repo/src/lib.rs".parse().unwrap(),
+                Path::new("\\\\?\\C:\\repo")
+            )
+            .unwrap(),
+            "src/lib.rs"
+        );
+        assert_eq!(
+            relative_uri(
+                &"file://server/share/src/lib.rs".parse().unwrap(),
+                Path::new("\\\\?\\UNC\\server\\share")
+            )
+            .unwrap(),
+            "src/lib.rs"
+        );
         assert!(
             relative_uri(
                 &"file:///elsewhere/lib.rs".parse().unwrap(),
                 Path::new("/remote")
+            )
+            .is_err()
+        );
+        assert!(
+            relative_uri(
+                &"file:///D:/repo/src/lib.rs".parse().unwrap(),
+                Path::new("C:\\repo")
+            )
+            .is_err()
+        );
+        assert!(
+            relative_uri(
+                &"file:///c:/REPO/src/lib.rs".parse().unwrap(),
+                Path::new("C:\\repo")
+            )
+            .is_err(),
+            "drive normalization must not case-fold path components"
+        );
+        assert!(
+            relative_uri(
+                &"file:///C:/repo/../repo/src/lib.rs".parse().unwrap(),
+                Path::new("C:\\repo")
+            )
+            .is_err()
+        );
+        assert!(
+            relative_uri(
+                &"file:///C:/repo/%5C..%5Coutside.rs".parse().unwrap(),
+                Path::new("C:\\repo")
             )
             .is_err()
         );
@@ -352,6 +533,17 @@ mod tests {
         assert_eq!(
             action_text(&action, "a😀b", Path::new("/repo"), "lib.rs", Some(2)).unwrap(),
             "A😀B"
+        );
+        action.edit.as_mut().unwrap().changes = Some(HashMap::from([(
+            "file:///c:/repo/lib.rs".parse().unwrap(),
+            vec![TextEdit {
+                range: Range::new(Position::new(0, 3), Position::new(0, 4)),
+                new_text: "B".into(),
+            }],
+        )]));
+        assert_eq!(
+            action_text(&action, "a😀b", Path::new("C:\\repo"), "lib.rs", Some(2)).unwrap(),
+            "a😀B"
         );
         assert!(action_text(&action, "a😀b", Path::new("/repo"), "other.rs", Some(2)).is_err());
         action.command = Some(

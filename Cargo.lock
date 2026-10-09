@@ -8992,6 +8992,7 @@ dependencies = [
  "tempfile",
  "threadlane-project",
  "threadlane-protocol",
+ "tokio",
  "tracing",
  "wasmi",
 ]
