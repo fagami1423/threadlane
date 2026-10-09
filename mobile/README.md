@@ -20,9 +20,37 @@ project setting.
 2. iPhone: scan the QR with the Camera app — the registered
    `threadlane://` URL scheme launches the app and auto-fills host, port,
    and token.
-3. The desktop's listener is LAN-bound (`0.0.0.0`) and requires the
-   pairing token, minted fresh every time sharing starts. Sharing the QR
-   = sharing a live capability; hit **Stop sharing** when done.
+3. The desktop's listener binds all IPv4 interfaces (`0.0.0.0`) and requires
+   a pairing token. Paired devices retain their credentials for reconnection.
+   Treat the QR/link as a credential; remove a paired device on the desktop
+   to revoke its access.
+
+### Connecting over Tailscale
+
+1. Connect the Mac and iPhone to the same Tailscale network (tailnet).
+2. Enable **Share with mobile** on the Mac; use **Add device** for a new
+   pairing invitation. Keep Threadlane running and the Mac awake and online.
+3. In the iPhone's **Connection details**, set **Host** to the Mac's Tailscale
+   **IPv4 address**, for example `100.101.102.103`, without a URL prefix.
+   Keep the port and token from the pairing invitation, or your existing
+   saved connection. Tap **Connect**.
+4. To verify access across networks, turn off Wi-Fi on the iPhone and
+   reconnect over cellular with Tailscale still connected.
+
+The desktop QR/link normally advertises its LAN address, not its Tailscale
+address. After scanning, change **Host** before connecting over Tailscale.
+MagicDNS hostnames are not accepted by the pairing client; use the numeric
+IPv4 address. No router port forwarding, exit node, Serve, or Funnel is needed.
+If blocked, check the Mac's firewall, Tailscale incoming-connection setting,
+and tailnet access rules for the pairing port.
+
+Pairing accepts Tailscale's shared IPv4 range (`100.64.0.0/10`) in addition
+to local-network addresses. That range is also used by ISP carrier-grade NAT:
+an address alone does **not** prove that a connection is encrypted. Keep
+Tailscale connected and use the address assigned to your Mac in its device
+list. Tailscale encrypts the VPN traffic; Threadlane's `ws://` pairing transport
+does not add TLS. Sharing still listens on LAN interfaces too, so keep tokens
+private and do not expose the sharing port publicly.
 
 ## Layout
 

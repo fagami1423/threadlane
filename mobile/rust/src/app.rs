@@ -2420,7 +2420,7 @@ impl MobileApp {
                     .text_color(cx.theme().muted_foreground)
                     .child(
                         "Your selected desktop reconnects automatically. Keep the desktop app \
-                         open and both devices on the same network.",
+                         open and both devices on the same LAN or connected to Tailscale.",
                     ),
             );
         div()
@@ -2450,7 +2450,7 @@ impl MobileApp {
                 .child(div().text_sm().text_color(cx.theme().muted_foreground)
                     .child("On your desktop, open Share with mobile → Add device. Scan the QR with your phone’s camera. You only need to do this once.")))
             .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                .child("Connection details — enter a pairing manually, or update the address if your desktop moved networks."))
+                .child("Connection details — for Tailscale, use your desktop's Tailscale IPv4 address as Host. Keep the same port and token."))
             .child(
                 div()
                     .flex_none()
