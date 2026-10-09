@@ -1591,14 +1591,6 @@ impl CodingAgent {
             return Ok(());
         };
         journal.ensure_fresh()?;
-        let already_saved = journal.store.entries().iter().skip(first_entry).any(|entry| {
-            entry.lane == "main" && matches!(&entry.message,
-                AgentMessage::Custom { custom_type, payload }
-                    if custom_type == "agent_error" && payload.get("error").and_then(|v| v.as_str()) == Some(error))
-        });
-        if already_saved {
-            return Ok(());
-        }
         let retry_prompt = parse_slash_command(input)
             .is_none()
             .then(|| threadlane_protocol::RetryPrompt {
@@ -1606,6 +1598,16 @@ impl CodingAgent {
                 images: images.to_vec(),
             })
             .filter(threadlane_protocol::RetryPrompt::is_sendable);
+        let retry_prompt_value = serde_json::to_value(&retry_prompt).map_err(|error| error.to_string())?;
+        let already_saved = journal.store.entries().iter().skip(first_entry).any(|entry| {
+            entry.lane == "main" && matches!(&entry.message,
+                AgentMessage::Custom { custom_type, payload }
+                    if custom_type == "agent_error" && payload.get("error").and_then(|v| v.as_str()) == Some(error)
+                        && payload.get("retry_prompt") == Some(&retry_prompt_value))
+        });
+        if already_saved {
+            return Ok(());
+        }
         journal.append_message(AgentMessage::Custom {
             custom_type: "agent_error".into(),
             payload: serde_json::json!({ "error": error, "retry_prompt": retry_prompt }),
@@ -4492,6 +4494,12 @@ mod compaction_sync_tests {
                 .await,
             Some(Err(expected.into()))
         );
+        // A concurrent writer's identical error text for another submission
+        // must not suppress this prompt; exact repeats are still deduplicated.
+        let first = agent.harness.as_ref().unwrap().store.entries().len();
+        agent.persist_prompt_error("another submission", &[], expected, first).unwrap();
+        agent.persist_prompt_error("current submission", &[], expected, first).unwrap();
+        agent.persist_prompt_error("current submission", &[], expected, first).unwrap();
         drop(agent);
         let store = JsonlStore::open(&path).unwrap();
         let errors: Vec<_> = store
@@ -4505,14 +4513,16 @@ mod compaction_sync_tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(errors, [expected]);
+        assert_eq!(errors, [expected, expected, expected]);
         let messages: Vec<_> = store
             .entries()
             .iter()
             .map(|entry| entry.message.clone())
             .collect();
         let projected = threadlane_runtime::harness::project_chat_messages(&messages);
-        assert_eq!(projected.len(), 1);
+        assert_eq!(projected.len(), 3);
+        assert_eq!(projected[1].retry_prompt.as_ref().unwrap().text, "another submission");
+        assert_eq!(projected[2].retry_prompt.as_ref().unwrap().text, "current submission");
         assert_eq!(
             projected[0].role,
             threadlane_runtime::harness::UiMessageRole::Error
