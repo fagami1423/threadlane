@@ -32,6 +32,41 @@ Explore the [website and live UI-Kit demo](https://wheregmis.github.io/threadlan
 - **Extensibility** — Sandboxed WebAssembly System Interface (WASI) extensions and discovered skills.
 - **Automations** — Recurring prompts with durable run history, fresh chats, optional isolated worktrees, and explicit permission handling.
 
+## Editor language services
+
+Source tabs use GPUI Kit for completion, hover, diagnostic underlines,
+**Go to definition** (F12 or the editor options menu), and **Code actions**.
+Language services receive the current unsaved buffer; saving is not required.
+The active session must have a running Threadlane runtime in the same checkout.
+The status in the editor footer shows availability and diagnostic counts; click
+it, or choose **Refresh language services**, to retry after fixing an error.
+
+Install the appropriate server on the **daemon host** and make it available on
+its `PATH`: `rust-analyzer` for Rust, `typescript-language-server --stdio` for
+JavaScript/JSX/TypeScript/TSX, `gopls` for Go, or `pyright-langserver --stdio` for
+Python. Threadlane does not install servers automatically. Other languages retain
+syntax highlighting and offline current-file word suggestions. Empty successful
+LSP completions are authoritative; unavailable/failed servers fall back to words
+when **Word suggestions (this file)** is enabled. Those words are not live LSP.
+
+Local and remote editors use the same daemon/WASI bridge. Remote language
+services require protocol v8; older or disconnected daemons never fall back to
+client-side processes or filesystem access. Brokered process/filesystem
+permissions still apply. Unsaved source and editor broker payloads are ephemeral,
+not extension checkpoints or conversation events. Requests and results are
+bounded to 1 MiB and guarded by document, buffer revision, session, worktree,
+runtime, and connection identity; changing scope invalidates outstanding replies.
+
+Diagnostics refresh after editing and while the active buffer is idle. Servers
+without pull diagnostics must publish versioned diagnostics; pending/unsupported
+diagnostics are not reported as a clean buffer. Definition targets must remain
+inside the checkout and pass daemon validation. Existing dirty target tabs retain
+their edits; cross-file definition locations are not imposed on dirty buffers.
+Code actions apply undoable, current-buffer edits only. Commands, cross-file/resource
+operations, confirmation annotations, overlapping edits, and stale versioned edits
+are rejected. Completion snippets, commands, and additional edits (including
+auto-import edits) are not applied.
+
 ## Find in files
 
 Choose **Find in files…** in Files or the workspace command palette. Type literal,
