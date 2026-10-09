@@ -29,7 +29,7 @@ use threadlane_protocol::daemon::{
     SessionInfo, SessionSnapshot, TerminalEvent, WorktreeSetup,
 };
 use threadlane_protocol::editor_lsp::{
-    EditorLspRequest, EditorLspResponse, MAX_EDITOR_LSP_BYTES,
+    EditorLspOperation, EditorLspRequest, EditorLspResponse, MAX_EDITOR_LSP_BYTES,
 };
 use threadlane_protocol::orchestration::ModelRoles;
 use threadlane_protocol::ReasoningEffort;
@@ -46,6 +46,30 @@ use crate::projection::{
 const JOURNAL_CAPACITY: usize = 4096;
 /// Broadcast lag headroom per subscriber before `Lagged` drops events.
 const BROADCAST_CAPACITY: usize = 1024;
+
+fn parse_editor_server_document_version(
+    response: &serde_json::Value,
+    is_close: bool,
+) -> Result<Option<i32>, String> {
+    match response.get("server_document_version") {
+        Some(serde_json::Value::Null) if is_close => Ok(None),
+        Some(serde_json::Value::Number(version)) if !is_close => {
+            let version = version
+                .as_i64()
+                .ok_or("Editor LSP server document version must be an integer")?;
+            i32::try_from(version)
+                .map(Some)
+                .map_err(|_| "Editor LSP server document version is out of range".into())
+        }
+        Some(serde_json::Value::Null) => {
+            Err("Editor LSP response omitted its server document version".into())
+        }
+        Some(serde_json::Value::Number(_)) => {
+            Err("Editor LSP close response must not include a server document version".into())
+        }
+        _ => Err("Editor LSP response has an invalid server document version".into()),
+    }
+}
 
 /// Where a session's runtime was built to execute. `work_dir` is the
 /// effective execution directory (the worktree for worktree sessions).
@@ -1058,11 +1082,15 @@ impl DaemonCore {
             .get("diagnostics")
             .and_then(serde_json::Value::as_array)
             .cloned();
+        let is_close = matches!(&request.operation, EditorLspOperation::Close);
+        let server_document_version =
+            parse_editor_server_document_version(&extension_response, is_close)?;
         let response = EditorLspResponse {
             document_id: request.document_id,
             version: request.version,
             runtime_id: runtime.instance_id(),
             server,
+            server_document_version,
             result,
             diagnostics,
         };
@@ -2200,7 +2228,7 @@ mod composer_tests {
 
 #[cfg(test)]
 mod editor_lsp_tests {
-    use super::DaemonCore;
+    use super::{parse_editor_server_document_version, DaemonCore};
     use threadlane_protocol::daemon::{CommandResponse, SessionCommand, SessionEvent};
     use threadlane_protocol::editor_lsp::{
         EditorLspOperation, EditorLspPosition, EditorLspRequest, MAX_EDITOR_LSP_BYTES,
@@ -2218,6 +2246,47 @@ mod editor_lsp_tests {
             position: EditorLspPosition::default(),
             operation: EditorLspOperation::Hover,
         }
+    }
+
+    #[test]
+    fn server_document_version_is_a_bounded_integer_and_absent_only_on_close() {
+        assert_eq!(
+            parse_editor_server_document_version(
+                &serde_json::json!({"server_document_version":42}),
+                false,
+            )
+            .unwrap(),
+            Some(42)
+        );
+        assert_eq!(
+            parse_editor_server_document_version(
+                &serde_json::json!({"server_document_version":null}),
+                true,
+            )
+            .unwrap(),
+            None
+        );
+        assert!(
+            parse_editor_server_document_version(
+                &serde_json::json!({"server_document_version":2147483648u64}),
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_editor_server_document_version(
+                &serde_json::json!({"server_document_version":1.5}),
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_editor_server_document_version(
+                &serde_json::json!({"server_document_version":null}),
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

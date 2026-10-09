@@ -3,13 +3,19 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 use super::{
-    broker_message, frame_jsonrpc, fs_message, fs_request, lsp_notification, lsp_request,
-    process_request, send_broker_request, BrokerRequest, Invocation, Response,
+    broker_message, broker_recv_message, frame_jsonrpc, fs_message, fs_request,
+    lsp_notification, lsp_request, process_request, send_broker_request, BrokerRequest,
+    Invocation, ProcessRecvMessage, Response,
 };
 
 const MAX_EDITOR_LSP_BYTES: usize = 1024 * 1024;
 const MAX_EDITOR_PUMP_STEPS: u64 = 16;
 const EDITOR_RECV_TIMEOUT_MS: u64 = 500;
+const EDITOR_STARTUP_TIMEOUT_MS: u64 = 20_000;
+const EDITOR_QUERY_TIMEOUT_MS: u64 = 8_000;
+const MAX_STARTUP_EMPTY_READS: u16 =
+    (EDITOR_STARTUP_TIMEOUT_MS / EDITOR_RECV_TIMEOUT_MS) as u16;
+const MAX_QUERY_EMPTY_READS: u16 = (EDITOR_QUERY_TIMEOUT_MS / EDITOR_RECV_TIMEOUT_MS) as u16;
 const MAX_CACHED_DIAGNOSTICS: usize = 256;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -24,15 +30,17 @@ struct EditorState {
     candidate_uri: String,
     document: Option<DocumentState>,
     server_capabilities: Value,
-    last_server_version: u64,
+    last_server_version: i32,
     next_request_id: u64,
     pending_request_id: u64,
     pending_method: String,
     pending_operation: String,
     resume_phase: String,
     pump_steps: u64,
+    timeout_reads: u16,
+    failure_message: String,
     diagnostics: Option<Vec<Value>>,
-    diagnostics_version: Option<u64>,
+    diagnostics_version: Option<i32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -41,7 +49,7 @@ struct DocumentState {
     uri: String,
     document_id: u64,
     version: u64,
-    server_version: u64,
+    server_version: i32,
     language_id: String,
 }
 
@@ -65,20 +73,31 @@ struct Server {
 
 fn editor_file_uri(path: &str) -> String {
     let normalized = path.replace('\\', "/");
-    let mut uri = if normalized.starts_with('/') {
-        "file://".to_owned()
+    if let Some(unc_path) = normalized.strip_prefix("//") {
+        let (host, path) = unc_path.split_once('/').unwrap_or((unc_path, ""));
+        format!(
+            "file://{}/{}",
+            encode_uri_path(host),
+            encode_uri_path(path)
+        )
+    } else if normalized.starts_with('/') {
+        format!("file://{}", encode_uri_path(&normalized))
     } else {
-        "file:///".to_owned()
-    };
-    for byte in normalized.bytes() {
+        format!("file:///{}", encode_uri_path(&normalized))
+    }
+}
+
+fn encode_uri_path(path: &str) -> String {
+    let mut encoded = String::new();
+    for byte in path.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
-            uri.push(byte as char);
+            encoded.push(byte as char);
         } else {
             use std::fmt::Write;
-            let _ = write!(uri, "%{byte:02X}");
+            let _ = write!(encoded, "%{byte:02X}");
         }
     }
-    uri
+    encoded
 }
 
 pub(super) fn handle(invocation: &Invocation) -> Response {
@@ -165,17 +184,29 @@ fn server_for(path: &str) -> Option<Server> {
     let extension = Path::new(path).extension()?.to_str()?.to_ascii_lowercase();
     let (name, program, args, language_id) = match extension.as_str() {
         "rs" => ("rust-analyzer", "rust-analyzer", &[][..], "rust"),
-        "js" | "jsx" => (
+        "js" => (
             "typescript-language-server",
             "typescript-language-server",
             &["--stdio"][..],
             "javascript",
         ),
-        "ts" | "tsx" => (
+        "jsx" => (
+            "typescript-language-server",
+            "typescript-language-server",
+            &["--stdio"][..],
+            "javascriptreact",
+        ),
+        "ts" => (
             "typescript-language-server",
             "typescript-language-server",
             &["--stdio"][..],
             "typescript",
+        ),
+        "tsx" => (
+            "typescript-language-server",
+            "typescript-language-server",
+            &["--stdio"][..],
+            "typescriptreact",
         ),
         "go" => ("gopls", "gopls", &[][..], "go"),
         "py" | "pyi" => (
@@ -263,10 +294,10 @@ fn start_or_query(
         next_request_id: 1,
         ..EditorState::default()
     };
-    let mut requests = Vec::new();
-    if !old_process.is_empty() {
-        requests.push(process_request("kill", json!({"name": old_process})));
-    }
+    let mut requests = editor_processes_to_kill(&old_process, &state.process_name)
+        .into_iter()
+        .map(|name| process_request("kill", json!({"name": name})))
+        .collect::<Vec<_>>();
     requests.push(fs_request("absolute_path", json!({"path": request.path})));
     requests.push(fs_request("absolute_path", json!({"path": "."})));
     continue_with(
@@ -275,6 +306,17 @@ fn start_or_query(
         "Resolving editor workspace and document.",
         requests,
     )
+}
+
+fn editor_processes_to_kill(previous: &str, next: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    if previous.starts_with("lsp-editor-") {
+        names.push(previous.to_owned());
+    }
+    if next.starts_with("lsp-editor-") && !names.iter().any(|name| name == next) {
+        names.push(next.to_owned());
+    }
+    names
 }
 
 fn close_document(
@@ -287,7 +329,7 @@ fn close_document(
         .as_ref()
         .is_some_and(|document| document_matches(document, request));
     if !matches || state.process_name.is_empty() {
-        return result_response_with_diagnostics(invocation, state, Value::Null, None);
+        return result_response_with_diagnostics(invocation, state, Value::Null, None, None);
     }
     let document = state.document.take().expect("matching document exists");
     invalidate_diagnostics(state);
@@ -411,10 +453,18 @@ fn resume(invocation: &Invocation, request: &EditorRequest, state: &mut EditorSt
                 "Missing language-server send response".into(),
             ),
         },
-        "closing" => {
-            state.phase = "ready".into();
-            result_response(invocation, state, Value::Null)
-        }
+        "closing" => match process_result(invocation, "send") {
+            Some(Ok(_)) => {
+                state.phase = "ready".into();
+                result_response(invocation, state, Value::Null)
+            }
+            Some(Err(error)) => fail(invocation, state, error),
+            None => fail(
+                invocation,
+                state,
+                "Missing language-server close notification response".into(),
+            ),
+        },
         "sending_server_reply" => match process_result(invocation, "send") {
             Some(Ok(_)) => {
                 let phase = state.resume_phase.clone();
@@ -428,14 +478,13 @@ fn resume(invocation: &Invocation, request: &EditorRequest, state: &mut EditorSt
             ),
         },
         "stopping" => {
+            let error = if state.failure_message.is_empty() {
+                "Editor language-server transport failed; its process was stopped.".into()
+            } else {
+                std::mem::take(&mut state.failure_message)
+            };
             *state = EditorState::default();
-            with_state(
-                invocation,
-                state,
-                Response::error(
-                    "Editor language-server transport failed; its process was stopped.",
-                ),
-            )
+            with_state(invocation, state, Response::error(error))
         }
         phase => reset_error(
             invocation,
@@ -450,30 +499,43 @@ fn begin_initialize(invocation: &Invocation, state: &mut EditorState) -> Respons
     state.pending_request_id = id;
     state.pending_method = "initialize".into();
     state.phase = "sending_initialize".into();
-    let root_name = Path::new(&state.workspace_root)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("workspace");
-    let params = json!({
-        "processId": null,
-        "rootPath": state.workspace_root,
-        "rootUri": state.root_uri,
-        "workspaceFolders": [{"uri":state.root_uri,"name":root_name}],
-        "capabilities": {
-            "general": {"positionEncodings":["utf-16"]},
-            "workspace": {"applyEdit":false,"workspaceFolders":true},
-            "textDocument": {
-                "completion": {"completionItem":{"snippetSupport":false}},
-                "diagnostic": {"dynamicRegistration":false},
-            },
-        },
-    });
+    state.timeout_reads = 0;
+    state.pump_steps = 0;
+    let params = initialize_params(state);
     continue_with(
         invocation,
         state,
         "Initializing editor language server.",
         vec![send_frame(state, &lsp_request(id, "initialize", params))],
     )
+}
+
+fn initialize_params(state: &EditorState) -> Value {
+    let root_name = Path::new(&state.workspace_root)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace");
+    json!({
+        "processId": null,
+        "rootPath": state.workspace_root,
+        "rootUri": state.root_uri,
+        "workspaceFolders": [{"uri":state.root_uri,"name":root_name}],
+        "capabilities": {
+            "general": {"positionEncodings":["utf-16"]},
+            "workspace": {"workspaceFolders":true},
+            "textDocument": {
+                "completion": {"completionItem":{"snippetSupport":false}},
+                "diagnostic": {"dynamicRegistration":false},
+                "codeAction": {
+                    "codeActionLiteralSupport": {
+                        "codeActionKind": {
+                            "valueSet": ["quickfix", "refactor", "source"],
+                        },
+                    },
+                },
+            },
+        },
+    })
 }
 
 fn receive_message(
@@ -485,7 +547,7 @@ fn receive_message(
     let Some(message) = invocation
         .events
         .iter()
-        .find_map(|event| broker_message(event, "recv"))
+        .find_map(broker_recv_message)
     else {
         return fail(
             invocation,
@@ -494,7 +556,30 @@ fn receive_message(
         );
     };
     let message = match message {
-        Ok(message) => message,
+        Ok(ProcessRecvMessage::Message(message)) => message,
+        Ok(ProcessRecvMessage::Timeout) => {
+            state.timeout_reads = state.timeout_reads.saturating_add(1);
+            let (limit, phase_name) = if phase == "initializing" {
+                (MAX_STARTUP_EMPTY_READS, "startup")
+            } else {
+                (MAX_QUERY_EMPTY_READS, "query")
+            };
+            if state.timeout_reads >= limit {
+                return fail(
+                    invocation,
+                    state,
+                    format!("Timed out waiting for language-server {phase_name} response"),
+                );
+            }
+            return receive_next(invocation, state, &phase);
+        }
+        Ok(ProcessRecvMessage::Eof) => {
+            return fail(
+                invocation,
+                state,
+                "process/recv reached EOF before a JSON-RPC response".into(),
+            )
+        }
         Err(error) => return fail(invocation, state, error),
     };
     if message["jsonrpc"] != "2.0" {
@@ -521,6 +606,7 @@ fn receive_message(
     if id != state.pending_request_id {
         return pump_again(invocation, state, &phase);
     }
+    state.timeout_reads = 0;
     if message.get("error").is_some() {
         let detail = message["error"]["message"]
             .as_str()
@@ -729,7 +815,7 @@ fn open_notifications(
     frames
 }
 
-fn change_notification(document: &DocumentState, version: u64, text: &str) -> Value {
+fn change_notification(document: &DocumentState, version: i32, text: &str) -> Value {
     lsp_notification(
         "textDocument/didChange",
         json!({
@@ -756,6 +842,8 @@ fn start_query(
     state: &mut EditorState,
     mut frames: Vec<Value>,
 ) -> Response {
+    state.timeout_reads = 0;
+    state.pump_steps = 0;
     let Some(document) = state.document.as_ref() else {
         return with_state(
             invocation,
@@ -856,7 +944,10 @@ fn cache_published_diagnostics(state: &mut EditorState, message: &Value) {
         return;
     };
     if message["params"]["uri"].as_str() != Some(document.uri.as_str())
-        || message["params"]["version"].as_u64() != Some(document.server_version)
+        || message["params"]["version"]
+            .as_i64()
+            .and_then(|version| i32::try_from(version).ok())
+            != Some(document.server_version)
     {
         return;
     }
@@ -926,7 +1017,17 @@ fn result_response(invocation: &Invocation, state: &mut EditorState, result: Val
     } else {
         None
     };
-    result_response_with_diagnostics(invocation, state, result, diagnostics)
+    let server_document_version = state
+        .document
+        .as_ref()
+        .map(|document| document.server_version);
+    result_response_with_diagnostics(
+        invocation,
+        state,
+        result,
+        diagnostics,
+        server_document_version,
+    )
 }
 
 fn result_response_with_diagnostics(
@@ -934,6 +1035,7 @@ fn result_response_with_diagnostics(
     state: &EditorState,
     result: Value,
     diagnostics: Option<Vec<Value>>,
+    server_document_version: Option<i32>,
 ) -> Response {
     let response = json!({
         "server": if state.server.is_empty() {
@@ -943,6 +1045,7 @@ fn result_response_with_diagnostics(
         },
         "result": result,
         "diagnostics": diagnostics,
+        "server_document_version": server_document_version,
     });
     if serde_json::to_vec(&response).map_or(true, |bytes| bytes.len() > MAX_EDITOR_LSP_BYTES) {
         return with_state(
@@ -979,6 +1082,7 @@ fn fail(invocation: &Invocation, state: &mut EditorState, error: String) -> Resp
     if state.process_name.is_empty() {
         return reset_error(invocation, state, error);
     }
+    state.failure_message = error;
     state.phase = "stopping".into();
     continue_with(
         invocation,
@@ -992,17 +1096,93 @@ fn fail(invocation: &Invocation, state: &mut EditorState, error: String) -> Resp
 mod tests {
     use super::*;
 
+    fn editor_invocation(state: Value, events: Vec<super::super::ExtensionEvent>) -> Invocation {
+        Invocation {
+            name: "editor_lsp".into(),
+            arguments: json!({
+                "operation":"completion",
+                "path":"src/main.rs",
+                "document_id":7,
+                "version":1,
+                "text":"fn main() {}",
+                "position":{"line":0,"character":0},
+            }),
+            state,
+            events,
+        }
+    }
+
+    fn extension_state(state: &EditorState) -> Value {
+        json!({"editor":serde_json::to_value(state).unwrap()})
+    }
+
+    fn process_event(operation: &str, message: Value) -> super::super::ExtensionEvent {
+        super::super::ExtensionEvent {
+            topic: "broker_response".into(),
+            payload: json!({
+            "api_version":2,
+            "receipt_id":1,
+            "scope":"editor-session",
+            "capability":"process",
+                "operation":operation,
+                "ok":true,
+                "value":{"message":message.to_string()},
+            }),
+        }
+    }
+
+    fn recv_event(data: &str, eof: bool) -> super::super::ExtensionEvent {
+        process_event("recv", json!({"data":data,"eof":eof}))
+    }
+
+    fn process_error_event(
+        operation: &str,
+        code: &str,
+        message: &str,
+    ) -> super::super::ExtensionEvent {
+        super::super::ExtensionEvent {
+            topic: "broker_response".into(),
+            payload: json!({
+            "api_version":2,
+            "receipt_id":1,
+            "scope":"editor-session",
+            "capability":"process",
+                "operation":operation,
+                "ok":false,
+                "error":{"code":code,"message":message},
+            }),
+        }
+    }
+
+    fn initializing_state() -> EditorState {
+        EditorState {
+            phase: "initializing".into(),
+            server: "rust-analyzer".into(),
+            process_name: "lsp-editor-rust-analyzer".into(),
+            language_id: "rust".into(),
+            workspace_root: "/workspace".into(),
+            root_uri: "file:///workspace".into(),
+            candidate_uri: "file:///workspace/src/main.rs".into(),
+            pending_request_id: 1,
+            next_request_id: 2,
+            pending_method: "initialize".into(),
+            ..EditorState::default()
+        }
+    }
+
     #[test]
     fn editor_server_map_is_fixed_and_uses_language_specific_ids() {
         assert_eq!(server_for("src/main.rs").unwrap().language_id, "rust");
         assert_eq!(
             server_for("src/view.jsx").unwrap().language_id,
-            "javascript"
+            "javascriptreact"
         );
         assert_eq!(
             server_for("src/view.tsx").unwrap().language_id,
-            "typescript"
+            "typescriptreact"
         );
+        assert_eq!(server_for("src/view.js").unwrap().language_id, "javascript");
+        assert_eq!(server_for("src/view.ts").unwrap().language_id, "typescript");
         assert_eq!(server_for("src/main.go").unwrap().program, "gopls");
         assert_eq!(
             server_for("src/main.pyi").unwrap().program,
@@ -1136,6 +1316,7 @@ mod tests {
         let body: Value = serde_json::from_str(&response.message).unwrap();
         assert_eq!(body["result"], Value::Null);
         assert_eq!(body["diagnostics"], Value::Null);
+        assert_eq!(body["server_document_version"], Value::Null);
         assert_eq!(state.document.as_ref().unwrap().document_id, 9);
         assert_eq!(state.diagnostics_version, Some(document.server_version));
     }
@@ -1216,5 +1397,278 @@ mod tests {
         assert_eq!(outer["server"], "agent-lsp");
         assert_eq!(outer["other"]["kept"], true);
         assert_eq!(outer["editor"]["phase"], "ready");
+    }
+
+    #[test]
+    fn editor_file_uris_encode_unix_windows_and_unc_paths() {
+        assert_eq!(
+            editor_file_uri("/tmp/a b/é#.rs"),
+            "file:///tmp/a%20b/%C3%A9%23.rs"
+        );
+        assert_eq!(
+            editor_file_uri(r"C:\Users\dev\file name.ts"),
+            "file:///C:/Users/dev/file%20name.ts"
+        );
+        assert_eq!(
+            editor_file_uri(r"\\server\share\folder name\file.rs"),
+            "file://server/share/folder%20name/file.rs"
+        );
+    }
+
+    #[test]
+    fn initialization_advertises_safe_code_action_literals_only() {
+        let params = initialize_params(&initializing_state());
+        let capabilities = &params["capabilities"];
+        assert_eq!(
+            capabilities["textDocument"]["codeAction"]["codeActionLiteralSupport"]
+                ["codeActionKind"]["valueSet"],
+            json!(["quickfix", "refactor", "source"])
+        );
+        assert!(capabilities["workspace"].get("applyEdit").is_none());
+        assert!(
+            capabilities["textDocument"]["codeAction"]
+                .get("resolveSupport")
+                .is_none()
+        );
+        assert!(capabilities["workspace"].get("executeCommand").is_none());
+    }
+
+    #[test]
+    fn absent_editor_metadata_cleans_only_editor_processes() {
+        assert_eq!(
+            editor_processes_to_kill("", "lsp-editor-rust-analyzer"),
+            vec!["lsp-editor-rust-analyzer"]
+        );
+        assert_eq!(
+            editor_processes_to_kill("lsp-rust-analyzer", "lsp-editor-rust-analyzer"),
+            vec!["lsp-editor-rust-analyzer"]
+        );
+        assert_eq!(
+            editor_processes_to_kill(
+                "lsp-editor-typescript-language-server",
+                "lsp-editor-rust-analyzer",
+            ),
+            vec![
+                "lsp-editor-typescript-language-server",
+                "lsp-editor-rust-analyzer",
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_live_read_retries_and_initialization_can_complete() {
+        let state = extension_state(&initializing_state());
+        let response = super::handle(&editor_invocation(
+            state,
+            vec![recv_event("", false)],
+        ));
+        assert!(response.continue_after_broker);
+        let state = response.state.unwrap();
+        let editor: EditorState = serde_json::from_value(state["editor"].clone()).unwrap();
+        assert_eq!(editor.phase, "initializing");
+        assert_eq!(editor.timeout_reads, 1);
+
+        let initialize = json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "result":{"capabilities":{"positionEncoding":"utf-16"}},
+        });
+        let response = super::handle(&editor_invocation(
+            state,
+            vec![recv_event(&initialize.to_string(), false)],
+        ));
+        assert!(response.continue_after_broker);
+        let editor: EditorState =
+            serde_json::from_value(response.state.unwrap()["editor"].clone()).unwrap();
+        assert_eq!(editor.phase, "sending_query");
+        assert_eq!(editor.timeout_reads, 0);
+        assert_eq!(editor.document.unwrap().server_version, 1);
+    }
+
+    #[test]
+    fn startup_and_query_timeout_budgets_fail_with_actionable_errors() {
+        for (phase, expected_limit, expected_error) in [
+            (
+                "initializing",
+                MAX_STARTUP_EMPTY_READS,
+                "Timed out waiting for language-server startup response",
+            ),
+            (
+                "querying",
+                MAX_QUERY_EMPTY_READS,
+                "Timed out waiting for language-server query response",
+            ),
+        ] {
+            let mut state = EditorState {
+                phase: phase.into(),
+                server: "rust-analyzer".into(),
+                process_name: "lsp-editor-rust-analyzer".into(),
+                pending_request_id: 3,
+                pending_method: "textDocument/completion".into(),
+                pending_operation: "completion".into(),
+                ..EditorState::default()
+            };
+            if phase == "querying" {
+                state.document = Some(DocumentState {
+                    path: "src/main.rs".into(),
+                    uri: "file:///workspace/src/main.rs".into(),
+                    document_id: 7,
+                    version: 1,
+                    server_version: 2,
+                    language_id: "rust".into(),
+                });
+                state.last_server_version = 2;
+            }
+            let mut state = extension_state(&state);
+            for _ in 0..expected_limit {
+                let response = super::handle(&editor_invocation(state, vec![recv_event("", false)]));
+                assert!(response.continue_after_broker);
+                state = response.state.unwrap();
+            }
+            let editor: EditorState =
+                serde_json::from_value(state["editor"].clone()).unwrap();
+            assert_eq!(editor.phase, "stopping");
+            assert_eq!(editor.timeout_reads, expected_limit);
+
+            let stopped = super::handle(&editor_invocation(state, vec![]));
+            assert_eq!(stopped.error.as_deref(), Some(expected_error));
+        }
+    }
+
+    #[test]
+    fn eof_fails_without_spending_the_timeout_budget() {
+        let state = extension_state(&initializing_state());
+        let response =
+            super::handle(&editor_invocation(state, vec![recv_event("", true)]));
+        let state = response.state.unwrap();
+        let editor: EditorState = serde_json::from_value(state["editor"].clone()).unwrap();
+        assert_eq!(editor.phase, "stopping");
+        assert_eq!(editor.timeout_reads, 0);
+        assert_eq!(
+            editor.failure_message,
+            "process/recv reached EOF before a JSON-RPC response"
+        );
+    }
+
+    #[test]
+    fn query_completes_after_notifications_and_empty_reads() {
+        let document = DocumentState {
+            path: "src/main.rs".into(),
+            uri: "file:///workspace/src/main.rs".into(),
+            document_id: 7,
+            version: 2,
+            server_version: 4,
+            language_id: "rust".into(),
+        };
+        let state = EditorState {
+            phase: "querying".into(),
+            server: "rust-analyzer".into(),
+            process_name: "lsp-editor-rust-analyzer".into(),
+            document: Some(document.clone()),
+            last_server_version: document.server_version,
+            pending_request_id: 9,
+            pending_method: "textDocument/completion".into(),
+            pending_operation: "completion".into(),
+            ..EditorState::default()
+        };
+        let notification = json!({
+            "jsonrpc":"2.0",
+            "method":"textDocument/publishDiagnostics",
+            "params":{
+                "uri":document.uri,
+                "version":document.server_version,
+                "diagnostics":[{"message":"warning"}],
+            },
+        });
+        let response = super::handle(&editor_invocation(
+            extension_state(&state),
+            vec![recv_event(&notification.to_string(), false)],
+        ));
+        let state = response.state.unwrap();
+        let editor: EditorState = serde_json::from_value(state["editor"].clone()).unwrap();
+        assert_eq!(editor.pump_steps, 1);
+        assert_eq!(editor.timeout_reads, 0);
+        assert_eq!(current_diagnostics(&editor).len(), 1);
+
+        let response = super::handle(&editor_invocation(state, vec![recv_event("", false)]));
+        let state = response.state.unwrap();
+        let editor: EditorState = serde_json::from_value(state["editor"].clone()).unwrap();
+        assert_eq!(editor.phase, "querying");
+        assert_eq!(editor.pump_steps, 1);
+        assert_eq!(editor.timeout_reads, 1);
+
+        let completion = json!({"jsonrpc":"2.0","id":9,"result":{"items":[]}});
+        let response = super::handle(&editor_invocation(
+            state,
+            vec![recv_event(&completion.to_string(), false)],
+        ));
+        let body: Value = serde_json::from_str(&response.message).unwrap();
+        assert_eq!(body["server_document_version"], 4);
+        assert_eq!(body["diagnostics"].as_array().unwrap().len(), 1);
+        let editor: EditorState =
+            serde_json::from_value(response.state.unwrap()["editor"].clone()).unwrap();
+        assert_eq!(editor.phase, "ready");
+        assert_eq!(editor.timeout_reads, 0);
+        assert_eq!(editor.pump_steps, 0);
+    }
+
+    #[test]
+    fn close_send_failure_stops_transport_and_preserves_the_broker_error() {
+        let state = EditorState {
+            phase: "closing".into(),
+            server: "rust-analyzer".into(),
+            process_name: "lsp-editor-rust-analyzer".into(),
+            ..EditorState::default()
+        };
+        let response = super::handle(&editor_invocation(
+            extension_state(&state),
+            vec![process_error_event("send", "permission_denied", "close denied")],
+        ));
+        let state = response.state.unwrap();
+        let editor: EditorState = serde_json::from_value(state["editor"].clone()).unwrap();
+        assert_eq!(editor.phase, "stopping");
+        assert!(editor
+            .failure_message
+            .contains("process/send broker error permission_denied: close denied"));
+
+        let response = super::handle(&editor_invocation(state, vec![]));
+        assert_eq!(
+            response.error.as_deref(),
+            Some("process/send broker error permission_denied: close denied")
+        );
+    }
+
+    #[test]
+    fn server_document_version_stops_before_i32_overflow() {
+        let document = DocumentState {
+            path: "src/main.rs".into(),
+            uri: "file:///workspace/src/main.rs".into(),
+            document_id: 7,
+            version: 1,
+            server_version: i32::MAX,
+            language_id: "rust".into(),
+        };
+        let state = EditorState {
+            phase: "ready".into(),
+            server: "rust-analyzer".into(),
+            process_name: "lsp-editor-rust-analyzer".into(),
+            document: Some(document),
+            last_server_version: i32::MAX,
+            ..EditorState::default()
+        };
+        let mut invocation = editor_invocation(
+            extension_state(&state),
+            vec![],
+        );
+        invocation.arguments["version"] = json!(2);
+        let response = super::handle(&invocation);
+        let editor: EditorState =
+            serde_json::from_value(response.state.unwrap()["editor"].clone()).unwrap();
+        assert_eq!(editor.phase, "stopping");
+        assert_eq!(editor.last_server_version, i32::MAX);
+        assert_eq!(
+            editor.failure_message,
+            "Editor language-server document version exhausted"
+        );
     }
 }

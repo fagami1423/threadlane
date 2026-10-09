@@ -54,6 +54,7 @@ pub struct EditorLspResponse {
     pub version: u64,
     pub runtime_id: u64,
     pub server: String,
+    pub server_document_version: Option<i32>,
     pub result: serde_json::Value,
     /// Only diagnostics known to belong to this snapshot. `None` means pending
     /// or unsupported, not a clean buffer; an empty array means no diagnostics.
@@ -106,6 +107,7 @@ mod tests {
                 version: 7,
                 runtime_id: 9,
                 server: "rust-analyzer".into(),
+                server_document_version: Some(4),
                 result: serde_json::json!({"items":[]}),
                 diagnostics: Some(vec![]),
             }),

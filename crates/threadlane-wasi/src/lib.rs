@@ -146,6 +146,59 @@ impl WasiExtensionInvocationResult {
     }
 }
 
+fn merge_extension_state(
+    previous: &Value,
+    response_state: Option<Value>,
+    ephemeral: bool,
+    ephemeral_keys: &HashSet<String>,
+) -> Result<Value, String> {
+    if ephemeral {
+        let Some(response_state) = response_state else {
+            return Ok(previous.clone());
+        };
+        let Some(previous) = previous.as_object() else {
+            if response_state
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+            {
+                return Ok(previous.clone());
+            }
+            return Err(
+                "Cannot preserve non-ephemeral extension state because it is not an object".into(),
+            );
+        };
+        let mut next = response_state
+            .as_object()
+            .cloned()
+            .ok_or("Ephemeral extension state response must be an object")?;
+        for (key, value) in previous {
+            if !ephemeral_keys.contains(key) {
+                next.insert(key.clone(), value.clone());
+            }
+        }
+        return Ok(Value::Object(next));
+    }
+
+    let mut next = response_state.unwrap_or_else(|| serde_json::json!({}));
+    let Some(previous) = previous.as_object() else {
+        return Ok(next);
+    };
+    let reserved = previous
+        .iter()
+        .filter(|(key, _)| ephemeral_keys.contains(*key))
+        .collect::<Vec<_>>();
+    if reserved.is_empty() {
+        return Ok(next);
+    }
+    let next = next
+        .as_object_mut()
+        .ok_or("Cannot preserve ephemeral extension state because the response state is not an object")?;
+    for (key, value) in reserved {
+        next.insert(key.clone(), value.clone());
+    }
+    Ok(Value::Object(next.clone()))
+}
+
 #[derive(Default)]
 struct WasiStoreData {
     policy: CapabilityPolicy,
@@ -2889,6 +2942,7 @@ impl WasiExtensionManager {
             owns_operation,
             identity.filter(|_| kind == "hook"),
         )?;
+        let previous_state = state.clone();
         #[derive(Serialize)]
         struct Invocation<'a> {
             api_version: u32,
@@ -2927,17 +2981,24 @@ impl WasiExtensionManager {
             ),
         }
         .and_then(|mut result| {
-            // Missing state resets stale transient phases to the stable default.
-            // Commit before acknowledging events or exposing broker work to the host.
+            // Merge state before acknowledging events or exposing broker work.
             let _commit = self
                 .state_commit
                 .lock()
                 .map_err(|_| "Extension state commit lock poisoned".to_string())?;
-            let state = result
-                .response
-                .state
-                .clone()
-                .unwrap_or_else(|| serde_json::json!({}));
+            let ephemeral_keys = self
+                .ephemeral_state_keys
+                .lock()
+                .map_err(|_| "Ephemeral extension state lock poisoned".to_string())?
+                .get(&extension.manifest.name)
+                .cloned()
+                .unwrap_or_default();
+            let state = merge_extension_state(
+                &previous_state,
+                result.response.state.clone(),
+                ephemeral,
+                &ephemeral_keys,
+            )?;
             let mut requests = if result.response.error.is_none() {
                 self.filter_granted_requests(
                     std::mem::take(&mut result.broker_requests)
@@ -4061,6 +4122,83 @@ mod ephemeral_broker_tests {
             .unwrap()
             .get(name)
             .is_none_or(Vec::is_empty));
+    }
+
+    #[test]
+    fn ordinary_state_reset_preserves_ephemeral_editor_memory_but_not_checkpoint() {
+        let project = tempfile::tempdir().unwrap();
+        let manager = WasiExtensionManager::for_project_session(project.path(), "editor-session");
+        manager
+            .reload_from_roots(None, Some(project.path()))
+            .unwrap();
+        let name = "lsp_ext";
+        let keys = HashSet::from(["editor".to_owned()]);
+        manager
+            .ephemeral_state_keys
+            .lock()
+            .unwrap()
+            .insert(name.into(), keys.clone());
+        let previous = serde_json::json!({
+            "editor":{"phase":"ready","document_id":7},
+            "agent_lsp":{"server":"rust-analyzer"},
+        });
+
+        let state = merge_extension_state(&previous, None, false, &keys).unwrap();
+        assert_eq!(state["editor"]["document_id"], 7);
+        assert!(state.get("agent_lsp").is_none());
+        manager
+            .persist_state_events_reply(name, &state, false, None, None)
+            .unwrap();
+        manager.states.lock().unwrap().insert(name.into(), state.clone());
+
+        assert_eq!(manager.extension_state(name), Some(state));
+        let checkpoint = manager
+            .load_checkpoint_in_scope(name, &Some("editor-session".into()))
+            .unwrap()
+            .unwrap();
+        assert!(checkpoint.state.get("editor").is_none());
+        assert!(checkpoint.state.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ephemeral_failure_without_state_preserves_agent_state() {
+        let project = tempfile::tempdir().unwrap();
+        let manager = WasiExtensionManager::for_project_session(project.path(), "editor-session");
+        manager
+            .reload_from_roots(None, Some(project.path()))
+            .unwrap();
+        let name = "lsp_ext";
+        let keys = HashSet::from(["editor".to_owned()]);
+        manager
+            .ephemeral_state_keys
+            .lock()
+            .unwrap()
+            .insert(name.into(), keys.clone());
+        let previous = serde_json::json!({
+            "editor":{"phase":"querying","document_id":7},
+            "agent_lsp":{"phase":"requesting","server":"rust-analyzer"},
+        });
+
+        let state = merge_extension_state(&previous, None, true, &keys).unwrap();
+        assert_eq!(state, previous);
+        manager
+            .persist_state_events_reply(name, &state, false, None, None)
+            .unwrap();
+        manager.states.lock().unwrap().insert(name.into(), state.clone());
+
+        assert_eq!(
+            manager.extension_state(name).unwrap()["agent_lsp"]["phase"],
+            "requesting"
+        );
+        let checkpoint = manager
+            .load_checkpoint_in_scope(name, &Some("editor-session".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            checkpoint.state["agent_lsp"]["server"],
+            "rust-analyzer"
+        );
+        assert!(checkpoint.state.get("editor").is_none());
     }
 }
 

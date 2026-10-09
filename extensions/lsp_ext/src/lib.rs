@@ -454,7 +454,40 @@ fn fs_message(event: &ExtensionEvent, operation: &str) -> Option<Result<String, 
     Some(Ok(value.message.as_str().unwrap_or_default().to_owned()))
 }
 
+#[derive(Debug, PartialEq)]
+enum ProcessRecvMessage {
+    Message(serde_json::Value),
+    Timeout,
+    Eof,
+}
+
 fn broker_message(
+    event: &ExtensionEvent,
+    operation: &str,
+) -> Option<Result<serde_json::Value, String>> {
+    let response = process_broker_message(event, operation)?;
+    if operation != "recv" {
+        return Some(response);
+    }
+    Some(response.and_then(|message| match process_recv_message(message)? {
+        ProcessRecvMessage::Message(message) => Ok(message),
+        ProcessRecvMessage::Timeout => {
+            Err("process/recv timed out without a JSON-RPC response".into())
+        }
+        ProcessRecvMessage::Eof => {
+            Err("process/recv reached EOF before a JSON-RPC response".into())
+        }
+    }))
+}
+
+fn broker_recv_message(
+    event: &ExtensionEvent,
+) -> Option<Result<ProcessRecvMessage, String>> {
+    process_broker_message(event, "recv")
+        .map(|message| message.and_then(process_recv_message))
+}
+
+fn process_broker_message(
     event: &ExtensionEvent,
     operation: &str,
 ) -> Option<Result<serde_json::Value, String>> {
@@ -502,24 +535,26 @@ fn broker_message(
         }
         value => value,
     };
-    if operation != "recv" {
-        return Some(Ok(message));
-    }
+    Some(Ok(message))
+}
+
+fn process_recv_message(
+    message: serde_json::Value,
+) -> Result<ProcessRecvMessage, String> {
     let data = message
         .get("data")
         .and_then(serde_json::Value::as_str)
-        .filter(|data| !data.is_empty())
-        .ok_or_else(|| {
-            if message.get("eof").and_then(serde_json::Value::as_bool) == Some(true) {
-                "process/recv reached EOF before a JSON-RPC response".into()
-            } else {
-                "process/recv timed out without a JSON-RPC response".into()
-            }
-        });
-    Some(data.and_then(|data| {
-        serde_json::from_str(data)
-            .map_err(|error| format!("Invalid process/recv JSON-RPC payload: {error}"))
-    }))
+        .ok_or_else(|| "process/recv response is missing string data".to_owned())?;
+    if data.is_empty() {
+        return match message.get("eof").and_then(serde_json::Value::as_bool) {
+            Some(true) => Ok(ProcessRecvMessage::Eof),
+            Some(false) => Ok(ProcessRecvMessage::Timeout),
+            None => Err("process/recv response is missing its EOF flag".into()),
+        };
+    }
+    serde_json::from_str(data)
+        .map(ProcessRecvMessage::Message)
+        .map_err(|error| format!("Invalid process/recv JSON-RPC payload: {error}"))
 }
 
 fn lsp_language_id(path: &str) -> &'static str {
