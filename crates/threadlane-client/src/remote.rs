@@ -158,8 +158,10 @@ impl RemoteDaemon {
         Self::start(url.into(), token, None, Ok(executor), false)
     }
 
-    /// Explicit opt-in for the existing token-protected LAN pairing listener.
-    /// Only literal private/link-local/loopback IPs or localhost are accepted.
+    /// Explicit opt-in for the existing token-protected LAN/VPN pairing listener.
+    /// Only literal private/link-local/loopback/shared IPs or localhost are accepted.
+    /// Shared IPv4 addresses (100.64.0.0/10) support Tailscale; callers must ensure
+    /// their VPN is connected, since the address alone does not guarantee encryption.
     /// Ordinary remote connections retain the TLS policy.
     pub fn connect_pairing(
         url: impl Into<String>,
@@ -192,22 +194,24 @@ impl RemoteDaemon {
             .into_client_request()
             .map_err(|_| "invalid pairing URL")?;
         let uri = request.uri();
-        let local = uri.host().is_some_and(|host| {
+        let pairing_address = uri.host().is_some_and(|host| {
             host == "localhost"
                 || host
                     .trim_matches(['[', ']'])
                     .parse::<std::net::IpAddr>()
                     .is_ok_and(|ip| match ip {
                         std::net::IpAddr::V4(ip) => {
-                            ip.is_loopback() || ip.is_private() || ip.is_link_local()
+                            let [first, second, ..] = ip.octets();
+                            let shared = first == 100 && (64..=127).contains(&second);
+                            ip.is_loopback() || ip.is_private() || ip.is_link_local() || shared
                         }
                         std::net::IpAddr::V6(ip) => {
                             ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
                         }
                     })
         });
-        if uri.scheme_str() != Some("ws") || !local {
-            return Err("pairing requires a local network ws:// address".into());
+        if uri.scheme_str() != Some("ws") || !pairing_address {
+            return Err("Pairing requires a local network or Tailscale IPv4 ws:// address. Use your desktop's IP address, not a hostname.".into());
         }
         Ok(())
     }
@@ -1462,11 +1466,14 @@ mod tests {
     }
 
     #[test]
-    fn pairing_is_explicit_and_confined_to_token_protected_local_addresses() {
+    fn pairing_is_explicit_and_confined_to_token_protected_local_or_shared_addresses() {
         for address in [
             "ws://127.0.0.1:8080",
             "ws://192.168.1.10:8080",
             "ws://10.0.0.1:8080",
+            "ws://100.64.0.0:8080",
+            "ws://100.101.102.103:8080",
+            "ws://100.127.255.255:8080",
             "ws://[::1]:8080",
         ] {
             assert!(
@@ -1476,8 +1483,12 @@ mod tests {
         }
         for address in [
             "ws://8.8.8.8:8080",
+            "ws://100.63.255.255:8080",
+            "ws://100.128.0.0:8080",
             "ws://example.com:8080",
+            "ws://desktop.example.ts.net:8080",
             "wss://192.168.1.10:8080",
+            "wss://100.101.102.103:8080",
         ] {
             assert!(
                 RemoteDaemon::validate_pairing(address, "token").is_err(),
@@ -1485,6 +1496,14 @@ mod tests {
             );
         }
         assert!(RemoteDaemon::validate_pairing("ws://127.0.0.1:8080", "").is_err());
+        for token in ["", " ", "invalid\r\ntoken"] {
+            assert!(RemoteDaemon::validate_pairing("ws://100.101.102.103:8080", token).is_err());
+        }
+        assert!(RemoteDaemon::transport_policy_error(
+            "ws://100.101.102.103:8080",
+            &Some("token".into())
+        )
+        .is_some());
         assert!(RemoteDaemon::transport_policy_error(
             "ws://192.168.1.10:8080",
             &Some("token".into())
