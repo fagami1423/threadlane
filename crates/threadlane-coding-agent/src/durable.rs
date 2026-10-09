@@ -979,15 +979,29 @@ impl CodingAgent {
         };
         for (index, lane) in lanes.iter().enumerate() {
             if let Some(path) = self.session_file.as_deref() {
-                let mut journal = CodingSessionHarness::open(path)?;
-                if let Err(error) = journal.commit_subagent_lane(lane) {
-                    self.completed_subagent_lanes
-                        .lock()
-                        .map_err(|_| "Completed subagent lane sink is unavailable".to_string())?
-                        .extend_from_slice(&lanes[index..]);
-                    self.interrupted_subagent_recovery = InterruptedSubagentRecoveryState::Pending;
-                    return Err(error);
-                }
+                let mut journal = match CodingSessionHarness::open(path).and_then(|mut journal| {
+                    journal.commit_subagent_lane(lane)?;
+                    Ok(journal)
+                }) {
+                    Ok(journal) => journal,
+                    Err(error) => {
+                        self.completed_subagent_lanes
+                            .lock()
+                            .map_err(|_| "Completed subagent lane sink is unavailable".to_string())?
+                            .extend_from_slice(&lanes[index..]);
+                        self.interrupted_subagent_recovery =
+                            InterruptedSubagentRecoveryState::Pending;
+                        return Err(error);
+                    }
+                };
+                self.hub.settle_run(
+                    &lane.lane_name,
+                    &lane.run_id,
+                    match lane.status {
+                        SubagentLaneStatus::Completed => "completed",
+                        SubagentLaneStatus::Failed => "failed",
+                    },
+                );
                 #[cfg(test)]
                 if let Some(observer) = self.subagent_branch_observer.as_ref() {
                     observer();

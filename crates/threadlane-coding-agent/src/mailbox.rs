@@ -165,6 +165,27 @@ impl SubagentHub {
         self.wake.notify_waiters();
     }
 
+    /// A delayed parent completion must not settle a newer revived run on the same lane.
+    pub(crate) fn settle_run(&self, lane_name: &str, run_id: &str, outcome: &str) {
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let Some(lane) = inner
+                .lanes
+                .get(lane_name)
+                .filter(|lane| lane.run_id == run_id)
+            else {
+                return;
+            };
+            let killed = inner.killed.contains(lane_name) || inner.killed.contains(&lane.agent);
+            inner.lanes.get_mut(lane_name).unwrap().live = false;
+            inner.outcomes.insert(
+                lane_name.to_owned(),
+                if killed { "killed" } else { outcome }.to_owned(),
+            );
+        }
+        self.wake.notify_waiters();
+    }
+
     /// Record a terminal outcome (`completed`, `failed`, `killed`).
     pub(crate) fn set_outcome(&self, lane_name: &str, outcome: impl Into<String>) {
         {
@@ -454,6 +475,36 @@ pub type ReviveHook = Arc<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settling_old_run_does_not_settle_revived_lane_and_preserves_kill_outcome() {
+        let hub = SubagentHub::new();
+        hub.register(
+            "lane".into(),
+            "old-run".into(),
+            "worker".into(),
+            "task".into(),
+            "model".into(),
+        );
+        hub.settle_run("lane", "old-run", "completed");
+        assert!(!hub.resolve_lane("lane").unwrap().live);
+        hub.register(
+            "lane".into(),
+            "new-run".into(),
+            "worker".into(),
+            "task".into(),
+            "model".into(),
+        );
+        hub.settle_run("lane", "old-run", "failed");
+        let revived = hub.resolve_lane("lane").unwrap();
+        assert!(revived.live);
+        assert_eq!(revived.outcome, None);
+        assert!(hub.flag_killed("lane", "worker"));
+        hub.settle_run("lane", "new-run", "failed");
+        let killed = hub.resolve_lane("lane").unwrap();
+        assert!(!killed.live);
+        assert_eq!(killed.outcome.as_deref(), Some("killed"));
+    }
 
     #[test]
     fn peer_send_drain_and_alias_resolution() {

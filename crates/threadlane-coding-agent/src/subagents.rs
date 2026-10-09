@@ -510,17 +510,21 @@ pub(crate) fn accept_completed_subagent_lanes(
     lanes: Vec<CompletedSubagentLane>,
     session_file: Option<&Path>,
 ) -> Result<(), String> {
+    // Publish only after the child writer is done; failed commits remain queued for retry.
+    let committed = (|| {
+        if let Some(path) = session_file {
+            let mut journal = CodingSessionHarness::open(path)?;
+            for lane in &lanes {
+                journal.commit_subagent_lane(lane)?;
+            }
+        }
+        Ok(())
+    })();
     completed_lanes
         .lock()
         .map_err(|_| "Completed subagent lane sink is unavailable".to_string())?
-        .extend(lanes.clone());
-    if let Some(path) = session_file {
-        let mut journal = CodingSessionHarness::open(path)?;
-        for lane in &lanes {
-            journal.commit_subagent_lane(lane)?;
-        }
-    }
-    Ok(())
+        .extend(lanes);
+    committed
 }
 
 pub(crate) async fn run_subagents_with_context(
@@ -883,18 +887,11 @@ pub(crate) async fn run_subagents_with_context(
                     session_file.as_deref(),
                 )?;
             }
-            // Record the terminal outcome for `hub list`/`hub wait`. A lane
-            // killed via `hub kill` keeps its `killed` outcome instead of
-            // being relabeled by the natural completion path.
-            if hub_for_outcome.is_killed(&lane.lane_name, &lane.agent) {
-                hub_for_outcome.set_outcome(&lane.lane_name, "killed");
-            } else {
-                hub_for_outcome.set_outcome(
-                    &lane.lane_name,
-                    if succeeded { "completed" } else { "failed" },
-                );
-            }
-            hub_for_outcome.mark_settled(&lane.lane_name, false);
+            hub_for_outcome.settle_run(
+                &lane.lane_name,
+                &lane.run_id,
+                if succeeded { "completed" } else { "failed" },
+            );
             Ok((result, lane))
         }
     };
@@ -1177,15 +1174,11 @@ pub(crate) async fn revive_subagent_lane(
             );
             return;
         }
-        if hub.is_killed(&lane.lane_name, &lane.agent) {
-            hub.set_outcome(&lane.lane_name, "killed");
-        } else {
-            hub.set_outcome(
-                &lane.lane_name,
-                if succeeded { "completed" } else { "failed" },
-            );
-        }
-        hub.mark_settled(&lane.lane_name, false);
+        hub.settle_run(
+            &lane.lane_name,
+            &lane.run_id,
+            if succeeded { "completed" } else { "failed" },
+        );
     });
     Ok(format!(
         "Revived lane {lane_name} with a follow-up turn. Use `hub wait` to block until it settles and `hub read {lane_name}` for output."
@@ -2831,6 +2824,148 @@ mod result_tests {
             1,
             "cancelled worker must release child state"
         );
+    }
+
+    #[test]
+    fn completion_commits_before_waiting_to_publish_to_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let child = CodingSessionHarness::open(&path)
+            .unwrap()
+            .start_subagent_lane("worker", "task", None)
+            .unwrap();
+        let lane = CompletedSubagentLane {
+            lane_name: child.identity.lane_name,
+            run_id: child.identity.run_id,
+            agent: "worker".into(),
+            task: "task".into(),
+            model: "test-model".into(),
+            status: SubagentLaneStatus::Completed,
+            messages: vec![],
+            error: None,
+            escalation_reason: None,
+        };
+        let sink = Arc::new(std::sync::Mutex::new(vec![]));
+        let parent = sink.lock().unwrap();
+        let child_sink = sink.clone();
+        let child_path = path.clone();
+        let run_id = lane.run_id.clone();
+        let child = std::thread::spawn(move || {
+            accept_completed_subagent_lanes(&child_sink, vec![lane], Some(&child_path)).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let committed = loop {
+            let store = JsonlStore::open_read_only(&path).unwrap();
+            if store.records().iter().any(|record| matches!(record,
+                threadlane_runtime::harness::Record::OperationFinished { run_id: id, .. } if id == &run_id)) {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::yield_now();
+        };
+        drop(parent);
+        child.join().unwrap();
+        assert!(
+            committed,
+            "child commit must finish before publication can race a parent drain"
+        );
+        assert_eq!(sink.lock().unwrap().len(), 1);
+        let store = JsonlStore::open_read_only(&path).unwrap();
+        assert_eq!(
+            store
+                .entries()
+                .iter()
+                .filter(|entry| matches!(&entry.message,
+            AgentMessage::Custom { custom_type, .. } if custom_type == "subagent_lane"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_retry_settles_hub_after_child_commit_failure() {
+        use crate::{CodingAgent, CodingAgentOptions};
+        use threadlane_prompt::SystemPromptConfig;
+        use threadlane_runtime::harness::Reducer;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut agent = CodingAgent::new(CodingAgentOptions {
+            api_key: "test-key".into(),
+            account_id: None,
+            model: "test-model".into(),
+            work_dir: dir.path().into(),
+            session_file: Some(path.clone()),
+            system_prompt: SystemPromptConfig::default(),
+            agent_config: None,
+            coding_config: None,
+            browser: BrowserBridge::unavailable(),
+        });
+        agent
+            .begin_harness_run(AgentMessage::user("parent task", vec![]))
+            .await
+            .unwrap();
+        let child = agent
+            .harness
+            .as_mut()
+            .unwrap()
+            .start_subagent_lane("worker", "task", None)
+            .unwrap();
+        let lane = CompletedSubagentLane {
+            lane_name: child.identity.lane_name,
+            run_id: child.identity.run_id,
+            agent: "worker".into(),
+            task: "task".into(),
+            model: "test-model".into(),
+            status: SubagentLaneStatus::Failed,
+            messages: vec![],
+            error: Some("child timed out".into()),
+            escalation_reason: None,
+        };
+        agent.hub.register(
+            lane.lane_name.clone(),
+            lane.run_id.clone(),
+            lane.agent.clone(),
+            lane.task.clone(),
+            lane.model.clone(),
+        );
+        let backup = dir.path().join("session.backup");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let error = accept_completed_subagent_lanes(
+            &agent.completed_subagent_lanes,
+            vec![lane.clone()],
+            Some(&path),
+        )
+        .unwrap_err();
+        assert!(!error.is_empty());
+        assert_eq!(agent.completed_subagent_lanes.lock().unwrap().len(), 1);
+        assert!(agent.hub.resolve_lane(&lane.lane_name).unwrap().live);
+        assert!(agent.commit_completed_subagent_lanes().is_err());
+        assert_eq!(
+            agent.completed_subagent_lanes.lock().unwrap().len(),
+            1,
+            "failed parent retry must retain completion"
+        );
+        assert!(agent.hub.resolve_lane(&lane.lane_name).unwrap().live);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
+        agent.commit_completed_subagent_lanes().unwrap();
+        let roster = agent.hub.resolve_lane(&lane.lane_name).unwrap();
+        assert!(!roster.live, "successful parent retry must settle the hub");
+        assert_eq!(roster.outcome.as_deref(), Some("failed"));
+        let store = JsonlStore::open_read_only(&path).unwrap();
+        assert!(Reducer::reduce(&store)
+            .unwrap()
+            .lane(&lane.lane_name)
+            .unwrap()
+            .open_operation
+            .is_none());
+        CodingSessionHarness::open(&path)
+            .unwrap()
+            .resume_subagent_lane(&lane.lane_name, "recover partial work")
+            .unwrap();
     }
 
     #[tokio::test]
