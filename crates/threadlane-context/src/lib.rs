@@ -156,7 +156,11 @@ mod tests {
             "claude-haiku-5-5",
             "claude-fable-5-1",
         ] {
-            assert_eq!(model_context_limit(&format!("anthropic/{id}")), Some(1_000_000), "{id}");
+            assert_eq!(
+                model_context_limit(&format!("anthropic/{id}")),
+                Some(1_000_000),
+                "{id}"
+            );
             assert_eq!(model_context_limit(id), Some(1_000_000), "{id}");
         }
         assert_eq!(model_context_limit("anthropic/claude-unknown-9"), None);

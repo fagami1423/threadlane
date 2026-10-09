@@ -1589,7 +1589,10 @@ mod tests {
         assert!(!is_opencode_model("anthropic/claude-sonnet-x"));
         assert!(!is_antigravity_model("anthropic/claude-sonnet-x"));
         let client = ProviderClient::new("key".to_string(), None);
-        assert_eq!(client.provider_kind("anthropic/claude-sonnet-x"), "anthropic");
+        assert_eq!(
+            client.provider_kind("anthropic/claude-sonnet-x"),
+            "anthropic"
+        );
         assert_eq!(client.provider_kind("opencode-go/kimi-k3"), "opencode-go");
         assert_eq!(client.provider_kind("gpt-5"), "openai");
         assert_eq!(

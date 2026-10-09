@@ -1265,7 +1265,9 @@ mod tests {
         assert!(models.iter().all(|model| {
             model.provider == ModelProvider::Anthropic && model.id.starts_with("anthropic/")
         }));
-        assert!(models.iter().any(|model| model.id == "anthropic/claude-opus-5-5"));
+        assert!(models
+            .iter()
+            .any(|model| model.id == "anthropic/claude-opus-5-5"));
         assert_eq!(
             provider_for_id("anthropic/claude-opus-5-5", None),
             ModelProvider::Anthropic

@@ -1306,7 +1306,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Serializes tests that point `ANTHROPIC_BASE_URL` at a mock server.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Serves one canned HTTP response and returns the raw request it saw.
     async fn serve_once(
@@ -1372,7 +1372,7 @@ mod tests {
 
     #[tokio::test]
     async fn streams_a_tool_turn_from_a_local_mock_server() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let body = sse(&[
             json!({"type": "message_start", "message": {"usage": {"input_tokens": 9}}}),
             json!({"type": "content_block_start", "index": 0,
@@ -1439,7 +1439,7 @@ mod tests {
     #[tokio::test]
     async fn provider_client_replays_a_real_tool_history() {
         use threadlane_protocol::{ProviderPort, RuntimeRequest};
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let body = sse(&[
             json!({"type": "message_start", "message": {"usage": {"input_tokens": 5}}}),
             json!({"type": "content_block_delta", "index": 0,
@@ -1524,7 +1524,7 @@ mod tests {
 
     #[tokio::test]
     async fn maps_http_401_without_leaking_the_key() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let (base, server) = serve_once(
             "401 Unauthorized",
             "application/json",
@@ -1549,7 +1549,7 @@ mod tests {
 
     #[tokio::test]
     async fn truncated_stream_reports_an_error() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let body = sse(&[json!({"type": "content_block_delta", "index": 0,
                                 "delta": {"type": "text_delta", "text": "hi"}})]);
         let (base, server) = serve_once("200 OK", "text/event-stream", vec![body]).await;

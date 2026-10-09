@@ -161,7 +161,11 @@ fn builtin_reasoning_entry(
 /// https://platform.claude.com/docs/en/about-claude/models/overview.
 pub const ANTHROPIC_BUILTIN_MODELS: &[(&str, &str, usize)] = &[
     ("anthropic/claude-opus-5-5", "Claude Opus 5.5", 1_000_000),
-    ("anthropic/claude-sonnet-5-5", "Claude Sonnet 5.5", 1_000_000),
+    (
+        "anthropic/claude-sonnet-5-5",
+        "Claude Sonnet 5.5",
+        1_000_000,
+    ),
     ("anthropic/claude-haiku-5-5", "Claude Haiku 5.5", 1_000_000),
     ("anthropic/claude-fable-5-1", "Claude Fable 5.1", 1_000_000),
 ];
