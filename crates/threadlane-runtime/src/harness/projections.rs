@@ -4,8 +4,8 @@
 //! to render chat transcripts, tool activity, and reasoning blocks without
 //! performing domain-level message reductions.
 
-use threadlane_protocol::AgentMessage;
 use serde::{Deserialize, Serialize};
+use threadlane_protocol::{AgentMessage, RetryPrompt};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UiMessageRole {
@@ -36,6 +36,8 @@ pub struct UiChatMessage {
     pub content: String,
     pub tool_activities: Vec<UiToolActivity>,
     pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_prompt: Option<RetryPrompt>,
 }
 
 pub use threadlane_protocol::projection::{tool_activity_summary, tool_activity_display_summary};
@@ -61,6 +63,7 @@ pub fn project_chat_messages(agent_messages: &[AgentMessage]) -> Vec<UiChatMessa
                     content: content.clone(),
                     tool_activities: Vec::new(),
                     reasoning_content: None,
+                    retry_prompt: None,
                 });
             }
             AgentMessage::UserWithImages { content, .. } => {
@@ -70,6 +73,7 @@ pub fn project_chat_messages(agent_messages: &[AgentMessage]) -> Vec<UiChatMessa
                     content: content.clone(),
                     tool_activities: Vec::new(),
                     reasoning_content: None,
+                    retry_prompt: None,
                 });
             }
             AgentMessage::Assistant {
@@ -120,6 +124,7 @@ pub fn project_chat_messages(agent_messages: &[AgentMessage]) -> Vec<UiChatMessa
                     content: content.clone().unwrap_or_default(),
                     tool_activities,
                     reasoning_content,
+                    retry_prompt: None,
                 });
                 // Index after the pop/push above: recording earlier would
                 // capture a pre-pop position when a reasoning-only message
@@ -178,6 +183,7 @@ pub fn project_chat_messages(agent_messages: &[AgentMessage]) -> Vec<UiChatMessa
                     content: String::new(),
                     tool_activities: vec![tool_info],
                     reasoning_content: None,
+                    retry_prompt: None,
                 });
             }
             AgentMessage::System { content } => {
@@ -193,6 +199,7 @@ pub fn project_chat_messages(agent_messages: &[AgentMessage]) -> Vec<UiChatMessa
                     content: content.clone(),
                     tool_activities: Vec::new(),
                     reasoning_content: None,
+                    retry_prompt: None,
                 });
             }
             AgentMessage::Custom {
@@ -212,6 +219,7 @@ pub fn project_chat_messages(agent_messages: &[AgentMessage]) -> Vec<UiChatMessa
                         content: String::new(),
                         tool_activities: Vec::new(),
                         reasoning_content: Some(text),
+                        retry_prompt: None,
                     });
                     continue;
                 }
@@ -227,10 +235,20 @@ pub fn project_chat_messages(agent_messages: &[AgentMessage]) -> Vec<UiChatMessa
                         content: format!("Summary of prior conversation:\n{summary_text}"),
                         tool_activities: Vec::new(),
                         reasoning_content: None,
+                        retry_prompt: None,
                     });
                     continue;
                 }
                 let is_error_type = custom_type == "error" || custom_type == "agent_error";
+                let retry_prompt = if is_error_type {
+                    payload
+                        .get("retry_prompt")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok())
+                        .filter(RetryPrompt::is_sendable)
+                } else {
+                    None
+                };
                 result.push(UiChatMessage {
                     id: format!("msg_{counter}"),
                     role: if is_error_type {
@@ -241,6 +259,7 @@ pub fn project_chat_messages(agent_messages: &[AgentMessage]) -> Vec<UiChatMessa
                     content: text,
                     tool_activities: Vec::new(),
                     reasoning_content: None,
+                    retry_prompt,
                 });
             }
         }
@@ -253,6 +272,41 @@ pub fn project_chat_messages(agent_messages: &[AgentMessage]) -> Vec<UiChatMessa
 mod tests {
     use super::*;
     use threadlane_protocol::{RuntimeToolCall, RuntimeToolCallFunction};
+
+    #[test]
+    fn retry_prompt_is_owned_by_error_not_neighboring_user() {
+        let retry = RetryPrompt {
+            text: String::new(),
+            images: vec![threadlane_protocol::ImageAttachment {
+                display_name: "shot.png".into(),
+                data_url: "data:image/png;base64,AA==".into(),
+            }],
+        };
+        let rows = project_chat_messages(&[
+            AgentMessage::user("old text", vec![]),
+            AgentMessage::Custom {
+                custom_type: "agent_error".into(),
+                payload: serde_json::json!({"error":"failed", "retry_prompt": retry}),
+            },
+            AgentMessage::user("later queued prompt", vec![]),
+            AgentMessage::Custom {
+                custom_type: "agent_error".into(),
+                payload: serde_json::json!({"error":"legacy"}),
+            },
+            AgentMessage::Custom {
+                custom_type: "agent_error".into(),
+                payload: serde_json::json!({"error":"malformed", "retry_prompt":{"text":"partial"}}),
+            },
+            AgentMessage::Custom {
+                custom_type: "status".into(),
+                payload: serde_json::json!({"text":"status", "retry_prompt":retry}),
+            },
+        ]);
+        assert_eq!(rows[1].retry_prompt, Some(retry));
+        for index in [0, 2, 3, 4, 5] {
+            assert!(rows[index].retry_prompt.is_none());
+        }
+    }
 
     #[test]
     fn multiline_command_arguments_are_sanitized_to_single_line_summary() {

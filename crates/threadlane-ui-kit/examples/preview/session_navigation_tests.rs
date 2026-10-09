@@ -26,6 +26,7 @@ fn message(id: &str, role: MessageRole, content: &str) -> ChatMessageInfo {
         streaming: false,
         reasoning_content: None,
         reasoning_expanded: false,
+        retry_prompt: None,
     }
 }
 

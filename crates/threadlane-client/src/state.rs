@@ -123,6 +123,7 @@ impl ClientState {
                         streaming: true,
                         reasoning_content: None,
                         reasoning_expanded: false,
+                        retry_prompt: None,
                     });
                 }
             }
@@ -147,6 +148,7 @@ impl ClientState {
                         streaming: true,
                         reasoning_content: Some(delta),
                         reasoning_expanded: false,
+                        retry_prompt: None,
                     });
                 }
             }
@@ -181,6 +183,7 @@ impl ClientState {
                         streaming: true,
                         reasoning_content: None,
                         reasoning_expanded: false,
+                        retry_prompt: None,
                     });
                 }
             }
@@ -281,6 +284,7 @@ impl ClientState {
                                 streaming: false,
                                 reasoning_content: None,
                                 reasoning_expanded: false,
+                                retry_prompt: None,
                             });
                 // Keep the request pending until the user answers
                 // or dismisses it in the question card. Never
@@ -298,6 +302,7 @@ impl ClientState {
                     streaming: false,
                     reasoning_content: None,
                     reasoning_expanded: false,
+                    retry_prompt: None,
                 });
                 self.is_generating = false;
                 self.session_status = Some(error);

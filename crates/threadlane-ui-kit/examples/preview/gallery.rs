@@ -120,6 +120,7 @@ impl Gallery {
                 content: String::new(), tool_activities: Vec::new(), streaming: false,
                 reasoning_content: Some("Inspect existing components, preserve controlled state, and verify keyboard access.".into()),
                 reasoning_expanded: false,
+                retry_prompt: None,
             },
             decision: None,
             queued_messages: sample_queue(),

@@ -224,6 +224,19 @@ pub struct ImageAttachment {
     pub data_url: String,
 }
 
+/// Exact user submission associated with a retryable failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryPrompt {
+    pub text: String,
+    pub images: Vec<ImageAttachment>,
+}
+
+impl RetryPrompt {
+    pub fn is_sendable(&self) -> bool {
+        !self.text.trim().is_empty() || !self.images.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeferredHandle {
     pub(crate) handle_id: String,

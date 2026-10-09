@@ -354,6 +354,7 @@ mod regeneration_tests {
             streaming: false,
             reasoning_content: Some("private reasoning".into()),
             reasoning_expanded: false,
+            retry_prompt: None,
         }
     }
 

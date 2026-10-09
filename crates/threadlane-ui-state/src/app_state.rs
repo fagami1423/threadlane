@@ -4614,6 +4614,7 @@ impl AppState {
                                 streaming: true,
                                 reasoning_content: None,
                                 reasoning_expanded: false,
+                                retry_prompt: None,
                             });
                         }
                     }
@@ -4637,6 +4638,7 @@ impl AppState {
                                 streaming: true,
                                 reasoning_content: Some(delta.clone()),
                                 reasoning_expanded: false,
+                                retry_prompt: None,
                             });
                         }
                     }
@@ -4672,6 +4674,7 @@ impl AppState {
                                 streaming: true,
                                 reasoning_content: None,
                                 reasoning_expanded: false,
+                                retry_prompt: None,
                             });
                         }
                     }
@@ -5438,6 +5441,7 @@ impl AppState {
                         streaming: false,
                         reasoning_content: None,
                         reasoning_expanded: false,
+                        retry_prompt: None,
                     });
                     self.client.session_status = Some(status);
                     // A successful scheduled completion must also capture its
@@ -6189,6 +6193,7 @@ impl AppState {
                 streaming: false,
                 reasoning_content: None,
                 reasoning_expanded: false,
+                retry_prompt: None,
             });
         }
     }
@@ -6241,18 +6246,11 @@ impl AppState {
         // CLI login — so it has no Threadlane provider credential to check, and
         // gating it on one blocks every ACP turn before it starts.
         if api_key.is_empty() && !threadlane_acp_engine::is_acp_model(&model) {
-            self.messages_mut().push(ChatMessageInfo {
-                id: format!("credential-error-{session_id}"),
-                role: MessageRole::Error,
-                content: format!(
-                    "No API key configured for model `{model}`. Open Settings and save the provider credential."
-                ),
-                tool_activities: Vec::new(),
-                streaming: false,
-                reasoning_content: None,
-                reasoning_expanded: false,
-            });
-            return Ok(());
+            // Reject before accepting/clearing the submission. The controller
+            // restores its exact payload to the session-scoped composer draft.
+            return Err(format!(
+                "No API key configured for model `{model}`. Open Settings and save the provider credential."
+            ));
         }
 
         // New-task ACP picks have no session to apply to yet; they wait here
@@ -6332,6 +6330,7 @@ impl AppState {
             streaming: false,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
         });
 
         self.client.is_generating = true;

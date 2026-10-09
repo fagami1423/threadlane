@@ -100,8 +100,8 @@ pub fn dispatch(state: &mut AppState, action: AppAction) {
                     .push(crate::RequestedComposerInsert {
                         text,
                         images,
-                        session_id: None,
-                        work_dir: None,
+                        session_id: state.active_session_id.clone(),
+                        work_dir: state.active_work_dir.clone(),
                     });
             }
         }

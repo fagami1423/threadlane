@@ -1562,35 +1562,57 @@ impl CodingAgent {
         images: Vec<ImageAttachment>,
     ) -> Option<Result<String, String>> {
         let first_entry = self.harness.as_ref().map_or(0, |h| h.store.entries().len());
-        let result = self.handle_input_inner(input, images).await;
+        let result = self.handle_input_inner(input, images.clone()).await;
         if let Some(Err(error)) = &result {
             // Pre-acceptance failures have no finish_harness_run to persist them.
             // Save them before the surface reloads its durable transcript.
-            if let Some(journal) = self.harness.as_mut() {
-                let message = AgentMessage::Custom {
-                    custom_type: "agent_error".into(),
-                    payload: serde_json::json!({ "error": error }),
-                };
-                let persisted = journal.ensure_fresh().and_then(|()| {
-                    if !journal
-                        .store
-                        .entries()
-                        .iter()
-                        .skip(first_entry)
-                        .any(|entry| entry.lane == "main" && entry.message == message)
-                    {
-                        journal.append_message(message)?;
-                    }
-                    Ok(())
-                });
-                if let Err(persistence_error) = persisted {
-                    return Some(Err(format!(
-                        "{error}\nCould not save error: {persistence_error}"
-                    )));
-                }
+            if let Err(persistence_error) =
+                self.persist_prompt_error(input, &images, error, first_entry)
+            {
+                return Some(Err(format!(
+                    "{error}\nCould not save error: {persistence_error}"
+                )));
             }
         }
         result
+    }
+
+    /// Save failures that occur before a prompt reaches the turn driver as well
+    /// as its fallback errors. Never infer a retry from a previous user row.
+    pub(crate) fn persist_prompt_error(
+        &mut self,
+        input: &str,
+        images: &[ImageAttachment],
+        error: &str,
+        // usize::MAX disables deduplication for failures before input handling.
+        first_entry: usize,
+    ) -> Result<(), String> {
+        let Some(journal) = self.harness.as_mut() else {
+            return Ok(());
+        };
+        journal.ensure_fresh()?;
+        let retry_prompt = parse_slash_command(input)
+            .is_none()
+            .then(|| threadlane_protocol::RetryPrompt {
+                text: input.to_owned(),
+                images: images.to_vec(),
+            })
+            .filter(threadlane_protocol::RetryPrompt::is_sendable);
+        let retry_prompt_value = serde_json::to_value(&retry_prompt).map_err(|error| error.to_string())?;
+        let already_saved = journal.store.entries().iter().skip(first_entry).any(|entry| {
+            entry.lane == "main" && matches!(&entry.message,
+                AgentMessage::Custom { custom_type, payload }
+                    if custom_type == "agent_error" && payload.get("error").and_then(|v| v.as_str()) == Some(error)
+                        && payload.get("retry_prompt") == Some(&retry_prompt_value))
+        });
+        if already_saved {
+            return Ok(());
+        }
+        journal.append_message(AgentMessage::Custom {
+            custom_type: "agent_error".into(),
+            payload: serde_json::json!({ "error": error, "retry_prompt": retry_prompt }),
+        })?;
+        Ok(())
     }
 
     async fn handle_input_inner(
@@ -4377,6 +4399,70 @@ mod compaction_sync_tests {
     }
 
     #[tokio::test]
+    async fn retry_prompt_uses_exact_failed_run_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut agent = CodingAgent::new_with_provider(
+            CodingAgentOptions {
+                api_key: "test-key".into(),
+                account_id: None,
+                model: "test-model".into(),
+                work_dir: dir.path().to_path_buf(),
+                session_file: Some(path.clone()),
+                system_prompt: SystemPromptConfig::default(),
+                agent_config: None,
+                coding_config: None,
+                browser: BrowserBridge::unavailable(),
+            },
+            Arc::new(RecordingProvider::default()),
+        );
+        let images = vec![threadlane_protocol::ImageAttachment {
+            display_name: "shot.png".into(),
+            data_url: "data:image/png;base64,AA==".into(),
+        }];
+        let accepted = agent
+            .begin_harness_run(AgentMessage::user("inspect", images.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        agent
+            .harness
+            .as_mut()
+            .unwrap()
+            .append_message(AgentMessage::user("unrelated later input", vec![]))
+            .unwrap();
+        agent
+            .finish_harness_run(
+                Some(&accepted.run_id),
+                OperationOutcome::Failed,
+                Some("test failure".into()),
+            )
+            .await
+            .unwrap();
+        let store = JsonlStore::open(&path).unwrap();
+        let messages: Vec<_> = store.entries().iter().map(|e| e.message.clone()).collect();
+        let projected = threadlane_runtime::harness::project_chat_messages(&messages);
+        let error = projected
+            .iter()
+            .find(|m| m.content == "test failure")
+            .unwrap();
+        assert_eq!(
+            error.retry_prompt,
+            Some(threadlane_protocol::RetryPrompt {
+                text: "inspect".into(),
+                images
+            })
+        );
+        assert_eq!(
+            projected
+                .iter()
+                .filter(|m| m.content == "test failure")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn pre_acceptance_error_survives_transcript_reload() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
@@ -4397,9 +4483,23 @@ mod compaction_sync_tests {
         agent.harness_journal_error = Some("cannot accept prompt".into());
         let expected = "Harness Error: cannot accept prompt";
         assert_eq!(
-            agent.handle_input_with_images("continue", vec![]).await,
+            agent
+                .handle_input_with_images(
+                    "",
+                    vec![threadlane_protocol::ImageAttachment {
+                        display_name: "shot.png".into(),
+                        data_url: "data:image/png;base64,AA==".into()
+                    }]
+                )
+                .await,
             Some(Err(expected.into()))
         );
+        // A concurrent writer's identical error text for another submission
+        // must not suppress this prompt; exact repeats are still deduplicated.
+        let first = agent.harness.as_ref().unwrap().store.entries().len();
+        agent.persist_prompt_error("another submission", &[], expected, first).unwrap();
+        agent.persist_prompt_error("current submission", &[], expected, first).unwrap();
+        agent.persist_prompt_error("current submission", &[], expected, first).unwrap();
         drop(agent);
         let store = JsonlStore::open(&path).unwrap();
         let errors: Vec<_> = store
@@ -4413,19 +4513,25 @@ mod compaction_sync_tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(errors, [expected]);
+        assert_eq!(errors, [expected, expected, expected]);
         let messages: Vec<_> = store
             .entries()
             .iter()
             .map(|entry| entry.message.clone())
             .collect();
         let projected = threadlane_runtime::harness::project_chat_messages(&messages);
-        assert_eq!(projected.len(), 1);
+        assert_eq!(projected.len(), 3);
+        assert_eq!(projected[1].retry_prompt.as_ref().unwrap().text, "another submission");
+        assert_eq!(projected[2].retry_prompt.as_ref().unwrap().text, "current submission");
         assert_eq!(
             projected[0].role,
             threadlane_runtime::harness::UiMessageRole::Error
         );
         assert_eq!(projected[0].content, expected);
+        let retry = projected[0].retry_prompt.as_ref().unwrap();
+        assert_eq!(retry.text, "");
+        assert_eq!(retry.images[0].display_name, "shot.png");
+        assert_eq!(retry.images[0].data_url, "data:image/png;base64,AA==");
     }
 
     impl LongToolLoopProvider {

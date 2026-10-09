@@ -219,6 +219,7 @@ pub fn compute_session_messages(session_file: &Path) -> Result<Vec<ChatMessageIn
                     streaming: false,
                     reasoning_content: None,
                     reasoning_expanded: false,
+                    retry_prompt: None,
                 });
             }
         }
@@ -527,6 +528,7 @@ pub fn project_agent_messages(agent_messages: Vec<AgentMessage>) -> Vec<ChatMess
             streaming: false,
             reasoning_content: msg.reasoning_content,
             reasoning_expanded: false,
+            retry_prompt: msg.retry_prompt,
         })
         .collect()
 }
@@ -1548,6 +1550,22 @@ mod tests {
     use threadlane_runtime::harness::{
         JsonlStore, OperationIntent, OperationOutcome, Record, SessionStore,
     };
+
+    #[test]
+    fn retry_prompt_survives_daemon_projection() {
+        let retry = threadlane_protocol::RetryPrompt {
+            text: "inspect this".into(),
+            images: vec![threadlane_protocol::ImageAttachment {
+                display_name: "shot.png".into(),
+                data_url: "data:image/png;base64,AA==".into(),
+            }],
+        };
+        let rows = super::project_agent_messages(vec![threadlane_protocol::AgentMessage::Custom {
+            custom_type: "agent_error".into(),
+            payload: serde_json::json!({"error":"failed", "retry_prompt":retry}),
+        }]);
+        assert_eq!(rows[0].retry_prompt.as_ref(), Some(&retry));
+    }
 
     fn started(id: &str, seq: u64, lane: &str, intent: OperationIntent) -> Record {
         Record::OperationStarted {

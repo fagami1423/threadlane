@@ -30,7 +30,8 @@ pub use interaction::{
 pub use live::{LiveOverlayKind, StreamTarget, LIVE_FRAME_MAX_WIDTH};
 pub use messages::{
     AgentMessage, AgentToolCall, AgentToolDefinition, AgentToolResult, DeferredHandle,
-    ImageAttachment, PlanItem, PlanItemStatus, ReasoningEffort, SessionPlan, TokenUsage,
+    ImageAttachment, PlanItem, PlanItemStatus, ReasoningEffort, RetryPrompt, SessionPlan,
+    TokenUsage,
 };
 pub use orchestration::OrchestratorMode;
 pub use tool::{

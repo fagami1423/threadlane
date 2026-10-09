@@ -152,6 +152,7 @@ fn shared_conversation_find_keyboard_palette_and_narrow_layout(cx: &mut TestAppC
             streaming: false,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
         })
         .collect::<Vec<_>>();
     let mut snapshot: Snapshot =

@@ -427,15 +427,18 @@ fn samples() -> Vec<SubagentActivityInfo> {
             tool_activities: vec![ToolActivityInfo { id: "sample-read".into(), title: "read_file".into(), category: "Loaded".into(), display_summary: "Read ui-kit/src/lib.rs".into(),
                 arguments: r#"{"path":"ui-kit/src/lib.rs"}"#.into(), detail: "1:a3f| pub mod agents;\n2:b4c| pub use agents::*;".into(), is_expanded: false }],
             streaming: false, reasoning_content: None, reasoning_expanded: false,
+            retry_prompt: None,
         }]),
         ("Reviewer", SubagentActivityStatus::Failed, "Validate the shared layout at narrow widths", vec![ChatMessageInfo {
             id: "sample-review-message".into(), role: MessageRole::Error, content: "A layout check needs attention.".into(),
             tool_activities: vec![ToolActivityInfo { id: "sample-check".into(), title: "run_command".into(), category: "Error".into(), display_summary: "Check the preview layout".into(),
                 arguments: r#"{"command":"cargo check -p threadlane-ui-kit-preview"}"#.into(), detail: "Exit Status: exit status: 1\n--- STDOUT ---\n\n--- STDERR ---\nSample error: profile header exceeds the panel width.".into(), is_expanded: false }],
             streaming: false, reasoning_content: None, reasoning_expanded: false,
+            retry_prompt: None,
         }]),
         ("Reviewer", SubagentActivityStatus::Completed, "Review the shared tool disclosures", vec![ChatMessageInfo {
             id: "sample-completed-message".into(), role: MessageRole::Assistant, content: "The tool rows reuse the same components as chat.".into(), tool_activities: Vec::new(), streaming: false, reasoning_content: None, reasoning_expanded: false,
+            retry_prompt: None,
         }]),
         ("Designer", SubagentActivityStatus::Queued, "Review the activity hierarchy", Vec::new()),
     ].into_iter().enumerate().map(|(task_index, (agent, status, task, messages))| SubagentActivityInfo {
