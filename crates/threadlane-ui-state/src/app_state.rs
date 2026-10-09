@@ -4614,6 +4614,7 @@ impl AppState {
                                 streaming: true,
                                 reasoning_content: None,
                                 reasoning_expanded: false,
+                                retry_prompt: None,
                             });
                         }
                     }
@@ -4637,6 +4638,7 @@ impl AppState {
                                 streaming: true,
                                 reasoning_content: Some(delta.clone()),
                                 reasoning_expanded: false,
+                                retry_prompt: None,
                             });
                         }
                     }
@@ -4672,6 +4674,7 @@ impl AppState {
                                 streaming: true,
                                 reasoning_content: None,
                                 reasoning_expanded: false,
+                                retry_prompt: None,
                             });
                         }
                     }
@@ -5438,6 +5441,7 @@ impl AppState {
                         streaming: false,
                         reasoning_content: None,
                         reasoning_expanded: false,
+                        retry_prompt: None,
                     });
                     self.client.session_status = Some(status);
                     // A successful scheduled completion must also capture its
@@ -6189,6 +6193,7 @@ impl AppState {
                 streaming: false,
                 reasoning_content: None,
                 reasoning_expanded: false,
+                retry_prompt: None,
             });
         }
     }
@@ -6244,6 +6249,10 @@ impl AppState {
             self.messages_mut().push(ChatMessageInfo {
                 id: format!("credential-error-{session_id}"),
                 role: MessageRole::Error,
+                retry_prompt: Some(threadlane_protocol::RetryPrompt {
+                    text: text.clone(),
+                    images: images.clone(),
+                }),
                 content: format!(
                     "No API key configured for model `{model}`. Open Settings and save the provider credential."
                 ),
@@ -6332,6 +6341,7 @@ impl AppState {
             streaming: false,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
         });
 
         self.client.is_generating = true;

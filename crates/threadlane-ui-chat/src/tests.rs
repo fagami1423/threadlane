@@ -758,7 +758,7 @@ fn chat_errors_are_bounded_deduplicated_and_keep_recovery_details(cx: &mut gpui:
             _: &mut gpui::Window,
             cx: &mut gpui::Context<Self>,
         ) -> impl gpui::IntoElement {
-            super::render_chat_error("test", &self.error, &self.model, cx)
+            super::render_chat_error("test", &self.error, None, &self.model, cx)
         }
     }
 
@@ -795,6 +795,7 @@ fn chat_errors_are_bounded_deduplicated_and_keep_recovery_details(cx: &mut gpui:
         streaming: false,
         reasoning_content: None,
         reasoning_expanded: false,
+        retry_prompt: None,
     };
     assert!(super::visible_session_status(Some(&error), Some(&message)).is_none());
     assert_eq!(
@@ -832,43 +833,48 @@ fn chat_errors_are_bounded_deduplicated_and_keep_recovery_details(cx: &mut gpui:
 }
 
 #[test]
-fn last_retryable_prompt_prefers_the_latest_user_message() {
-    let user = |id: &str, content: &str| ChatMessageInfo {
-        id: id.into(),
-        role: MessageRole::User,
-        content: content.into(),
-        tool_activities: Vec::new(),
+fn retry_dispatch_rejects_stale_actions() {
+    let payload = threadlane_protocol::RetryPrompt {
+        text: "inspect screenshot".into(),
+        images: vec![threadlane_protocol::ImageAttachment {
+            display_name: "shot.png".into(),
+            data_url: "data:image/png;base64,AA==".into(),
+        }],
+    };
+    let mut state = threadlane_ui_state::AppState::for_tests();
+    state.active_session_id = Some("retry-session".into());
+    state.active_work_dir = Some("/retry-project".into());
+    state.messages = vec![ChatMessageInfo {
+        id: "failed".into(),
+        role: MessageRole::Error,
+        content: "failed".into(),
+        tool_activities: vec![],
         streaming: false,
         reasoning_content: None,
         reasoning_expanded: false,
-    };
-    let assistant = |id: &str| ChatMessageInfo {
-        id: id.into(),
-        role: MessageRole::Assistant,
-        content: "done".into(),
-        tool_activities: Vec::new(),
-        streaming: false,
-        reasoning_content: None,
-        reasoning_expanded: false,
-    };
-    assert_eq!(super::last_retryable_prompt(&[]), None);
-    assert_eq!(super::last_retryable_prompt(&[assistant("a")]), None);
-    assert_eq!(
-        super::last_retryable_prompt(&[user("u", "   ")]),
-        None,
-        "whitespace-only prompts cannot be resent"
+        retry_prompt: Some(payload.clone()),
+    }]
+    .into();
+    let path = std::path::Path::new("/retry-project");
+    super::retry_failed_prompt(&mut state, "other-session", path, "failed", &payload);
+    super::retry_failed_prompt(
+        &mut state,
+        "retry-session",
+        std::path::Path::new("/other-project"),
+        "failed",
+        &payload,
     );
-    assert_eq!(
-        super::last_retryable_prompt(&[user("u1", "first"), assistant("a"), user("u2", "second")]),
-        Some("second".to_string()),
-        "retry resends the latest user prompt, not an earlier one"
-    );
+    super::retry_failed_prompt(&mut state, "retry-session", path, "missing", &payload);
+    let mut stale = payload.clone();
+    stale.text = "other prompt".into();
+    super::retry_failed_prompt(&mut state, "retry-session", path, "failed", &stale);
+    state.is_generating = true;
+    super::retry_failed_prompt(&mut state, "retry-session", path, "failed", &payload);
+    assert!(state.requested_composer_inserts.is_empty());
 }
 
 #[gpui::test]
-fn error_retry_appears_only_with_a_user_prompt_and_no_active_run(
-    cx: &mut gpui::TestAppContext,
-) {
+fn error_retry_requires_an_exact_payload_and_no_active_run(cx: &mut gpui::TestAppContext) {
     use gpui::AppContext as _;
 
     struct ErrorHarness {
@@ -882,7 +888,18 @@ fn error_retry_appears_only_with_a_user_prompt_and_no_active_run(
             _: &mut gpui::Window,
             cx: &mut gpui::Context<Self>,
         ) -> impl gpui::IntoElement {
-            super::render_chat_error("retry-test", &self.error, &self.model, cx)
+            super::render_chat_error(
+                "retry-test",
+                &self.error,
+                self.model
+                    .read(cx)
+                    .messages
+                    .iter()
+                    .find(|m| m.role == MessageRole::Error)
+                    .and_then(|m| m.retry_prompt.clone()),
+                &self.model,
+                cx,
+            )
         }
     }
 
@@ -894,6 +911,7 @@ fn error_retry_appears_only_with_a_user_prompt_and_no_active_run(
         streaming: false,
         reasoning_content: None,
         reasoning_expanded: false,
+        retry_prompt: None,
     };
     let show_error = |cx: &mut gpui::TestAppContext,
                         model: gpui::Entity<threadlane_ui_state::AppState>| {
@@ -917,21 +935,34 @@ fn error_retry_appears_only_with_a_user_prompt_and_no_active_run(
 
     let with_prompt = cx.new(|_| {
         let mut state = threadlane_ui_state::AppState::for_tests();
-        state.messages = vec![
-            message(MessageRole::User, "try again"),
-            message(MessageRole::Error, "boom"),
-        ]
-        .into();
+        state.active_session_id = Some("retry-session".into());
+        state.active_work_dir = Some("/retry-project".into());
+        let mut error = message(MessageRole::Error, "boom");
+        error.retry_prompt = Some(threadlane_protocol::RetryPrompt {
+            text: String::new(),
+            images: vec![threadlane_protocol::ImageAttachment {
+                display_name: "screenshot.png".into(),
+                data_url: "data:image/png;base64,AA==".into(),
+            }],
+        });
+        state.messages = vec![message(MessageRole::User, "unrelated old text"), error].into();
         state
     });
     assert!(
         show_error(cx, with_prompt),
-        "a failed turn with a prior user prompt offers Retry"
+        "an image-only failed submission offers Retry"
     );
 
     let generating = cx.new(|_| {
         let mut state = threadlane_ui_state::AppState::for_tests();
-        state.messages = vec![message(MessageRole::User, "try again")].into();
+        state.active_session_id = Some("retry-session".into());
+        state.active_work_dir = Some("/retry-project".into());
+        let mut error = message(MessageRole::Error, "boom");
+        error.retry_prompt = Some(threadlane_protocol::RetryPrompt {
+            text: "try again".into(),
+            images: vec![],
+        });
+        state.messages = vec![error].into();
         state.is_generating = true;
         state
     });
@@ -1261,6 +1292,7 @@ fn grouped_tool_activities_borrows_in_order_and_hides_plan_updates() {
         streaming: false,
         reasoning_content: None,
         reasoning_expanded: false,
+        retry_prompt: None,
     };
     let messages = vec![
         activity_message(&[("tool-1", "read_file"), ("plan", "update_plan")]),
@@ -1284,6 +1316,7 @@ fn progress_summary_never_reuses_a_previous_turns_tool() {
         streaming: false,
         reasoning_content: None,
         reasoning_expanded: false,
+        retry_prompt: None,
     };
     let mut activity = user.clone();
     activity.role = MessageRole::Assistant;
@@ -1342,6 +1375,7 @@ fn transcript_rows_group_consecutive_tool_only_messages() {
         streaming: false,
         reasoning_content: None,
         reasoning_expanded: false,
+        retry_prompt: None,
     };
     let messages = vec![
         message("user", false),
@@ -1378,6 +1412,7 @@ fn queued_messages_leave_transcript_only_while_generating() {
         streaming: false,
         reasoning_content: None,
         reasoning_expanded: false,
+        retry_prompt: None,
     })
     .collect();
     assert_eq!(
@@ -1419,6 +1454,7 @@ fn queue_filter_transitions_keep_retained_list_in_sync(cx: &mut gpui::TestAppCon
                         streaming: false,
                         reasoning_content: None,
                         reasoning_expanded: false,
+                        retry_prompt: None,
                     })
                     .collect::<Vec<_>>(),
             );
@@ -1459,6 +1495,7 @@ fn queued_panel_tracks_active_messages_and_generation(cx: &mut gpui::TestAppCont
                 streaming: false,
                 reasoning_content: None,
                 reasoning_expanded: false,
+                retry_prompt: None,
             })
             .collect::<Vec<_>>()
             .into();
@@ -1655,6 +1692,7 @@ fn reading_history_survives_new_activity_and_jump_resumes_following(cx: &mut gpu
                 streaming: false,
                 reasoning_content: None,
                 reasoning_expanded: false,
+                retry_prompt: None,
             })
             .collect::<Vec<_>>()
             .into();
@@ -1839,12 +1877,23 @@ fn completed_activity_disclosure_renders_interactive_tool_rows(cx: &mut gpui::Te
             streaming: false,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
         };
-        let mut messages = (0..60).map(|index| ChatMessageInfo {
-            id: format!("history-{index}"), role: MessageRole::User,
-            content: format!("Historical message {index}. {}", "Keep this reading position. ".repeat(5)),
-            tool_activities: Vec::new(), streaming: false, reasoning_content: None, reasoning_expanded: false,
-        }).collect::<Vec<_>>();
+        let mut messages = (0..60)
+            .map(|index| ChatMessageInfo {
+                id: format!("history-{index}"),
+                role: MessageRole::User,
+                content: format!(
+                    "Historical message {index}. {}",
+                    "Keep this reading position. ".repeat(5)
+                ),
+                tool_activities: Vec::new(),
+                streaming: false,
+                reasoning_content: None,
+                reasoning_expanded: false,
+                retry_prompt: None,
+            })
+            .collect::<Vec<_>>();
         messages.insert(20, tool_message);
         state.messages = messages.into();
         state
@@ -1989,6 +2038,7 @@ fn tool_previews_stay_compact_until_expanded_and_bound_output(cx: &mut gpui::Tes
             streaming: false,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
         }]
         .into();
         std::sync::Arc::make_mut(&mut state.messages).push(ChatMessageInfo {
@@ -1999,6 +2049,7 @@ fn tool_previews_stay_compact_until_expanded_and_bound_output(cx: &mut gpui::Tes
             streaming: false,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
         });
         state
     });
@@ -2151,9 +2202,13 @@ fn progress_summary_fits_at_narrow_width_and_zoom(cx: &mut gpui::TestAppContext)
             },
         );
         std::sync::Arc::make_mut(&mut state.messages).push(ChatMessageInfo {
-            id: "activity-layout".into(), role: MessageRole::Assistant,
-            content: String::new(), streaming: true,
-            reasoning_content: None, reasoning_expanded: false,
+            id: "activity-layout".into(),
+            role: MessageRole::Assistant,
+            content: String::new(),
+            streaming: true,
+            reasoning_content: None,
+            reasoning_expanded: false,
+            retry_prompt: None,
             tool_activities: vec![ToolActivityInfo {
                 id: "command".into(), category: "Running".into(),
                 title: "run_command".into(),
@@ -2263,6 +2318,7 @@ fn transcript_disclosure_metadata_fits_at_narrow_width_and_zoom(cx: &mut gpui::T
                 streaming: false,
                 reasoning_content: Some("Reasoning detail.".into()),
                 reasoning_expanded: false,
+                retry_prompt: None,
             },
         });
         *capture.borrow_mut() = Some(host.clone());
@@ -2312,6 +2368,7 @@ fn reasoning_disclosure_supports_keyboard_and_pauses_following(cx: &mut gpui::Te
             id: "reasoning-test".into(), role: MessageRole::Assistant,
             content: "Long response paragraph.\n\n".repeat(100), tool_activities: Vec::new(), streaming: false,
             reasoning_content: Some("Reasoning detail.\n".repeat(100)), reasoning_expanded: false,
+            retry_prompt: None,
         }].into();
         state
     });
@@ -2426,6 +2483,7 @@ fn user_message_edit_loads_composer_for_resend(cx: &mut gpui::TestAppContext) {
             streaming: false,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
         }]
         .into();
         state
@@ -2522,6 +2580,7 @@ fn user_message_edit_hidden_while_generating(cx: &mut gpui::TestAppContext) {
             streaming: false,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
         }]
         .into();
         state.is_generating = true;
@@ -2558,6 +2617,7 @@ fn user_message_exposes_copy_action(cx: &mut gpui::TestAppContext) {
             streaming: false,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
         }]
         .into();
         state
@@ -2593,6 +2653,7 @@ fn completed_assistant_message_exposes_copy_action(cx: &mut gpui::TestAppContext
             streaming: false,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
         }]
         .into();
         state
@@ -2628,6 +2689,7 @@ fn message_copy_shows_copied_feedback(cx: &mut gpui::TestAppContext) {
             streaming: false,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
         }]
         .into();
         state
@@ -2686,6 +2748,7 @@ fn streaming_assistant_message_hides_copy_action(cx: &mut gpui::TestAppContext) 
             streaming: true,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
         }]
         .into();
         state
@@ -2723,6 +2786,7 @@ fn mount_assistant_message<'a>(
             streaming,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
         }]
         .into();
         state
@@ -2941,6 +3005,7 @@ fn shared_code_blocks_preserve_native_guards_and_copy(cx: &mut gpui::TestAppCont
                 streaming,
                 reasoning_content: None,
                 reasoning_expanded: false,
+                retry_prompt: None,
             }]
             .into();
             state
@@ -3009,6 +3074,7 @@ fn code_block_wrap_toggles_layout_and_preserves_copy(cx: &mut gpui::TestAppConte
             streaming: false,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
         }]
         .into();
         state
@@ -3078,6 +3144,7 @@ fn code_block_wrap_is_per_block(cx: &mut gpui::TestAppContext) {
             streaming: false,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
         }]
         .into();
         state
@@ -3124,6 +3191,7 @@ fn code_block_wrap_survives_append_and_resets_on_replace(cx: &mut gpui::TestAppC
             streaming: true,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
         }]
         .into();
         state
@@ -3157,6 +3225,7 @@ fn code_block_wrap_survives_append_and_resets_on_replace(cx: &mut gpui::TestAppC
             streaming: true,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
         }]
         .into();
         cx.notify();
@@ -3175,6 +3244,7 @@ fn code_block_wrap_survives_append_and_resets_on_replace(cx: &mut gpui::TestAppC
             streaming: false,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
         }]
         .into();
         cx.notify();
@@ -3204,6 +3274,7 @@ fn code_block_wrap_resets_on_session_change(cx: &mut gpui::TestAppContext) {
             streaming: false,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
         }]
         .into();
         state
@@ -3912,6 +3983,7 @@ fn find_message(id: &str, role: MessageRole, content: &str) -> ChatMessageInfo {
         streaming: false,
         reasoning_content: None,
         reasoning_expanded: false,
+        retry_prompt: None,
     }
 }
 
@@ -4977,6 +5049,7 @@ fn prompt_landmarks_list_user_prompts_in_chronological_order() {
         streaming: false,
         reasoning_content: None,
         reasoning_expanded: false,
+        retry_prompt: None,
     };
     let messages = vec![
         msg("u1", MessageRole::User, "first prompt\nwith newlines"),
@@ -5049,6 +5122,7 @@ fn prompt_test_messages() -> Vec<ChatMessageInfo> {
         streaming: false,
         reasoning_content: None,
         reasoning_expanded: false,
+        retry_prompt: None,
     };
     vec![
         msg("u1", MessageRole::User, "first prompt"),
@@ -5287,6 +5361,7 @@ fn prompt_rail_reveals_unmeasured_active_tick(cx: &mut gpui::TestAppContext) {
                 streaming: false,
                 reasoning_content: None,
                 reasoning_expanded: false,
+                retry_prompt: None,
             })
             .collect::<Vec<_>>()
             .into();
@@ -5344,6 +5419,7 @@ fn conversation_outline_focuses_and_jumps_to_prompts(cx: &mut gpui::TestAppConte
                 streaming: false,
                 reasoning_content: None,
                 reasoning_expanded: false,
+                retry_prompt: None,
             });
         }
         state.messages = messages.into();
@@ -6016,6 +6092,7 @@ fn completed_group_keeps_attention_rows_visible_and_preserves_order(cx: &mut gpu
             streaming: false,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
             tool_activities: [
                 ("read", "Result"),
                 ("running", "Working"),

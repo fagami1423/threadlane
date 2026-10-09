@@ -4794,6 +4794,7 @@ fn mirror_trigger_fires_once_per_computer_activity() {
         streaming: true,
         reasoning_content: None,
         reasoning_expanded: false,
+        retry_prompt: None,
     });
     assert!(state.take_computer_mirror_trigger());
     assert!(
@@ -5906,6 +5907,7 @@ fn remote_edit_queued_message_restores_staged_images_via_command_result() {
         streaming: false,
         reasoning_content: None,
         reasoning_expanded: false,
+        retry_prompt: None,
     }]
     .into();
 
@@ -5972,6 +5974,7 @@ fn remote_edit_queued_message_scopes_restore_to_project() {
         streaming: false,
         reasoning_content: None,
         reasoning_expanded: false,
+        retry_prompt: None,
     }]
     .into();
 
@@ -6018,6 +6021,7 @@ fn remote_edit_queued_message_reply_survives_a_session_switch() {
         streaming: false,
         reasoning_content: None,
         reasoning_expanded: false,
+        retry_prompt: None,
     }]
     .into();
 
@@ -6064,6 +6068,7 @@ fn remote_edit_queued_message_recovers_via_journaled_cancel_event() {
         streaming: false,
         reasoning_content: None,
         reasoning_expanded: false,
+        retry_prompt: None,
     }]
     .into();
 
@@ -6169,6 +6174,7 @@ fn queued_echo(id: &str) -> ChatMessageInfo {
         streaming: false,
         reasoning_content: None,
         reasoning_expanded: false,
+        retry_prompt: None,
     }
 }
 

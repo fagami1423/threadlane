@@ -33,10 +33,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::acp::AcpConfigOption;
-use crate::interaction::QuestionAnswer;
-use crate::messages::{ImageAttachment, ReasoningEffort, SessionPlan, TokenUsage};
-use crate::orchestration::{ModelRoles, OrchestratorMode};
 use crate::events::{AgentEvent, SubagentIsolation};
+use crate::interaction::QuestionAnswer;
+use crate::messages::{ImageAttachment, ReasoningEffort, RetryPrompt, SessionPlan, TokenUsage};
+use crate::orchestration::{ModelRoles, OrchestratorMode};
 use crate::repo::{GitOperation, GitResponse, ProjectFileNode};
 
 /// Daemon wire protocol version, announced by the server in the
@@ -912,6 +912,8 @@ pub struct ChatMessageInfo {
     pub streaming: bool,
     pub reasoning_content: Option<String>,
     pub reasoning_expanded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_prompt: Option<RetryPrompt>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -975,6 +977,36 @@ mod tests {
     use super::*;
     use crate::acp::ACP_CONFIG_CATEGORY_MODEL;
     use crate::interaction::{PermissionRequest, QuestionItemAnswer};
+
+    #[test]
+    fn retry_prompt_preserves_images_and_legacy_rows() {
+        let legacy = serde_json::json!({"id":"error", "role":"Error", "content":"failed", "tool_activities":[], "streaming":false, "reasoning_content":null, "reasoning_expanded":false});
+        let mut row: ChatMessageInfo = serde_json::from_value(legacy).unwrap();
+        assert!(row.retry_prompt.is_none());
+        for text in ["", "describe screenshot", "text only"] {
+            let images = if text == "text only" {
+                vec![]
+            } else {
+                vec![ImageAttachment {
+                    display_name: "shot.png".into(),
+                    data_url: "data:image/png;base64,AA==".into(),
+                }]
+            };
+            row.retry_prompt = Some(RetryPrompt {
+                text: text.into(),
+                images,
+            });
+            assert!(row.retry_prompt.as_ref().unwrap().is_sendable());
+            let decoded: ChatMessageInfo =
+                serde_json::from_value(serde_json::to_value(&row).unwrap()).unwrap();
+            assert_eq!(decoded, row);
+        }
+        assert!(!RetryPrompt {
+            text: "  ".into(),
+            images: vec![]
+        }
+        .is_sendable());
+    }
 
     #[test]
     fn session_command_round_trips_through_json() {

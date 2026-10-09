@@ -18,7 +18,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use threadlane_compaction::CompactionParams;
 use threadlane_context::{context_budget_for_project, BudgetConfig};
-use threadlane_protocol::{AgentEvent, AgentMessage, AgentToolResult, SubagentRecoveryStatus};
+use threadlane_protocol::{
+    AgentEvent, AgentMessage, AgentToolResult, RetryPrompt, SubagentRecoveryStatus,
+};
 use threadlane_runtime::harness::{
     HookContext, HookKind, JsonlStore, OperationOutcome, PromptSnapshot, Record as HarnessRecord,
     Reducer, SessionStore,
@@ -657,9 +659,29 @@ impl CodingAgent {
                 .as_deref()
                 .filter(|message| !message.trim().is_empty())
             {
+                let retry_prompt = journal
+                    .store
+                    .entry(&format!("entry-{run_id}-user"))
+                    .and_then(|entry| match &entry.message {
+                        AgentMessage::User { content } if !content.trim().is_empty() => {
+                            Some(RetryPrompt {
+                                text: content.clone(),
+                                images: Vec::new(),
+                            })
+                        }
+                        AgentMessage::UserWithImages { content, images }
+                            if !content.trim().is_empty() || !images.is_empty() =>
+                        {
+                            Some(RetryPrompt {
+                                text: content.clone(),
+                                images: images.clone(),
+                            })
+                        }
+                        _ => None,
+                    });
                 journal.append_message(AgentMessage::Custom {
                     custom_type: "agent_error".into(),
-                    payload: serde_json::json!({ "error": message }),
+                    payload: serde_json::json!({ "error": message, "retry_prompt": retry_prompt }),
                 })?;
             }
         }

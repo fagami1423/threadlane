@@ -97,14 +97,6 @@ fn visible_session_status<'a>(
     })
 }
 
-fn last_retryable_prompt(messages: &[ChatMessageInfo]) -> Option<String> {
-    messages
-        .iter()
-        .rev()
-        .find(|message| message.role == MessageRole::User && !message.content.trim().is_empty())
-        .map(|message| message.content.clone())
-}
-
 /// Compact but unambiguous checkout path: worktrees inside the project root
 /// render relative to it (`.threadlane/worktrees/<name>`), anything else
 /// shrinks `$HOME`/`%USERPROFILE%` to `~`.
@@ -171,73 +163,116 @@ fn is_current_project(active: Option<&PathBuf>, candidate: &Path) -> bool {
     active.is_some_and(|dir| dir.as_path() == candidate)
 }
 
-fn render_chat_error(id: &str, error: &str, model: &Entity<AppState>, cx: &App) -> Div {
+fn retry_failed_prompt(
+    state: &mut AppState,
+    session_id: &str,
+    work_dir: &std::path::Path,
+    error_id: &str,
+    payload: &threadlane_protocol::RetryPrompt,
+) {
+    if state.active_session_id.as_deref() != Some(session_id)
+        || state.active_work_dir.as_deref() != Some(work_dir)
+        || state.is_generating
+        || !payload.is_sendable()
+        || !state.messages.iter().any(|message| {
+            message.id == error_id
+                && message.role == MessageRole::Error
+                && message.retry_prompt.as_ref() == Some(payload)
+        })
+    {
+        return;
+    }
+    controller::dispatch(
+        state,
+        AppAction::SendPromptWithImages {
+            text: payload.text.clone(),
+            images: payload.images.clone(),
+        },
+    );
+}
+
+fn render_chat_error(
+    id: &str,
+    error: &str,
+    retry_prompt: Option<threadlane_protocol::RetryPrompt>,
+    model: &Entity<AppState>,
+    cx: &App,
+) -> Div {
     let (summary, needs_provider_settings) = chat_error_summary(error);
     let details = error.to_owned();
-    let retry_text = last_retryable_prompt(&model.read(cx).messages);
-    let can_retry = retry_text.is_some() && !model.read(cx).is_generating;
+    let retry_prompt = retry_prompt.filter(threadlane_protocol::RetryPrompt::is_sendable);
+    let identity = model
+        .read(cx)
+        .active_session_id
+        .clone()
+        .zip(model.read(cx).active_work_dir.clone());
+    let can_retry = retry_prompt.is_some() && identity.is_some() && !model.read(cx).is_generating;
     div().w_full().my_2().px_4().child(
-        threadlane_ui_kit::chat_error_card(summary, cx)
-            .child(
-                div()
-                    .mt_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .children(can_retry.then(|| {
-                        let text = retry_text.clone().expect("retry gated on a user prompt");
-                        let model = model.clone();
-                        Button::new(SharedString::from(format!("chat-error-retry-{id}")))
-                            .label("Resend")
-                            .small()
-                            .rounded_md()
-                            .tooltip("Resend the last message")
-                            .accessibility_label("Resend the last message")
-                            .debug_selector(|| "chat-error-retry".into())
-                            .on_click(move |_, _, cx| {
-                                model.update(cx, |state, cx| {
-                                    controller::dispatch(
-                                        state,
-                                        AppAction::SendPrompt(text.clone()),
-                                    );
-                                    cx.notify();
-                                });
-                            })
-                    }))
-                    .children(needs_provider_settings.then(|| {
-                        let model = model.clone();
-                        Button::new(SharedString::from(format!("chat-error-settings-{id}")))
-                            .label("Settings…")
-                            .accessibility_label("Open provider settings")
-                            .small()
-                            .rounded_md()
-                            .tooltip("Open provider settings")
-                            .debug_selector(|| "chat-error-settings".into())
-                            .on_click(move |_, _, cx| {
-                                model.update(cx, |state, cx| {
-                                    controller::dispatch(state, AppAction::OpenSettings);
-                                    cx.notify();
-                                });
-                            })
-                    }))
-                    .child(
-                        Button::new(SharedString::from(format!("chat-error-copy-{id}")))
-                            .icon(IconName::Copy)
-                            .accessibility_label("Copy full error to clipboard")
-                            .ghost()
-                            .small()
-                            .rounded_md()
-                            .tooltip("Copy full error to clipboard")
-                            .debug_selector(|| "chat-error-copy".into())
-                            .on_click(move |_, window, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(details.clone()));
-                                window.push_notification(
-                                    Notification::info("Copied error details"),
-                                    cx,
+        threadlane_ui_kit::chat_error_card(summary, cx).child(
+            div()
+                .mt_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .children(can_retry.then(|| {
+                    let payload = retry_prompt
+                        .clone()
+                        .expect("retry gated on an exact payload");
+                    let error_id = id.to_owned();
+                    let identity = identity.clone().expect("retry gated on session identity");
+                    let model = model.clone();
+                    Button::new(SharedString::from(format!("chat-error-retry-{id}")))
+                        .label("Resend")
+                        .small()
+                        .rounded_md()
+                        .tooltip("Resend the failed message")
+                        .accessibility_label("Resend the failed message")
+                        .debug_selector(|| "chat-error-retry".into())
+                        .on_click(move |_, _, cx| {
+                            model.update(cx, |state, cx| {
+                                retry_failed_prompt(
+                                    state,
+                                    &identity.0,
+                                    &identity.1,
+                                    &error_id,
+                                    &payload,
                                 );
-                            }),
-                    ),
-            ),
+                                cx.notify();
+                            });
+                        })
+                }))
+                .children(needs_provider_settings.then(|| {
+                    let model = model.clone();
+                    Button::new(SharedString::from(format!("chat-error-settings-{id}")))
+                        .label("Settings…")
+                        .accessibility_label("Open provider settings")
+                        .small()
+                        .rounded_md()
+                        .tooltip("Open provider settings")
+                        .debug_selector(|| "chat-error-settings".into())
+                        .on_click(move |_, _, cx| {
+                            model.update(cx, |state, cx| {
+                                controller::dispatch(state, AppAction::OpenSettings);
+                                cx.notify();
+                            });
+                        })
+                }))
+                .child(
+                    Button::new(SharedString::from(format!("chat-error-copy-{id}")))
+                        .icon(IconName::Copy)
+                        .accessibility_label("Copy full error to clipboard")
+                        .ghost()
+                        .small()
+                        .rounded_md()
+                        .tooltip("Copy full error to clipboard")
+                        .debug_selector(|| "chat-error-copy".into())
+                        .on_click(move |_, window, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(details.clone()));
+                            window
+                                .push_notification(Notification::info("Copied error details"), cx);
+                        }),
+                ),
+        ),
     )
 }
 use threadlane_coding_agent::commands::{available_slash_commands, SlashCommandInfo};
@@ -2735,7 +2770,13 @@ impl ChatListView {
                         }
                     }),
             ),
-            MessageRole::Error => render_chat_error(&msg.id, &msg.content, &self.model, cx),
+            MessageRole::Error => render_chat_error(
+                &msg.id,
+                &msg.content,
+                msg.retry_prompt.clone(),
+                &self.model,
+                cx,
+            ),
         }
         .into_any_element()
     }
@@ -4828,7 +4869,7 @@ impl ChatListView {
                     || status.starts_with("Error")
                     || needs_provider_settings;
                 if is_error {
-                    return render_chat_error("session-status", &status, &self.model, cx)
+                    return render_chat_error("session-status", &status, None, &self.model, cx)
                         .into_any_element();
                 }
                 div()

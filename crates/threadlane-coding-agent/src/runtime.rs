@@ -1562,14 +1562,21 @@ impl CodingAgent {
         images: Vec<ImageAttachment>,
     ) -> Option<Result<String, String>> {
         let first_entry = self.harness.as_ref().map_or(0, |h| h.store.entries().len());
-        let result = self.handle_input_inner(input, images).await;
+        let result = self.handle_input_inner(input, images.clone()).await;
         if let Some(Err(error)) = &result {
             // Pre-acceptance failures have no finish_harness_run to persist them.
             // Save them before the surface reloads its durable transcript.
             if let Some(journal) = self.harness.as_mut() {
+                let retry_prompt = parse_slash_command(input)
+                    .is_none()
+                    .then(|| threadlane_protocol::RetryPrompt {
+                        text: input.to_owned(),
+                        images: images.clone(),
+                    })
+                    .filter(threadlane_protocol::RetryPrompt::is_sendable);
                 let message = AgentMessage::Custom {
                     custom_type: "agent_error".into(),
-                    payload: serde_json::json!({ "error": error }),
+                    payload: serde_json::json!({ "error": error, "retry_prompt": retry_prompt }),
                 };
                 let persisted = journal.ensure_fresh().and_then(|()| {
                     if !journal
@@ -1577,7 +1584,14 @@ impl CodingAgent {
                         .entries()
                         .iter()
                         .skip(first_entry)
-                        .any(|entry| entry.lane == "main" && entry.message == message)
+                        .any(|entry| {
+                            entry.lane == "main"
+                                && matches!(
+                                    (&entry.message, &message),
+                                    (AgentMessage::Custom { custom_type: a, payload: ap }, AgentMessage::Custom { custom_type: b, payload: bp })
+                                        if a == b && a == "agent_error" && ap.get("error") == bp.get("error")
+                                )
+                        })
                     {
                         journal.append_message(message)?;
                     }
@@ -4377,6 +4391,70 @@ mod compaction_sync_tests {
     }
 
     #[tokio::test]
+    async fn retry_prompt_uses_exact_failed_run_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut agent = CodingAgent::new_with_provider(
+            CodingAgentOptions {
+                api_key: "test-key".into(),
+                account_id: None,
+                model: "test-model".into(),
+                work_dir: dir.path().to_path_buf(),
+                session_file: Some(path.clone()),
+                system_prompt: SystemPromptConfig::default(),
+                agent_config: None,
+                coding_config: None,
+                browser: BrowserBridge::unavailable(),
+            },
+            Arc::new(RecordingProvider::default()),
+        );
+        let images = vec![threadlane_protocol::ImageAttachment {
+            display_name: "shot.png".into(),
+            data_url: "data:image/png;base64,AA==".into(),
+        }];
+        let accepted = agent
+            .begin_harness_run(AgentMessage::user("inspect", images.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        agent
+            .harness
+            .as_mut()
+            .unwrap()
+            .append_message(AgentMessage::user("unrelated later input", vec![]))
+            .unwrap();
+        agent
+            .finish_harness_run(
+                Some(&accepted.run_id),
+                OperationOutcome::Failed,
+                Some("test failure".into()),
+            )
+            .await
+            .unwrap();
+        let store = JsonlStore::open(&path).unwrap();
+        let messages: Vec<_> = store.entries().iter().map(|e| e.message.clone()).collect();
+        let projected = threadlane_runtime::harness::project_chat_messages(&messages);
+        let error = projected
+            .iter()
+            .find(|m| m.content == "test failure")
+            .unwrap();
+        assert_eq!(
+            error.retry_prompt,
+            Some(threadlane_protocol::RetryPrompt {
+                text: "inspect".into(),
+                images
+            })
+        );
+        assert_eq!(
+            projected
+                .iter()
+                .filter(|m| m.content == "test failure")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn pre_acceptance_error_survives_transcript_reload() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
@@ -4397,7 +4475,15 @@ mod compaction_sync_tests {
         agent.harness_journal_error = Some("cannot accept prompt".into());
         let expected = "Harness Error: cannot accept prompt";
         assert_eq!(
-            agent.handle_input_with_images("continue", vec![]).await,
+            agent
+                .handle_input_with_images(
+                    "",
+                    vec![threadlane_protocol::ImageAttachment {
+                        display_name: "shot.png".into(),
+                        data_url: "data:image/png;base64,AA==".into()
+                    }]
+                )
+                .await,
             Some(Err(expected.into()))
         );
         drop(agent);
@@ -4426,6 +4512,10 @@ mod compaction_sync_tests {
             threadlane_runtime::harness::UiMessageRole::Error
         );
         assert_eq!(projected[0].content, expected);
+        let retry = projected[0].retry_prompt.as_ref().unwrap();
+        assert_eq!(retry.text, "");
+        assert_eq!(retry.images[0].display_name, "shot.png");
+        assert_eq!(retry.images[0].data_url, "data:image/png;base64,AA==");
     }
 
     impl LongToolLoopProvider {

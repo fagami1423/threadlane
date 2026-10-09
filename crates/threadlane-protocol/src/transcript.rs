@@ -193,6 +193,7 @@ mod search_tests {
             streaming: false,
             reasoning_content: None,
             reasoning_expanded: false,
+            retry_prompt: None,
         }
     }
 
