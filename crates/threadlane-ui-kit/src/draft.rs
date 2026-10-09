@@ -108,7 +108,7 @@ pub fn save_draft_button(unavailable_reason: Option<&str>) -> Button {
     let hint = unavailable_reason.unwrap_or("Save draft for later");
     Button::new("stash-prompt-btn")
         .debug_selector(|| "stash-prompt-btn".into())
-        .icon(IconName::Folder)
+        .icon(IconName::Inbox)
         .ghost()
         .small()
         .rounded_lg()

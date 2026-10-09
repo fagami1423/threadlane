@@ -2246,7 +2246,7 @@ impl WorkspaceView {
     ) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
         let inset = if self.sidebar_collapsed {
-            window.rem_size() * 6.875
+            window.rem_size() * threadlane_ui_theme::WINDOW_CONTROLS_CONTENT_INSET
         } else {
             window.rem_size() * 0.875
         };

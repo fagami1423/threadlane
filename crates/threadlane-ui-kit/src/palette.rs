@@ -48,7 +48,7 @@ pub fn workspace_commands() -> Vec<WorkspaceCommand> {
             "new",
             Icon::from(IconName::Plus),
             &["task", "fresh", "session", "new"],
-            "⌘N",
+            crate::navigation::new_task_shortcut(),
         ),
         (
             "Go to Task…",

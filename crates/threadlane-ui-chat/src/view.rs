@@ -1357,8 +1357,8 @@ impl ChatListView {
                 .flat_map(|project| project.sessions.iter())
                 .find(|session| state.active_session_id.as_deref() == Some(&session.id));
             let title = active_session
-                .map(|session| session.title.clone())
-                .unwrap_or_else(|| "New task".to_string());
+                .map(threadlane_ui_kit::session_display_title)
+                .unwrap_or_else(|| threadlane_ui_kit::UNTITLED_SESSION_TITLE.to_string());
             let attention = active_session
                 .map(|session| state.session_attention(session))
                 .unwrap_or(SessionAttention::Idle);
@@ -1492,7 +1492,7 @@ impl ChatListView {
         };
         let checkout_path = checkout
             .as_ref()
-            .map(|dir| dir.display().to_string());
+            .map(|dir| threadlane_ui_kit::display_path(dir));
         let menu_model = self.model.clone();
         let model = self.model.clone();
         threadlane_ui_kit::environment_panel(
@@ -2742,7 +2742,7 @@ impl ChatListView {
 
     fn render_new_task(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().colors;
-        let (projects, active_work_dir) = {
+        let (projects, active_work_dir, needs_provider) = {
             let state = self.model.read(cx);
             (
                 state
@@ -2751,6 +2751,7 @@ impl ChatListView {
                     .map(|project| (project.name.clone(), project.work_dir.clone()))
                     .collect::<Vec<_>>(),
                 state.active_work_dir.clone(),
+                state.available_models().is_empty(),
             )
         };
         let selected_project = projects
@@ -2761,7 +2762,7 @@ impl ChatListView {
         let selected_project_path = projects
             .iter()
             .find(|(_, work_dir)| active_work_dir.as_ref() == Some(work_dir))
-            .map(|(_, work_dir)| work_dir.display().to_string());
+            .map(|(_, work_dir)| threadlane_ui_kit::display_path(work_dir));
         let model = self.model.clone();
         let hero_active_dir = active_work_dir.clone();
 
@@ -2875,8 +2876,25 @@ impl ChatListView {
                 div()
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child("Describe a goal, plan changes, or ask questions about your project."),
+                    .child(if needs_provider {
+                        "Connect a model provider first, then describe a goal or ask a question."
+                    } else {
+                        "Describe a goal, plan changes, or ask questions about your project."
+                    }),
             )
+            .children(needs_provider.then(|| {
+                let model = self.model.clone();
+                Button::new("hero-open-provider-settings")
+                    .icon(IconName::Settings)
+                    .label("Connect a provider")
+                    .primary()
+                    .on_click(move |_event, _window, cx| {
+                        model.update(cx, |state, cx| {
+                            controller::dispatch(state, AppAction::OpenSettings);
+                            cx.notify();
+                        });
+                    })
+            }))
             .child(
                 div()
                     .flex()
@@ -2895,6 +2913,7 @@ impl ChatListView {
                             .outline()
                             .small()
                             .rounded_full()
+                            .disabled(needs_provider)
                             .on_click(move |_event, window, cx| {
                                 input.update(cx, |input, cx| {
                                     input.set_value(&prompt_str, window, cx);
@@ -3737,8 +3756,15 @@ impl ChatListView {
             })
             .collect::<Vec<_>>();
 
+        // The new-task hero carries its own "Connect a provider" action; only
+        // show the banner where that hero is not on screen.
+        let hero_visible = self.current_tab == CentralTab::Chat && {
+            let state = self.model.read(cx);
+            state.is_new_task
+                || (state.messages.is_empty() && !state.active_session_is_loading())
+        };
         let provider_setup_model = self.model.clone();
-        let provider_setup_banner = needs_provider.then(|| {
+        let provider_setup_banner = (needs_provider && !hero_visible).then(|| {
             div()
                 .debug_selector(|| "provider-setup-banner".into())
                 .w_full()
@@ -3858,7 +3884,7 @@ impl ChatListView {
         let project_chip_active = active_work_dir.clone();
         let project_chip_tooltip = active_work_dir
             .as_ref()
-            .map(|dir| dir.display().to_string())
+            .map(|dir| threadlane_ui_kit::display_path(dir))
             .unwrap_or_else(|| selected_project_name.clone());
         let project_chip = threadlane_ui_kit::composer_project_button(
             selected_project_name.clone(),
@@ -4621,7 +4647,10 @@ impl ChatListView {
             } else {
                 None
             };
-            threadlane_ui_kit::save_draft_button(stash_unavailable_reason)
+            // Offered only once there is a task and something to save; the
+            // remaining reasons are transient and keep it visible but disabled.
+            let stash_offered = active_session_id.is_some() && has_composer_text;
+            stash_offered.then(|| threadlane_ui_kit::save_draft_button(stash_unavailable_reason)
                 .on_click(move |_event, window, cx| {
                     if let Some(session_id) = &do_stash_session_id {
                         let text = do_stash_input.read(cx).value().to_string();
@@ -4642,7 +4671,7 @@ impl ChatListView {
                             });
                         }
                     }
-                })
+                }))
         };
 
         // The composer-level "Recall previous prompt" command: same gates as
@@ -4653,11 +4682,17 @@ impl ChatListView {
             } else {
                 self.prompt_recall_block_reason(has_composer_text, cx)
             };
-            threadlane_ui_kit::recall_prompt_button(recall_unavailable_reason)
+            // Hidden while there is nothing to recall at all; transient
+            // blocks (typing, a running turn) keep it visible but disabled.
+            let recall_offered = self.prompt_recall.is_some() || {
+                let state = self.model.read(cx);
+                !state.is_new_task && state.active_session_id.is_some()
+            } && !self.recallable_prompts(cx).is_empty();
+            recall_offered.then(|| threadlane_ui_kit::recall_prompt_button(recall_unavailable_reason)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.step_prompt_recall(true, window, cx);
                     this.focus_composer(window, cx);
-                }))
+                })))
         };
 
         let setup_card = self
@@ -4888,8 +4923,8 @@ impl ChatListView {
                             .child(div().flex_1().min_w_2())
                             .child(
                                 threadlane_ui_kit::composer_actions_group()
-                                    .child(stash_button)
-                                    .child(prompt_recall_button)
+                                    .children(stash_button)
+                                    .children(prompt_recall_button)
                                     .children(subagent_popover)
                                     .children(context_percent_label.map(|label| {
                                         div()
@@ -4897,7 +4932,8 @@ impl ChatListView {
                                             .text_color(theme.muted_foreground)
                                             .child(label)
                                     }))
-                                    .child(context_meter)
+                                    // Nothing to measure before the first exchange.
+                                    .children((!hero_visible).then_some(context_meter))
                                     .child({
                                         let send_hint = if preparing_worktree {
                                             "Wait for worktree setup to finish before sending"

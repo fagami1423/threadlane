@@ -1081,6 +1081,7 @@ impl SessionPreview {
         let card = kit::sidebar_session_card(
             &self.session,
             kit::SidebarSessionCardState {
+                show_project: true,
                 project: project.clone(),
                 attention: SessionAttention::Idle,
                 selected,
@@ -1194,6 +1195,7 @@ impl SessionPreview {
                 false,
                 SessionAttention::Idle,
                 navigation.into_any_element(),
+                false,
                 |window, cx| Self::preview_notice("New task", window, cx),
                 cx,
             ))

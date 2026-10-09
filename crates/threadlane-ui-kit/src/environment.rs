@@ -45,6 +45,34 @@ pub fn environment_changes_label(status: Option<&GitStatus>) -> String {
         summary
     }
 }
+/// "2 ahead · 1 behind", omitting a side that is zero; `None` when in sync.
+pub fn environment_sync_label(ahead: usize, behind: usize) -> Option<String> {
+    match (ahead, behind) {
+        (0, 0) => None,
+        (ahead, 0) => Some(format!("{ahead} ahead")),
+        (0, behind) => Some(format!("{behind} behind")),
+        (ahead, behind) => Some(format!("{ahead} ahead · {behind} behind")),
+    }
+}
+
+/// `owner/repo` from an https or scp-style remote, falling back to the last
+/// path segment, so the row is not mistaken for the local folder name.
+pub fn environment_repository_label(remote: &str) -> String {
+    let trimmed = remote.trim().trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let path = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest.split_once('/').map_or("", |(_, path)| path))
+        .or_else(|| trimmed.split_once(':').map(|(_, path)| path))
+        .unwrap_or(trimmed);
+    let mut segments = path.rsplit('/').filter(|segment| !segment.is_empty());
+    match (segments.next(), segments.next()) {
+        (Some(repo), Some(owner)) => format!("{owner}/{repo}"),
+        (Some(repo), None) => repo.to_owned(),
+        _ => "GitHub repository".to_owned(),
+    }
+}
+
 /// Menu builders read host state when opened, preserving current Git capabilities.
 /// `checkout_path` is the session's effective working directory — for a
 /// worktree session that differs from the project root, and keeping it on
@@ -158,29 +186,36 @@ pub fn environment_panel(
                 .child(
                     div()
                         .px_2()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .min_w_0()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(location),
-                )
-                .children(checkout_path.map(|path| {
-                    let full_path = path.clone();
-                    div()
-                        .id("environment-checkout-path")
-                        .debug_selector(|| "environment-checkout-path".into())
-                        .px_2()
-                        .min_w_0()
-                        .tooltip(move |window, cx| {
-                            gpui_component::tooltip::Tooltip::new(full_path.clone())
-                                .build(window, cx)
-                        })
-                        .child(
+                        .child(div().flex_none().child(if checkout_path.is_some() { format!("{location} ·") } else { location.to_owned() }))
+                        .children(checkout_path.map(|path| {
+                            let full_path = path.clone();
                             div()
-                                .truncate()
-                                .text_xs()
-                                .text_color(theme.muted_foreground.opacity(0.8))
-                                .child(path),
-                        )
-                }))
+                                .id("environment-checkout-path")
+                                .debug_selector(|| "environment-checkout-path".into())
+                                .flex_1()
+                                .min_w_0()
+                                .tooltip(move |window, cx| {
+                                    gpui_component::tooltip::Tooltip::new(full_path.clone())
+                                        .build(window, cx)
+                                })
+                                .child(
+                                    // Keep the tail (the project folder) visible.
+                                    div()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis_start()
+                                        .text_color(theme.muted_foreground.opacity(0.8))
+                                        .child(path),
+                                )
+                        })),
+                )
+                .child(section_label("Git", cx))
                 .child(
                     Button::new("environment-branch")
                         .ghost()
@@ -220,13 +255,20 @@ pub fn environment_panel(
                         .flex()
                         .flex_col()
                         .gap_2()
-                        .children((status.ahead > 0 || status.behind > 0).then(|| {
+                        .children(environment_sync_label(status.ahead, status.behind).map(|label| {
                             div()
+                                .id("environment-sync")
                                 .debug_selector(|| "environment-sync".into())
                                 .px_2()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
-                                .child(format!("{} ahead · {} behind", status.ahead, status.behind))
+                                .tooltip(|window, cx| {
+                                    gpui_component::tooltip::Tooltip::new(
+                                        "Commits ahead of / behind the upstream branch",
+                                    )
+                                    .build(window, cx)
+                                })
+                                .child(label)
                         }))
                         .child(
                             Button::new("environment-git-actions")
@@ -245,18 +287,8 @@ pub fn environment_panel(
                         )
                         .children(status.remote.as_ref().map(|remote| {
                             let on_action = on_action.clone();
-                            let repository = remote
-                                .trim()
-                                .trim_end_matches('/')
-                                .rsplit('/')
-                                .next()
-                                .unwrap_or_default()
-                                .trim_end_matches(".git");
-                            let repository = if repository.is_empty() {
-                                "GitHub repository"
-                            } else {
-                                repository
-                            };
+                            let repository = environment_repository_label(remote);
+                            let repository = repository.as_str();
                             Button::new("environment-repository")
                                 .debug_selector(|| "environment-repository".into())
                                 .ghost()
@@ -314,9 +346,10 @@ pub fn environment_panel(
                 .child(
                     div()
                         .mt_1()
-                        .pt_2()
+                        .pt_1()
                         .border_t_1()
                         .border_color(theme.border)
+                        .child(section_label("Open", cx))
                         .child(
                             Button::new("environment-files")
                                 .debug_selector(|| "environment-files".into())
@@ -391,4 +424,42 @@ pub fn environment_git_menu(
         EnvironmentAction::CreateBranch,
         status.is_some(),
     ))
+}
+
+/// Small heading that separates status rows from the actions below them.
+fn section_label(label: &'static str, cx: &App) -> Div {
+    div()
+        .px_2()
+        .pt_2()
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(cx.theme().muted_foreground.opacity(0.8))
+        .child(label)
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::{environment_repository_label, environment_sync_label};
+
+    #[test]
+    fn sync_label_omits_zero_sides() {
+        assert_eq!(environment_sync_label(0, 0), None);
+        assert_eq!(environment_sync_label(3, 0).as_deref(), Some("3 ahead"));
+        assert_eq!(environment_sync_label(0, 2).as_deref(), Some("2 behind"));
+        assert_eq!(environment_sync_label(3, 2).as_deref(), Some("3 ahead · 2 behind"));
+    }
+
+    #[test]
+    fn repository_label_prefers_owner_and_repo() {
+        for remote in [
+            "https://github.com/wheregmis/threadlane.git",
+            "https://github.com/wheregmis/threadlane/",
+            "git@github.com:wheregmis/threadlane.git",
+            "ssh://git@github.com/wheregmis/threadlane",
+        ] {
+            assert_eq!(environment_repository_label(remote), "wheregmis/threadlane", "{remote}");
+        }
+        assert_eq!(environment_repository_label("threadlane"), "threadlane");
+        assert_eq!(environment_repository_label(""), "GitHub repository");
+    }
 }

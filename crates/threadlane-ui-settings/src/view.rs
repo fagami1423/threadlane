@@ -523,7 +523,7 @@ impl SettingsView {
                 window.open_alert_dialog(cx, move |alert, _, _| {
                     let owner = owner.clone();
                     let path_to_remove = path.clone();
-                    kit_settings::project_removal_dialog(alert, &name, &path.to_string_lossy())
+                    kit_settings::project_removal_dialog(alert, &name, &threadlane_ui_kit::display_path(&path))
                         .on_ok(move |_, _, cx| {
                             let _ = owner.update(cx, |this, cx| {
                                 let result = this.model.update(cx, |state, cx| {

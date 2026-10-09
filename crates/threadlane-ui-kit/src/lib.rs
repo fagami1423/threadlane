@@ -546,11 +546,25 @@ pub struct SessionIdentity {
     pub tooltip: String,
 }
 
+/// Title shown for a session that has not been named yet. Discovery seeds
+/// `SessionInfo::title` with the raw session id until a title is generated;
+/// that id is an implementation detail, not something to show a user.
+pub const UNTITLED_SESSION_TITLE: &str = "New task";
+
+pub fn session_display_title(session: &SessionInfo) -> String {
+    if session.title.trim().is_empty() || session.title == session.id {
+        UNTITLED_SESSION_TITLE.to_string()
+    } else {
+        session.title.clone()
+    }
+}
+
 pub fn session_identity(session: &SessionInfo) -> SessionIdentity {
     let Some(issue) = session.github_issue.as_ref() else {
+        let title = session_display_title(session);
         return SessionIdentity {
-            title: session.title.clone(),
-            tooltip: session.title.clone(),
+            tooltip: title.clone(),
+            title,
         };
     };
     let prefix = format!("#{}", issue.number);

@@ -658,6 +658,7 @@ impl Gallery {
             let card = kit::sidebar_session_card(
                 &session,
                 kit::SidebarSessionCardState {
+                    show_project: true,
                     project,
                     attention,
                     selected: index == 0,

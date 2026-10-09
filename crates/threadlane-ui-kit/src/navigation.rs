@@ -218,43 +218,33 @@ pub fn session_signal_row() -> Div {
 }
 
 pub fn sidebar_project_filter_row() -> Div {
-    div().flex().items_center().gap_1().px_3().pt_1().pb_1()
+    div().flex().items_center().gap_1().pl_4().pr_3().pt_2().pb_1()
 }
 
 pub fn sidebar_project_filter_button(label: &str, selected: bool, cx: &App) -> Button {
     let theme = cx.theme().colors;
+    // A quiet filter control, not a destination: it scopes the task list
+    // below and must not look like Automations/Issues/PRs above it.
     Button::new("sidebar-project-filter")
         .debug_selector(|| "sidebar-project-filter".into())
-        .accessibility_label(format!("Filter sessions by project: {label}"))
-        .tooltip("Filter sessions by project")
+        .accessibility_label(format!("Filter tasks by project: {label}"))
+        .tooltip("Filter tasks by project")
         .dropdown_caret(true)
         .selected(selected)
         .ghost()
-        .small()
-        .w_full()
-        .justify_start()
+        .xsmall()
         .child(
             div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .w_full()
                 .min_w_0()
-                .child(
-                    Icon::new(IconName::Folder)
-                        .size_3p5()
-                        .text_color(theme.foreground),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .truncate()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.foreground)
-                        .child(label.to_owned()),
-                ),
+                .max_w(rems(9.0))
+                .truncate()
+                .text_xs()
+                .text_color(if selected {
+                    theme.foreground
+                } else {
+                    theme.muted_foreground
+                })
+                .child(label.to_owned()),
         )
 }
 
@@ -269,8 +259,17 @@ pub fn sidebar_project_filter(
     sidebar_project_filter_row()
         .child(
             div()
-                .min_w_0()
                 .flex_1()
+                .min_w_0()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(cx.theme().muted_foreground)
+                .child("Projects"),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_none()
                 .child(sidebar_project_filter_button(label, selected, cx).dropdown_menu(menu)),
         )
         .child(attach)
@@ -282,12 +281,14 @@ pub fn sidebar_project_filter_item(label: &str, sessions: usize, selected: bool)
 }
 
 pub fn sidebar_attach_project_button() -> Button {
+    // A folder-plus, not a bare plus: a lone plus in the sidebar reads as
+    // "new task", which is the separate button above.
     Button::new("attach-project-btn")
-        .icon(IconName::Plus)
-        .accessibility_label("Attach project")
-        .tooltip("Attach project…")
+        .icon(Icon::default().path("icons/folder-plus.svg"))
+        .accessibility_label("Attach project folder")
+        .tooltip("Attach a project folder…")
         .ghost()
-        .small()
+        .xsmall()
 }
 
 pub fn session_project_label(project: impl Into<SharedString>, cx: &App) -> Div {
@@ -371,21 +372,62 @@ pub fn sidebar_surface(cx: &App) -> Div {
 }
 
 /// Production brand, new-task control and activity indicator, shared by every host.
+///
+/// `toggle_row` replaces the brand row where the app draws a caption strip
+/// (the brand moves into the strip): the row then only reserves room for the
+/// floating sidebar toggle and keeps the activity indicator.
 pub fn sidebar_header(
     loading: bool,
     working: bool,
     attention: SessionAttention,
     navigation: AnyElement,
+    toggle_row: bool,
     on_new_task: impl Fn(&mut Window, &mut App) + 'static,
     cx: &App,
 ) -> Div {
     let theme = cx.theme().colors;
+    // The toggle floats over this row, so it needs no leading content.
+    let leading = if toggle_row {
+        div().flex_1().into_any_element()
+    } else {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .size(rems(1.5))
+                    .rounded_lg()
+                    .bg(theme.foreground.opacity(0.12))
+                    .border_1()
+                    .border_color(theme.foreground.opacity(0.2))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::default()
+                            .path("icons/threadlane.svg")
+                            .size_4()
+                            .text_color(theme.foreground),
+                    ),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(theme.foreground)
+                    .child("Threadlane"),
+            )
+            .into_any_element()
+    };
     div()
         .flex()
         .flex_col()
         .gap_2()
         .px_2p5()
-        .pt(threadlane_ui_theme::WINDOW_CONTROLS_CLEARANCE)
+        .when(!toggle_row, |header| {
+            header.pt(threadlane_ui_theme::WINDOW_CONTROLS_CLEARANCE)
+        })
         .pb_1p5()
         .bg(theme.title_bar)
         .child(
@@ -393,39 +435,19 @@ pub fn sidebar_header(
                 .flex()
                 .items_center()
                 .justify_between()
+                .gap_2()
                 .px_1p5()
-                .pt_1()
-                .pb_2()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .size(rems(1.5))
-                                .rounded_lg()
-                                .bg(theme.foreground.opacity(0.12))
-                                .border_1()
-                                .border_color(theme.foreground.opacity(0.2))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    Icon::default()
-                                        .path("icons/threadlane.svg")
-                                        .size_4()
-                                        .text_color(theme.foreground),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_semibold()
-                                .text_color(theme.foreground)
-                                .child("Threadlane"),
-                        ),
-                )
+                .map(|row| {
+                    if toggle_row {
+                        // Same height as the other panel headers; the left
+                        // padding clears the floating sidebar toggle.
+                        row.min_h(threadlane_ui_theme::WINDOW_CONTROLS_CLEARANCE)
+                            .pl(rems(threadlane_ui_theme::WINDOW_CONTROLS_CONTENT_INSET - 1.0))
+                    } else {
+                        row.pt_1().pb_2()
+                    }
+                })
+                .child(leading)
                 .child({
                     let is_loading = loading;
                     let active_attention = Some(attention);
@@ -504,13 +526,13 @@ pub fn sidebar_header(
                 .items_center()
                 .child(
                     Button::new("new-task-btn")
-                        .accessibility_label("Start a new task (⌘N)")
+                        .accessibility_label(new_task_tooltip())
                         .ghost()
                         .xsmall()
                         .compact()
                         .w_full()
                         .justify_start()
-                        .tooltip("Start a new task (⌘N)")
+                        .tooltip(new_task_tooltip())
                         .child(
                             div()
                                 .flex()
@@ -541,7 +563,7 @@ pub fn sidebar_header(
                                         .text_xs()
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(theme.muted_foreground.opacity(0.85))
-                                        .child("⌘N"),
+                                        .child(new_task_shortcut()),
                                 ),
                         )
                         .on_click(move |_event, window, cx| {
@@ -828,7 +850,7 @@ pub fn sidebar_history_empty(
                 .outline()
                 .small()
                 .accessibility_label("Start a new task")
-                .tooltip("Start a new task (⌘N)")
+                .tooltip(new_task_tooltip())
                 .on_click(move |_, window, cx| request(SidebarEmptyAction::NewTask, window, cx))
         }))
 }
@@ -855,4 +877,42 @@ pub fn session_history_group(
 /// Shared card inset; group headers own their own alignment spine.
 pub fn session_history_card_row(card: impl IntoElement) -> Div {
     div().px_2().child(card)
+}
+
+
+/// Platform-appropriate label for the `BeginNewTask` binding (cmd-n on macOS,
+/// ctrl-n elsewhere).
+pub fn new_task_shortcut() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "⌘N"
+    } else {
+        "Ctrl+N"
+    }
+}
+
+fn new_task_tooltip() -> String {
+    format!("Start a new task ({})", new_task_shortcut())
+}
+
+/// Path text for display. Strips the Windows verbatim prefix (`\\?\C:\…`)
+/// that canonicalization adds; it is noise to a reader.
+pub fn display_path(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_string(),
+        _ => text,
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::display_path;
+    use std::path::Path;
+
+    #[test]
+    fn display_path_strips_only_drive_verbatim_prefix() {
+        assert_eq!(display_path(Path::new(r"\\?\C:\work\repo")), r"C:\work\repo");
+        assert_eq!(display_path(Path::new(r"\\?\UNC\srv\share")), r"\\?\UNC\srv\share");
+        assert_eq!(display_path(Path::new("/home/me/repo")), "/home/me/repo");
+    }
 }

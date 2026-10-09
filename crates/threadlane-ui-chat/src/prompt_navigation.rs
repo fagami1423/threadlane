@@ -39,7 +39,7 @@ impl ChatListView {
 
     /// User prompts eligible for recall: nonblank text, excluding pending
     /// optimistic queue/steer echoes.
-    fn recallable_prompts(&mut self, cx: &App) -> Vec<PromptLandmark> {
+    pub(super) fn recallable_prompts(&mut self, cx: &App) -> Vec<PromptLandmark> {
         self.prompt_landmark_entries(cx)
             .iter()
             .filter(|landmark| !landmark.pending_echo && !landmark.text.trim().is_empty())

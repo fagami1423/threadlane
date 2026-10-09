@@ -33,7 +33,7 @@ pub fn settings_projects(
             div().flex().items_center().gap_3()
                 .child(div().flex_1().min_w_0()
                     .child(div().text_sm().child(format!("{}{}", project.name, if project.active { " · Active" } else { "" })))
-                    .child(div().text_xs().text_color(muted).child(project.path.to_string_lossy().into_owned()))
+                    .child(div().text_xs().text_color(muted).child(crate::display_path(&project.path)))
                     .when_some(project.disabled_reason.clone(), |row, reason| row.child(div().text_xs().text_color(muted).child(reason))))
                 .child(Button::new(id.clone()).debug_selector(move || id.to_string()).label("Remove…").outline().small()
                     .accessibility_label(format!("Remove project {}", project.name))

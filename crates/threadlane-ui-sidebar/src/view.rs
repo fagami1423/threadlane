@@ -956,6 +956,7 @@ impl SidebarView {
             state.is_generating,
             state.active_session_attention().unwrap_or(SessionAttention::Idle),
             self.render_github_nav(cx).into_any_element(),
+            threadlane_ui_theme::APP_CAPTION_STRIP,
             |window, cx| window.dispatch_action(Box::new(crate::BeginNewTask), cx),
             cx,
         )
@@ -1053,6 +1054,7 @@ impl SidebarView {
             .unwrap_or_else(|| "Project".into());
         let card_state = threadlane_ui_kit::SidebarSessionCardState {
             project,
+            show_project: state.projects.len() > 1,
             attention,
             selected: is_active,
             pinned: state.is_session_pinned(&session.work_dir, &session.id),

@@ -26,6 +26,7 @@ impl Render for CardHost {
         div().w(px(self.width)).child(sidebar_session_card(
             &session,
             SidebarSessionCardState {
+                show_project: true,
                 project: "A long project name".into(),
                 attention: SessionAttention::Ready,
                 selected: self.selected,
