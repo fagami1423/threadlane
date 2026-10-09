@@ -567,6 +567,48 @@ impl CodingSessionHarness {
             .map_err(|error| error.to_string())
     }
 
+    /// Commit completion before exposing a settled hub lane; parent drains are idempotent.
+    pub(crate) fn commit_subagent_lane(
+        &mut self,
+        lane: &crate::subagents::CompletedSubagentLane,
+    ) -> Result<(), String> {
+        self.ensure_fresh()?;
+        let recorded = self.store.entries().iter().any(|entry| {
+            entry.lane == lane.lane_name
+                && matches!(&entry.message,
+                AgentMessage::Custom { custom_type, payload }
+                    if custom_type == "subagent_lane" && payload["run_id"] == lane.run_id)
+        });
+        let (status, outcome) = match lane.status {
+            crate::subagents::SubagentLaneStatus::Completed => {
+                ("completed", OperationOutcome::Completed)
+            }
+            crate::subagents::SubagentLaneStatus::Failed => ("failed", OperationOutcome::Failed),
+        };
+        if !recorded {
+            for message in &lane.messages {
+                self.append_message_to_lane(&lane.lane_name, &lane.run_id, message.clone())?;
+            }
+            self.append_message_to_lane(
+                &lane.lane_name,
+                &lane.run_id,
+                AgentMessage::Custom {
+                    custom_type: "subagent_lane".into(),
+                    payload: serde_json::json!({
+                        "lane": lane.lane_name,
+                        "run_id": lane.run_id,
+                        "agent": lane.agent,
+                        "task": lane.task,
+                        "model": lane.model,
+                        "status": status,
+                        "error": lane.error,
+                    }),
+                },
+            )?;
+        }
+        self.finish_subagent_lane(&lane.lane_name, &lane.run_id, outcome, lane.error.clone())
+    }
+
     pub(crate) fn finish_subagent_lane(
         &mut self,
         lane: &str,

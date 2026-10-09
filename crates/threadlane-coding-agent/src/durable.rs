@@ -977,55 +977,20 @@ impl CodingAgent {
                 .map_err(|_| "Completed subagent lane sink is unavailable".to_string())?;
             std::mem::take(&mut *completed)
         };
-        for lane in &lanes {
-            let status = match lane.status {
-                SubagentLaneStatus::Completed => "completed",
-                SubagentLaneStatus::Failed => "failed",
-            };
-            let mut messages = Vec::with_capacity(lane.messages.len() + 1);
-            messages.push(AgentMessage::Custom {
-                custom_type: "subagent_lane".into(),
-                payload: serde_json::json!({
-                    "lane": lane.lane_name,
-                    "run_id": lane.run_id,
-                    "agent": lane.agent,
-                    "task": lane.task,
-                    "model": lane.model,
-                    "status": status,
-                    "error": lane.error,
-                }),
-            });
-            messages.extend(lane.messages.clone());
-            if let Some(path) = self.session_file.as_deref() {
-                let mut journal = CodingSessionHarness::open(path)?;
-                for msg in &messages {
-                    journal.append_message_to_lane(&lane.lane_name, &lane.run_id, msg.clone())?;
-                }
-            }
-            #[cfg(test)]
-            if let Some(observer) = self.subagent_branch_observer.as_ref() {
-                observer();
-            }
-        }
         for (index, lane) in lanes.iter().enumerate() {
             if let Some(path) = self.session_file.as_deref() {
-                let outcome = match lane.status {
-                    SubagentLaneStatus::Completed => OperationOutcome::Completed,
-                    SubagentLaneStatus::Failed => OperationOutcome::Failed,
-                };
                 let mut journal = CodingSessionHarness::open(path)?;
-                if let Err(error) = journal.finish_subagent_lane(
-                    &lane.lane_name,
-                    &lane.run_id,
-                    outcome,
-                    lane.error.clone(),
-                ) {
+                if let Err(error) = journal.commit_subagent_lane(lane) {
                     self.completed_subagent_lanes
                         .lock()
                         .map_err(|_| "Completed subagent lane sink is unavailable".to_string())?
                         .extend_from_slice(&lanes[index..]);
                     self.interrupted_subagent_recovery = InterruptedSubagentRecoveryState::Pending;
                     return Err(error);
+                }
+                #[cfg(test)]
+                if let Some(observer) = self.subagent_branch_observer.as_ref() {
+                    observer();
                 }
                 let fusion_generation = self.fusion.lock().ok().and_then(|state| {
                     state.as_ref().map(|state| state.compaction_generation)
