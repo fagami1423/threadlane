@@ -20,6 +20,8 @@
 //! The default file locations keep the Threadlane `.threadlane/acp.json`
 //! convention; other hosts may pass explicit paths to the settings loaders.
 
+mod spawn;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
@@ -1020,13 +1022,28 @@ impl AcpConnection {
         cwd: Option<&Path>,
         handler: Arc<dyn AcpClientHandler>,
     ) -> Result<Self, String> {
-        let mut command = Command::new(&config.command);
+        // Resolve against the child's own PATH/PATHEXT: an agent config may
+        // override them (Windows env names are case-insensitive).
+        let child_env = |name: &str| {
+            config
+                .env
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| std::ffi::OsString::from(value))
+                .or_else(|| std::env::var_os(name))
+        };
+        let program = spawn::resolve_program(
+            &config.command,
+            child_env("PATH").as_deref(),
+            child_env("PATHEXT").as_deref(),
+        );
+        let mut command = Command::new(program);
         command.args(&config.args);
         for (key, value) in &config.env {
             command.env(key, value);
         }
         if let Some(dir) = cwd {
-            command.current_dir(dir);
+            command.current_dir(spawn::simplified_cwd(dir));
         }
         command
             .stdin(Stdio::piped())
@@ -1200,8 +1217,10 @@ impl AcpConnection {
         cwd: &Path,
         mcp_servers: Vec<Value>,
     ) -> Result<AcpNewSessionResult, String> {
+        // Agents resolve this path themselves (Node's `realpath` throws on a
+        // `\\?\C:\…` verbatim path), so send the plain drive form.
         let params = json!({
-            "cwd": cwd.to_string_lossy(),
+            "cwd": spawn::simplified_cwd(cwd).to_string_lossy(),
             "mcpServers": mcp_servers,
         });
         let result = self
