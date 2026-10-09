@@ -218,6 +218,7 @@ Threadlane supports the following connection methods:
 
 - **Google Antigravity** — OAuth credentials with Cloud Code Assist endpoint discovery.
 - **OpenAI/Codex** — Use the built-in PKCE device-authorization flow or configure an API key in Settings. Threadlane stores its credentials under `~/.threadlane` and can read Codex CLI credentials from `~/.codex/auth.json`.
+- **Anthropic (Claude)** — Native Messages API provider, API keys only. Set `ANTHROPIC_API_KEY` in the environment before launching Threadlane; `anthropic/` models then appear in the model picker (`ANTHROPIC_BASE_URL` overrides the endpoint). Claude.ai subscription login and Claude Code credentials are not supported. Settings key storage is planned as a follow-up.
 - **External ACP agents** — Configure agent binaries in `~/.threadlane/acp.json` or `<project>/.threadlane/acp.json`, or use **Settings → ACP Agents**. Authenticate the external agent separately, then select it from the model picker or with `/model` as `acp/<id>`.
 
 Example ACP configuration:

@@ -6,6 +6,7 @@ pub enum ModelProvider {
     OpenAi,
     Antigravity,
     OpenCode,
+    Anthropic,
     Acp,
 }
 
@@ -15,6 +16,7 @@ impl ModelProvider {
             Self::OpenAi => "OpenAI",
             Self::Antigravity => "Antigravity",
             Self::OpenCode => "OpenCode",
+            Self::Anthropic => "Anthropic",
             Self::Acp => "External agents",
         }
     }
@@ -24,6 +26,9 @@ impl ModelProvider {
             Self::OpenAi => "icons/providers/openai.svg",
             Self::Antigravity => "icons/providers/google.svg",
             Self::OpenCode => "icons/providers/opencode.svg",
+            // Deliberately the neutral generic-agent glyph: Anthropic's logo is a
+            // trademark. Open for the maintainer to pick a final icon.
+            Self::Anthropic => "icons/providers/acp.svg",
             Self::Acp => "icons/providers/acp.svg",
         }
     }
@@ -55,6 +60,22 @@ const OPENCODE_MODELS: &[(&str, &str)] = &[
     ("opencode-go/hy3", "HY 3"),
 ];
 
+/// Native Anthropic catalog, listed only when `ANTHROPIC_API_KEY` is set.
+/// Seeds come from the registry so ids/labels have one source of truth.
+fn models_for_anthropic_key(has_key: bool) -> Vec<ModelOption> {
+    if !has_key {
+        return Vec::new();
+    }
+    threadlane_provider::model_registry::ANTHROPIC_BUILTIN_MODELS
+        .iter()
+        .map(|(id, label, _)| ModelOption {
+            id: (*id).to_string(),
+            label: (*label).to_string(),
+            provider: ModelProvider::Anthropic,
+        })
+        .collect()
+}
+
 fn provider_models(models: &[(&str, &str)], provider: ModelProvider) -> Vec<ModelOption> {
     models
         .iter()
@@ -77,6 +98,9 @@ pub fn available_models_for_project(
         threadlane_auth::antigravity_auth::load_antigravity_credentials().is_some(),
         threadlane_coding_agent::credentials::opencode_api_key().is_some(),
     );
+    models.extend(models_for_anthropic_key(credentials_allow(
+        ModelProvider::Anthropic,
+    )));
     merge_discovered_opencode_models(&mut models);
     merge_discovered_openai_models(&mut models);
     merge_registry_models(&mut models, project_root);
@@ -668,9 +692,11 @@ fn provider_for_id(id: &str, declared: Option<&str>) -> ModelProvider {
         "openai" => ModelProvider::OpenAi,
         "antigravity" => ModelProvider::Antigravity,
         "opencode" | "opencode-go" => ModelProvider::OpenCode,
+        "anthropic" => ModelProvider::Anthropic,
         "acp" => ModelProvider::Acp,
         _ if id.starts_with("antigravity/") => ModelProvider::Antigravity,
         _ if id.starts_with("opencode-go/") => ModelProvider::OpenCode,
+        _ if id.starts_with("anthropic/") => ModelProvider::Anthropic,
         _ if id.starts_with("acp/") => ModelProvider::Acp,
         _ => ModelProvider::OpenAi,
     }
@@ -684,6 +710,9 @@ fn credentials_allow(provider: ModelProvider) -> bool {
         }
         ModelProvider::OpenCode => {
             threadlane_coding_agent::credentials::opencode_api_key().is_some()
+        }
+        ModelProvider::Anthropic => {
+            threadlane_coding_agent::credentials::anthropic_api_key().is_some()
         }
         ModelProvider::Acp => true,
     }
@@ -793,6 +822,7 @@ fn option_for(model_id: &str) -> Option<ModelOption> {
     provider_models(ANTIGRAVITY_MODELS, ModelProvider::Antigravity)
         .into_iter()
         .chain(provider_models(OPENCODE_MODELS, ModelProvider::OpenCode))
+        .chain(models_for_anthropic_key(true))
         .find(|model| model.id == model_id)
 }
 
@@ -1225,6 +1255,32 @@ mod tests {
         assert!(models_for_credentials(false, true)
             .iter()
             .all(|model| model.provider == ModelProvider::OpenCode));
+    }
+
+    #[test]
+    fn anthropic_models_are_hidden_without_a_key_and_listed_with_one() {
+        assert!(models_for_anthropic_key(false).is_empty());
+        let models = models_for_anthropic_key(true);
+        assert!(models.len() >= 2);
+        assert!(models.iter().all(|model| {
+            model.provider == ModelProvider::Anthropic && model.id.starts_with("anthropic/")
+        }));
+        assert!(models
+            .iter()
+            .any(|model| model.id == "anthropic/claude-opus-5-5"));
+        assert_eq!(
+            provider_for_id("anthropic/claude-opus-5-5", None),
+            ModelProvider::Anthropic
+        );
+        assert_eq!(
+            provider_for_id("x", Some("anthropic")),
+            ModelProvider::Anthropic
+        );
+        // Labels resolve for a saved selection even before the key is seen.
+        assert_eq!(
+            label_for("anthropic/claude-sonnet-5-5").as_deref(),
+            Some("Claude Sonnet 5.5")
+        );
     }
 
     #[test]

@@ -55,6 +55,7 @@ pub fn model_context_limit_for_project(model: &str, project_root: Option<&std::p
     let unadorned = model
         .strip_prefix("antigravity/")
         .or_else(|| model.strip_prefix("opencode-go/"))
+        .or_else(|| model.strip_prefix("anthropic/"))
         .unwrap_or(model);
     match unadorned {
         "gemini-3.7-flash" | "gemini-3.6-flash" | "gemini-3.5-flash" => Some(1_000_000),
@@ -62,6 +63,9 @@ pub fn model_context_limit_for_project(model: &str, project_root: Option<&std::p
         "gpt-5.6-luna" | "gpt-5.4" | "gpt-5.5" | "gpt-5.6-sol" | "gpt-5.6-terra" => Some(1_000_000),
         "gpt-5.4-mini" | "gpt-4o" | "gpt-4o-mini" => Some(128_000),
         "claude-sonnet-4-6" | "claude-opus-4-6" => Some(200_000),
+        "claude-fable-5-1" | "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-haiku-5-5" => {
+            Some(1_000_000)
+        }
         "gpt-oss-120b" => Some(128_000),
         _ => None,
     }
@@ -143,6 +147,24 @@ pub fn context_budget_for_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anthropic_models_resolve_context_windows_with_or_without_prefix() {
+        for id in [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-1",
+        ] {
+            assert_eq!(
+                model_context_limit(&format!("anthropic/{id}")),
+                Some(1_000_000),
+                "{id}"
+            );
+            assert_eq!(model_context_limit(id), Some(1_000_000), "{id}");
+        }
+        assert_eq!(model_context_limit("anthropic/claude-unknown-9"), None);
+    }
 
     #[test]
     fn adaptive_budget_balances_known_large_and_unknown_models() {

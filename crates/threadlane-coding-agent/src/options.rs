@@ -39,6 +39,8 @@ impl HarnessCompositionSnapshot {
             "antigravity"
         } else if options.model.starts_with("opencode-go/") {
             "opencode-go"
+        } else if options.model.starts_with("anthropic/") {
+            "anthropic"
         } else if options.model.starts_with("acp/") {
             "acp"
         } else {

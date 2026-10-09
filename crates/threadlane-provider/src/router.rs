@@ -1,3 +1,4 @@
+use crate::anthropic::AnthropicClient;
 use crate::antigravity::AntigravityClient;
 use crate::convert::{convert_to_codex_llm, convert_to_llm};
 use crate::openai::OpenAIClient;
@@ -15,6 +16,7 @@ use tokio::sync::mpsc;
 
 const ANTIGRAVITY_MODEL_PREFIX: &str = "antigravity/";
 const OPENCODE_MODEL_PREFIX: &str = "opencode-go/";
+const ANTHROPIC_MODEL_PREFIX: &str = crate::anthropic::ANTHROPIC_MODEL_PREFIX;
 
 pub fn is_antigravity_model(model: &str) -> bool {
     model.starts_with(ANTIGRAVITY_MODEL_PREFIX)
@@ -22,6 +24,10 @@ pub fn is_antigravity_model(model: &str) -> bool {
 
 pub fn is_opencode_model(model: &str) -> bool {
     model.starts_with(OPENCODE_MODEL_PREFIX)
+}
+
+pub fn is_anthropic_model(model: &str) -> bool {
+    model.starts_with(ANTHROPIC_MODEL_PREFIX)
 }
 
 fn is_quota_or_rate_limit(error: &str) -> bool {
@@ -179,6 +185,7 @@ pub struct ProviderClient {
     antigravity: AntigravityClient,
     opencode: OpenCodeGoClient,
     opencode_api_key: Option<String>,
+    anthropic: AnthropicClient,
     antigravity_credentials: crate::credentials::SharedAntigravityCredentials,
 }
 
@@ -247,6 +254,7 @@ impl Clone for ProviderClient {
             antigravity: self.antigravity.clone(),
             opencode: self.opencode.clone(),
             opencode_api_key: self.opencode_api_key.clone(),
+            anthropic: self.anthropic.clone(),
             antigravity_credentials: self.antigravity_credentials.clone(),
         }
     }
@@ -348,6 +356,7 @@ impl ProviderClient {
             antigravity: AntigravityClient::new_with_credentials(antigravity_credentials.clone()),
             opencode,
             opencode_api_key,
+            anthropic: AnthropicClient::new(),
             antigravity_credentials,
         }
     }
@@ -359,13 +368,15 @@ impl ProviderClient {
         codex_accounts: crate::credentials::SharedCodexResolver,
     ) -> Self {
         let (api_key, account_id) = self.openai.credentials_pair();
-        Self::new_with_resolver(
+        let mut client = Self::new_with_resolver(
             api_key,
             account_id,
             codex_accounts,
             self.opencode_api_key.clone(),
             self.antigravity_credentials.clone(),
-        )
+        );
+        client.anthropic = self.anthropic.clone();
+        client
     }
 
     /// Attaches the stored OpenCode API key for Zen requests.
@@ -402,6 +413,7 @@ impl ProviderClient {
             antigravity: AntigravityClient::new(),
             opencode: OpenCodeGoClient::new(),
             opencode_api_key: None,
+            anthropic: AnthropicClient::new(),
             antigravity_credentials: Arc::new(crate::credentials::NoopAntigravityCredentials),
         }
     }
@@ -423,6 +435,7 @@ impl ProviderClient {
             antigravity: AntigravityClient::new(),
             opencode: OpenCodeGoClient::new(),
             opencode_api_key: None,
+            anthropic: AnthropicClient::new(),
             antigravity_credentials: Arc::new(crate::credentials::NoopAntigravityCredentials),
         }
     }
@@ -434,7 +447,7 @@ impl ProviderClient {
 
     #[cfg(test)]
     fn determine_format(&self, model: &str) -> PayloadFormat {
-        if is_antigravity_model(model) || is_opencode_model(model) {
+        if is_antigravity_model(model) || is_opencode_model(model) || is_anthropic_model(model) {
             PayloadFormat::ChatCompletions
         } else if self.openai.is_codex() {
             PayloadFormat::Codex
@@ -448,6 +461,8 @@ impl ProviderClient {
             "antigravity"
         } else if is_opencode_model(model) {
             "opencode-go"
+        } else if is_anthropic_model(model) {
+            "anthropic"
         } else if self.openai.is_codex() {
             "codex"
         } else {
@@ -476,6 +491,14 @@ impl ProviderClient {
         if is_opencode_model(&model) {
             tracing::debug!(provider = "opencode-go", "selected provider");
             let provider = Arc::new(self.opencode.clone());
+            provider
+                .stream_chat_completion(source, prompt_cache_key, event_tx)
+                .await;
+            return;
+        }
+        if is_anthropic_model(&model) {
+            tracing::debug!(provider = "anthropic", "selected provider");
+            let provider = Arc::new(self.anthropic.clone());
             provider
                 .stream_chat_completion(source, prompt_cache_key, event_tx)
                 .await;
@@ -613,6 +636,8 @@ impl ProviderClient {
             Arc::new(self.antigravity.clone())
         } else if is_opencode_model(model) {
             Arc::new(self.opencode.clone())
+        } else if is_anthropic_model(model) {
+            Arc::new(self.anthropic.clone())
         } else {
             Arc::new(self.openai.clone())
         };
@@ -624,6 +649,8 @@ impl ProviderClient {
             Arc::new(self.antigravity.clone())
         } else if is_opencode_model(model) {
             Arc::new(self.opencode.clone())
+        } else if is_anthropic_model(model) {
+            Arc::new(self.anthropic.clone())
         } else {
             Arc::new(self.openai.clone())
         };
@@ -643,7 +670,7 @@ impl ProviderClient {
         if model.starts_with("acp/") {
             return Err("automatic titles are skipped for external agents".into());
         }
-        if !is_opencode_model(model) {
+        if !is_opencode_model(model) && !is_anthropic_model(model) {
             return self.openai.generate_title(model, prompt).await;
         }
 
@@ -681,19 +708,19 @@ impl ProviderClient {
             Ok(result) => result,
             Err(_) => {
                 stream_task.abort();
-                return Err("OpenCode title request timed out".to_owned());
+                return Err("Provider title request timed out".to_owned());
             }
         };
 
         if stream_task.await.is_err() && error.is_none() {
-            return Err("OpenCode title stream terminated unexpectedly".to_owned());
+            return Err("Provider title stream terminated unexpectedly".to_owned());
         }
         if let Some(error) = error {
             return Err(error);
         }
 
         if text.trim().is_empty() {
-            Err("OpenCode title response did not contain text".to_owned())
+            Err("Provider title response did not contain text".to_owned())
         } else {
             Ok(text)
         }
@@ -1551,6 +1578,27 @@ mod tests {
         assert!(is_antigravity_model("antigravity/gemini-3.6-flash"));
         assert!(!is_antigravity_model("gpt-5.6-luna"));
         assert!(!is_antigravity_model("gemini-3.6-flash"));
+    }
+
+    #[test]
+    fn routes_only_prefixed_models_to_anthropic() {
+        assert!(is_anthropic_model("anthropic/claude-sonnet-x"));
+        assert!(!is_anthropic_model("claude-sonnet-x"));
+        assert!(!is_anthropic_model("opencode-go/anthropic/claude"));
+        assert!(!is_anthropic_model("antigravity/claude-sonnet-x"));
+        assert!(!is_opencode_model("anthropic/claude-sonnet-x"));
+        assert!(!is_antigravity_model("anthropic/claude-sonnet-x"));
+        let client = ProviderClient::new("key".to_string(), None);
+        assert_eq!(
+            client.provider_kind("anthropic/claude-sonnet-x"),
+            "anthropic"
+        );
+        assert_eq!(client.provider_kind("opencode-go/kimi-k3"), "opencode-go");
+        assert_eq!(client.provider_kind("gpt-5"), "openai");
+        assert_eq!(
+            client.determine_format("anthropic/claude-sonnet-x"),
+            PayloadFormat::ChatCompletions
+        );
     }
 
     #[test]
