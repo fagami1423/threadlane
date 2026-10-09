@@ -19,14 +19,10 @@
 
 ### Bug Fixes
 
-* **acp:** launch npm-shim agents on Windows and send a plain cwd ([a3ef03f](https://github.com/wheregmis/threadlane/commit/a3ef03f7d89657999824da04bf913ebf19daddd7))
 * **acp:** launch npm-shim agents on Windows and send a plain cwd ([c6b8037](https://github.com/wheregmis/threadlane/commit/c6b80374b58e4ede04d809c02564f80091372671))
-* **acp:** skip unsupported Windows PATHEXT candidates ([a23fcd7](https://github.com/wheregmis/threadlane/commit/a23fcd72f7730b7fa643520c192e546d6e82e008))
 * **acp:** skip unsupported Windows PATHEXT candidates ([8fd22d2](https://github.com/wheregmis/threadlane/commit/8fd22d2f41b2fb753e4922461fc794cf81402e36))
-* allow mobile pairing over Tailscale IPv4 ([a603285](https://github.com/wheregmis/threadlane/commit/a60328559ce224ea7823e5fc42d45b38db9924a1))
 * allow mobile pairing over Tailscale IPv4 ([49c83b0](https://github.com/wheregmis/threadlane/commit/49c83b0e8b6bd949c17d9ee71d92a9ed7e90a2ad))
 * **chat:** deduplicate failures by exact retry payload ([b8a8b70](https://github.com/wheregmis/threadlane/commit/b8a8b7074024978789e3a7743adbca7bbf56a7fa))
-* **chat:** resend exact failed prompts with image attachments ([0ff61af](https://github.com/wheregmis/threadlane/commit/0ff61afa07752fc2e3822b92a68c8b7eef9ad76e))
 * **chat:** resend exact failed prompts with image attachments ([6a60c7f](https://github.com/wheregmis/threadlane/commit/6a60c7ff665c826a11b8d959978c31a9a3c37de2))
 * **chat:** restore rejected credential submissions to scoped drafts ([f4ac16f](https://github.com/wheregmis/threadlane/commit/f4ac16f1d9f3f552fa4f1211ffd8350dbef1ebe6))
 * **chat:** retain retry payload for ACP preflight failures ([05b6403](https://github.com/wheregmis/threadlane/commit/05b64032b1b1659886826fd72b1435d64d580554))
