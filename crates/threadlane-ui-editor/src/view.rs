@@ -50,6 +50,7 @@ pub struct EditorTab {
     request_generation: u64,
     baseline_loaded: bool,
     editor_state: Option<Entity<EditorState>>,
+    workbench: Option<Entity<threadlane_ui_kit::EditorWorkbench>>,
     text_view_state: Option<Entity<TextViewState>>,
     markdown_preview: threadlane_ui_kit::MarkdownPreview,
     _subscription: Option<Subscription>,
@@ -579,6 +580,7 @@ impl EditorView {
             request_generation: 0,
             baseline_loaded: true,
             editor_state: None,
+            workbench: None,
             markdown_preview: threadlane_ui_kit::MarkdownPreview::new(cx),
             text_view_state: Some(markdown_state),
             _subscription: None,
@@ -650,6 +652,9 @@ impl EditorView {
                 .default_value("")
         });
 
+        let workbench = cx.new(|cx| {
+            threadlane_ui_kit::EditorWorkbench::new(editor.clone(), lang, window, cx)
+        });
         let target_path = relative_path.to_string();
         let target_project = project_dir.to_path_buf();
         let subscription = cx.subscribe(&editor, move |this, editor, event: &InputEvent, cx| {
@@ -710,6 +715,7 @@ impl EditorView {
             request_generation: 0,
             baseline_loaded: false,
             editor_state: Some(editor.clone()),
+            workbench: Some(workbench),
             markdown_preview: threadlane_ui_kit::MarkdownPreview::new(cx),
             text_view_state: None,
             _subscription: Some(subscription),
@@ -1593,6 +1599,8 @@ impl Render for EditorView {
                         }
                     } else if active_tab.markdown_preview.is_active() {
                         active_tab.markdown_preview.body(cx)
+                    } else if let Some(ref workbench) = active_tab.workbench {
+                        workbench.clone().into_any_element()
                     } else if let Some(ref editor) = active_tab.editor_state {
                         threadlane_ui_kit::editor_buffer(editor)
                             .into_any_element()

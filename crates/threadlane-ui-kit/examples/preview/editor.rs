@@ -20,6 +20,7 @@ const SAMPLE_DIFF: &str = "--- a/example.rs\n+++ b/example.rs\n@@ -1,3 +1,3 @@\n
 
 pub struct EditorPreview {
     buffer: Entity<EditorState>,
+    workbench: Entity<kit::EditorWorkbench>,
     diffs: HashMap<String, Entity<TextViewState>>,
     saved: String,
     tabs: Vec<String>,
@@ -50,11 +51,13 @@ impl EditorPreview {
                 })
                 .default_value(SAMPLE)
         });
+        let workbench = cx.new(|cx| kit::EditorWorkbench::new(buffer.clone(), "rust", window, cx));
         let subscription = cx.subscribe(&buffer, |_, _, _: &InputEvent, cx| cx.notify());
         let markdown = format!("```diff\n{SAMPLE_DIFF}\n```");
         let diff = cx.new(|cx| TextViewState::markdown(&markdown, cx));
         Self {
             buffer,
+            workbench,
             diffs: HashMap::from([(DIFF.into(), diff)]),
             saved: SAMPLE.into(),
             tabs: vec![FILE.into(), DIFF.into()],
@@ -299,7 +302,7 @@ impl Render for EditorPreview {
                     ))
             }))
             .child(if self.selected.as_deref() == Some(FILE) {
-                kit::editor_buffer(&self.buffer).into_any_element()
+                self.workbench.clone().into_any_element()
             } else if let Some(diff) = self.selected.as_ref().and_then(|id| self.diffs.get(id)) {
                 kit::editor_diff(diff, cx).into_any_element()
             } else {

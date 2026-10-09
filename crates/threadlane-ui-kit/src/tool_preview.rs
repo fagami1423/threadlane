@@ -16,9 +16,10 @@ pub fn detect_language(path_str: &str) -> &'static str {
         .as_deref()
     {
         Some("rs") => "rust",
-        Some("py") => "python",
+        Some("py" | "pyi") => "python",
         Some("js" | "mjs" | "cjs" | "jsx") => "javascript",
-        Some("ts" | "mts" | "cts" | "tsx") => "typescript",
+        Some("ts" | "mts" | "cts") => "typescript",
+        Some("tsx") => "tsx",
         Some("json") => "json",
         Some("toml") => "toml",
         Some("yaml" | "yml") => "yaml",
@@ -31,6 +32,10 @@ pub fn detect_language(path_str: &str) -> &'static str {
         Some("cpp" | "hpp" | "cc" | "cxx" | "hh") => "cpp",
         Some("diff" | "patch") => "diff",
         Some("zig") => "zig",
+        Some("java") => "java",
+        Some("rb" | "gemspec") => "ruby",
+        Some("sql") => "sql",
+        Some("cmake") => "cmake",
         _ => match path
             .file_name()
             .and_then(|name| name.to_str())
@@ -39,6 +44,10 @@ pub fn detect_language(path_str: &str) -> &'static str {
         {
             Some("dockerfile") => "bash",
             Some("cargo.lock") => "toml",
+            Some("makefile" | "gnumakefile") => "make",
+            Some("cmakelists.txt") => "cmake",
+            Some("gemfile" | "rakefile") => "ruby",
+            Some(".bashrc" | ".bash_profile" | ".zshrc" | ".profile") => "bash",
             _ => "text",
         },
     }

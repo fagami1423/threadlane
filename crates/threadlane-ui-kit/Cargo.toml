@@ -6,6 +6,8 @@ autoexamples = false
 description = "Threadlane's native agent UI toolkit: conversation, composer, tools, decisions and navigation"
 
 [dependencies]
+anyhow = "1"
+lsp-types = "0.97"
 vt100.workspace = true
 threadlane-automation.workspace = true
 gpui.workspace = true
@@ -19,7 +21,7 @@ regex.workspace = true
 
 # The standalone native gallery needs the same grammars as the desktop host.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-gpui-component = { workspace = true, features = ["tree-sitter-rust", "tree-sitter-python", "tree-sitter-javascript", "tree-sitter-typescript", "tree-sitter-html", "tree-sitter-css", "tree-sitter-bash", "tree-sitter-toml", "tree-sitter-yaml", "tree-sitter-markdown", "tree-sitter-diff"] }
+gpui-component = { workspace = true, features = ["tree-sitter-rust", "tree-sitter-python", "tree-sitter-javascript", "tree-sitter-typescript", "tree-sitter-tsx", "tree-sitter-html", "tree-sitter-css", "tree-sitter-bash", "tree-sitter-toml", "tree-sitter-yaml", "tree-sitter-markdown", "tree-sitter-diff", "tree-sitter-go", "tree-sitter-c", "tree-sitter-cpp", "tree-sitter-zig", "tree-sitter-java", "tree-sitter-ruby", "tree-sitter-sql", "tree-sitter-make", "tree-sitter-cmake"] }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
