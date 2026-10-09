@@ -833,7 +833,7 @@ fn chat_errors_are_bounded_deduplicated_and_keep_recovery_details(cx: &mut gpui:
 }
 
 #[test]
-fn retry_dispatch_rejects_stale_actions() {
+fn retry_dispatch_preserves_payload_and_rejects_stale_actions() {
     let payload = threadlane_protocol::RetryPrompt {
         text: "inspect screenshot".into(),
         images: vec![threadlane_protocol::ImageAttachment {
@@ -871,6 +871,16 @@ fn retry_dispatch_rejects_stale_actions() {
     state.is_generating = true;
     super::retry_failed_prompt(&mut state, "retry-session", path, "failed", &payload);
     assert!(state.requested_composer_inserts.is_empty());
+    state.is_generating = false;
+    state.test_start_worktree_setup();
+    super::retry_failed_prompt(&mut state, "retry-session", path, "failed", &payload);
+    let restored = state.requested_composer_inserts.last().expect("rejected send restored");
+    assert_eq!(restored.text, payload.text);
+    assert_eq!(restored.images, payload.images);
+    assert_eq!(restored.session_id.as_deref(), Some("retry-session"));
+    assert_eq!(restored.work_dir.as_deref(), Some(path));
+    state.active_session_id = Some("other-session".into());
+    assert_ne!(state.requested_composer_inserts[0].session_id, state.active_session_id);
 }
 
 #[gpui::test]

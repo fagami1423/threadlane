@@ -6246,22 +6246,11 @@ impl AppState {
         // CLI login — so it has no Threadlane provider credential to check, and
         // gating it on one blocks every ACP turn before it starts.
         if api_key.is_empty() && !threadlane_acp_engine::is_acp_model(&model) {
-            self.messages_mut().push(ChatMessageInfo {
-                id: format!("credential-error-{session_id}"),
-                role: MessageRole::Error,
-                retry_prompt: Some(threadlane_protocol::RetryPrompt {
-                    text: text.clone(),
-                    images: images.clone(),
-                }),
-                content: format!(
-                    "No API key configured for model `{model}`. Open Settings and save the provider credential."
-                ),
-                tool_activities: Vec::new(),
-                streaming: false,
-                reasoning_content: None,
-                reasoning_expanded: false,
-            });
-            return Ok(());
+            // Reject before accepting/clearing the submission. The controller
+            // restores its exact payload to the session-scoped composer draft.
+            return Err(format!(
+                "No API key configured for model `{model}`. Open Settings and save the provider credential."
+            ));
         }
 
         // New-task ACP picks have no session to apply to yet; they wait here
