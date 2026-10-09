@@ -48,4 +48,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: gpui-check-${{ runner.os }}
+      - uses: taiki-e/install-action@nextest
+      - name: Test ACP subprocess handling
+        run: cargo nextest run -p threadlane-acp
       - run: cargo check -p threadlane-gpui
