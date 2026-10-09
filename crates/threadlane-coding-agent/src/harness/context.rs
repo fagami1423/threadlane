@@ -346,7 +346,7 @@ impl CodingSessionHarness {
         if snapshots.is_empty() {
             return Ok((Vec::new(), work_dir));
         }
-        let messages = self.model_context("main")?.messages();
+        let messages = self.model_context("main")?.into_messages();
         let by_call: HashMap<_, _> = snapshots
             .iter()
             .map(|snapshot| (snapshot.source_tool_call_id.as_str(), snapshot))

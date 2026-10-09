@@ -228,7 +228,7 @@ impl CodingSessionHarness {
     ) -> Result<(), String> {
         self.ensure_fresh()?;
         let budget = context_budget(model, &BudgetConfig::from(config));
-        let messages = self.model_context("main")?.messages();
+        let messages = self.model_context("main")?.into_messages();
         let post_tokens = estimate_request_tokens(&messages, None, &CompactionParams::from(config));
         let generation = self.compaction_generation().saturating_add(1);
         let record = HarnessRecord::ContextCompacted {

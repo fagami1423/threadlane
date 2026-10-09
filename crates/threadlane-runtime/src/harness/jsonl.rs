@@ -846,6 +846,26 @@ impl SessionStore for JsonlStore {
         self.entry_positions.get(id).map(|index| &self.entries[*index])
     }
 
+    fn branch(&self, leaf_id: Option<&str>, limit: usize) -> Vec<Entry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut current = match leaf_id {
+            Some(id) => self.entry(id),
+            None => self.entries.last(),
+        };
+        let mut branch = Vec::new();
+        while let Some(entry) = current {
+            branch.push(entry.clone());
+            if branch.len() == limit {
+                break;
+            }
+            current = entry.parent_id.as_deref().and_then(|id| self.entry(id));
+        }
+        branch.reverse();
+        branch
+    }
+
     fn append_actions_atomically(
         &mut self,
         actions: &[super::EffectAction],
@@ -1639,6 +1659,46 @@ mod tests {
             },
             false,
         )
+    }
+
+    #[test]
+    fn indexed_branch_tracks_append_atomic_refresh_and_reload() {
+        fn ids(store: &JsonlStore, leaf: Option<&str>, limit: usize) -> Vec<String> {
+            store
+                .branch(leaf, limit)
+                .into_iter()
+                .map(|entry| entry.id)
+                .collect()
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("branches.jsonl");
+        let mut store = JsonlStore::open(&path).unwrap();
+        assert!(store.branch(None, usize::MAX).is_empty());
+        store.append_entry(user_entry("root", "main")).unwrap();
+        let mut next = user_entry("next", "main");
+        next.parent_id = Some("root".into());
+        store.append_entry(next).unwrap();
+        let mut fork = user_entry("fork", "child");
+        fork.parent_id = Some("root".into());
+        store
+            .append_actions_atomically(&[EffectAction::AppendEntry { entry: fork }])
+            .unwrap();
+        let assert_branches = |store: &JsonlStore| {
+            assert_eq!(ids(store, Some("next"), usize::MAX), ["root", "next"]);
+            assert_eq!(ids(store, Some("fork"), usize::MAX), ["root", "fork"]);
+            assert_eq!(ids(store, None, 1), ["fork"]);
+            assert!(store.branch(Some("missing"), usize::MAX).is_empty());
+            assert!(store.branch(Some("next"), 0).is_empty());
+        };
+        assert_branches(&store);
+        assert_branches(&JsonlStore::open_read_only(&path).unwrap());
+        let mut observer = JsonlStore::open_read_only(&path).unwrap();
+        let mut tail = user_entry("tail", "main");
+        tail.parent_id = Some("next".into());
+        store.append_entry(tail).unwrap();
+        observer.ensure_fresh().unwrap();
+        assert_eq!(ids(&observer, Some("tail"), 2), ["next", "tail"]);
+        assert_eq!(ids(&observer, None, usize::MAX), ["root", "next", "tail"]);
     }
 
     #[test]

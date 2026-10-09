@@ -16,6 +16,11 @@ pub fn file_mtime(path: &Path) -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
+fn discovery_fingerprint(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()?))
+}
+
 pub fn effective_session_work_dir(
     canonical_work_dir: &Path,
     id: &str,
@@ -165,6 +170,16 @@ pub fn discover_sessions_in_project_cached(
     work_dir: &Path,
     cache: &mut SessionDiscoveryCache,
 ) -> Vec<SessionInfo> {
+    discover_sessions_in_project_cached_with_loader(work_dir, cache, |path| {
+        JsonlStore::open_read_only(path)
+    })
+}
+
+fn discover_sessions_in_project_cached_with_loader(
+    work_dir: &Path,
+    cache: &mut SessionDiscoveryCache,
+    mut load_store: impl FnMut(&Path) -> std::io::Result<JsonlStore>,
+) -> Vec<SessionInfo> {
     let sessions_dir = work_dir.join(".threadlane/sessions");
     let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
         return Vec::new();
@@ -191,11 +206,11 @@ pub fn discover_sessions_in_project_cached(
             .get(&path)
             .map(|cached| cached.info.session_file.as_path())
             .unwrap_or(path.as_path());
-        let metadata = std::fs::metadata(cached_data_path).ok();
-        let len = metadata.as_ref().map_or(0, |metadata| metadata.len());
-        let modified = metadata.and_then(|metadata| metadata.modified().ok());
-        let info = match cache.entries.get(&path) {
-            Some(cached) if cached.len == len && cached.modified == modified => {
+        let cached_fingerprint = discovery_fingerprint(cached_data_path);
+        let info = match (cache.entries.get(&path), cached_fingerprint) {
+            (Some(cached), Some((len, modified)))
+                if cached.len == len && cached.modified == Some(modified) =>
+            {
                 // Session files do not change when a worktree is deleted or
                 // recreated, so a metadata cache hit can carry a stale
                 // `worktree_available`. Recompute that one cheap probe per pass.
@@ -210,7 +225,7 @@ pub fn discover_sessions_in_project_cached(
                         path.clone(),
                         SessionDiscoveryCacheEntry {
                             len,
-                            modified,
+                            modified: Some(modified),
                             info: info.clone(),
                         },
                     );
@@ -222,8 +237,10 @@ pub fn discover_sessions_in_project_cached(
                     .file_stem()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| "session".into());
+                let stub_fingerprint = discovery_fingerprint(&path);
+                let stub = load_store(&path);
                 let (runtime_work_dir, is_worktree, stub_branch, github_issue) =
-                    match JsonlStore::open_read_only(&path) {
+                    match &stub {
                         Ok(store) => {
                             let facts = store.facts();
                             let is_worktree = facts
@@ -244,8 +261,14 @@ pub fn discover_sessions_in_project_cached(
                     };
                 let session_file =
                     resolve_session_transcript_file(&path, &runtime_work_dir, &id, is_worktree);
+                let (transcript, pre_open_fingerprint) = if session_file == path {
+                    (stub, stub_fingerprint)
+                } else {
+                    let fingerprint = discovery_fingerprint(&session_file);
+                    (load_store(&session_file), fingerprint)
+                };
                 let (title, health, recorded_branch, completion_summary) =
-                    match JsonlStore::open_read_only(&session_file) {
+                    match transcript {
                         Ok(store) => (
                             extract_session_title(&store, &id),
                             SessionHealth::Healthy,
@@ -264,9 +287,11 @@ pub fn discover_sessions_in_project_cached(
                     };
                 let git_branch =
                     effective_session_git_branch(&runtime_work_dir, is_worktree, recorded_branch);
-                let metadata = std::fs::metadata(&session_file).ok();
-                let len = metadata.as_ref().map_or(0, |metadata| metadata.len());
-                let modified = metadata.and_then(|metadata| metadata.modified().ok());
+                let post_projection_fingerprint = discovery_fingerprint(&session_file);
+                let cache_fingerprint = match (pre_open_fingerprint, post_projection_fingerprint) {
+                    (Some(before), Some(after)) if before == after => Some(after),
+                    _ => None,
+                };
                 let worktree_available = !is_worktree || runtime_work_dir.is_dir();
                 let info = SessionInfo {
                     id,
@@ -282,14 +307,18 @@ pub fn discover_sessions_in_project_cached(
                     worktree_available,
                     completion_summary,
                 };
-                cache.entries.insert(
-                    path.clone(),
-                    SessionDiscoveryCacheEntry {
-                        len,
-                        modified,
-                        info: info.clone(),
-                    },
-                );
+                if let Some((len, modified)) = cache_fingerprint {
+                    cache.entries.insert(
+                        path.clone(),
+                        SessionDiscoveryCacheEntry {
+                            len,
+                            modified: Some(modified),
+                            info: info.clone(),
+                        },
+                    );
+                } else {
+                    cache.entries.remove(&path);
+                }
                 info
             }
         };
@@ -303,4 +332,124 @@ pub fn discover_sessions_in_project_cached(
             .then_with(|| a.title.cmp(&b.title))
     });
     sessions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        canonical_session_file, discover_sessions_in_project_cached,
+        discover_sessions_in_project_cached_with_loader,
+    };
+    use crate::types::{SessionCompletionSummary, SessionDiscoveryCache, SessionHealth};
+    use std::cell::Cell;
+    use std::path::Path;
+    use threadlane_runtime::harness::{JsonlStore, SessionStore};
+
+    #[test]
+    fn discovery_reuses_local_transcript_and_refreshes_changed_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().canonicalize().unwrap();
+        let path = canonical_session_file(&project, "local");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut store = JsonlStore::open(&path).unwrap();
+        store.set_name("Original title").unwrap();
+        store.append_fact("main", "git_branch", "feature", None).unwrap();
+        let mut cache = SessionDiscoveryCache::default();
+        for _ in 0..2 {
+            let sessions = discover_sessions_in_project_cached(&project, &mut cache);
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].title, "Original title");
+            assert_eq!(sessions[0].session_file, path);
+            assert_eq!(sessions[0].git_branch.as_deref(), Some("feature"));
+            assert_eq!(sessions[0].health, SessionHealth::Healthy);
+            assert_eq!(
+                sessions[0].completion_summary,
+                SessionCompletionSummary::None
+            );
+        }
+        store.set_name("Changed title").unwrap();
+        assert_eq!(
+            discover_sessions_in_project_cached(&project, &mut cache)[0].title,
+            "Changed title"
+        );
+        drop(store);
+        std::fs::write(&path, "{invalid journal}\n").unwrap();
+        let sessions = discover_sessions_in_project_cached(&project, &mut cache);
+        assert_eq!(sessions[0].health, SessionHealth::Warning);
+        assert_eq!(sessions[0].title, "Unreadable session");
+        assert_eq!(
+            sessions[0].completion_summary,
+            SessionCompletionSummary::Unknown
+        );
+    }
+
+    #[test]
+    fn discovery_does_not_cache_snapshot_if_journal_changes_during_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().canonicalize().unwrap();
+        let path = canonical_session_file(&project, "local");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut store = JsonlStore::open(&path).unwrap();
+        store.set_name("Original title").unwrap();
+        drop(store);
+
+        let mut cache = SessionDiscoveryCache::default();
+        let open_count = Cell::new(0);
+        {
+            let mut loader = |path: &Path| {
+                open_count.set(open_count.get() + 1);
+                JsonlStore::open_read_only(path)
+            };
+            let sessions =
+                discover_sessions_in_project_cached_with_loader(&project, &mut cache, &mut loader);
+            assert_eq!(sessions[0].title, "Original title");
+            assert_eq!(open_count.get(), 1);
+            open_count.set(0);
+            let sessions =
+                discover_sessions_in_project_cached_with_loader(&project, &mut cache, &mut loader);
+            assert_eq!(sessions[0].title, "Original title");
+            assert_eq!(open_count.get(), 0);
+        }
+
+        let mut writer = JsonlStore::open(&path).unwrap();
+        writer
+            .set_name("Snapshot title captured before concurrent append")
+            .unwrap();
+        drop(writer);
+
+        let race_open_count = Cell::new(0);
+        let injected_write = Cell::new(false);
+        let mut loader = |path: &Path| {
+            race_open_count.set(race_open_count.get() + 1);
+            let snapshot = JsonlStore::open_read_only(path)?;
+            if !injected_write.replace(true) {
+                let mut writer = JsonlStore::open(path)?;
+                writer
+                    .set_name("Changed title after reader opened its snapshot")
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                drop(writer);
+            }
+            Ok(snapshot)
+        };
+        let raced =
+            discover_sessions_in_project_cached_with_loader(&project, &mut cache, &mut loader);
+
+        assert_eq!(race_open_count.get(), 1);
+        assert_eq!(
+            raced[0].title,
+            "Snapshot title captured before concurrent append"
+        );
+        assert!(!cache.entries.contains_key(&path));
+
+        let refreshed = discover_sessions_in_project_cached(&project, &mut cache);
+        assert_eq!(
+            refreshed[0].title,
+            "Changed title after reader opened its snapshot"
+        );
+        assert!(cache.entries.contains_key(&path));
+        assert_eq!(
+            cache.entries[&path].info.title,
+            "Changed title after reader opened its snapshot"
+        );
+    }
 }

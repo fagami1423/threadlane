@@ -25,7 +25,7 @@ impl CodingSessionHarness {
             .as_ref()
             .and_then(|store| store.model_context("main").ok())
         {
-            context.messages()
+            context.into_messages()
         } else {
             JsonlStore::recover_main_entries(source)
                 .map_err(|error| format!("Could not recover the source transcript: {error}"))?
