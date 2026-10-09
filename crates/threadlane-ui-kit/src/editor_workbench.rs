@@ -22,6 +22,13 @@ actions!(
     ]
 );
 
+pub(crate) fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("ctrl-g", GoToLine, Some("EditorWorkbench")),
+        KeyBinding::new("alt-z", ToggleWrap, Some("EditorWorkbench")),
+    ]);
+}
+
 /// Presentation and in-memory editing only; the host still owns I/O and save guards.
 pub struct EditorWorkbench {
     editor: Entity<EditorState>,
@@ -41,10 +48,6 @@ impl EditorWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        cx.bind_keys([
-            KeyBinding::new("ctrl-g", GoToLine, Some("EditorWorkbench")),
-            KeyBinding::new("alt-z", ToggleWrap, Some("EditorWorkbench")),
-        ]);
         editor.update(cx, |state, cx| {
             state.set_soft_wrap(true, window, cx);
             state.set_indent_guides(true, window, cx);
@@ -162,6 +165,14 @@ fn parse_location(query: &str, text: &Rope) -> Option<Position> {
     ))
 }
 
+fn editor_position_accessibility_label(position: Position) -> String {
+    format!(
+        "Line {}, column {}. Go to line (Ctrl+G)",
+        position.line + 1,
+        position.character + 1
+    )
+}
+
 impl Render for EditorWorkbench {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let position = self.editor.read(cx).cursor_position();
@@ -226,7 +237,9 @@ impl Render for EditorWorkbench {
                                         position.line + 1,
                                         position.character + 1
                                     ))
-                                    .accessibility_label("Go to line")
+                                    .accessibility_label(
+                                        editor_position_accessibility_label(position)
+                                    )
                                     .tooltip("Go to line (Ctrl+G)")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.go_to_line(&GoToLine, window, cx)
@@ -287,23 +300,42 @@ impl Render for EditorWorkbench {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_location, EditorWorkbench};
+    use super::{
+        editor_position_accessibility_label, parse_location, EditorWorkbench, GoToLine, ToggleWrap,
+    };
     use gpui::{AppContext, TestAppContext};
     use gpui_component::input::{EditorState, Position, Rope};
+
+    fn workbench_binding_counts(cx: &mut gpui::App) -> (usize, usize) {
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        (
+            keymap.bindings_for_action(&GoToLine).count(),
+            keymap.bindings_for_action(&ToggleWrap).count(),
+        )
+    }
 
     #[gpui::test]
     fn editor_workbench_wrap_shortcut_preserves_buffer_and_provider(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
+        cx.update(crate::init_editor);
+        let bindings_before = cx.update(workbench_binding_counts);
+        assert_eq!(bindings_before, (1, 1));
         let (root, cx) = cx.add_window_view(|window, cx| {
             let editor = cx.new(|cx| {
                 EditorState::new(window, cx)
                     .language("rust")
                     .default_value("fn main() {}")
             });
+            let _duplicate = cx.new(|cx| EditorWorkbench::new(editor.clone(), "rust", window, cx));
             let workbench = cx.new(|cx| EditorWorkbench::new(editor.clone(), "rust", window, cx));
             editor.update(cx, |state, cx| state.focus(window, cx));
             gpui_component::Root::new(workbench, window, cx)
         });
+        assert_eq!(
+            cx.update(|_, cx| workbench_binding_counts(cx)),
+            bindings_before
+        );
         let workbench = root.read_with(cx, |root, _| {
             root.view().clone().downcast::<EditorWorkbench>().unwrap()
         });
@@ -320,6 +352,7 @@ mod tests {
     #[gpui::test]
     fn editor_completion_acceptance_replaces_whole_token_and_undoes(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
+        cx.update(crate::init_editor);
         let (root, cx) = cx.add_window_view(|window, cx| {
             let editor = cx.new(|cx| {
                 EditorState::new(window, cx)
@@ -401,5 +434,13 @@ mod tests {
         ] {
             assert_eq!(parse_location(query, &text), None, "{query}");
         }
+    }
+
+    #[test]
+    fn editor_position_accessibility_label_includes_location_and_shortcut() {
+        assert_eq!(
+            editor_position_accessibility_label(Position::new(23, 0)),
+            "Line 24, column 1. Go to line (Ctrl+G)"
+        );
     }
 }

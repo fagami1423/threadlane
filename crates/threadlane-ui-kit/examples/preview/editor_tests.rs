@@ -37,6 +37,7 @@ fn closed_sample_reopens_saved_bytes_through_shared_control_and_shortcut(cx: &mu
 #[gpui::test]
 fn saved_review_diffs_reuse_editor_tabs_and_preserve_unsaved_sample(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
+    cx.update(threadlane_ui_kit::init_editor);
     cx.update(threadlane_ui_theme::init_bundled);
     let saved = Rc::new(RefCell::new(None));
     let capture = saved.clone();

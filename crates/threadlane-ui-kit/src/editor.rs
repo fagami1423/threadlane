@@ -156,6 +156,7 @@ pub fn confirm_editor_reload(
 actions!(editor, [AddSelectionToChat, ReopenClosedFile, SavePanelDocument]);
 
 pub fn init_editor(cx: &mut App) {
+    crate::editor_workbench::init(cx);
     cx.bind_keys([
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-s", SavePanelDocument, Some("PanelDocument")),
