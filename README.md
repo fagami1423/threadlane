@@ -258,6 +258,19 @@ cargo nextest run -p threadlane-updater
 cargo nextest run --workspace
 ```
 
+### Session-read benchmark
+
+```bash
+cargo run --release -p threadlane-benchmarks --bin session_reads
+```
+
+Compares `JsonlStore`'s indexed branch reads with the reference `SessionStore`
+implementation on identical synthetic journals of 1,000, 10,000, and 50,000
+entries. CSV output reports median microseconds per read over nine samples for
+both a 32-entry tail and the full branch. Fixture creation and journal opening
+are excluded; each case checks identical output before timing. These are
+in-memory branch-read measurements, not end-to-end app startup timings.
+
 ## Packaging and releases
 
 Prefer squash merges with Conventional Commit titles (`feat:`, `fix:`, etc.). Plain merges can make Release Please list both the implementation and its merge message. The release workflow removes only duplicates verified against the merge message and Git ancestry, from the current release's changelog and PR description. Distinct follow-up commits remain. Run `node scripts/clean-release-notes.test.cjs` when changing this cleanup.

@@ -28,6 +28,11 @@ pub struct CompactionCheckpoint {
 }
 
 impl ModelContextProjection {
+    /// Consume the projection without copying its message payloads.
+    pub fn into_messages(self) -> Vec<AgentMessage> {
+        self.entries.into_iter().map(|entry| entry.message).collect()
+    }
+
     pub fn messages(&self) -> Vec<AgentMessage> {
         self.entries
             .iter()
@@ -212,7 +217,7 @@ pub trait SessionStore {
         Self: Sized,
     {
         self.model_context(lane)
-            .map(|ctx| ctx.messages())
+            .map(ModelContextProjection::into_messages)
             .unwrap_or_default()
     }
     fn get_persisted_messages(&self) -> Vec<AgentMessage> {
@@ -460,6 +465,24 @@ use threadlane_protocol::{AgentMessage, TokenUsage};
         });
         assert_eq!(store.lane_log("main", 3, 1).len(), 1);
         assert_eq!(store.usage_sum("main").total_tokens, 3);
+    }
+
+    #[test]
+    fn owned_context_messages_reuse_payload_allocations() {
+        let mut store = MemoryStore::new("owned-context");
+        store.append_message(None, AgentMessage::user("large payload".repeat(1024), vec![]));
+        let context = store.model_context("main").unwrap();
+        let expected = context.messages();
+        let AgentMessage::User { content } = &context.entries[0].message else {
+            panic!("expected user message");
+        };
+        let allocation = content.as_ptr();
+        let messages = context.into_messages();
+        assert_eq!(messages, expected);
+        let AgentMessage::User { content } = &messages[0] else {
+            panic!("expected user message");
+        };
+        assert_eq!(content.as_ptr(), allocation);
     }
 
     #[test]

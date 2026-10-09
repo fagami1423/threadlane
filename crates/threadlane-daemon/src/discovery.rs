@@ -222,8 +222,9 @@ pub fn discover_sessions_in_project_cached(
                     .file_stem()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| "session".into());
+                let stub = JsonlStore::open_read_only(&path);
                 let (runtime_work_dir, is_worktree, stub_branch, github_issue) =
-                    match JsonlStore::open_read_only(&path) {
+                    match &stub {
                         Ok(store) => {
                             let facts = store.facts();
                             let is_worktree = facts
@@ -244,8 +245,13 @@ pub fn discover_sessions_in_project_cached(
                     };
                 let session_file =
                     resolve_session_transcript_file(&path, &runtime_work_dir, &id, is_worktree);
+                let transcript = if session_file == path {
+                    stub
+                } else {
+                    JsonlStore::open_read_only(&session_file)
+                };
                 let (title, health, recorded_branch, completion_summary) =
-                    match JsonlStore::open_read_only(&session_file) {
+                    match transcript {
                         Ok(store) => (
                             extract_session_title(&store, &id),
                             SessionHealth::Healthy,
@@ -303,4 +309,49 @@ pub fn discover_sessions_in_project_cached(
             .then_with(|| a.title.cmp(&b.title))
     });
     sessions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{canonical_session_file, discover_sessions_in_project_cached};
+    use crate::types::{SessionCompletionSummary, SessionDiscoveryCache, SessionHealth};
+    use threadlane_runtime::harness::{JsonlStore, SessionStore};
+
+    #[test]
+    fn discovery_reuses_local_transcript_and_refreshes_changed_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().canonicalize().unwrap();
+        let path = canonical_session_file(&project, "local");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut store = JsonlStore::open(&path).unwrap();
+        store.set_name("Original title").unwrap();
+        store.append_fact("main", "git_branch", "feature", None).unwrap();
+        let mut cache = SessionDiscoveryCache::default();
+        for _ in 0..2 {
+            let sessions = discover_sessions_in_project_cached(&project, &mut cache);
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].title, "Original title");
+            assert_eq!(sessions[0].session_file, path);
+            assert_eq!(sessions[0].git_branch.as_deref(), Some("feature"));
+            assert_eq!(sessions[0].health, SessionHealth::Healthy);
+            assert_eq!(
+                sessions[0].completion_summary,
+                SessionCompletionSummary::None
+            );
+        }
+        store.set_name("Changed title").unwrap();
+        assert_eq!(
+            discover_sessions_in_project_cached(&project, &mut cache)[0].title,
+            "Changed title"
+        );
+        drop(store);
+        std::fs::write(&path, "{invalid journal}\n").unwrap();
+        let sessions = discover_sessions_in_project_cached(&project, &mut cache);
+        assert_eq!(sessions[0].health, SessionHealth::Warning);
+        assert_eq!(sessions[0].title, "Unreadable session");
+        assert_eq!(
+            sessions[0].completion_summary,
+            SessionCompletionSummary::Unknown
+        );
+    }
 }

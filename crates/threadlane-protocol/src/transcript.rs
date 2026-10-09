@@ -43,29 +43,41 @@ pub fn is_activity_only(message: &ChatMessageInfo) -> bool {
 
 pub fn build_transcript_rows(messages: &[ChatMessageInfo], generating: bool) -> Vec<TranscriptRow> {
     let mut rows = Vec::with_capacity(messages.len().saturating_add(1));
-    let mut index = 0;
-    while index < messages.len() {
-        // Pending follow-ups live above the composer, not in the accepted transcript.
-        if is_queued_message(&messages[index], generating) {
-            index += 1;
-            continue;
-        }
-        if !is_activity_only(&messages[index]) {
-            rows.push(TranscriptRow::Message(index));
-            index += 1;
-            continue;
-        }
-
-        let start = index;
-        while index < messages.len() && is_activity_only(&messages[index]) {
-            index += 1;
-        }
-        rows.push(TranscriptRow::Activities(start..index));
-    }
-    if generating {
-        rows.push(TranscriptRow::Working);
-    }
+    rows.extend(transcript_rows(messages, generating));
     rows
+}
+
+fn transcript_rows(
+    messages: &[ChatMessageInfo],
+    mut generating: bool,
+) -> impl Iterator<Item = TranscriptRow> + '_ {
+    let mut index = 0;
+    std::iter::from_fn(move || {
+        while index < messages.len() {
+            // Pending follow-ups live above the composer, not in the accepted transcript.
+            if is_queued_message(&messages[index], generating) {
+                index += 1;
+                continue;
+            }
+            if !is_activity_only(&messages[index]) {
+                let row = TranscriptRow::Message(index);
+                index += 1;
+                return Some(row);
+            }
+
+            let start = index;
+            while index < messages.len() && is_activity_only(&messages[index]) {
+                index += 1;
+            }
+            return Some(TranscriptRow::Activities(start..index));
+        }
+        if generating {
+            generating = false;
+            Some(TranscriptRow::Working)
+        } else {
+            None
+        }
+    })
 }
 
 pub fn grouped_tool_activities(
@@ -108,12 +120,9 @@ fn conversation_matches<'a>(
     query: &str,
 ) -> impl Iterator<Item = ConversationMatch> + 'a {
     let query = query.to_lowercase();
-    let rows = if query.trim().is_empty() {
-        Vec::new()
-    } else {
-        build_transcript_rows(messages, generating)
-    };
-    rows.into_iter()
+    let search_enabled = !query.trim().is_empty();
+    transcript_rows(messages, generating)
+        .take(if search_enabled { usize::MAX } else { 0 })
         .enumerate()
         .filter_map(move |(row_index, row)| {
             let TranscriptRow::Message(index) = row else {
@@ -181,8 +190,11 @@ pub fn next_find_match(selected: Option<usize>, count: usize, previous: bool) ->
 
 #[cfg(test)]
 mod search_tests {
-    use super::{find_conversation_messages, first_conversation_match};
-    use crate::daemon::{ChatMessageInfo, MessageRole};
+    use super::{
+        build_transcript_rows, find_conversation_messages, first_conversation_match,
+        transcript_rows, TranscriptRow,
+    };
+    use crate::daemon::{ChatMessageInfo, MessageRole, ToolActivityInfo};
 
     fn message(id: &str, role: MessageRole, content: &str) -> ChatMessageInfo {
         ChatMessageInfo {
@@ -216,6 +228,50 @@ mod search_tests {
             assert!(first_conversation_match(&messages, true, query).is_none());
             assert!(find_conversation_messages(&messages, true, query).is_empty());
         }
+    }
+
+    #[test]
+    fn lazy_transcript_rows_preserve_groups_queue_and_working_row() {
+        let mut activity = message("tool", MessageRole::Assistant, "");
+        activity.tool_activities.push(ToolActivityInfo {
+            title: "read_file".into(),
+            id: "call".into(),
+            category: "Loaded".into(),
+            display_summary: String::new(),
+            detail: String::new(),
+            arguments: String::new(),
+            is_expanded: false,
+        });
+        let messages = vec![
+            message("queued-user-1", MessageRole::User, "needle"),
+            activity.clone(),
+            activity,
+            message("user-1", MessageRole::User, "needle"),
+        ];
+        let expected = vec![
+            TranscriptRow::Activities(1..3),
+            TranscriptRow::Message(3),
+            TranscriptRow::Working,
+        ];
+        assert_eq!(build_transcript_rows(&messages, true), expected);
+        let mut rows = transcript_rows(&messages, true);
+        for row in expected {
+            assert_eq!(rows.next(), Some(row));
+        }
+        assert_eq!(rows.next(), None);
+        assert_eq!(rows.next(), None);
+        let hit = first_conversation_match(&messages, true, "needle").unwrap();
+        assert_eq!(hit.row_index, 1);
+        assert_eq!(hit.message_id, "user-1");
+        assert_eq!(
+            build_transcript_rows(&messages, false),
+            vec![
+                TranscriptRow::Message(0),
+                TranscriptRow::Activities(1..3),
+                TranscriptRow::Message(3)
+            ]
+        );
+        assert_eq!(build_transcript_rows(&[], true), vec![TranscriptRow::Working]);
     }
 
     #[test]

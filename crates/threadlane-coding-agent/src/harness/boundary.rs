@@ -135,7 +135,7 @@ impl CodingSessionHarness {
                 )
                 .collect::<Vec<_>>()
         };
-        let mut current = with_system(self.model_context("main")?.messages());
+        let mut current = with_system(self.model_context("main")?.into_messages());
         let mut visible =
             self.provider_read_context(&current, request.tool_schema_json.as_deref(), read_digests);
         let pre_tokens = estimate_request_tokens(
@@ -230,7 +230,7 @@ impl CodingSessionHarness {
                 reason,
                 prepared,
             )?;
-            current = with_system(self.model_context("main")?.messages());
+            current = with_system(self.model_context("main")?.into_messages());
             visible = self.provider_read_context(
                 &current,
                 request.tool_schema_json.as_deref(),

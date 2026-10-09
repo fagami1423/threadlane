@@ -190,7 +190,7 @@ impl AgentRuntime {
         Ok(std::iter::once(AgentMessage::System {
             content: system_prompt,
         })
-        .chain(context.messages())
+        .chain(context.into_messages())
         .collect())
     }
 
