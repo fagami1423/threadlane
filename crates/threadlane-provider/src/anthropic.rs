@@ -304,6 +304,17 @@ pub fn chat_payload_to_messages_request(payload: &Value) -> Value {
         request.insert("system".into(), system.join("\n\n").into());
     }
     request.insert("messages".into(), Value::Array(messages));
+    // Documented top-level control (`output_config.effort`, GA on every model
+    // in the catalog). Unrecognized values are omitted, which keeps the
+    // model's own default instead of guessing.
+    if let Some(effort) = payload
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .map(|effort| effort.trim().to_ascii_lowercase())
+        .filter(|effort| matches!(effort.as_str(), "low" | "medium" | "high"))
+    {
+        request.insert("output_config".into(), json!({"effort": effort}));
+    }
 
     let tools: Vec<Value> = payload
         .get("tools")
@@ -396,6 +407,16 @@ fn decode_thinking_blocks(signature: &str, model: &str) -> Option<Vec<Value>> {
             }
         });
     valid.then_some(blocks)
+}
+
+/// True when `signature` is thinking data written by [`encode_thinking_blocks`]
+/// (a JSON object with an `anthropic_model` key). Other providers must not
+/// forward it: after a model switch it would otherwise reach them as if it
+/// were their own opaque signature.
+pub(crate) fn is_anthropic_thinking_signature(signature: &str) -> bool {
+    serde_json::from_str::<Value>(signature)
+        .ok()
+        .is_some_and(|value| value.get("anthropic_model").is_some())
 }
 
 /// Incremental parser for the Messages SSE stream. Feed raw text with
@@ -842,6 +863,55 @@ mod tests {
             json!([{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
         );
         assert!(request.get("tools").is_none());
+    }
+
+    #[test]
+    fn maps_reasoning_effort_to_output_config() {
+        let request_for = |effort: Value| {
+            chat_payload_to_messages_request(&json!({
+                "model": "anthropic/m", "reasoning_effort": effort, "messages": []
+            }))
+        };
+        for level in ["low", "medium", "high"] {
+            assert_eq!(
+                request_for(json!(level))["output_config"],
+                json!({"effort": level})
+            );
+        }
+        assert_eq!(
+            request_for(json!(" HIGH "))["output_config"],
+            json!({"effort": "high"})
+        );
+        for ignored in [
+            json!("off"),
+            json!("minimal"),
+            json!("ultra"),
+            json!(7),
+            json!(""),
+        ] {
+            assert!(request_for(ignored).get("output_config").is_none());
+        }
+        let absent = chat_payload_to_messages_request(&json!({
+            "model": "anthropic/m", "messages": []
+        }));
+        assert!(absent.get("output_config").is_none());
+    }
+
+    #[test]
+    fn detects_anthropic_thinking_signatures_only() {
+        let ours =
+            encode_thinking_blocks("m", vec![json!({"type": "redacted_thinking", "data": "d"})])
+                .unwrap();
+        assert!(is_anthropic_thinking_signature(&ours));
+        for other in [
+            "CiQBjz1rX-gemini-style-opaque",
+            "",
+            "[1,2]",
+            "{\"blocks\":[]}",
+            "not json {",
+        ] {
+            assert!(!is_anthropic_thinking_signature(other), "{other}");
+        }
     }
 
     #[test]
@@ -1490,6 +1560,7 @@ mod tests {
             !lower.contains("authorization:"),
             "must not send a bearer token"
         );
+        assert!(lower.contains("\"output_config\":{\"effort\":\"medium\"}"));
         let sent: Value = serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(sent["model"], "claude-sonnet-5-5");
         assert_eq!(sent["system"], "You are Threadlane.");

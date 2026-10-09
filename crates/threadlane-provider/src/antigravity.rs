@@ -950,10 +950,15 @@ fn convert_openai_payload(payload: &Value) -> Result<(String, Value), String> {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 let id = call.get("id").and_then(Value::as_str).unwrap_or_default();
+                // Anthropic thinking data persisted by an earlier Claude turn is
+                // not a Gemini signature; treat it as missing.
                 let thought_signature = call
                     .get("thoughtSignature")
                     .or_else(|| call.get("thought_signature"))
-                    .and_then(Value::as_str);
+                    .and_then(Value::as_str)
+                    .filter(|signature| {
+                        !crate::anthropic::is_anthropic_thinking_signature(signature)
+                    });
                 if requires_thought_signature(&runtime_model) && thought_signature.is_none() {
                     if id.is_empty() {
                         unreplayable_unnamed_calls += 1;
@@ -1923,6 +1928,60 @@ mod tests {
             "new-model-ultra"
         );
         std::env::remove_var("ANTIGRAVITY_RUNTIME_MODEL_MAP_JSON");
+    }
+
+    #[test]
+    fn anthropic_thinking_signatures_are_not_sent_as_gemini_signatures() {
+        let anthropic_signature = json!({
+            "anthropic_model": "claude-opus-5-5",
+            "blocks": [{"type": "thinking", "thinking": "", "signature": "SIG"}]
+        })
+        .to_string();
+        let payload = |model: &str, signature: &str| {
+            json!({
+                "model": model,
+                "messages": [
+                    { "role": "user", "content": "Inspect this" },
+                    { "role": "assistant", "content": null, "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": { "name": "read_file", "arguments": "{}" },
+                        "thoughtSignature": signature
+                    }]},
+                    { "role": "tool", "tool_call_id": "call-1", "content": "contents" }
+                ],
+            })
+        };
+
+        // A model that does not require signatures keeps the call but sends none.
+        let (_, request) = convert_openai_payload(&payload(
+            "antigravity/gemini-2.5-flash",
+            &anthropic_signature,
+        ))
+        .unwrap();
+        assert!(!request.to_string().contains("anthropic_model"));
+        assert!(request["contents"][1]["parts"][0]
+            .get("thoughtSignature")
+            .is_none());
+
+        // A model that requires one takes the existing missing-signature path
+        // (the unreplayable call is dropped) instead of forwarding ours.
+        let (_, request) = convert_openai_payload(&payload(
+            "antigravity/gemini-3.6-flash",
+            &anthropic_signature,
+        ))
+        .unwrap();
+        assert!(!request.to_string().contains("anthropic_model"));
+        assert!(!request.to_string().contains("functionCall"));
+
+        // A genuine Gemini signature still passes through.
+        let (_, request) =
+            convert_openai_payload(&payload("antigravity/gemini-3.6-flash", "gemini-sig-1"))
+                .unwrap();
+        assert_eq!(
+            request["contents"][1]["parts"][0]["thoughtSignature"],
+            "gemini-sig-1"
+        );
     }
 
     #[test]
