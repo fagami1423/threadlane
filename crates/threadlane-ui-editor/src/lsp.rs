@@ -158,23 +158,7 @@ pub(super) fn attach(
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let next = this.update(cx, |this, cx| {
-                    if this.blocked.is_some()
-                        || this.last_edit.elapsed() < Duration::from_millis(450)
-                    {
-                        return None;
-                    }
-                    let snapshot = match this.capture(cx) {
-                        Ok(snapshot) => snapshot,
-                        Err(error) => {
-                            this.clear_presentation(cx);
-                            this.status(
-                                "LSP: unavailable",
-                                format!("{error}. Current-file words remain available."),
-                                cx,
-                            );
-                            return None;
-                        }
-                    };
+                    let snapshot = this.poll_snapshot(cx)?;
                     Some(this.query(
                         snapshot.text.to_string(),
                         0,
@@ -235,6 +219,23 @@ pub(super) fn attach(
 }
 
 impl LanguageService {
+    fn poll_snapshot(&mut self, cx: &mut Context<Self>) -> Option<Snapshot> {
+        if self.blocked.is_some() || self.last_edit.elapsed() < Duration::from_millis(450) {
+            return None;
+        }
+        match self.capture(cx) {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                self.status(
+                    "LSP: unavailable",
+                    format!("{error}. Current-file words remain available."),
+                    cx,
+                );
+                None
+            }
+        }
+    }
+
     fn capture(&self, cx: &App) -> Result<Snapshot> {
         let owner = self
             .owner
@@ -844,6 +845,8 @@ impl CodeActionProvider for Provider {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::{LanguageService, Snapshot};
     use crate::view::EditorView;
     use gpui::{AppContext as _, Entity, Task, TestAppContext, VisualTestContext};
@@ -969,8 +972,9 @@ mod tests {
 
     #[gpui::test]
     fn editor_lsp_unavailable_completion_falls_back_and_accepts(cx: &mut TestAppContext) {
-        let (view, _model, _directory, cx) = fixture(cx);
-        let (_, buffer) = entities(&view, cx);
+        let (view, model, _directory, cx) = fixture(cx);
+        let (service, buffer) = entities(&view, cx);
+        model.update(cx, |model, _| model.active_session_id = None);
         cx.update(|window, cx| {
             buffer.update(cx, |buffer, cx| {
                 buffer.set_value("alpha_value\nalp_suffix", window, cx);
@@ -989,6 +993,17 @@ mod tests {
             let menu = buffer.completion_menu_state();
             assert!(menu.open);
             assert_eq!(menu.items[0].label, "alpha_value");
+        });
+
+        service.update(cx, |service, _| {
+            service.blocked = None;
+            service.last_edit = Instant::now() - Duration::from_secs(1);
+        });
+        assert!(service
+            .update(cx, |service, cx| service.poll_snapshot(cx))
+            .is_none());
+        buffer.read_with(cx, |buffer, _| {
+            assert!(buffer.completion_menu_state().open);
         });
 
         cx.simulate_keystrokes("enter");
