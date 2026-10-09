@@ -1566,45 +1566,51 @@ impl CodingAgent {
         if let Some(Err(error)) = &result {
             // Pre-acceptance failures have no finish_harness_run to persist them.
             // Save them before the surface reloads its durable transcript.
-            if let Some(journal) = self.harness.as_mut() {
-                let retry_prompt = parse_slash_command(input)
-                    .is_none()
-                    .then(|| threadlane_protocol::RetryPrompt {
-                        text: input.to_owned(),
-                        images: images.clone(),
-                    })
-                    .filter(threadlane_protocol::RetryPrompt::is_sendable);
-                let message = AgentMessage::Custom {
-                    custom_type: "agent_error".into(),
-                    payload: serde_json::json!({ "error": error, "retry_prompt": retry_prompt }),
-                };
-                let persisted = journal.ensure_fresh().and_then(|()| {
-                    if !journal
-                        .store
-                        .entries()
-                        .iter()
-                        .skip(first_entry)
-                        .any(|entry| {
-                            entry.lane == "main"
-                                && matches!(
-                                    (&entry.message, &message),
-                                    (AgentMessage::Custom { custom_type: a, payload: ap }, AgentMessage::Custom { custom_type: b, payload: bp })
-                                        if a == b && a == "agent_error" && ap.get("error") == bp.get("error")
-                                )
-                        })
-                    {
-                        journal.append_message(message)?;
-                    }
-                    Ok(())
-                });
-                if let Err(persistence_error) = persisted {
-                    return Some(Err(format!(
-                        "{error}\nCould not save error: {persistence_error}"
-                    )));
-                }
+            if let Err(persistence_error) =
+                self.persist_prompt_error(input, &images, error, first_entry)
+            {
+                return Some(Err(format!(
+                    "{error}\nCould not save error: {persistence_error}"
+                )));
             }
         }
         result
+    }
+
+    /// Save failures that occur before a prompt reaches the turn driver as well
+    /// as its fallback errors. Never infer a retry from a previous user row.
+    pub(crate) fn persist_prompt_error(
+        &mut self,
+        input: &str,
+        images: &[ImageAttachment],
+        error: &str,
+        // usize::MAX disables deduplication for failures before input handling.
+        first_entry: usize,
+    ) -> Result<(), String> {
+        let Some(journal) = self.harness.as_mut() else {
+            return Ok(());
+        };
+        journal.ensure_fresh()?;
+        let already_saved = journal.store.entries().iter().skip(first_entry).any(|entry| {
+            entry.lane == "main" && matches!(&entry.message,
+                AgentMessage::Custom { custom_type, payload }
+                    if custom_type == "agent_error" && payload.get("error").and_then(|v| v.as_str()) == Some(error))
+        });
+        if already_saved {
+            return Ok(());
+        }
+        let retry_prompt = parse_slash_command(input)
+            .is_none()
+            .then(|| threadlane_protocol::RetryPrompt {
+                text: input.to_owned(),
+                images: images.to_vec(),
+            })
+            .filter(threadlane_protocol::RetryPrompt::is_sendable);
+        journal.append_message(AgentMessage::Custom {
+            custom_type: "agent_error".into(),
+            payload: serde_json::json!({ "error": error, "retry_prompt": retry_prompt }),
+        })?;
+        Ok(())
     }
 
     async fn handle_input_inner(

@@ -511,7 +511,13 @@ impl SessionController {
                     Ok(options) => {
                         on_acp_options(options, None, None);
                     }
-                    Err(error) => {
+                    Err(mut error) => {
+                        let mut agent = task_runtime.agent.lock().await;
+                        if let Err(persistence_error) =
+                            agent.persist_prompt_error(&text, &images, &error, usize::MAX)
+                        {
+                            error = format!("{error}\nCould not save error: {persistence_error}");
+                        }
                         cleanup.error = Some(error.clone());
                         on_acp_options(Vec::new(), Some(error), Some((config_id, value)));
                         return;
@@ -529,7 +535,12 @@ impl SessionController {
                     .flatten();
             let mut agent = task_runtime.agent.lock().await;
             if let Some(branch) = git_branch {
-                if let Err(error) = agent.set_fact("git_branch", &branch) {
+                if let Err(mut error) = agent.set_fact("git_branch", &branch) {
+                    if let Err(persistence_error) =
+                        agent.persist_prompt_error(&text, &images, &error, usize::MAX)
+                    {
+                        error = format!("{error}\nCould not save error: {persistence_error}");
+                    }
                     cleanup.error = Some(error.clone());
                     on_agent_event(AgentEvent::AgentError { error });
                     return;
@@ -649,5 +660,68 @@ impl SessionController {
         let _guard = self.prompt_lock.lock().await;
         let mut agent = self.agent.lock().await;
         agent.set_acp_config_option(config_id, value).await
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use threadlane_protocol::{AgentMessage, RetryPrompt};
+    use threadlane_runtime::harness::JsonlStore;
+
+    #[tokio::test]
+    async fn acp_preflight_failure_retains_exact_retry_prompt_before_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let runtime = SessionController::new(CodingAgentOptions {
+            api_key: "test-key".into(),
+            account_id: None,
+            model: "test-model".into(),
+            work_dir: dir.path().to_path_buf(),
+            session_file: Some(path.clone()),
+            system_prompt: Default::default(),
+            agent_config: None,
+            coding_config: None,
+            browser: threadlane_protocol::browser::BrowserBridge::unavailable(),
+        });
+        let payload = RetryPrompt {
+            text: String::new(),
+            images: vec![ImageAttachment {
+                display_name: "shot.png".into(),
+                data_url: "data:image/png;base64,AA==".into(),
+            }],
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // A non-ACP model deterministically fails config preflight without
+        // spawning a process or sending a provider request.
+        runtime
+            .spawn_interactive_turn(
+                payload.text.clone(),
+                payload.images.clone(),
+                ReasoningEffort::default(),
+                dir.path().to_path_buf(),
+                vec![("model".into(), "chosen-model".into())],
+                |_| {},
+                |_| {},
+                |_, error, _| assert!(error.is_some()),
+                move || {
+                    let _ = tx.send(());
+                },
+            )
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let store = JsonlStore::open(&path).unwrap();
+        let messages: Vec<_> = store.entries().iter().map(|e| e.message.clone()).collect();
+        assert!(!messages.iter().any(|m| matches!(
+            m,
+            AgentMessage::User { .. } | AgentMessage::UserWithImages { .. }
+        )));
+        let rows = threadlane_runtime::harness::project_chat_messages(&messages);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].retry_prompt.as_ref(), Some(&payload));
+        assert!(!runtime.is_generating());
     }
 }
