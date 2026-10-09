@@ -73,6 +73,25 @@ struct Server {
 
 fn editor_file_uri(path: &str) -> String {
     let normalized = path.replace('\\', "/");
+    let normalized = if let Some(path) = normalized.strip_prefix("//?/") {
+        if path
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UNC/"))
+        {
+            format!("//{}", &path[4..])
+        } else if path
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic)
+            && path.as_bytes().get(1) == Some(&b':')
+        {
+            path.to_owned()
+        } else {
+            format!("//?/{path}")
+        }
+    } else {
+        normalized
+    };
     if let Some(unc_path) = normalized.strip_prefix("//") {
         let (host, path) = unc_path.split_once('/').unwrap_or((unc_path, ""));
         format!(
@@ -1412,6 +1431,14 @@ mod tests {
         assert_eq!(
             editor_file_uri(r"\\server\share\folder name\file.rs"),
             "file://server/share/folder%20name/file.rs"
+        );
+        assert_eq!(
+            editor_file_uri(r"\\?\C:\repo\file name.rs"),
+            "file:///C:/repo/file%20name.rs"
+        );
+        assert_eq!(
+            editor_file_uri(r"\\?\UNC\server\share\file name.rs"),
+            "file://server/share/file%20name.rs"
         );
     }
 

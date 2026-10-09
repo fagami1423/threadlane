@@ -1235,7 +1235,9 @@ impl BrokerAwareWasiToolExecutor {
         let mut operation = self
             .extensions
             .begin_ephemeral_command_operation("editor_lsp")
-            .ok_or_else(|| "WASI command `editor_lsp` is unavailable; load the lsp_ext extension".to_string())?
+            .ok_or_else(|| {
+                "WASI command `editor_lsp` is unavailable; install and enable `lsp_ext` in the daemon's global extension scope. Project-only or shadowing copies are not eligible".to_string()
+            })?
             .map_err(|error| error.to_string())?;
         self.pump_broker_continuations(&mut operation, "editor_lsp", args, None)
             .await
@@ -1386,6 +1388,7 @@ mod broker_continuation_tests {
         MAX_BROKER_CONTINUATION_ROUNDS,
     };
     use async_trait::async_trait;
+    use std::path::Path;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -1519,6 +1522,83 @@ mod broker_continuation_tests {
         finite: bool,
         emit_request: bool,
     ) -> (tempfile::TempDir, Arc<WasiExtensionManager>) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(format!(
+            ".threadlane/extensions/{extension_name}.wasm"
+        ));
+        write_fixture_module(&path, extension_name, finite, emit_request);
+        let manager = Arc::new(WasiExtensionManager::new());
+        assert_eq!(
+            manager
+                .reload_from_roots(None, Some(directory.path()))
+                .unwrap(),
+            1
+        );
+        (directory, manager)
+    }
+
+    fn fixture_with_global_lsp_extension(
+        finite: bool,
+        emit_request: bool,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<WasiExtensionManager>,
+    ) {
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let path = global.path().join("extensions/lsp_ext.wasm");
+        write_fixture_module(&path, "lsp_ext", finite, emit_request);
+        let manager = Arc::new(WasiExtensionManager::new());
+        assert_eq!(
+            manager
+                .reload_from_roots(Some(global.path()), Some(project.path()))
+                .unwrap(),
+            1
+        );
+        (project, global, manager)
+    }
+
+    fn fixture_with_project_override_lsp(
+        finite: bool,
+        emit_request: bool,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<WasiExtensionManager>,
+    ) {
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        write_fixture_module(
+            &global.path().join("extensions/lsp_ext.wasm"),
+            "lsp_ext",
+            finite,
+            emit_request,
+        );
+        write_fixture_module(
+            &project
+                .path()
+                .join(".threadlane/extensions/lsp_ext.wasm"),
+            "lsp_ext",
+            finite,
+            emit_request,
+        );
+        let manager = Arc::new(WasiExtensionManager::new());
+        assert_eq!(
+            manager
+                .reload_from_roots(Some(global.path()), Some(project.path()))
+                .unwrap(),
+            1
+        );
+        (project, global, manager)
+    }
+
+    fn write_fixture_module(
+        path: &Path,
+        extension_name: &str,
+        finite: bool,
+        emit_request: bool,
+    ) {
         // Exercise the production WASM invocation, queued broker outcomes,
         // and executor loop. The finite fixture settles after six dispatches.
         let manifest = serde_json::json!({
@@ -1581,18 +1661,8 @@ mod broker_continuation_tests {
             manifest_result = (8u64 << 32) | manifest.len() as u64,
             pending_result = (1024u64 << 32) | pending.len() as u64,
         );
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(".threadlane/extensions/rounds.wasm");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, module).unwrap();
-        let manager = Arc::new(WasiExtensionManager::new());
-        assert_eq!(
-            manager
-                .reload_from_roots(None, Some(directory.path()))
-                .unwrap(),
-            1
-        );
-        (directory, manager)
     }
 
     async fn run_fixture(finite: bool, emit_request: bool) -> (Result<String, String>, usize) {
@@ -1719,7 +1789,7 @@ mod broker_continuation_tests {
 
     #[tokio::test]
     async fn editor_lsp_command_entrypoint_runs_the_broker_continuation_pump() {
-        let (_directory, manager) = fixture_with_extension_name("lsp_ext", true, true);
+        let (_project, _global, manager) = fixture_with_global_lsp_extension(true, true);
         let counter = Arc::new(RoundCounter {
             manager: manager.clone(),
             rounds: AtomicUsize::new(0),
@@ -1733,6 +1803,27 @@ mod broker_continuation_tests {
 
         assert_eq!(result, "done");
         assert_eq!(counter.rounds.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test]
+    async fn editor_lsp_project_override_is_rejected_before_broker_invocation() {
+        let (_project, _global, manager) = fixture_with_project_override_lsp(true, true);
+        let counter = Arc::new(RoundCounter {
+            manager: manager.clone(),
+            rounds: AtomicUsize::new(0),
+            state_extension: "lsp_ext",
+        });
+        let mut dispatcher = CapabilityDispatcher::new();
+        dispatcher.register("tools", counter.clone());
+        let executor = BrokerAwareWasiToolExecutor::new(manager, Arc::new(dispatcher));
+
+        let error = executor
+            .execute_editor_lsp_command("{}")
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("global extension scope"), "{error}");
+        assert_eq!(counter.rounds.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

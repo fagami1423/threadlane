@@ -211,6 +211,27 @@ pub struct WasiExtension {
     wasm_bytes: Vec<u8>,
     engine: Engine,
     module: Arc<Module>,
+    trusted_global_editor_lsp: bool,
+}
+
+fn is_trusted_global_editor_lsp_record(
+    record: &packages::ExtensionRecord,
+    project_root: Option<&Path>,
+) -> bool {
+    if record.name() != "lsp_ext"
+        || record.scope() != packages::ExtensionScope::Global
+        || !record.is_enabled()
+        || !record.is_effective()
+    {
+        return false;
+    }
+    let Some(project_root) = project_root.and_then(|root| root.canonicalize().ok()) else {
+        return false;
+    };
+    let Ok(module_path) = record.module_path().canonicalize() else {
+        return false;
+    };
+    !module_path.starts_with(project_root)
 }
 
 impl WasiExtension {
@@ -336,6 +357,7 @@ impl WasiExtension {
             wasm_bytes,
             engine,
             module: Arc::new(module),
+            trusted_global_editor_lsp: false,
         })
     }
 
@@ -869,7 +891,7 @@ impl WasiExtensionManager {
             // A module that changed (or vanished) between discovery and load
             // skips like a discovery-time failure: warn, retire the stale
             // registration below, and keep the other extensions running.
-            let extension = match WasiExtension::load_from_file(record.module_path()) {
+            let mut extension = match WasiExtension::load_from_file(record.module_path()) {
                 Ok(extension) => extension,
                 Err(error) => {
                     tracing::warn!(
@@ -885,6 +907,8 @@ impl WasiExtensionManager {
                     record.module_path().display()
                 ));
             }
+            extension.trusted_global_editor_lsp =
+                is_trusted_global_editor_lsp_record(&record, project_root);
             loaded.insert(extension.manifest.name.clone(), Arc::new(extension));
         }
         let loaded_count = loaded.len();
@@ -2400,24 +2424,42 @@ impl WasiExtensionManager {
                 "Only the fixed editor_lsp command can use ephemeral broker state".into(),
             ));
         }
-        self.begin_response_operation("command", name)
-            .map(|operation| {
-                operation.and_then(|mut operation| {
-                    if operation.extension.manifest.name != "lsp_ext" {
-                        return Err(
-                            "The fixed editor_lsp command must be provided by lsp_ext".into(),
-                        );
-                    }
-                    self.ephemeral_state_keys
-                        .lock()
-                        .map_err(|_| "Ephemeral extension state lock poisoned".to_string())?
-                        .entry(operation.extension.manifest.name.clone())
-                        .or_default()
-                        .insert("editor".into());
-                    operation.ephemeral = true;
-                    Ok(operation)
-                })
-            })
+        let extension = match self.extensions.read() {
+            Ok(extensions) => extensions.get("lsp_ext").cloned(),
+            Err(_) => return Some(Err("Extension registry lock poisoned".into())),
+        }?;
+        if !extension.trusted_global_editor_lsp {
+            return Some(Err(
+                "Automatic editor LSP requires `lsp_ext` installed and enabled in the daemon's global extension scope; project-only or shadowing copies are not eligible".into(),
+            ));
+        }
+        if !extension
+            .manifest
+            .commands
+            .iter()
+            .any(|command| command.name == name)
+        {
+            return Some(Err(
+                "The global `lsp_ext` extension must declare the fixed `editor_lsp` command"
+                    .into(),
+            ));
+        }
+        let mut operation = match self.claim_operation(extension, "command", name) {
+            Ok(operation) => operation,
+            Err(error) => return Some(Err(error)),
+        };
+        let mut ephemeral_keys = match self.ephemeral_state_keys.lock() {
+            Ok(keys) => keys,
+            Err(_) => {
+                return Some(Err("Ephemeral extension state lock poisoned".into()));
+            }
+        };
+        ephemeral_keys
+            .entry("lsp_ext".into())
+            .or_default()
+            .insert("editor".into());
+        operation.ephemeral = true;
+        Some(Ok(operation))
     }
 
     /// Acquire each hook only when visited, preserving name order without
@@ -3876,6 +3918,191 @@ mod reload_tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn write_editor_lsp_extension(
+        extensions_root: &Path,
+        name: &str,
+        include_command: bool,
+    ) -> PathBuf {
+        let commands = if include_command {
+            vec![serde_json::json!({
+                "name": "editor_lsp",
+                "description": "test editor command",
+            })]
+        } else {
+            Vec::new()
+        };
+        let manifest = serde_json::json!({
+            "api_version": BROKER_API_VERSION,
+            "name": name,
+            "version": "1",
+            "description": "test",
+            "capabilities": ["process"],
+            "commands": commands,
+        })
+        .to_string();
+        let module = format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (data (i32.const 8) "{manifest}")
+                (func (export "extension_info") (result i64) (i64.const {result})))"#,
+            manifest = manifest.replace('\\', "\\\\").replace('"', "\\\""),
+            result = (8u64 << 32) | manifest.len() as u64,
+        );
+        let path = extensions_root.join(format!("{name}.wasm"));
+        fs::create_dir_all(extensions_root).unwrap();
+        fs::write(&path, module).unwrap();
+        path
+    }
+
+    fn editor_lsp_manager(global_root: Option<&Path>, project_root: &Path) -> WasiExtensionManager {
+        let manager =
+            WasiExtensionManager::for_project_session(project_root, "editor-lsp-provenance");
+        manager
+            .reload_from_roots(global_root, Some(project_root))
+            .unwrap();
+        manager
+    }
+
+    fn expect_unavailable_editor_lsp(manager: &WasiExtensionManager) -> String {
+        match manager.begin_ephemeral_command_operation("editor_lsp") {
+            Some(Err(error)) => error,
+            Some(Ok(_)) => panic!("untrusted editor LSP command must not be claimed"),
+            None => panic!("expected a registered but ineligible lsp_ext"),
+        }
+    }
+
+    #[test]
+    fn ephemeral_editor_lsp_requires_an_effective_global_installation() {
+        let global = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        write_editor_lsp_extension(
+            &project.path().join(".threadlane/extensions"),
+            "lsp_ext",
+            true,
+        );
+        let manager = editor_lsp_manager(Some(global.path()), project.path());
+        let error = expect_unavailable_editor_lsp(&manager);
+        assert!(error.contains("global extension scope"), "{error}");
+        assert!(!manager
+            .active_operations
+            .lock()
+            .unwrap()
+            .contains("lsp_ext"));
+
+        let global = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        write_editor_lsp_extension(&global.path().join("extensions"), "lsp_ext", true);
+        let manager = editor_lsp_manager(Some(global.path()), project.path());
+        let operation = manager
+            .begin_ephemeral_command_operation("editor_lsp")
+            .unwrap()
+            .unwrap();
+        assert!(manager
+            .active_operations
+            .lock()
+            .unwrap()
+            .contains("lsp_ext"));
+        drop(operation);
+        assert!(!manager
+            .active_operations
+            .lock()
+            .unwrap()
+            .contains("lsp_ext"));
+
+        let global = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        write_editor_lsp_extension(&global.path().join("extensions"), "lsp_ext", true);
+        let project_module = write_editor_lsp_extension(
+            &project.path().join(".threadlane/extensions"),
+            "lsp_ext",
+            true,
+        );
+        let project_module = project_module.canonicalize().unwrap();
+        let manager = editor_lsp_manager(Some(global.path()), project.path());
+        assert_eq!(
+            manager
+                .extensions
+                .read()
+                .unwrap()
+                .get("lsp_ext")
+                .unwrap()
+                .file_path
+                .as_deref(),
+            Some(project_module.as_path())
+        );
+        let error = expect_unavailable_editor_lsp(&manager);
+        assert!(error.contains("global extension scope"), "{error}");
+        assert!(!manager
+            .active_operations
+            .lock()
+            .unwrap()
+            .contains("lsp_ext"));
+    }
+
+    #[test]
+    fn ephemeral_editor_lsp_rejects_a_canonical_global_module_inside_the_project() {
+        let project = tempdir().unwrap();
+        let alias_parent = project.path().join("alias-parent");
+        fs::create_dir_all(&alias_parent).unwrap();
+        let global_root = alias_parent.join("..").join("nested-global");
+        write_editor_lsp_extension(&global_root.join("extensions"), "lsp_ext", true);
+
+        let manager = editor_lsp_manager(Some(&global_root), project.path());
+        let error = expect_unavailable_editor_lsp(&manager);
+
+        assert!(error.contains("global extension scope"), "{error}");
+        assert!(!manager
+            .active_operations
+            .lock()
+            .unwrap()
+            .contains("lsp_ext"));
+    }
+
+    #[test]
+    fn ephemeral_editor_lsp_requires_the_declared_fixed_command() {
+        let global = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        write_editor_lsp_extension(&global.path().join("extensions"), "lsp_ext", false);
+
+        let manager = editor_lsp_manager(Some(global.path()), project.path());
+        let error = expect_unavailable_editor_lsp(&manager);
+
+        assert!(error.contains("must declare"), "{error}");
+        assert!(!manager
+            .active_operations
+            .lock()
+            .unwrap()
+            .contains("lsp_ext"));
+    }
+
+    #[test]
+    fn ephemeral_editor_lsp_ignores_missing_and_disabled_global_modules() {
+        let global = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let manager = WasiExtensionManager::for_project_session(project.path(), "editor-lsp");
+        assert_eq!(
+            manager
+                .reload_from_roots(Some(global.path()), Some(project.path()))
+                .unwrap(),
+            0
+        );
+        assert!(manager
+            .begin_ephemeral_command_operation("editor_lsp")
+            .is_none());
+
+        let module = write_editor_lsp_extension(&global.path().join("extensions"), "lsp_ext", true);
+        fs::write(format!("{}.disabled", module.display()), "").unwrap();
+        assert_eq!(
+            manager
+                .reload_from_roots(Some(global.path()), Some(project.path()))
+                .unwrap(),
+            0
+        );
+        assert!(manager
+            .begin_ephemeral_command_operation("editor_lsp")
+            .is_none());
+    }
+
     #[test]
     fn tool_definition_slice_is_reused() {
         let manager = WasiExtensionManager::new();
@@ -3918,22 +4145,34 @@ mod reload_tests {
     }
 
     #[test]
-    fn ephemeral_editor_command_cannot_be_shadowed_by_another_extension() {
+    fn ephemeral_editor_command_uses_the_fixed_registry_key() {
         let manager = WasiExtensionManager::new();
         let mut extension = WasiExtension::load_from_bytes(b"\0asm\x01\0\0\0".to_vec()).unwrap();
+        extension.manifest.name = "spoof".into();
         extension.manifest.commands.push(WasiCommandDefinition {
             name: "editor_lsp".into(),
             description: "test command".into(),
         });
         manager.register_extension(extension).unwrap();
 
-        let result = manager
+        assert!(manager
             .begin_ephemeral_command_operation("editor_lsp")
-            .unwrap();
-        assert!(matches!(
-            result,
-            Err(error) if error.contains("must be provided by lsp_ext")
-        ));
+            .is_none());
+    }
+
+    #[test]
+    fn ephemeral_editor_command_rejects_untrusted_fixed_extension() {
+        let manager = WasiExtensionManager::new();
+        let mut extension = WasiExtension::load_from_bytes(b"\0asm\x01\0\0\0".to_vec()).unwrap();
+        extension.manifest.name = "lsp_ext".into();
+        extension.manifest.commands.push(WasiCommandDefinition {
+            name: "editor_lsp".into(),
+            description: "test command".into(),
+        });
+        manager.register_extension(extension).unwrap();
+
+        let error = expect_unavailable_editor_lsp(&manager);
+        assert!(error.contains("global extension scope"), "{error}");
     }
 
     #[test]

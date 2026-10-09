@@ -41,6 +41,14 @@ The active session must have a running Threadlane runtime in the same checkout.
 The status in the editor footer shows availability and diagnostic counts; click
 it, or choose **Refresh language services**, to retry after fixing an error.
 
+Automatic editor language services require `lsp_ext` to be installed and enabled
+in the daemon host's global extension scope, through Extensions settings or a
+global installation. Project-only copies are not eligible, and a project-scoped
+`lsp_ext` that shadows a global copy disables automatic editor services rather
+than falling back to the project module. The local `scripts/build_extensions.sh`
+workflow installs bundled extensions into the project checkout; developers must
+also install the bundled `lsp_ext` globally to use editor language services.
+
 Install the appropriate server on the **daemon host** and make it available on
 its `PATH`: `rust-analyzer` for Rust, `typescript-language-server --stdio` for
 JavaScript/JSX/TypeScript/TSX, `gopls` for Go, or `pyright-langserver --stdio` for
