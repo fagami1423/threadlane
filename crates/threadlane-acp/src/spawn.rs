@@ -41,7 +41,14 @@ fn resolve_windows_program(
         .unwrap_or(".COM;.EXE;.BAT;.CMD")
         .split(';')
         .map(str::trim)
-        .filter(|extension| !extension.is_empty())
+        // Command uses CreateProcess for native executables and handles .bat/
+        // .cmd through cmd.exe. Other PATHEXT entries need file associations
+        // (ShellExecute), which Command does not use.
+        .filter(|extension| {
+            [".com", ".exe", ".bat", ".cmd"]
+                .iter()
+                .any(|supported| extension.eq_ignore_ascii_case(supported))
+        })
         .collect::<Vec<_>>();
     let Some(path) = path else {
         return bare.to_path_buf();
@@ -74,25 +81,27 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     fn resolve(command: &str, existing: &[&str]) -> PathBuf {
+        resolve_with_pathext(command, existing, ".COM;.EXE;.BAT;.CMD")
+    }
+
+    fn resolve_with_pathext(command: &str, existing: &[&str], pathext: &str) -> PathBuf {
         let existing = existing.iter().map(PathBuf::from).collect::<Vec<_>>();
-        resolve_windows_program(
-            command,
-            Some(OsStr::new(r"C:\tools;C:\nodejs")),
-            Some(OsStr::new(".COM;.EXE;.BAT;.CMD")),
-            |candidate| existing.iter().any(|path| path == candidate),
-        )
+        let path = std::env::join_paths(["tools", "nodejs"]).unwrap();
+        resolve_windows_program(command, Some(&path), Some(OsStr::new(pathext)), |candidate| {
+            existing.iter().any(|path| path == candidate)
+        })
     }
 
     #[test]
     fn bare_names_find_npm_cmd_shims() {
-        assert_eq!(resolve("npx", &[r"C:\nodejs\npx.cmd"]), Path::new(r"C:\nodejs\npx.cmd"));
+        assert_eq!(resolve("npx", &["nodejs/npx.cmd"]), Path::new("nodejs/npx.cmd"));
     }
 
     #[test]
     fn earlier_path_entries_and_exe_win() {
         assert_eq!(
-            resolve("node", &[r"C:\nodejs\node.exe", r"C:\tools\node.cmd", r"C:\tools\node.exe"]),
-            Path::new(r"C:\tools\node.exe")
+            resolve("node", &["nodejs/node.exe", "tools/node.cmd", "tools/node.exe"]),
+            Path::new("tools/node.exe")
         );
     }
 
@@ -101,6 +110,72 @@ mod tests {
         assert_eq!(resolve(r"C:\bin\agent", &[r"C:\bin\agent.cmd"]), Path::new(r"C:\bin\agent"));
         assert_eq!(resolve("agent.exe", &[r"C:\tools\agent.exe"]), Path::new("agent.exe"));
         assert_eq!(resolve("missing", &[]), Path::new("missing"));
+    }
+
+    #[test]
+    fn unsupported_pathext_candidates_do_not_shadow_cmd_shims() {
+        for unsupported in ["vbs", "js", "wsf", "msc"] {
+            let file = format!("tools/npx.{unsupported}");
+            let pathext = format!(".{unsupported};.CMD");
+            assert_eq!(
+                resolve_with_pathext("npx", &[&file, "nodejs/npx.cmd"], &pathext),
+                Path::new("nodejs/npx.cmd")
+            );
+            assert_eq!(resolve_with_pathext("npx", &[&file], &pathext), Path::new("npx"));
+        }
+    }
+
+    #[test]
+    fn supported_pathext_order_case_and_whitespace_are_preserved() {
+        for extension in ["com", "exe", "bat", "cmd"] {
+            let file = format!("tools/agent.{extension}");
+            let pathext = format!("; .JS ; .{} ; .EXE ;;", extension.to_ascii_uppercase());
+            assert_eq!(
+                resolve_with_pathext("agent", &[&file, "tools/agent.exe"], &pathext),
+                Path::new(&file)
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_program_resolution_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("npx.cmd"), "").unwrap();
+        assert_eq!(
+            super::resolve_program("npx", Some(dir.path().as_os_str()), Some(OsStr::new(".CMD"))),
+            Path::new("npx")
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn resolved_batch_shims_spawn_despite_unsupported_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = simplified_cwd(dir.path());
+        for extension in ["vbs", "js", "wsf", "msc"] {
+            std::fs::write(dir.path().join(format!("agent.{extension}")), "invalid executable")
+                .unwrap();
+        }
+        for extension in ["cmd", "bat"] {
+            let shim = dir.path().join(format!("agent.{extension}"));
+            std::fs::write(&shim, "@echo off\r\necho %~1\r\n").unwrap();
+            let pathext = format!(".VBS;.JS;.WSF;.MSC;.{}", extension.to_ascii_uppercase());
+            let program = super::resolve_program(
+                "agent",
+                Some(dir.path().as_os_str()),
+                Some(OsStr::new(&pathext)),
+            );
+            assert_eq!(program, shim);
+            let output = tokio::process::Command::new(program)
+                .arg("ACP shim started")
+                .current_dir(&cwd)
+                .output()
+                .await
+                .expect("Rust must launch the resolved batch shim through cmd.exe");
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "ACP shim started");
+        }
     }
 
     #[test]
