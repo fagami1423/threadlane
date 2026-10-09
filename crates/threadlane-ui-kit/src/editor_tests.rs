@@ -5,6 +5,29 @@ use crate::{
 use gpui::{AppContext, TestAppContext};
 
 #[test]
+fn editor_language_detection_matches_enabled_native_grammars() {
+    use gpui_component::highlighter::Language;
+    for (file, language) in [
+        ("src/Component.TSX", "tsx"),
+        ("src/main.go", "go"),
+        ("source.c", "c"),
+        ("include/header.hpp", "cpp"),
+        ("build.zig", "zig"),
+        ("Main.java", "java"),
+        ("Gemfile", "ruby"),
+        ("db/query.sql", "sql"),
+        ("Makefile", "make"),
+        ("CMakeLists.txt", "cmake"),
+        ("types.pyi", "python"),
+        (".zshrc", "bash"),
+    ] {
+        assert_eq!(crate::tool_preview::detect_language(file), language);
+        assert_eq!(Language::from_str(language).name(), language);
+    }
+    assert_eq!(crate::tool_preview::detect_language("unknown.filetype"), "text");
+}
+
+#[test]
 fn reopen_control_describes_identity_availability_and_saved_file_policy() {
     let mut control = crate::ReopenClosedFileControl::default();
     assert_eq!(control.description(), "No closed files in this window.");
