@@ -30,7 +30,7 @@ use threadlane_runtime::harness::{HookContext, HookEffect, HookHandler, HookKind
 use threadlane_skills::agents::{AgentScope, discover_agents};
 use threadlane_skills::{LoadSkillToolExecutor as SkillLoader, SkillRegistry};
 use threadlane_tools::remove_worktree_cargo_target_dir;
-use threadlane_wasi::WasiExtensionManager;
+use threadlane_wasi::{WasiExtensionManager, WasiExtensionOperation};
 use threadlane_wasi::broker::{
     BROKER_API_VERSION, BrokerError, CapabilityDispatcher, HostBrokerRequest,
 };
@@ -998,6 +998,9 @@ pub(crate) fn extension_before_tool_hook_handler(
                 "tool_name": tool_name,
                 "tool_arguments": context.tool_arguments.as_deref().unwrap_or(""),
             });
+            let _lsp_gate = extensions
+                .lock_lsp_hook_dispatch("before_tool_call")
+                .await;
             for operation in extensions.begin_hook_operations("before_tool_call") {
                 let mut operation = operation
                     .map_err(|error| format!("Extension hook error: {error}"))?;
@@ -1094,6 +1097,9 @@ pub(crate) fn create_after_tool_hook_handler(
                     }
                 }
             }
+            let _lsp_gate = extensions
+                .lock_lsp_hook_dispatch("after_tool_call")
+                .await;
             for operation in extensions.begin_hook_operations("after_tool_call") {
                 let mut operation = match operation {
                     Ok(operation) => operation,
@@ -1221,6 +1227,30 @@ impl ToolExecutor for BrokerAwareWasiToolExecutor {
 }
 
 impl BrokerAwareWasiToolExecutor {
+    pub(crate) fn new(
+        extensions: Arc<WasiExtensionManager>,
+        broker_dispatcher: Arc<CapabilityDispatcher>,
+    ) -> Self {
+        Self {
+            extensions,
+            broker_dispatcher,
+        }
+    }
+
+    pub(crate) async fn execute_editor_lsp_command(&self, args: &str) -> Result<String, String> {
+        let _lsp_gate = self.extensions.lock_lsp_extension().await;
+        let mut operation = self
+            .extensions
+            .begin_ephemeral_command_operation("editor_lsp")
+            .ok_or_else(|| {
+                "WASI command `editor_lsp` is unavailable; install and enable `lsp_ext` in the daemon's global extension scope. Project-only or shadowing copies are not eligible".to_string()
+            })?
+            .map_err(|error| error.to_string())?;
+        self.pump_broker_continuations(&mut operation, "editor_lsp", args, None)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn execute_tool_impl(
         &self,
         name: &str,
@@ -1242,9 +1272,30 @@ impl BrokerAwareWasiToolExecutor {
             }
         }
 
+        let _lsp_gate = self.extensions.lock_lsp_tool_owner(name).await;
         let mut operation = match self.extensions.begin_tool_operation(name)? {
             Ok(operation) => operation,
             Err(error) => return Some(Err(persistence_error(error))),
+        };
+        Some(
+            self.pump_broker_continuations(&mut operation, name, args, identity)
+                .await,
+        )
+    }
+
+    async fn pump_broker_continuations(
+        &self,
+        operation: &mut WasiExtensionOperation<'_>,
+        name: &str,
+        args: &str,
+        identity: Option<&ToolExecutionIdentity>,
+    ) -> Result<String, ToolExecutionError> {
+        let persistence_error = |error| {
+            if identity.is_some() {
+                ToolExecutionError::RecoveryRequired(error)
+            } else {
+                ToolExecutionError::Failed(error)
+            }
         };
         let mut continuation_rounds = 0;
         loop {
@@ -1253,22 +1304,22 @@ impl BrokerAwareWasiToolExecutor {
                 None => operation.invoke(args),
             } {
                 Ok(invocation) => invocation,
-                Err(error) => return Some(Err(persistence_error(error))),
+                Err(error) => return Err(persistence_error(error)),
             };
             if let Some(error) = invocation.response.error {
-                return Some(Err(ToolExecutionError::Failed(error)));
+                return Err(ToolExecutionError::Failed(error));
             }
             let continue_after_broker = invocation.response.continue_after_broker;
             let immediate_message = invocation.response.message.unwrap_or_default();
             let requests = invocation.host_broker_requests;
             if requests.is_empty() {
                 if continue_after_broker {
-                    return Some(Err(ToolExecutionError::Failed(format!(
+                    return Err(ToolExecutionError::Failed(format!(
                         "WASI tool `{name}` requested a broker continuation without any requests; \
                          check capability grants and clear `continue_after_broker` when finished"
-                    ))));
+                    )));
                 }
-                return Some(Ok(immediate_message));
+                return Ok(immediate_message);
             }
             if continue_after_broker && continuation_rounds >= MAX_BROKER_CONTINUATION_ROUNDS {
                 let message = format!(
@@ -1287,19 +1338,19 @@ impl BrokerAwareWasiToolExecutor {
                     None => self.extensions.enqueue_broker_results(outcomes),
                 };
                 if let Err(error) = persisted {
-                    return Some(Err(persistence_error(error)));
+                    return Err(persistence_error(error));
                 }
-                return Some(Err(ToolExecutionError::Failed(message)));
+                return Err(ToolExecutionError::Failed(message));
             }
 
             let dispatch = match self.broker_dispatcher.dispatch_envelopes(requests).await {
                 Ok(dispatch) => dispatch,
-                Err(error) => return Some(Err(persistence_error(error.message))),
+                Err(error) => return Err(persistence_error(error.message)),
             };
             let operation_results = dispatch.operation_results;
             if continue_after_broker {
                 if let Err(error) = self.extensions.enqueue_broker_results(operation_results) {
-                    return Some(Err(persistence_error(error)));
+                    return Err(persistence_error(error));
                 }
                 continuation_rounds += 1;
                 continue;
@@ -1311,9 +1362,9 @@ impl BrokerAwareWasiToolExecutor {
             {
                 let message = error.message.clone();
                 if let Err(error) = self.extensions.enqueue_broker_results(operation_results) {
-                    return Some(Err(persistence_error(format!("{message}; {error}"))));
+                    return Err(persistence_error(format!("{message}; {error}")));
                 }
-                return Some(Err(ToolExecutionError::Failed(message)));
+                return Err(ToolExecutionError::Failed(message));
             }
 
             let broker_message = operation_results
@@ -1329,11 +1380,11 @@ impl BrokerAwareWasiToolExecutor {
                         .and_then(Value::as_str)
                         .or_else(|| result.value.get("output").and_then(Value::as_str))
                         .map(str::to_owned)
-                });
+            });
             if let Err(error) = self.extensions.enqueue_broker_results(operation_results) {
-                return Some(Err(persistence_error(error)));
+                return Err(persistence_error(error));
             }
-            return Some(Ok(broker_message.unwrap_or(immediate_message)));
+            return Ok(broker_message.unwrap_or(immediate_message));
         }
     }
 }
@@ -1341,15 +1392,17 @@ impl BrokerAwareWasiToolExecutor {
 #[cfg(test)]
 mod broker_continuation_tests {
     use super::{
-        run_lsp_diagnostics_after_write, BrokerAwareWasiToolExecutor, CapabilityDispatcher,
-        MAX_BROKER_CONTINUATION_ROUNDS,
+        create_after_tool_hook_handler, run_lsp_diagnostics_after_write,
+        BrokerAwareWasiToolExecutor, CapabilityDispatcher, MAX_BROKER_CONTINUATION_ROUNDS,
     };
     use async_trait::async_trait;
+    use std::path::Path;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
     use threadlane_protocol::ToolExecutor;
+    use threadlane_runtime::harness::HookContext;
     use threadlane_wasi::{
         broker::{BrokerError, BrokerRequest, CapabilityHandler},
         WasiExtensionManager,
@@ -1358,6 +1411,7 @@ mod broker_continuation_tests {
     struct RoundCounter {
         manager: Arc<WasiExtensionManager>,
         rounds: AtomicUsize,
+        state_extension: &'static str,
     }
 
     struct FailingOutcomeStorage {
@@ -1462,16 +1516,118 @@ mod broker_continuation_tests {
         fn handle(&self, _: &BrokerRequest) -> Result<serde_json::Value, BrokerError> {
             let round = self.rounds.fetch_add(1, Ordering::SeqCst) + 1;
             self.manager
-                .set_extension_state("rounds", serde_json::json!(round))
+                .set_extension_state(self.state_extension, serde_json::json!(round))
                 .unwrap();
             Ok(serde_json::Value::Null)
         }
     }
 
     fn fixture(finite: bool, emit_request: bool) -> (tempfile::TempDir, Arc<WasiExtensionManager>) {
+        fixture_with_extension_name("rounds", finite, emit_request)
+    }
+
+    fn fixture_with_extension_name(
+        extension_name: &str,
+        finite: bool,
+        emit_request: bool,
+    ) -> (tempfile::TempDir, Arc<WasiExtensionManager>) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(format!(
+            ".threadlane/extensions/{extension_name}.wasm"
+        ));
+        write_fixture_module(&path, extension_name, finite, emit_request);
+        let manager = Arc::new(WasiExtensionManager::new());
+        assert_eq!(
+            manager
+                .reload_from_roots(None, Some(directory.path()))
+                .unwrap(),
+            1
+        );
+        (directory, manager)
+    }
+
+    fn fixture_with_global_lsp_extension(
+        finite: bool,
+        emit_request: bool,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<WasiExtensionManager>,
+    ) {
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let path = global.path().join("extensions/lsp_ext.wasm");
+        write_fixture_module(&path, "lsp_ext", finite, emit_request);
+        let manager = Arc::new(WasiExtensionManager::new());
+        assert_eq!(
+            manager
+                .reload_from_roots(Some(global.path()), Some(project.path()))
+                .unwrap(),
+            1
+        );
+        (project, global, manager)
+    }
+
+    fn fixture_with_project_override_lsp(
+        finite: bool,
+        emit_request: bool,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<WasiExtensionManager>,
+    ) {
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        write_fixture_module(
+            &global.path().join("extensions/lsp_ext.wasm"),
+            "lsp_ext",
+            finite,
+            emit_request,
+        );
+        write_fixture_module(
+            &project
+                .path()
+                .join(".threadlane/extensions/lsp_ext.wasm"),
+            "lsp_ext",
+            finite,
+            emit_request,
+        );
+        let manager = Arc::new(WasiExtensionManager::new());
+        assert_eq!(
+            manager
+                .reload_from_roots(Some(global.path()), Some(project.path()))
+                .unwrap(),
+            1
+        );
+        (project, global, manager)
+    }
+
+    fn write_fixture_module(
+        path: &Path,
+        extension_name: &str,
+        finite: bool,
+        emit_request: bool,
+    ) {
         // Exercise the production WASM invocation, queued broker outcomes,
         // and executor loop. The finite fixture settles after six dispatches.
-        let manifest = serde_json::json!({"api_version":2,"name":"rounds","version":"1","description":"test","capabilities":["tools"],"tools":[{"name":"rounds","description":"test","parameters":{}},{"name":"lsp_diagnostics","description":"test","parameters":{}}]}).to_string();
+        let manifest = serde_json::json!({
+            "api_version":2,
+            "name":extension_name,
+            "version":"1",
+            "description":"test",
+            "capabilities":["tools"],
+            "tools":[
+                {"name":"rounds","description":"test","parameters":{}},
+                {"name":"lsp_diagnostics","description":"test","parameters":{}},
+            ],
+            "commands":[{"name":"editor_lsp","description":"test"}],
+            "hooks":if extension_name == "lsp_ext" {
+                vec!["after_tool_call"]
+            } else {
+                vec![]
+            },
+        })
+        .to_string();
         let pending = r#"{"message":"waiting","continue_after_broker":true}"#;
         let done = r#"{"message":"done","state":{}}"#;
         let request =
@@ -1505,11 +1661,14 @@ mod broker_continuation_tests {
           (data (i32.const 3072) "{request}")
           (func (export "extension_info") (result i64) (i64.const {manifest_result}))
           (func (export "alloc") (param i32) (result i32) (i32.const 4096))
-          (func (export "execute_tool") (param $ptr i32) (param $len i32) (result i64)
+          (func $invoke (param $ptr i32) (param $len i32) (result i64)
             (local $end i32)
             {finish}
             {request_call}
-            (i64.const {pending_result})))"#,
+            (i64.const {pending_result}))
+          (export "execute_tool" (func $invoke))
+          (export "execute_command" (func $invoke))
+          (export "after_tool_call" (func $invoke)))"#,
             manifest = escape(&manifest),
             pending = escape(pending),
             done = escape(done),
@@ -1517,18 +1676,8 @@ mod broker_continuation_tests {
             manifest_result = (8u64 << 32) | manifest.len() as u64,
             pending_result = (1024u64 << 32) | pending.len() as u64,
         );
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(".threadlane/extensions/rounds.wasm");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, module).unwrap();
-        let manager = Arc::new(WasiExtensionManager::new());
-        assert_eq!(
-            manager
-                .reload_from_roots(None, Some(directory.path()))
-                .unwrap(),
-            1
-        );
-        (directory, manager)
     }
 
     async fn run_fixture(finite: bool, emit_request: bool) -> (Result<String, String>, usize) {
@@ -1536,6 +1685,7 @@ mod broker_continuation_tests {
         let counter = Arc::new(RoundCounter {
             manager: manager.clone(),
             rounds: AtomicUsize::new(0),
+            state_extension: "rounds",
         });
         let mut dispatcher = CapabilityDispatcher::new();
         dispatcher.register("tools", counter.clone());
@@ -1569,6 +1719,8 @@ mod broker_continuation_tests {
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
         calls: AtomicUsize,
+        pause_first: bool,
+        state_extension: Option<(Arc<WasiExtensionManager>, &'static str)>,
     }
 
     #[async_trait]
@@ -1582,9 +1734,21 @@ mod broker_continuation_tests {
             _: &BrokerRequest,
             _: &str,
         ) -> Result<serde_json::Value, BrokerError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some((manager, extension)) = &self.state_extension {
+                let round = manager
+                    .extension_state(extension)
+                    .and_then(|state| state.as_u64())
+                    .unwrap_or_default()
+                    + 1;
+                manager
+                    .set_extension_state(extension, serde_json::json!(round))
+                    .unwrap();
+            }
             self.entered.notify_one();
-            self.release.notified().await;
+            if self.pause_first && call == 0 {
+                self.release.notified().await;
+            }
             Ok(serde_json::Value::Null)
         }
     }
@@ -1600,6 +1764,8 @@ mod broker_continuation_tests {
             entered: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
             calls: AtomicUsize::new(0),
+            pause_first: true,
+            state_extension: None,
         });
         let mut dispatcher = CapabilityDispatcher::new();
         dispatcher.register("tools", handler.clone());
@@ -1635,6 +1801,171 @@ mod broker_continuation_tests {
     }
 
     #[tokio::test]
+    async fn editor_and_agent_lsp_operations_wait_on_the_shared_gate() {
+        let (_project, _global, manager) = fixture_with_global_lsp_extension(true, true);
+        let handler = Arc::new(PausedBroker {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            calls: AtomicUsize::new(0),
+            pause_first: true,
+            state_extension: Some((manager.clone(), "lsp_ext")),
+        });
+        let mut dispatcher = CapabilityDispatcher::new();
+        dispatcher.register("tools", handler.clone());
+        let executor = Arc::new(BrokerAwareWasiToolExecutor::new(
+            manager.clone(),
+            Arc::new(dispatcher),
+        ));
+
+        let editor_executor = executor.clone();
+        let editor = tokio::spawn(async move {
+            editor_executor.execute_editor_lsp_command("{}").await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handler.entered.notified(),
+        )
+        .await
+        .unwrap();
+        let tool_executor = executor.clone();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let tool = tokio::spawn(async move {
+            started.send(()).unwrap();
+            tool_executor.execute_tool("lsp_diagnostics", "{}").await
+        });
+        entered.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!tool.is_finished(), "agent LSP tool bypassed the shared gate");
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+
+        handler.release.notify_one();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), editor)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            "done"
+        );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), tool)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            "done"
+        );
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test]
+    async fn canceled_editor_lsp_owner_releases_gate_and_extension_claim() {
+        let (_project, _global, manager) = fixture_with_global_lsp_extension(true, true);
+        let handler = Arc::new(PausedBroker {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            calls: AtomicUsize::new(0),
+            pause_first: true,
+            state_extension: Some((manager.clone(), "lsp_ext")),
+        });
+        let mut dispatcher = CapabilityDispatcher::new();
+        dispatcher.register("tools", handler.clone());
+        let executor = Arc::new(BrokerAwareWasiToolExecutor::new(
+            manager.clone(),
+            Arc::new(dispatcher),
+        ));
+
+        let editor_executor = executor.clone();
+        let editor = tokio::spawn(async move {
+            editor_executor.execute_editor_lsp_command("{}").await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handler.entered.notified(),
+        )
+        .await
+        .unwrap();
+        let gate_manager = manager.clone();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            started.send(()).unwrap();
+            let _gate = gate_manager.lock_lsp_extension().await;
+        });
+        entered.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "LSP gate waiter bypassed the owner");
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+
+        editor.abort();
+        assert!(editor.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        let operation = manager
+            .begin_tool_operation("lsp_diagnostics")
+            .unwrap()
+            .unwrap();
+        drop(operation);
+    }
+
+    #[tokio::test]
+    async fn editor_lsp_after_tool_hook_waits_on_the_shared_gate() {
+        let (_project, _global, manager) = fixture_with_global_lsp_extension(true, true);
+        let handler = Arc::new(PausedBroker {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            calls: AtomicUsize::new(0),
+            pause_first: true,
+            state_extension: Some((manager.clone(), "lsp_ext")),
+        });
+        let mut dispatcher = CapabilityDispatcher::new();
+        dispatcher.register("tools", handler.clone());
+        let dispatcher = Arc::new(dispatcher);
+        let executor = Arc::new(BrokerAwareWasiToolExecutor::new(
+            manager.clone(),
+            dispatcher.clone(),
+        ));
+        let hook = create_after_tool_hook_handler(manager, dispatcher);
+
+        let editor_executor = executor.clone();
+        let editor = tokio::spawn(async move {
+            editor_executor.execute_editor_lsp_command("{}").await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handler.entered.notified(),
+        )
+        .await
+        .unwrap();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let hook_task = tokio::spawn(async move {
+            started.send(()).unwrap();
+            hook(HookContext::default()).await
+        });
+        entered.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!hook_task.is_finished(), "after-tool LSP hook bypassed the shared gate");
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+
+        handler.release.notify_one();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), editor)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            "done"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), hook_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn broker_continuations_allow_normal_protocol_setup_and_bound_runaways() {
         assert_eq!(
             serde_json::to_value(threadlane_runtime::CodingAgentConfig::default()).unwrap()
@@ -1653,6 +1984,45 @@ mod broker_continuation_tests {
     }
 
     #[tokio::test]
+    async fn editor_lsp_command_entrypoint_runs_the_broker_continuation_pump() {
+        let (_project, _global, manager) = fixture_with_global_lsp_extension(true, true);
+        let counter = Arc::new(RoundCounter {
+            manager: manager.clone(),
+            rounds: AtomicUsize::new(0),
+            state_extension: "lsp_ext",
+        });
+        let mut dispatcher = CapabilityDispatcher::new();
+        dispatcher.register("tools", counter.clone());
+        let executor = BrokerAwareWasiToolExecutor::new(manager, Arc::new(dispatcher));
+
+        let result = executor.execute_editor_lsp_command("{}").await.unwrap();
+
+        assert_eq!(result, "done");
+        assert_eq!(counter.rounds.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test]
+    async fn editor_lsp_project_override_is_rejected_before_broker_invocation() {
+        let (_project, _global, manager) = fixture_with_project_override_lsp(true, true);
+        let counter = Arc::new(RoundCounter {
+            manager: manager.clone(),
+            rounds: AtomicUsize::new(0),
+            state_extension: "lsp_ext",
+        });
+        let mut dispatcher = CapabilityDispatcher::new();
+        dispatcher.register("tools", counter.clone());
+        let executor = BrokerAwareWasiToolExecutor::new(manager, Arc::new(dispatcher));
+
+        let error = executor
+            .execute_editor_lsp_command("{}")
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("global extension scope"), "{error}");
+        assert_eq!(counter.rounds.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn durable_broker_protocol_failures_save_terminal_replies_without_replaying_rounds() {
         use threadlane_protocol::{AgentToolCall, ToolExecutionIdentity};
         for emit_request in [false, true] {
@@ -1668,6 +2038,7 @@ mod broker_continuation_tests {
             let counter = Arc::new(RoundCounter {
                 manager: manager.clone(),
                 rounds: AtomicUsize::new(0),
+                state_extension: "rounds",
             });
             let mut dispatcher = CapabilityDispatcher::new();
             dispatcher.register("tools", counter.clone());

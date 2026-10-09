@@ -70,7 +70,7 @@ pub use picker::*;
 mod editor;
 mod editor_completion;
 mod editor_workbench;
-pub use editor_workbench::EditorWorkbench;
+pub use editor_workbench::{EditorLanguageRefresh, EditorWorkbench};
 mod editor_markdown;
 pub use editor_markdown::*;
 #[cfg(test)]

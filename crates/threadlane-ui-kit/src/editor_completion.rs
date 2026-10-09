@@ -13,6 +13,51 @@ const MAX_SUGGESTIONS: usize = 50;
 
 pub(crate) struct BufferWords;
 
+pub(crate) struct LanguageCompletion {
+    pub primary: std::rc::Rc<dyn CompletionProvider>,
+    pub words: bool,
+    pub editor: gpui::WeakEntity<gpui_component::input::EditorState>,
+}
+
+impl CompletionProvider for LanguageCompletion {
+    fn completions(
+        &self,
+        text: &Rope,
+        offset: usize,
+        trigger: CompletionContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<CompletionResponse>> {
+        let primary = self.primary.completions(text, offset, trigger, window, cx);
+        let text = text.clone();
+        let words = self.words;
+        let editor = self.editor.clone();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |cx| match primary.await {
+            Ok(result) => Ok(result),
+            Err(error) if !words => Err(error),
+            Err(_) => {
+                let current = cx.update(|cx| {
+                    editor
+                        .upgrade()
+                        .is_some_and(|editor| editor.read(cx).text() == &text)
+                });
+                if !current {
+                    return Ok(CompletionResponse::Array(vec![]));
+                }
+                executor
+                    .spawn(async move { Ok(CompletionResponse::Array(suggestions(&text, offset))) })
+                    .await
+            }
+        })
+    }
+
+    fn is_completion_trigger(&self, offset: usize, new_text: &str, cx: &mut App) -> bool {
+        self.primary.is_completion_trigger(offset, new_text, cx)
+            || self.words && BufferWords.is_completion_trigger(offset, new_text, cx)
+    }
+}
+
 fn is_word(ch: char) -> bool {
     ch == '_' || ch.is_alphanumeric()
 }
@@ -81,7 +126,7 @@ impl CompletionProvider for BufferWords {
 
 #[cfg(test)]
 mod tests {
-    use super::{suggestions, MAX_BUFFER_BYTES, MAX_SUGGESTIONS};
+    use super::{MAX_BUFFER_BYTES, MAX_SUGGESTIONS, suggestions};
     use gpui_component::input::Rope;
     use lsp_types::{CompletionTextEdit, Position, Range};
 

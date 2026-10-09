@@ -12,6 +12,12 @@ threadlane-ui-state.workspace = true
 threadlane-ui-kit.workspace = true
 threadlane-client.workspace = true
 tracing.workspace = true
+anyhow = "1"
+lsp-types = "0.97"
+serde_json.workspace = true
+threadlane-protocol.workspace = true
+url.workspace = true
+percent-encoding = "2"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

@@ -146,6 +146,59 @@ impl WasiExtensionInvocationResult {
     }
 }
 
+fn merge_extension_state(
+    previous: &Value,
+    response_state: Option<Value>,
+    ephemeral: bool,
+    ephemeral_keys: &HashSet<String>,
+) -> Result<Value, String> {
+    if ephemeral {
+        let Some(response_state) = response_state else {
+            return Ok(previous.clone());
+        };
+        let Some(previous) = previous.as_object() else {
+            if response_state
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+            {
+                return Ok(previous.clone());
+            }
+            return Err(
+                "Cannot preserve non-ephemeral extension state because it is not an object".into(),
+            );
+        };
+        let mut next = response_state
+            .as_object()
+            .cloned()
+            .ok_or("Ephemeral extension state response must be an object")?;
+        for (key, value) in previous {
+            if !ephemeral_keys.contains(key) {
+                next.insert(key.clone(), value.clone());
+            }
+        }
+        return Ok(Value::Object(next));
+    }
+
+    let mut next = response_state.unwrap_or_else(|| serde_json::json!({}));
+    let Some(previous) = previous.as_object() else {
+        return Ok(next);
+    };
+    let reserved = previous
+        .iter()
+        .filter(|(key, _)| ephemeral_keys.contains(*key))
+        .collect::<Vec<_>>();
+    if reserved.is_empty() {
+        return Ok(next);
+    }
+    let next = next
+        .as_object_mut()
+        .ok_or("Cannot preserve ephemeral extension state because the response state is not an object")?;
+    for (key, value) in reserved {
+        next.insert(key.clone(), value.clone());
+    }
+    Ok(Value::Object(next.clone()))
+}
+
 #[derive(Default)]
 struct WasiStoreData {
     policy: CapabilityPolicy,
@@ -158,6 +211,27 @@ pub struct WasiExtension {
     wasm_bytes: Vec<u8>,
     engine: Engine,
     module: Arc<Module>,
+    trusted_global_editor_lsp: bool,
+}
+
+fn is_trusted_global_editor_lsp_record(
+    record: &packages::ExtensionRecord,
+    project_root: Option<&Path>,
+) -> bool {
+    if record.name() != "lsp_ext"
+        || record.scope() != packages::ExtensionScope::Global
+        || !record.is_enabled()
+        || !record.is_effective()
+    {
+        return false;
+    }
+    let Some(project_root) = project_root.and_then(|root| root.canonicalize().ok()) else {
+        return false;
+    };
+    let Ok(module_path) = record.module_path().canonicalize() else {
+        return false;
+    };
+    !module_path.starts_with(project_root)
 }
 
 impl WasiExtension {
@@ -283,6 +357,7 @@ impl WasiExtension {
             wasm_bytes,
             engine,
             module: Arc::new(module),
+            trusted_global_editor_lsp: false,
         })
     }
 
@@ -592,7 +667,11 @@ pub struct WasiExtensionManager {
     in_flight_events: Mutex<HashMap<String, Vec<Arc<WasiExtensionEvent>>>>,
     /// Delivery ends at each checkpoint; call ownership spans broker awaits.
     active_operations: Mutex<HashSet<String>>,
+    /// Serializes broker-backed operations owned by the LSP extension.
+    lsp_operation_gate: tokio::sync::Mutex<()>,
     unsettled_broker: Mutex<HashMap<String, Vec<Arc<BrokerIntent>>>>,
+    ephemeral_broker_receipts: Mutex<HashMap<String, HashSet<u64>>>,
+    ephemeral_state_keys: Mutex<HashMap<String, HashSet<String>>>,
     terminal_replies: Mutex<HashMap<String, Arc<SavedToolReply>>>,
     last_broker_id: AtomicU64,
     pending_broker_requests: Mutex<HashMap<Option<String>, Vec<HostBrokerRequest>>>,
@@ -613,12 +692,20 @@ pub struct WasiExtensionOperation<'a> {
     extension: Arc<WasiExtension>,
     kind: &'static str,
     name: String,
+    ephemeral: bool,
 }
 
 impl WasiExtensionOperation<'_> {
     pub fn invoke(&mut self, args: &str) -> Result<WasiExtensionInvocationResult, String> {
-        self.manager
-            .invoke_owned(&self.extension, self.kind, &self.name, args, true, None)
+        self.manager.invoke_owned(
+            &self.extension,
+            self.kind,
+            &self.name,
+            args,
+            true,
+            None,
+            self.ephemeral,
+        )
     }
 
     pub fn invoke_for_execution(
@@ -633,6 +720,7 @@ impl WasiExtensionOperation<'_> {
             args,
             true,
             Some(identity),
+            false,
         )
     }
 
@@ -651,6 +739,7 @@ impl WasiExtensionOperation<'_> {
             args,
             true,
             Some(identity),
+            false,
         )
     }
 
@@ -691,6 +780,10 @@ impl WasiExtensionOperation<'_> {
 
 impl Drop for WasiExtensionOperation<'_> {
     fn drop(&mut self) {
+        if self.ephemeral {
+            self.manager
+                .discard_ephemeral_broker_receipts(&self.extension.manifest.name);
+        }
         if let Ok(mut active) = self.manager.active_operations.lock() {
             active.remove(&self.extension.manifest.name);
         }
@@ -698,6 +791,50 @@ impl Drop for WasiExtensionOperation<'_> {
 }
 
 impl WasiExtensionManager {
+    fn discard_ephemeral_broker_receipts(&self, extension_name: &str) {
+        let Ok(_commit) = self.state_commit.lock() else {
+            return;
+        };
+        let receipts = self
+            .ephemeral_broker_receipts
+            .lock()
+            .ok()
+            .and_then(|mut receipts| receipts.remove(extension_name))
+            .unwrap_or_default();
+        if receipts.is_empty() {
+            return;
+        }
+        if let Ok(mut unsettled) = self.unsettled_broker.lock() {
+            if let Some(intents) = unsettled.get_mut(extension_name) {
+                intents.retain(|intent| !receipts.contains(&intent.receipt.id));
+            }
+        }
+        if let Ok(mut pending) = self.pending_events.lock() {
+            for queues in pending.values_mut() {
+                if let Some(events) = queues.get_mut(extension_name) {
+                    events.retain(|event| {
+                        event
+                            .payload
+                            .get("receipt_id")
+                            .and_then(Value::as_u64)
+                            .is_none_or(|id| !receipts.contains(&id))
+                    });
+                }
+            }
+        }
+        if let Ok(mut in_flight) = self.in_flight_events.lock() {
+            if let Some(events) = in_flight.get_mut(extension_name) {
+                events.retain(|event| {
+                    event
+                        .payload
+                        .get("receipt_id")
+                        .and_then(Value::as_u64)
+                        .is_none_or(|id| !receipts.contains(&id))
+                });
+            }
+        }
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -756,7 +893,7 @@ impl WasiExtensionManager {
             // A module that changed (or vanished) between discovery and load
             // skips like a discovery-time failure: warn, retire the stale
             // registration below, and keep the other extensions running.
-            let extension = match WasiExtension::load_from_file(record.module_path()) {
+            let mut extension = match WasiExtension::load_from_file(record.module_path()) {
                 Ok(extension) => extension,
                 Err(error) => {
                     tracing::warn!(
@@ -772,6 +909,8 @@ impl WasiExtensionManager {
                     record.module_path().display()
                 ));
             }
+            extension.trusted_global_editor_lsp =
+                is_trusted_global_editor_lsp_record(&record, project_root);
             loaded.insert(extension.manifest.name.clone(), Arc::new(extension));
         }
         let loaded_count = loaded.len();
@@ -2160,23 +2299,55 @@ impl WasiExtensionManager {
                 .cloned()
                 .unwrap_or_default()
         };
+        let ephemeral_receipts = self
+            .ephemeral_broker_receipts
+            .lock()
+            .map_err(|_| "Ephemeral broker receipt lock poisoned".to_string())?
+            .values()
+            .flat_map(|receipts| receipts.iter().copied())
+            .collect::<HashSet<_>>();
+        events.retain(|event| {
+            event
+                .payload
+                .get("receipt_id")
+                .and_then(Value::as_u64)
+                .is_none_or(|id| !ephemeral_receipts.contains(&id))
+        });
+        let durable_unsettled = unsettled
+            .iter()
+            .filter(|intent| !ephemeral_receipts.contains(&intent.receipt.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let ephemeral_state_keys = self
+            .ephemeral_state_keys
+            .lock()
+            .map_err(|_| "Ephemeral extension state lock poisoned".to_string())?
+            .get(extension_name)
+            .cloned()
+            .unwrap_or_default();
+        let mut persistent_state = state.clone();
+        if let Some(object) = persistent_state.as_object_mut() {
+            for key in ephemeral_state_keys {
+                object.remove(&key);
+            }
+        }
         let last_broker_id = self.last_broker_id.load(Ordering::SeqCst);
         persist_checkpoint(
             &path,
-            state,
+            &persistent_state,
             &events,
             last_broker_id,
-            unsettled,
+            &durable_unsettled,
             terminal_reply.map(Arc::as_ref),
         )
         .map_err(|error| {
             self.record_state_write_error(&path, error, || UnconfirmedState::Extension {
                 name: extension_name.into(),
-                state: state.clone(),
+                state: persistent_state.clone(),
                 events,
                 acknowledged,
                 last_broker_id,
-                intents: unsettled.to_vec(),
+                intents: durable_unsettled,
                 unpublished: !include_in_flight,
                 terminal_reply: terminal_reply.cloned(),
             })
@@ -2246,6 +2417,86 @@ impl WasiExtensionManager {
         self.begin_response_operation("command", name)
     }
 
+    pub fn begin_ephemeral_command_operation(
+        &self,
+        name: &str,
+    ) -> Option<Result<WasiExtensionOperation<'_>, String>> {
+        if name != "editor_lsp" {
+            return Some(Err(
+                "Only the fixed editor_lsp command can use ephemeral broker state".into(),
+            ));
+        }
+        let extension = match self.extensions.read() {
+            Ok(extensions) => extensions.get("lsp_ext").cloned(),
+            Err(_) => return Some(Err("Extension registry lock poisoned".into())),
+        }?;
+        if !extension.trusted_global_editor_lsp {
+            return Some(Err(
+                "Automatic editor LSP requires `lsp_ext` installed and enabled in the daemon's global extension scope; project-only or shadowing copies are not eligible".into(),
+            ));
+        }
+        if !extension
+            .manifest
+            .commands
+            .iter()
+            .any(|command| command.name == name)
+        {
+            return Some(Err(
+                "The global `lsp_ext` extension must declare the fixed `editor_lsp` command"
+                    .into(),
+            ));
+        }
+        let mut operation = match self.claim_operation(extension, "command", name) {
+            Ok(operation) => operation,
+            Err(error) => return Some(Err(error)),
+        };
+        let mut ephemeral_keys = match self.ephemeral_state_keys.lock() {
+            Ok(keys) => keys,
+            Err(_) => {
+                return Some(Err("Ephemeral extension state lock poisoned".into()));
+            }
+        };
+        ephemeral_keys
+            .entry("lsp_ext".into())
+            .or_default()
+            .insert("editor".into());
+        operation.ephemeral = true;
+        Some(Ok(operation))
+    }
+
+    pub async fn lock_lsp_extension(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.lsp_operation_gate.lock().await
+    }
+
+    pub async fn lock_lsp_tool_owner(
+        &self,
+        name: &str,
+    ) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        let is_lsp_owner = self
+            .find_response_extension("tool", name)
+            .is_some_and(|extension| extension.manifest.name == "lsp_ext");
+        if is_lsp_owner {
+            Some(self.lsp_operation_gate.lock().await)
+        } else {
+            None
+        }
+    }
+
+    pub async fn lock_lsp_hook_dispatch(
+        &self,
+        hook_name: &str,
+    ) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        let has_lsp_hook = self
+            .find_hook_extensions(hook_name)
+            .iter()
+            .any(|extension| extension.manifest.name == "lsp_ext");
+        if has_lsp_hook {
+            Some(self.lsp_operation_gate.lock().await)
+        } else {
+            None
+        }
+    }
+
     /// Acquire each hook only when visited, preserving name order without
     /// reserving unrelated extensions during another hook's broker dispatch.
     pub fn begin_hook_operations(
@@ -2310,6 +2561,7 @@ impl WasiExtensionManager {
             extension,
             kind,
             name: name.to_owned(),
+            ephemeral: false,
         })
     }
 
@@ -2718,7 +2970,7 @@ impl WasiExtensionManager {
         name: &str,
         args: &str,
     ) -> Result<WasiExtensionInvocationResult, String> {
-        self.invoke_owned(extension, kind, name, args, false, None)
+        self.invoke_owned(extension, kind, name, args, false, None, false)
     }
 
     fn invoke_owned(
@@ -2729,6 +2981,7 @@ impl WasiExtensionManager {
         args: &str,
         owns_operation: bool,
         identity: Option<&ToolExecutionIdentity>,
+        ephemeral: bool,
     ) -> Result<WasiExtensionInvocationResult, String> {
         if let Some(identity) = identity {
             if !identity.matches_call(&identity.tool_call_id, &identity.tool_name)
@@ -2766,6 +3019,7 @@ impl WasiExtensionManager {
             owns_operation,
             identity.filter(|_| kind == "hook"),
         )?;
+        let previous_state = state.clone();
         #[derive(Serialize)]
         struct Invocation<'a> {
             api_version: u32,
@@ -2804,17 +3058,24 @@ impl WasiExtensionManager {
             ),
         }
         .and_then(|mut result| {
-            // Missing state resets stale transient phases to the stable default.
-            // Commit before acknowledging events or exposing broker work to the host.
+            // Merge state before acknowledging events or exposing broker work.
             let _commit = self
                 .state_commit
                 .lock()
                 .map_err(|_| "Extension state commit lock poisoned".to_string())?;
-            let state = result
-                .response
-                .state
-                .clone()
-                .unwrap_or_else(|| serde_json::json!({}));
+            let ephemeral_keys = self
+                .ephemeral_state_keys
+                .lock()
+                .map_err(|_| "Ephemeral extension state lock poisoned".to_string())?
+                .get(&extension.manifest.name)
+                .cloned()
+                .unwrap_or_default();
+            let state = merge_extension_state(
+                &previous_state,
+                result.response.state.clone(),
+                ephemeral,
+                &ephemeral_keys,
+            )?;
             let mut requests = if result.response.error.is_none() {
                 self.filter_granted_requests(
                     std::mem::take(&mut result.broker_requests)
@@ -2859,6 +3120,16 @@ impl WasiExtensionManager {
                     request: request.request.clone(),
                 }));
                 request.receipt = Some(receipt);
+            }
+            if ephemeral {
+                let mut ephemeral_receipts = self
+                    .ephemeral_broker_receipts
+                    .lock()
+                    .map_err(|_| "Ephemeral broker receipt lock poisoned".to_string())?;
+                ephemeral_receipts
+                    .entry(extension.manifest.name.clone())
+                    .or_default()
+                    .extend(intents.iter().map(|intent| intent.receipt.id));
             }
             let terminal_reply = if kind == "hook" {
                 self.terminal_replies
@@ -3682,6 +3953,191 @@ mod reload_tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn write_editor_lsp_extension(
+        extensions_root: &Path,
+        name: &str,
+        include_command: bool,
+    ) -> PathBuf {
+        let commands = if include_command {
+            vec![serde_json::json!({
+                "name": "editor_lsp",
+                "description": "test editor command",
+            })]
+        } else {
+            Vec::new()
+        };
+        let manifest = serde_json::json!({
+            "api_version": BROKER_API_VERSION,
+            "name": name,
+            "version": "1",
+            "description": "test",
+            "capabilities": ["process"],
+            "commands": commands,
+        })
+        .to_string();
+        let module = format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (data (i32.const 8) "{manifest}")
+                (func (export "extension_info") (result i64) (i64.const {result})))"#,
+            manifest = manifest.replace('\\', "\\\\").replace('"', "\\\""),
+            result = (8u64 << 32) | manifest.len() as u64,
+        );
+        let path = extensions_root.join(format!("{name}.wasm"));
+        fs::create_dir_all(extensions_root).unwrap();
+        fs::write(&path, module).unwrap();
+        path
+    }
+
+    fn editor_lsp_manager(global_root: Option<&Path>, project_root: &Path) -> WasiExtensionManager {
+        let manager =
+            WasiExtensionManager::for_project_session(project_root, "editor-lsp-provenance");
+        manager
+            .reload_from_roots(global_root, Some(project_root))
+            .unwrap();
+        manager
+    }
+
+    fn expect_unavailable_editor_lsp(manager: &WasiExtensionManager) -> String {
+        match manager.begin_ephemeral_command_operation("editor_lsp") {
+            Some(Err(error)) => error,
+            Some(Ok(_)) => panic!("untrusted editor LSP command must not be claimed"),
+            None => panic!("expected a registered but ineligible lsp_ext"),
+        }
+    }
+
+    #[test]
+    fn ephemeral_editor_lsp_requires_an_effective_global_installation() {
+        let global = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        write_editor_lsp_extension(
+            &project.path().join(".threadlane/extensions"),
+            "lsp_ext",
+            true,
+        );
+        let manager = editor_lsp_manager(Some(global.path()), project.path());
+        let error = expect_unavailable_editor_lsp(&manager);
+        assert!(error.contains("global extension scope"), "{error}");
+        assert!(!manager
+            .active_operations
+            .lock()
+            .unwrap()
+            .contains("lsp_ext"));
+
+        let global = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        write_editor_lsp_extension(&global.path().join("extensions"), "lsp_ext", true);
+        let manager = editor_lsp_manager(Some(global.path()), project.path());
+        let operation = manager
+            .begin_ephemeral_command_operation("editor_lsp")
+            .unwrap()
+            .unwrap();
+        assert!(manager
+            .active_operations
+            .lock()
+            .unwrap()
+            .contains("lsp_ext"));
+        drop(operation);
+        assert!(!manager
+            .active_operations
+            .lock()
+            .unwrap()
+            .contains("lsp_ext"));
+
+        let global = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        write_editor_lsp_extension(&global.path().join("extensions"), "lsp_ext", true);
+        let project_module = write_editor_lsp_extension(
+            &project.path().join(".threadlane/extensions"),
+            "lsp_ext",
+            true,
+        );
+        let project_module = project_module.canonicalize().unwrap();
+        let manager = editor_lsp_manager(Some(global.path()), project.path());
+        assert_eq!(
+            manager
+                .extensions
+                .read()
+                .unwrap()
+                .get("lsp_ext")
+                .unwrap()
+                .file_path
+                .as_deref(),
+            Some(project_module.as_path())
+        );
+        let error = expect_unavailable_editor_lsp(&manager);
+        assert!(error.contains("global extension scope"), "{error}");
+        assert!(!manager
+            .active_operations
+            .lock()
+            .unwrap()
+            .contains("lsp_ext"));
+    }
+
+    #[test]
+    fn ephemeral_editor_lsp_rejects_a_canonical_global_module_inside_the_project() {
+        let project = tempdir().unwrap();
+        let alias_parent = project.path().join("alias-parent");
+        fs::create_dir_all(&alias_parent).unwrap();
+        let global_root = alias_parent.join("..").join("nested-global");
+        write_editor_lsp_extension(&global_root.join("extensions"), "lsp_ext", true);
+
+        let manager = editor_lsp_manager(Some(&global_root), project.path());
+        let error = expect_unavailable_editor_lsp(&manager);
+
+        assert!(error.contains("global extension scope"), "{error}");
+        assert!(!manager
+            .active_operations
+            .lock()
+            .unwrap()
+            .contains("lsp_ext"));
+    }
+
+    #[test]
+    fn ephemeral_editor_lsp_requires_the_declared_fixed_command() {
+        let global = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        write_editor_lsp_extension(&global.path().join("extensions"), "lsp_ext", false);
+
+        let manager = editor_lsp_manager(Some(global.path()), project.path());
+        let error = expect_unavailable_editor_lsp(&manager);
+
+        assert!(error.contains("must declare"), "{error}");
+        assert!(!manager
+            .active_operations
+            .lock()
+            .unwrap()
+            .contains("lsp_ext"));
+    }
+
+    #[test]
+    fn ephemeral_editor_lsp_ignores_missing_and_disabled_global_modules() {
+        let global = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let manager = WasiExtensionManager::for_project_session(project.path(), "editor-lsp");
+        assert_eq!(
+            manager
+                .reload_from_roots(Some(global.path()), Some(project.path()))
+                .unwrap(),
+            0
+        );
+        assert!(manager
+            .begin_ephemeral_command_operation("editor_lsp")
+            .is_none());
+
+        let module = write_editor_lsp_extension(&global.path().join("extensions"), "lsp_ext", true);
+        fs::write(format!("{}.disabled", module.display()), "").unwrap();
+        assert_eq!(
+            manager
+                .reload_from_roots(Some(global.path()), Some(project.path()))
+                .unwrap(),
+            0
+        );
+        assert!(manager
+            .begin_ephemeral_command_operation("editor_lsp")
+            .is_none());
+    }
+
     #[test]
     fn tool_definition_slice_is_reused() {
         let manager = WasiExtensionManager::new();
@@ -3721,6 +4177,37 @@ mod reload_tests {
             .expect("selected invocations must not retain a registry read guard");
         assert_eq!(command.manifest.name, "unnamed_wasi_ext");
         assert_eq!(hooks.len(), 1);
+    }
+
+    #[test]
+    fn ephemeral_editor_command_uses_the_fixed_registry_key() {
+        let manager = WasiExtensionManager::new();
+        let mut extension = WasiExtension::load_from_bytes(b"\0asm\x01\0\0\0".to_vec()).unwrap();
+        extension.manifest.name = "spoof".into();
+        extension.manifest.commands.push(WasiCommandDefinition {
+            name: "editor_lsp".into(),
+            description: "test command".into(),
+        });
+        manager.register_extension(extension).unwrap();
+
+        assert!(manager
+            .begin_ephemeral_command_operation("editor_lsp")
+            .is_none());
+    }
+
+    #[test]
+    fn ephemeral_editor_command_rejects_untrusted_fixed_extension() {
+        let manager = WasiExtensionManager::new();
+        let mut extension = WasiExtension::load_from_bytes(b"\0asm\x01\0\0\0".to_vec()).unwrap();
+        extension.manifest.name = "lsp_ext".into();
+        extension.manifest.commands.push(WasiCommandDefinition {
+            name: "editor_lsp".into(),
+            description: "test command".into(),
+        });
+        manager.register_extension(extension).unwrap();
+
+        let error = expect_unavailable_editor_lsp(&manager);
+        assert!(error.contains("global extension scope"), "{error}");
     }
 
     #[test]
@@ -3825,6 +4312,167 @@ mod reload_tests {
             .values()
             .flatten()
             .all(|request| request.invoking_extension != extension_name));
+    }
+}
+
+#[cfg(test)]
+mod ephemeral_broker_tests {
+    use super::*;
+
+    #[test]
+    fn ephemeral_editor_broker_payloads_are_excluded_from_checkpoints() {
+        let project = tempfile::tempdir().unwrap();
+        let manager = WasiExtensionManager::for_project_session(project.path(), "editor-session");
+        manager
+            .reload_from_roots(None, Some(project.path()))
+            .unwrap();
+        let name = "lsp_ext";
+        let source = "unsaved-private-buffer";
+        let intent = Arc::new(BrokerIntent {
+            receipt: BrokerReceipt {
+                id: 44,
+                scope: Some("editor-session".into()),
+            },
+            request: BrokerRequest {
+                api_version: BROKER_API_VERSION,
+                capability: "process".into(),
+                operation: "send".into(),
+                arguments: serde_json::json!({"data":source}),
+            },
+        });
+        let event = Arc::new(WasiExtensionEvent {
+            topic: "broker_response".into(),
+            payload: serde_json::json!({"receipt_id":44,"value":{"message":source}}),
+        });
+        manager
+            .unsettled_broker
+            .lock()
+            .unwrap()
+            .insert(name.into(), vec![intent.clone()]);
+        manager
+            .in_flight_events
+            .lock()
+            .unwrap()
+            .insert(name.into(), vec![event]);
+        manager
+            .ephemeral_broker_receipts
+            .lock()
+            .unwrap()
+            .insert(name.into(), HashSet::from([44]));
+        manager
+            .ephemeral_state_keys
+            .lock()
+            .unwrap()
+            .insert(name.into(), HashSet::from(["editor".into()]));
+
+        manager
+            .persist_state_events_reply(
+                name,
+                &serde_json::json!({
+                    "editor":{"diagnostics":[{"message":source}]},
+                    "ordinary":{"kept":true},
+                }),
+                true,
+                Some(&[intent]),
+                None,
+            )
+            .unwrap();
+
+        let checkpoint = manager
+            .load_checkpoint_in_scope(name, &Some("editor-session".into()))
+            .unwrap()
+            .unwrap();
+        assert!(checkpoint.unsettled.is_empty());
+        assert!(checkpoint.broker_events.is_empty());
+        assert!(checkpoint.state.get("editor").is_none());
+        assert_eq!(checkpoint.state["ordinary"]["kept"], true);
+        let persisted = fs::read_to_string(manager.state_path(name).unwrap()).unwrap();
+        assert!(!persisted.contains(source));
+
+        manager.discard_ephemeral_broker_receipts(name);
+        assert!(manager
+            .unsettled_broker
+            .lock()
+            .unwrap()
+            .get(name)
+            .is_none_or(Vec::is_empty));
+    }
+
+    #[test]
+    fn ordinary_state_reset_preserves_ephemeral_editor_memory_but_not_checkpoint() {
+        let project = tempfile::tempdir().unwrap();
+        let manager = WasiExtensionManager::for_project_session(project.path(), "editor-session");
+        manager
+            .reload_from_roots(None, Some(project.path()))
+            .unwrap();
+        let name = "lsp_ext";
+        let keys = HashSet::from(["editor".to_owned()]);
+        manager
+            .ephemeral_state_keys
+            .lock()
+            .unwrap()
+            .insert(name.into(), keys.clone());
+        let previous = serde_json::json!({
+            "editor":{"phase":"ready","document_id":7},
+            "agent_lsp":{"server":"rust-analyzer"},
+        });
+
+        let state = merge_extension_state(&previous, None, false, &keys).unwrap();
+        assert_eq!(state["editor"]["document_id"], 7);
+        assert!(state.get("agent_lsp").is_none());
+        manager
+            .persist_state_events_reply(name, &state, false, None, None)
+            .unwrap();
+        manager.states.lock().unwrap().insert(name.into(), state.clone());
+
+        assert_eq!(manager.extension_state(name), Some(state));
+        let checkpoint = manager
+            .load_checkpoint_in_scope(name, &Some("editor-session".into()))
+            .unwrap()
+            .unwrap();
+        assert!(checkpoint.state.get("editor").is_none());
+        assert!(checkpoint.state.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ephemeral_failure_without_state_preserves_agent_state() {
+        let project = tempfile::tempdir().unwrap();
+        let manager = WasiExtensionManager::for_project_session(project.path(), "editor-session");
+        manager
+            .reload_from_roots(None, Some(project.path()))
+            .unwrap();
+        let name = "lsp_ext";
+        let keys = HashSet::from(["editor".to_owned()]);
+        manager
+            .ephemeral_state_keys
+            .lock()
+            .unwrap()
+            .insert(name.into(), keys.clone());
+        let previous = serde_json::json!({
+            "editor":{"phase":"querying","document_id":7},
+            "agent_lsp":{"phase":"requesting","server":"rust-analyzer"},
+        });
+
+        let state = merge_extension_state(&previous, None, true, &keys).unwrap();
+        assert_eq!(state, previous);
+        manager
+            .persist_state_events_reply(name, &state, false, None, None)
+            .unwrap();
+        manager.states.lock().unwrap().insert(name.into(), state.clone());
+
+        assert_eq!(
+            manager.extension_state(name).unwrap()["agent_lsp"]["phase"],
+            "requesting"
+        );
+        let checkpoint = manager
+            .load_checkpoint_in_scope(name, &Some("editor-session".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            checkpoint.state["agent_lsp"]["server"],
+            "rust-analyzer"
+        );
+        assert!(checkpoint.state.get("editor").is_none());
     }
 }
 

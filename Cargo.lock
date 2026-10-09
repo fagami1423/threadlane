@@ -8703,14 +8703,20 @@ dependencies = [
 name = "threadlane-ui-editor"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "gpui-component",
  "gpui-pre",
+ "lsp-types",
+ "percent-encoding",
  "rfd",
+ "serde_json",
  "tempfile",
  "threadlane-client",
+ "threadlane-protocol",
  "threadlane-ui-kit",
  "threadlane-ui-state",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -8986,6 +8992,7 @@ dependencies = [
  "tempfile",
  "threadlane-project",
  "threadlane-protocol",
+ "tokio",
  "tracing",
  "wasmi",
 ]

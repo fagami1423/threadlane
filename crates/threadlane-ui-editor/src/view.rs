@@ -15,6 +15,9 @@ use threadlane_ui_kit::EditorSaveStatus;
 #[path = "guarded_save.rs"]
 mod guarded_save;
 
+#[path = "lsp.rs"]
+mod lsp;
+
 actions!(editor, [SaveFile]);
 
 /// How long a save/open status message stays visible before auto-expiring.
@@ -41,6 +44,7 @@ pub struct EditorTab {
     pending_content: Option<String>,
     pending_content_version: Option<String>,
     pending_line: Option<usize>,
+    pending_lsp_position: Option<lsp_types::Position>,
     loading: bool,
     open_error: Option<String>,
     client_origin: Option<Arc<dyn DaemonClient>>,
@@ -51,6 +55,7 @@ pub struct EditorTab {
     baseline_loaded: bool,
     editor_state: Option<Entity<EditorState>>,
     workbench: Option<Entity<threadlane_ui_kit::EditorWorkbench>>,
+    language_service: Option<Entity<lsp::LanguageService>>,
     text_view_state: Option<Entity<TextViewState>>,
     markdown_preview: threadlane_ui_kit::MarkdownPreview,
     _subscription: Option<Subscription>,
@@ -103,6 +108,7 @@ pub struct EditorView {
     closed_files: ClosedFileHistory,
     client_context: Option<ClientSnapshot>,
     next_request_generation: u64,
+    language_activation: u64,
     reopen_request: Option<(Entity<EditorState>, u64)>,
     focus_handle: FocusHandle,
     focus_restore_pending: Option<FocusHandle>,
@@ -137,6 +143,7 @@ impl EditorView {
             closed_files: ClosedFileHistory::default(),
             client_context: Some(client_context),
             next_request_generation: 0,
+            language_activation: 0,
             reopen_request: None,
             focus_handle: cx.focus_handle(),
             focus_restore_pending: None,
@@ -148,9 +155,17 @@ impl EditorView {
         !self.tabs.is_empty()
     }
 
-    fn set_active_tab_index(&mut self, index: Option<usize>) {
+    fn set_active_tab_index(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
         if self.active_tab_index != index {
+            if let Some(service) = self
+                .active_tab_index
+                .and_then(|index| self.tabs.get(index))
+                .and_then(|tab| tab.language_service.clone())
+            {
+                service.update(cx, |service, cx| service.deactivate(cx));
+            }
             self.focus_restore_pending = None;
+            self.language_activation = self.language_activation.wrapping_add(1);
         }
         self.active_tab_index = index;
     }
@@ -390,6 +405,7 @@ impl EditorView {
                     .find(|tab| tab.project_dir == project && tab.relative_path == path)
                 {
                     tab.pending_line = line;
+                    tab.pending_lsp_position = None;
                     if line.is_some() {
                         tab.markdown_preview.show_source();
                     }
@@ -455,7 +471,7 @@ impl EditorView {
         if let Some(index) = self.tabs.iter().position(|tab| {
             !tab.is_diff && tab.project_dir == target.project && tab.relative_path == target.path
         }) {
-            self.set_active_tab_index(Some(index));
+            self.set_active_tab_index(Some(index), cx);
             self.reopen_request = if self.tabs[index].loading {
                 self.tabs[index]
                     .editor_state
@@ -543,7 +559,7 @@ impl EditorView {
                     });
                 }
             }
-            self.set_active_tab_index(Some(existing_idx));
+            self.set_active_tab_index(Some(existing_idx), cx);
             cx.notify();
             return;
         }
@@ -571,6 +587,7 @@ impl EditorView {
             pending_content: None,
             pending_content_version: None,
             pending_line: None,
+            pending_lsp_position: None,
             loading: false,
             open_error: None,
             client_origin: None,
@@ -581,13 +598,14 @@ impl EditorView {
             baseline_loaded: true,
             editor_state: None,
             workbench: None,
+            language_service: None,
             markdown_preview: threadlane_ui_kit::MarkdownPreview::new(cx),
             text_view_state: Some(markdown_state),
             _subscription: None,
             _observe: None,
         });
 
-        self.set_active_tab_index(Some(self.tabs.len() - 1));
+        self.set_active_tab_index(Some(self.tabs.len() - 1), cx);
         self.status_msg = None;
         cx.notify();
     }
@@ -607,7 +625,7 @@ impl EditorView {
         {
             if self.tabs[existing_idx].client_invalidated {
                 if self.tabs[existing_idx].is_dirty {
-                    self.set_active_tab_index(Some(existing_idx));
+                    self.set_active_tab_index(Some(existing_idx), cx);
                     self.set_status(
                         "This buffer has unsaved edits from a previous daemon. Discard or copy them before reopening from the current checkout."
                             .into(),
@@ -618,7 +636,7 @@ impl EditorView {
                 }
                 self.remove_tab_at(existing_idx, cx);
             } else {
-                self.set_active_tab_index(Some(existing_idx));
+                self.set_active_tab_index(Some(existing_idx), cx);
                 if self.tabs[existing_idx].is_dirty {
                     self.set_status(
                         "Unsaved buffer preserved; saved-file line numbers may differ.".into(),
@@ -655,6 +673,14 @@ impl EditorView {
         let workbench = cx.new(|cx| {
             threadlane_ui_kit::EditorWorkbench::new(editor.clone(), lang, window, cx)
         });
+        let language_service = lsp::attach(
+            cx.weak_entity(),
+            self.model.clone(),
+            &editor,
+            &workbench,
+            relative_path,
+            cx,
+        );
         let target_path = relative_path.to_string();
         let target_project = project_dir.to_path_buf();
         let subscription = cx.subscribe(&editor, move |this, editor, event: &InputEvent, cx| {
@@ -669,6 +695,7 @@ impl EditorView {
                     let canceled_pending_content = tab.pending_content.take().is_some();
                     tab.pending_content_version = None;
                     tab.buffer_revision = tab.buffer_revision.wrapping_add(1);
+                    tab.pending_lsp_position = None;
                     tab.markdown_preview.refresh(current.clone(), cx);
                     let dirty = current.as_str() != tab.saved_content.as_str();
                     if canceled_pending_content && !tab.baseline_loaded {
@@ -706,6 +733,7 @@ impl EditorView {
             pending_content: None,
             pending_content_version: None,
             pending_line: None,
+            pending_lsp_position: None,
             loading: false,
             open_error: None,
             client_origin: None,
@@ -716,13 +744,14 @@ impl EditorView {
             baseline_loaded: false,
             editor_state: Some(editor.clone()),
             workbench: Some(workbench),
+            language_service,
             markdown_preview: threadlane_ui_kit::MarkdownPreview::new(cx),
             text_view_state: None,
             _subscription: Some(subscription),
             _observe: Some(observe),
         });
 
-        self.set_active_tab_index(Some(self.tabs.len() - 1));
+        self.set_active_tab_index(Some(self.tabs.len() - 1), cx);
         self.status_msg = None;
         cx.notify();
 
@@ -735,6 +764,9 @@ impl EditorView {
         };
         if tab.is_diff || tab.loading {
             return;
+        }
+        if let Some(service) = tab.language_service.clone() {
+            service.update(cx, |service, cx| service.deactivate(cx));
         }
         self.sync_client_context(cx);
         let Some(tab) = self.tabs.get(index) else {
@@ -889,6 +921,7 @@ impl EditorView {
             tab.pending_content = None;
             tab.pending_content_version = None;
             tab.pending_line = None;
+            tab.pending_lsp_position = None;
             tab.open_error = Some(if replaced {
                 "This file belongs to a previous daemon connection. Close it, then open it from the current checkout."
                     .into()
@@ -932,6 +965,7 @@ impl EditorView {
             }
             Err(error) => {
                 tab.pending_line = None;
+                tab.pending_lsp_position = None;
                 tab.pending_content = None;
                 tab.pending_content_version = None;
                 tracing::error!(
@@ -1009,7 +1043,7 @@ impl EditorView {
                 }
                 if Some(ix) == self.active_tab_index
                     && editor.read(cx).value().as_str() != "Loading…"
-                    && tab.pending_line.is_some()
+                    && (tab.pending_line.is_some() || tab.pending_lsp_position.is_some())
                     && !tab.loading
                 {
                     // Cursor scrolling needs the loaded document's completed layout.
@@ -1025,18 +1059,24 @@ impl EditorView {
                         {
                             return;
                         }
-                        let Some(line) = tab.pending_line.take() else {
+                        let position = if let Some(position) = tab.pending_lsp_position.take() {
+                            let text = editor.read(cx).value();
+                            let range = lsp_types::Range::new(position, position);
+                            let Ok(range) = crate::lsp_mapping::scalar_range(&text, range) else {
+                                return;
+                            };
+                            tab.pending_line = None;
+                            range.start
+                        } else if let Some(line) = tab.pending_line.take() {
+                            gpui_component::input::Position::new(
+                                line.saturating_sub(1).min(u32::MAX as usize) as u32,
+                                0,
+                            )
+                        } else {
                             return;
                         };
                         editor.update(cx, |editor, cx| {
-                            editor.set_cursor_position(
-                                gpui_component::input::Position::new(
-                                    line.saturating_sub(1).min(u32::MAX as usize) as u32,
-                                    0,
-                                ),
-                                window,
-                                cx,
-                            )
+                            editor.set_cursor_position(position, window, cx)
                         });
                         cx.notify();
                     });
@@ -1063,7 +1103,7 @@ impl EditorView {
 
     fn select_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.tabs.len() {
-            self.set_active_tab_index(Some(index));
+            self.set_active_tab_index(Some(index), cx);
             self.status_msg = None;
             cx.notify();
         }
@@ -1201,12 +1241,12 @@ impl EditorView {
                 self.reopen_request = None;
             }
             if self.tabs.is_empty() {
-                self.set_active_tab_index(None);
+                self.set_active_tab_index(None, cx);
             } else if let Some(active) = self.active_tab_index {
                 if active >= self.tabs.len() {
-                    self.set_active_tab_index(Some(self.tabs.len() - 1));
+                    self.set_active_tab_index(Some(self.tabs.len() - 1), cx);
                 } else if active > index {
-                    self.set_active_tab_index(Some(active - 1));
+                    self.set_active_tab_index(Some(active - 1), cx);
                 }
             }
             self.status_msg = None;

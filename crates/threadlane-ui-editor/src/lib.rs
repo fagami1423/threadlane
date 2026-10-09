@@ -5,5 +5,6 @@
 
 mod view;
 mod closed_files;
+mod lsp_mapping;
 
 pub use view::{detect_language, EditorView, SaveFile};
