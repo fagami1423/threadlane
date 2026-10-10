@@ -773,6 +773,7 @@ pub fn sidebar_history_empty(
     let theme = cx.theme().colors;
     let request = std::rc::Rc::new(on_action);
     div()
+        .w_full()
         .flex()
         .flex_col()
         .items_center()
@@ -801,7 +802,11 @@ pub fn sidebar_history_empty(
                 ),
         )
         .child(
+            // Full width so wrapped copy is measured at the sidebar width;
+            // shrink-to-content would reserve one line and paint the wrapped
+            // tail over the button below.
             div()
+                .w_full()
                 .flex()
                 .flex_col()
                 .items_center()
@@ -819,6 +824,7 @@ pub fn sidebar_history_empty(
                 )
                 .child(
                     div()
+                        .w_full()
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .text_center()
