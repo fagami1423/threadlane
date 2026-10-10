@@ -802,9 +802,10 @@ pub fn sidebar_history_empty(
                 ),
         )
         .child(
-            // Full width so wrapped copy is measured at the sidebar width;
-            // shrink-to-content would reserve one line and paint the wrapped
-            // tail over the button below.
+            // Single-line copy: the retained text measurement can paint a
+            // wrap taken in an earlier, narrower pass inside one reserved
+            // line, drawing the tail over the button. Copy fits the 12rem
+            // minimum sidebar; the ellipsis only guards larger fonts.
             div()
                 .w_full()
                 .flex()
@@ -828,10 +829,13 @@ pub fn sidebar_history_empty(
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .text_center()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .overflow_hidden()
                         .child(if has_filters {
                             "Try a different project"
                         } else {
-                            "Start a new session to begin coding"
+                            "Start a task to begin coding"
                         }),
                 ),
         )
