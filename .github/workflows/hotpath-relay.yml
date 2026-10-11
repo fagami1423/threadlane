@@ -1,0 +1,23 @@
+name: hotpath relay
+
+on:
+  workflow_run:
+    workflows: ["hotpath benchmark"] # the `name:` of the benchmark workflow
+    types: [completed]
+
+jobs:
+  relay:
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [provider, dispatch]
+    # Keep the tag in step with the `hotpath` version in Cargo.lock.
+    uses: pawurb/hotpath-rs/.github/workflows/hotpath-relay.yml@3c6a2b5dd994da3db5a3d23e1cc6b91c542bec2a # v0.28.5
+    permissions:
+      actions: read # download the artifact of the benchmark run
+      id-token: write # authenticate the upload
+      pull-requests: read # find the pull request the run belongs to
+    with:
+      benchmark: ${{ matrix.suite }}
+      artifact_name: hotpath-report-${{ matrix.suite }}
+      report_file: report.json
