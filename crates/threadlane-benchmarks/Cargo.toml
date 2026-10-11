@@ -9,6 +9,7 @@ description = "Centralized performance measurement harnesses for Threadlane"
 default = []
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath/hotpath-alloc"]
+hotpath-cloud = ["hotpath/hotpath-cloud"]
 
 [dependencies]
 async-trait.workspace = true

@@ -1,0 +1,80 @@
+name: hotpath benchmark
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  upload:
+    name: benchmark (push, ${{ matrix.suite }})
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [provider, dispatch]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: hotpath-benchmark
+      - name: Run benchmark and upload report
+        env:
+          HOTPATH_UPLOAD: fail-on-error
+          HOTPATH_UPLOAD_RESPONSE_PATH: ${{ github.workspace }}/upload.json
+          HOTPATH_BENCHMARK: ${{ matrix.suite }}
+          HOTPATH_USER_METADATA: runner=${{ runner.os }}-${{ runner.arch }},toolchain=1.95.0,profile=release
+          HOTPATH_OUTPUT_FORMAT: none
+          HOTPATH_METRICS_SERVER_OFF: 1
+        run: |
+          cargo run -q --release -p threadlane-benchmarks --bin ${{ matrix.suite }} \
+            --features hotpath,hotpath-alloc,hotpath-cloud
+          test -s "$HOTPATH_UPLOAD_RESPONSE_PATH"
+
+  report:
+    name: benchmark (pull request, ${{ matrix.suite }})
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [provider, dispatch]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The pull request's head commit, not the default merge commit.
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: hotpath-benchmark
+      - name: Run benchmark and write report
+        env:
+          HOTPATH_BENCHMARK: ${{ matrix.suite }}
+          HOTPATH_USER_METADATA: runner=${{ runner.os }}-${{ runner.arch }},toolchain=1.95.0,profile=release
+          HOTPATH_OUTPUT_FORMAT: json
+          HOTPATH_OUTPUT_PATH: report.json
+          HOTPATH_METRICS_SERVER_OFF: 1
+        run: |
+          cargo run -q --release -p threadlane-benchmarks --bin ${{ matrix.suite }} \
+            --features hotpath,hotpath-alloc,hotpath-cloud
+          test -s report.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hotpath-report-${{ matrix.suite }}
+          path: report.json
+          retention-days: 1
+          if-no-files-found: error
