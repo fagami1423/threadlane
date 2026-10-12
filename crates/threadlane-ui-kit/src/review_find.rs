@@ -8,7 +8,10 @@ use gpui_component::text::TextViewState;
 use gpui_component::{ActiveTheme, Disableable, Sizable, WindowExt};
 use gpui_kit::base::text::{RangeHighlight, RenderedText};
 
-use crate::{ReviewDiffAction, ReviewDiffContent, ReviewExcerptRequest, ReviewExcerptTarget};
+use crate::{
+    ReviewDiffAction, ReviewDiffContent, ReviewExcerptRequest, ReviewExcerptSnapshot,
+    ReviewExcerptTarget,
+};
 
 const MATCH_LIMIT: usize = 10_000;
 actions!(
@@ -84,6 +87,7 @@ pub struct ReviewDiffDocument {
     state: DocumentState,
     ignore_whitespace: bool,
     excerpt_target: Result<ReviewExcerptTarget, String>,
+    pressed_excerpt: Option<ReviewExcerptSnapshot>,
     content_revision: u64,
     has_textual_hunks: bool,
     open: bool,
@@ -173,6 +177,7 @@ impl ReviewDiffDocument {
             state: DocumentState::Loading,
             ignore_whitespace: false,
             excerpt_target: Err("No chat draft is available".into()),
+            pressed_excerpt: None,
             content_revision: 0,
             has_textual_hunks: false,
             open: false,
@@ -203,6 +208,7 @@ impl ReviewDiffDocument {
     }
 
     pub fn reset(&mut self, cx: &mut Context<Self>) {
+        self.pressed_excerpt = None;
         self.content_revision = self.content_revision.wrapping_add(1);
         self.excerpt_target = Err("No chat draft is available".into());
         self.has_textual_hunks = false;
@@ -236,6 +242,7 @@ impl ReviewDiffDocument {
     }
 
     pub fn loading(&mut self, ignore_whitespace: bool, cx: &mut Context<Self>) {
+        self.pressed_excerpt = None;
         self.content_revision = self.content_revision.wrapping_add(1);
         self.has_textual_hunks = false;
         if matches!(self.state, DocumentState::Ready { .. }) {
@@ -258,6 +265,7 @@ impl ReviewDiffDocument {
     }
 
     pub fn set_patch(&mut self, patch: &str, cx: &mut Context<Self>) {
+        self.pressed_excerpt = None;
         self.content_revision = self.content_revision.wrapping_add(1);
         self.has_textual_hunks = patch
             .lines()
@@ -296,6 +304,7 @@ impl ReviewDiffDocument {
         cx: &mut Context<Self>,
     ) {
         if self.excerpt_target != target {
+            self.pressed_excerpt = None;
             self.content_revision = self.content_revision.wrapping_add(1);
             self.excerpt_target = target;
             cx.notify();
@@ -329,30 +338,33 @@ impl ReviewDiffDocument {
         }
         Ok(ReviewExcerptRequest {
             document: cx.entity(),
-            target: target.clone(),
-            text: selected,
-            source: self.text.downgrade(),
-            source_range: self.text.read(cx).selected_source_range(),
-            content_revision: self.content_revision,
+            snapshot: ReviewExcerptSnapshot {
+                target: target.clone(),
+                text: selected,
+                source: self.text.downgrade(),
+                source_range: self.text.read(cx).selected_source_range(),
+                content_revision: self.content_revision,
+            },
         })
     }
 
     /// Hosts additionally recheck checkout and destination identity.
     pub fn excerpt_request_is_current(&self, request: &ReviewExcerptRequest, cx: &App) -> bool {
-        if self.content_revision != request.content_revision
-            || self.excerpt_target.as_ref().ok() != Some(&request.target)
+        let snapshot = &request.snapshot;
+        if self.content_revision != snapshot.content_revision
+            || self.excerpt_target.as_ref().ok() != Some(&snapshot.target)
             || !matches!(self.state, DocumentState::Ready { empty: false })
             || self.waiting_for_parse
             || !self.has_textual_hunks
-            || request.source.upgrade().as_ref() != Some(&self.text)
-            || crate::review_excerpt_block_reason(&request.text).is_some()
+            || snapshot.source.upgrade().as_ref() != Some(&self.text)
+            || crate::review_excerpt_block_reason(&snapshot.text).is_some()
         {
             return false;
         }
         let live = self.text.read(cx);
         let selected = live.selected_text();
         selected.is_empty()
-            || (selected == request.text && live.selected_source_range() == request.source_range)
+            || (selected == snapshot.text && live.selected_source_range() == snapshot.source_range)
     }
 
     fn add_excerpt(
@@ -368,7 +380,7 @@ impl ReviewDiffDocument {
             Ok(request)
                 if self.excerpt_request_is_current(&request, cx) && {
                     let live = gpui_kit::base::TextSelection::selected_text(window, cx);
-                    live.is_empty() || live == request.text
+                    live.is_empty() || live == request.text()
                 } =>
             {
                 cx.emit(request)
@@ -556,7 +568,16 @@ impl Render for ReviewDiffDocument {
         } else {
             "Find in diff (Ctrl+F)"
         };
-        let capture = self.excerpt_capture(window, cx);
+        let capture = self.excerpt_capture(window, cx).or_else(|reason| {
+            self.pressed_excerpt
+                .as_ref()
+                .map(|snapshot| ReviewExcerptRequest {
+                    document: cx.entity(),
+                    snapshot: snapshot.clone(),
+                })
+                .filter(|request| self.excerpt_request_is_current(request, cx))
+                .ok_or(reason)
+        });
         let reason = capture.as_ref().err().cloned();
         let snapshot = capture.ok();
         let action_snapshot = snapshot.clone();
@@ -635,10 +656,18 @@ impl Render for ReviewDiffDocument {
                             // Selection clears in capture phase before Button click.
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |this, _, window, cx| {
-                                    if pointer_snapshot.is_some() {
-                                        this.add_excerpt(pointer_snapshot.clone(), window, cx);
-                                    }
+                                cx.listener(move |this, _, _, cx| {
+                                    this.pressed_excerpt = pointer_snapshot
+                                        .as_ref()
+                                        .map(|request| request.snapshot.clone());
+                                    cx.notify();
+                                }),
+                            )
+                            .on_mouse_up_out(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.pressed_excerpt = None;
+                                    cx.notify();
                                 }),
                             )
                             .child(
@@ -654,13 +683,18 @@ impl Render for ReviewDiffDocument {
                                     .tooltip(excerpt_hint)
                                     .on_click(cx.listener(
                                         move |this, event: &ClickEvent, window, cx| {
-                                            if event.is_keyboard() {
-                                                this.add_excerpt(
-                                                    keyboard_snapshot.clone(),
-                                                    window,
-                                                    cx,
-                                                );
-                                            }
+                                            let capture = if event.is_keyboard() {
+                                                keyboard_snapshot.clone()
+                                            } else {
+                                                this.pressed_excerpt.take().map(|snapshot| {
+                                                    ReviewExcerptRequest {
+                                                        document: cx.entity(),
+                                                        snapshot,
+                                                    }
+                                                })
+                                            };
+                                            this.add_excerpt(capture, window, cx);
+                                            cx.notify();
                                         },
                                     )),
                             ),
@@ -835,14 +869,14 @@ mod tests {
                 document.excerpt_capture(window, cx).unwrap()
             })
         });
-        assert!(request.text.contains("+🦀 ```literal```"));
+        assert!(request.text().contains("+🦀 ```literal```"));
         document.update(cx, |document, cx| {
             assert!(document.excerpt_request_is_current(&request, cx));
             let mut changed_selection = request.clone();
-            changed_selection.text.push('x');
+            changed_selection.snapshot.text.push('x');
             assert!(!document.excerpt_request_is_current(&changed_selection, cx));
             let mut changed_range = request.clone();
-            changed_range.source_range = if request.source_range.is_some() {
+            changed_range.snapshot.source_range = if request.snapshot.source_range.is_some() {
                 None
             } else {
                 Some(0..1)
@@ -930,6 +964,32 @@ mod tests {
             "Tab focus transfer keeps the capture for keyboard button activation"
         );
         let bounds = cx.debug_bounds("review-add-selection").unwrap();
+        cx.simulate_mouse_down(
+            bounds.center(),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        settle(cx);
+        assert_eq!(received.borrow().len(), 2, "press alone must not insert");
+        let outside = gpui::point(gpui::px(-10.), gpui::px(-10.));
+        cx.simulate_mouse_move(outside, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(outside, gpui::MouseButton::Left, gpui::Modifiers::default());
+        settle(cx);
+        assert_eq!(
+            received.borrow().len(),
+            2,
+            "release outside cancels insertion"
+        );
+        document.read_with(cx, |document, _| {
+            assert!(document.pressed_excerpt.is_none())
+        });
+        document.update(cx, |document, cx| document.request_focus(cx));
+        settle(cx);
+        #[cfg(target_os = "macos")]
+        cx.simulate_keystrokes("cmd-a");
+        #[cfg(not(target_os = "macos"))]
+        cx.simulate_keystrokes("ctrl-a");
+        settle(cx);
         cx.simulate_click(bounds.center(), gpui::Modifiers::default());
         settle(cx);
         assert_eq!(

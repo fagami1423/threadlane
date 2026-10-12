@@ -44,6 +44,11 @@ impl ReviewExcerptTarget {
 #[derive(Clone)]
 pub struct ReviewExcerptRequest {
     pub(crate) document: Entity<ReviewDiffDocument>,
+    pub(crate) snapshot: ReviewExcerptSnapshot,
+}
+
+#[derive(Clone)]
+pub(crate) struct ReviewExcerptSnapshot {
     pub(crate) target: ReviewExcerptTarget,
     pub(crate) text: String,
     pub(crate) source: WeakEntity<TextViewState>,
@@ -56,10 +61,10 @@ impl ReviewExcerptRequest {
         &self.document
     }
     pub fn target(&self) -> &ReviewExcerptTarget {
-        &self.target
+        &self.snapshot.target
     }
     pub fn text(&self) -> &str {
-        &self.text
+        &self.snapshot.text
     }
 }
 

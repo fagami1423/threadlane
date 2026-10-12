@@ -541,6 +541,7 @@ impl SessionPreview {
                 }
                 match kit::format_review_excerpt(request.target(), request.text()) {
                     Ok(excerpt) => {
+                        host.editor_open = false;
                         host.input.update(cx, |input, cx| {
                             let existing = input.value();
                             let separator = if existing.is_empty() || existing.ends_with('\n') {

@@ -31,6 +31,77 @@ fn message(id: &str, role: MessageRole, content: &str) -> ChatMessageInfo {
 }
 
 #[gpui::test]
+fn shared_review_excerpt_reveals_chat_draft_from_editor(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    cx.update(threadlane_ui_theme::init_bundled);
+    let snapshot: Snapshot =
+        serde_json::from_value(serde_json::json!({"session":null,"messages":[]})).unwrap();
+    let saved = Rc::new(RefCell::new(None));
+    let capture = saved.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let view = cx.new(|cx| SessionPreview::with_snapshot(Arc::new(snapshot), window, cx));
+        let destination = {
+            let host = view.read(cx);
+            (
+                Some(host.session.work_dir.clone()),
+                Some(host.session.id.clone()),
+            )
+        };
+        view.update(cx, |host, cx| {
+            host.editor_open = true;
+            host.input
+                .update(cx, |input, cx| input.set_value("Question:", window, cx));
+        });
+        let document = cx.new(|cx| threadlane_ui_kit::ReviewDiffDocument::new(window, cx));
+        document.update(cx, |document, cx| {
+            document.set_excerpt_target(
+                Ok(threadlane_ui_kit::ReviewExcerptTarget::new(
+                    destination.0.clone().unwrap(),
+                    "src/a.rs".into(),
+                    destination,
+                    1,
+                    false,
+                )),
+                cx,
+            );
+            document.set_patch("@@ -1 +1 @@\n-old\n+new", cx);
+            document.request_focus(cx);
+        });
+        let agents = view.read(cx).agents.clone();
+        cx.subscribe(
+            &document,
+            move |_, _, request: &threadlane_ui_kit::ReviewExcerptRequest, cx| {
+                agents.update(cx, |_, cx| cx.emit(request.clone()));
+            },
+        )
+        .detach();
+        *capture.borrow_mut() = Some(view);
+        gpui_component::Root::new(document, window, cx)
+    });
+    let view = saved.borrow_mut().take().unwrap();
+    draw(cx);
+    #[cfg(target_os = "macos")]
+    cx.simulate_keystrokes("cmd-a");
+    #[cfg(not(target_os = "macos"))]
+    cx.simulate_keystrokes("ctrl-a");
+    draw(cx);
+    #[cfg(target_os = "macos")]
+    cx.simulate_keystrokes("cmd-shift-enter");
+    #[cfg(not(target_os = "macos"))]
+    cx.simulate_keystrokes("ctrl-shift-enter");
+    draw(cx);
+    view.read_with(cx, |host, cx| {
+        assert!(!host.editor_open, "successful insertion must reveal Chat");
+        assert!(host
+            .input
+            .read(cx)
+            .value()
+            .starts_with("Question:\nReview diff excerpt: src/a.rs\nDisplayed patch snapshot"));
+        assert!(host.input.read(cx).value().contains("-old\n+new"));
+    });
+}
+
+#[gpui::test]
 fn shared_code_blocks_keep_preview_actions_local(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     cx.update(threadlane_ui_theme::init_bundled);
