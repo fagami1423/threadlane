@@ -93,7 +93,7 @@ pub fn review_workspace_context(
                 .children((!state.has_changes).then(|| {
                     div()
                         .text_color(theme.muted_foreground)
-                        .child(state.git_state.clone())
+                        .child(format!("· {}", state.git_state))
                 })),
         )
         .child(
@@ -259,7 +259,10 @@ pub fn review_branch_header(
                 .items_center()
                 .gap_2()
                 .min_w(rems(5.0))
-                .flex_1()
+                // `flex_auto`, not `flex_1`: a zero basis never wraps, so the sync actions
+                // kept their width and the branch name was cut to a few letters. Sized to its
+                // name, the selector pushes the actions onto their own row when both don't fit.
+                .flex_auto()
                 .px_2()
                 .py_1()
                 .rounded_md()

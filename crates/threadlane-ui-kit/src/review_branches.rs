@@ -396,13 +396,7 @@ pub fn review_branch_section(
                                             theme.foreground.opacity(0.9)
                                         })
                                         .child(name),
-                                )
-                                .children(is_current.then(|| {
-                                    Tag::new()
-                                        .child("current")
-                                        .with_variant(TagVariant::Info)
-                                        .small()
-                                })),
+                                ),
                         )
                         .children((!rel_time.is_empty()).then(|| {
                             div()
