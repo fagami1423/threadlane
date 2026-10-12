@@ -45,6 +45,7 @@ pub struct Gallery {
     review_pr_sample: usize,
     review_pr_expanded: bool,
     draft_pr: Entity<crate::draft_pr::DraftPrPreview>,
+    review_excerpt: Entity<crate::review::ReviewExcerptPreview>,
 }
 
 impl Gallery {
@@ -89,6 +90,7 @@ impl Gallery {
         let draft_pr = cx.new(|cx| crate::draft_pr::DraftPrPreview::new(fixture.git_status.as_ref(), window, cx));
         Self {
             recovery_sample: 0,
+            review_excerpt: cx.new(|cx| crate::review::ReviewExcerptPreview::new(window, cx)),
             code_samples: cx.new(|_| crate::code_samples::CodeSamples::new()),
             file_picker_samples: cx.new(|_| crate::file_picker_samples::FilePickerSamples::new()),
             fixture, terminal, terminal_visible: true, _terminal_subscription: terminal_subscription,
@@ -913,6 +915,8 @@ impl Render for Gallery {
                 cx.listener(|host, value: &bool, _, cx| { host.ignore_whitespace = *value; cx.notify(); }), cx))
             .child(Button::new("gallery-document-modify").label("Mark sample as modified").small().ghost()
                 .on_click(cx.listener(|host, _, _, cx| { host.document_dirty = true; cx.notify(); })))
+            .child(heading("Review diff excerpts · local samples", cx))
+            .child(self.review_excerpt.clone())
             .child(heading("Environment · saved session", cx))
             .child(
                 div()

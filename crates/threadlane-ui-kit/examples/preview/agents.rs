@@ -37,9 +37,11 @@ pub struct AgentsPreview {
     review: Entity<crate::review::ReviewPreview>,
     trajectory: Entity<kit::TrajectoryView<crate::trajectory::CapturedTrajectory>>,
     _review_subscription: Subscription,
+    _review_excerpt_subscription: Subscription,
 }
 
 impl EventEmitter<AgentsPreviewEvent> for AgentsPreview {}
+impl EventEmitter<kit::ReviewExcerptRequest> for AgentsPreview {}
 
 impl AgentsPreview {
     pub fn new(
@@ -80,6 +82,10 @@ impl AgentsPreview {
                 .map(|snapshot| snapshot.agent_worktrees.clone())
                 .unwrap_or_default()
         };
+        let review_excerpt_subscription = cx
+            .subscribe(&review, |_, _, request: &kit::ReviewExcerptRequest, cx| {
+                cx.emit(request.clone())
+            });
         Self {
             worktrees,
             parent: snapshot
@@ -104,6 +110,7 @@ impl AgentsPreview {
                 )
             }),
             _review_subscription: review_subscription,
+            _review_excerpt_subscription: review_excerpt_subscription,
         }
     }
 

@@ -774,6 +774,13 @@ impl WorkspaceView {
                     this.insert_files_selection_to_chat(request.clone(), window, cx);
                 },
             );
+            let right_panel_review_excerpt_sub = cx.subscribe_in(
+                &right_panel,
+                window,
+                |this, _, request: &threadlane_ui_kit::ReviewExcerptRequest, window, cx| {
+                    this.insert_review_selection_to_chat(request.clone(), window, cx);
+                },
+            );
 
             let command_state_sub =
                 cx.observe(&command_state, |_this: &mut Self, _command_state, cx| {
@@ -818,7 +825,12 @@ impl WorkspaceView {
                 updater_tx,
                 pending_terminal_close: None,
                 terminal_subscriptions: Vec::new(),
-                _subscriptions: vec![sub, right_panel_sub, right_panel_selection_sub],
+                _subscriptions: vec![
+                    sub,
+                    right_panel_sub,
+                    right_panel_selection_sub,
+                    right_panel_review_excerpt_sub,
+                ],
             }
         });
         view.update(cx, |view, cx| {
@@ -1255,6 +1267,35 @@ impl WorkspaceView {
                 "The chat draft changed — the selection was not added",
                 cx,
             );
+        }
+    }
+
+    fn insert_review_selection_to_chat(
+        &mut self,
+        request: threadlane_ui_kit::ReviewExcerptRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .right_panel
+            .read(cx)
+            .review_excerpt_request_is_current(&request, cx)
+        {
+            window.push_notification(threadlane_ui_kit::STALE_REVIEW_EXCERPT, cx);
+            return;
+        }
+        let excerpt =
+            match threadlane_ui_kit::format_review_excerpt(request.target(), request.text()) {
+                Ok(excerpt) => excerpt,
+                Err(reason) => {
+                    window.push_notification(reason, cx);
+                    return;
+                }
+            };
+        if !self.chat_list.update(cx, |chat, cx| {
+            chat.append_draft_text_for(request.target().destination().clone(), &excerpt, window, cx)
+        }) {
+            window.push_notification(threadlane_ui_kit::STALE_REVIEW_EXCERPT, cx);
         }
     }
 
