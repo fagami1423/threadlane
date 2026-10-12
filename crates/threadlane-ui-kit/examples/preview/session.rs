@@ -372,6 +372,7 @@ pub struct SessionPreview {
     agents_open: bool,
     right_split: Entity<ResizableState>,
     _agents_subscription: Subscription,
+    _review_excerpt_subscription: Subscription,
     bottom_split: Entity<ResizableState>,
     _terminal_subscription: Subscription,
     automations: Entity<crate::automation::AutomationPreview>,
@@ -521,7 +522,45 @@ impl SessionPreview {
             cx.notify();
         });
         let command_state = cx.new(|cx| CommandState::new(window, cx));
-        let command_subscription = cx.observe(&command_state, |_,_,cx| cx.notify());
+        let review_excerpt_subscription = cx.subscribe_in(
+            &agents,
+            window,
+            |host, _, request: &kit::ReviewExcerptRequest, window, cx| {
+                let destination = (
+                    Some(host.session.work_dir.clone()),
+                    Some(host.session.id.clone()),
+                );
+                if request.target().destination() != &destination
+                    || !request
+                        .document()
+                        .read(cx)
+                        .excerpt_request_is_current(request, cx)
+                {
+                    window.push_notification(kit::STALE_REVIEW_EXCERPT, cx);
+                    return;
+                }
+                match kit::format_review_excerpt(request.target(), request.text()) {
+                    Ok(excerpt) => {
+                        host.editor_open = false;
+                        host.input.update(cx, |input, cx| {
+                            let existing = input.value();
+                            let separator = if existing.is_empty() || existing.ends_with('\n') {
+                                ""
+                            } else {
+                                "\n"
+                            };
+                            let text = format!("{existing}{separator}{excerpt}");
+                            input.select_all(window, cx);
+                            input.replace(text, window, cx);
+                            input.focus(window, cx);
+                        });
+                        cx.notify();
+                    }
+                    Err(reason) => window.push_notification(reason, cx),
+                }
+            },
+        );
+        let command_subscription = cx.observe(&command_state, |_, _, cx| cx.notify());
         let mut transcript = TranscriptState::new(window);
         let messages = Arc::new(snapshot.messages.clone());
         transcript.sync(messages.clone(), false, true, false);
@@ -560,6 +599,7 @@ impl SessionPreview {
             agents, agents_open: false,
             right_split: cx.new(|_| ResizableState::default()),
             _agents_subscription: agents_subscription,
+            _review_excerpt_subscription: review_excerpt_subscription,
             bottom_split: cx.new(|_| ResizableState::default()),
             _terminal_subscription: terminal_subscription,
             automations,

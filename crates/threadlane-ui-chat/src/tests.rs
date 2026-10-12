@@ -676,6 +676,69 @@ fn unsent_composer_drafts_and_images_follow_their_task(cx: &mut gpui::TestAppCon
 }
 
 #[gpui::test]
+fn review_excerpt_append_preserves_draft_images_clipboard_and_undo(cx: &mut gpui::TestAppContext) {
+    use gpui::{AppContext as _, Focusable};
+    cx.update(gpui_component::init);
+    let (chat, model, cx) = mount_chat_with_work_dir(cx, Some("/project".into()));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("keep clipboard".into()))
+    });
+    let destination = (Some("/project".into()), None);
+    let target = threadlane_ui_kit::ReviewExcerptTarget::new(
+        "/project".into(),
+        "src/🦀.rs".into(),
+        destination.clone(),
+        1,
+        true,
+    );
+    let excerpt = threadlane_ui_kit::format_review_excerpt(
+        &target,
+        "-old\r\n+  café ```literal```\n context  ",
+    )
+    .unwrap();
+    chat.update_in(cx, |chat, window, cx| {
+        chat.input_state
+            .update(cx, |input, cx| input.set_value("Question:", window, cx));
+        chat.pasted_images.push(super::ImageAttachment {
+            display_name: "shot.png".into(),
+            data_url: "data:image/png;base64,x".into(),
+        });
+        assert!(!chat.append_draft_text_for((Some("/other".into()), None), &excerpt, window, cx));
+        assert_eq!(chat.input_state.read(cx).value().as_ref(), "Question:");
+        assert!(chat.append_draft_text_for(destination, &excerpt, window, cx));
+        assert_eq!(
+            chat.input_state.read(cx).value().as_ref(),
+            format!("Question:\n{excerpt}")
+        );
+        assert_eq!(chat.pasted_images.len(), 1);
+        assert!(chat
+            .input_state
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window));
+    });
+    #[cfg(target_os = "macos")]
+    cx.simulate_keystrokes("cmd-z");
+    #[cfg(not(target_os = "macos"))]
+    cx.simulate_keystrokes("ctrl-z");
+    cx.run_until_parked();
+    chat.read_with(cx, |chat, cx| {
+        assert_eq!(chat.input_state.read(cx).value().as_ref(), "Question:");
+        assert_eq!(chat.pasted_images.len(), 1);
+    });
+    cx.update(|_, cx| {
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("keep clipboard")
+        )
+    });
+    model.read_with(cx, |state, _| assert!(!state.is_generating));
+}
+
+#[gpui::test]
 fn terminal_excerpt_append_targets_the_current_draft_only(cx: &mut gpui::TestAppContext) {
     use gpui::{AppContext as _, Focusable};
 

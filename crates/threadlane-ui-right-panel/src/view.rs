@@ -154,9 +154,22 @@ impl RightPanelView {
         let review_document_subscription = cx.subscribe(&review_document, |this, _, action, cx| {
             match action {
                 threadlane_ui_kit::ReviewDiffAction::Retry => this.reload_review_diff(cx),
-                threadlane_ui_kit::ReviewDiffAction::ShowWhitespace => this.set_ignore_whitespace(false, cx),
+                threadlane_ui_kit::ReviewDiffAction::ShowWhitespace => {
+                    this.set_ignore_whitespace(false, cx)
+                }
             }
         });
+        let review_excerpt_subscription = cx.subscribe_in(
+            &review_document,
+            window,
+            |this, _, request: &threadlane_ui_kit::ReviewExcerptRequest, window, cx| {
+                if this.review_excerpt_request_is_current(request, cx) {
+                    cx.emit(request.clone());
+                } else {
+                    window.push_notification(threadlane_ui_kit::STALE_REVIEW_EXCERPT, cx);
+                }
+            },
+        );
         let tree_state = cx.new(|cx| TreeState::new(cx));
         let commit_message_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Summary (required)"));
@@ -449,7 +462,12 @@ impl RightPanelView {
             event_tx,
             _watcher: None,
             watched_project: None,
-            _subscriptions: vec![observe_model, tree_subscription, review_document_subscription],
+            _subscriptions: vec![
+                observe_model,
+                tree_subscription,
+                review_document_subscription,
+                review_excerpt_subscription,
+            ],
         };
         panel.sync_project(cx);
         panel
@@ -1199,6 +1217,58 @@ impl RightPanelView {
         };
         editor.entity_id() == request.editor.entity_id()
             && editor.read(cx).selected_range() == request.snapshot.byte_range
+    }
+
+    fn review_excerpt_target(
+        &self,
+        cx: &App,
+    ) -> Result<threadlane_ui_kit::ReviewExcerptTarget, String> {
+        let request = self
+            .review_diff_request
+            .as_ref()
+            .ok_or("Open a single-file Review diff first")?;
+        let ReviewDiffTarget::File(path) = &request.target else {
+            return Err("Open a single file instead of All changes".into());
+        };
+        let state = self.model.read(cx);
+        if self.git_checkout_pending
+            || self.project.as_ref() != Some(&request.project)
+            || state.active_git_work_dir().as_ref() != Some(&request.project)
+            || state.active_session_id != self.review_session_id
+            || request.revision != self.review_diff_revision
+            || request.options != self.review_diff_options
+        {
+            return Err(threadlane_ui_kit::STALE_REVIEW_EXCERPT.into());
+        }
+        if state.active_work_dir.is_none() {
+            return Err("No chat draft is available".into());
+        }
+        Ok(threadlane_ui_kit::ReviewExcerptTarget::new(
+            request.project.clone(),
+            path.clone(),
+            (
+                state.active_work_dir.clone(),
+                state.active_session_id.clone(),
+            ),
+            request.revision,
+            request.options.ignore_whitespace,
+        ))
+    }
+
+    pub fn review_excerpt_request_is_current(
+        &self,
+        request: &threadlane_ui_kit::ReviewExcerptRequest,
+        cx: &App,
+    ) -> bool {
+        self.review_diff_state
+            .as_ref()
+            .is_some_and(|state| matches!(state, ReviewDiffState::Ready { empty: false }))
+            && self.review_excerpt_target(cx).as_ref().ok() == Some(request.target())
+            && &self.review_document == request.document()
+            && self
+                .review_document
+                .read(cx)
+                .excerpt_request_is_current(request, cx)
     }
 
     fn save_active_document(&mut self, cx: &mut Context<Self>) {
@@ -3073,10 +3143,15 @@ impl RightPanelView {
 }
 
 impl EventEmitter<threadlane_ui_kit::EditorSelectionRequest> for RightPanelView {}
+impl EventEmitter<threadlane_ui_kit::ReviewExcerptRequest> for RightPanelView {}
 
 impl Render for RightPanelView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_project(cx);
+        let excerpt_target = self.review_excerpt_target(cx);
+        self.review_document.update(cx, |document, cx| {
+            document.set_excerpt_target(excerpt_target, cx)
+        });
         for notification in self.pending_git_notifications.drain(..) {
             window.push_notification(notification, cx);
         }
@@ -3970,6 +4045,58 @@ mod review_diff_tests {
                 .h_96()
                 .child(self.panel.update(cx, |panel, cx| panel.render_files(cx)))
         }
+    }
+
+    #[gpui::test]
+    fn review_excerpt_host_guards_single_file_revision_checkout_and_destination(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let model = cx.new(|_| {
+            let mut state = AppState::for_tests();
+            state.active_work_dir = Some("/workspace".into());
+            state
+        });
+        let retained_model = model.clone();
+        let (panel, cx) =
+            cx.add_window_view(move |window, cx| RightPanelView::new(model, window, cx));
+        panel.update(cx, |panel, cx| {
+            panel.project = Some("/workspace".into());
+            let mut loaded = seed_review_diff(
+                panel,
+                std::path::Path::new("/workspace"),
+                "@@ -1 +1 @@\n-old\n+new",
+                cx,
+            );
+            assert!(
+                panel.review_excerpt_target(cx).is_err(),
+                "All changes never has excerpt capability"
+            );
+            loaded.target = ReviewDiffTarget::File("src/a.rs".into());
+            panel.review_diff_request = Some(loaded.clone());
+            let target = panel.review_excerpt_target(cx).unwrap();
+            assert_eq!(target.destination(), &(Some("/workspace".into()), None));
+            panel.review_diff_revision += 1;
+            assert!(panel.review_excerpt_target(cx).is_err());
+            panel.review_diff_revision = loaded.revision;
+            panel.review_diff_options.ignore_whitespace = true;
+            assert!(panel.review_excerpt_target(cx).is_err());
+            panel.review_diff_options = loaded.options;
+            panel.git_checkout_pending = true;
+            assert!(panel.review_excerpt_target(cx).is_err());
+            panel.git_checkout_pending = false;
+            retained_model.update(cx, |state, _| state.active_work_dir = Some("/other".into()));
+            assert!(panel.review_excerpt_target(cx).is_err());
+            retained_model.update(cx, |state, _| {
+                state.active_work_dir = Some("/workspace".into());
+                state.active_session_id = Some("different-session".into());
+            });
+            assert!(panel.review_excerpt_target(cx).is_err());
+            retained_model.update(cx, |state, _| state.active_session_id = None);
+            assert_eq!(panel.review_excerpt_target(cx).unwrap(), target);
+            panel.close_document(cx);
+            assert!(panel.review_excerpt_target(cx).is_err());
+        });
     }
 
     #[gpui::test]

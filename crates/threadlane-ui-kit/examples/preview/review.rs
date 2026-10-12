@@ -1,10 +1,11 @@
 //! Saved checkout host. Selection and drafts are local; Git actions never execute.
 use gpui::{prelude::*, *};
+use gpui_component::button::ButtonVariants;
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::menu::ContextMenuExt;
 use gpui_component::notification::Notification;
 use gpui_component::separator::Separator;
-use gpui_component::{ActiveTheme, WindowExt};
+use gpui_component::{ActiveTheme, Sizable, WindowExt};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use threadlane_protocol::daemon::SessionInfo;
 use threadlane_protocol::repo::{GitFile, GitStatus};
@@ -74,7 +75,117 @@ pub enum ReviewPreviewEvent {
     OpenDiff { title: String, content: String },
 }
 
+/// Gallery fixtures use the real shared command and a local undoable draft.
+pub struct ReviewExcerptPreview {
+    document: Entity<kit::ReviewDiffDocument>,
+    draft: Entity<gpui_component::input::TextareaState>,
+    fixture: usize,
+    _subscription: Subscription,
+}
+
+impl ReviewExcerptPreview {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let document = cx.new(|cx| kit::ReviewDiffDocument::new(window, cx));
+        let draft = cx.new(|cx| {
+            gpui_component::input::TextareaState::new(window, cx)
+                .placeholder("Local chat draft · Undo removes the excerpt")
+                .auto_grow(2, 8)
+        });
+        let subscription = cx.subscribe_in(
+            &document,
+            window,
+            |host, _, request: &kit::ReviewExcerptRequest, window, cx| {
+                if !host
+                    .document
+                    .read(cx)
+                    .excerpt_request_is_current(request, cx)
+                {
+                    window.push_notification(kit::STALE_REVIEW_EXCERPT, cx);
+                    return;
+                }
+                if let Ok(excerpt) = kit::format_review_excerpt(request.target(), request.text()) {
+                    host.draft.update(cx, |input, cx| {
+                        let existing = input.value();
+                        let separator = if existing.is_empty() || existing.ends_with('\n') {
+                            ""
+                        } else {
+                            "\n"
+                        };
+                        let text = format!("{existing}{separator}{excerpt}");
+                        input.select_all(window, cx);
+                        input.replace(text, window, cx);
+                        input.focus(window, cx);
+                    });
+                }
+            },
+        );
+        let mut preview = Self {
+            document,
+            draft,
+            fixture: 0,
+            _subscription: subscription,
+        };
+        preview.set_fixture(0, cx);
+        preview
+    }
+
+    fn set_fixture(&mut self, fixture: usize, cx: &mut Context<Self>) {
+        self.fixture = fixture;
+        self.document.update(cx, |document, cx| {
+            document.loading(fixture == 1, cx);
+            document.set_excerpt_target(match fixture {
+                4 => Err(kit::STALE_REVIEW_EXCERPT.into()),
+                5 => Err("No chat draft is available".into()),
+                _ => Ok(kit::ReviewExcerptTarget::new("/preview".into(), "src/example.rs".into(), (Some("/preview".into()), None), fixture as u64, fixture == 1)),
+            }, cx);
+            if fixture != 3 {
+                document.set_patch(if fixture == 2 { "" } else { "diff --git a/src/example.rs b/src/example.rs\n@@ -1 +1 @@\n-  old café\n+  new 🦀 ```literal```\n context" }, cx);
+            }
+        });
+        cx.notify();
+    }
+}
+
+impl Render for ReviewExcerptPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .min_w_0()
+            .child(
+                div().flex().flex_wrap().gap_1().children(
+                    [
+                        "Ready",
+                        "Filtered",
+                        "Empty",
+                        "Loading",
+                        "Stale",
+                        "No destination",
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, label)| {
+                        gpui_component::button::Button::new(("review-excerpt-fixture", index))
+                            .label(label)
+                            .small()
+                            .ghost()
+                            .on_click(
+                                cx.listener(move |host, _, _, cx| host.set_fixture(index, cx)),
+                            )
+                    }),
+                ),
+            )
+            .child(div().h(rems(18.)).flex().child(self.document.clone()))
+            .child(
+                gpui_component::input::Textarea::new(&self.draft)
+                    .aria_label("Review excerpt sample chat draft"),
+            )
+    }
+}
+
 impl EventEmitter<ReviewPreviewEvent> for ReviewPreview {}
+impl EventEmitter<kit::ReviewExcerptRequest> for ReviewPreview {}
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn capture_diffs(
@@ -162,6 +273,7 @@ pub struct ReviewPreview {
     _commit: Subscription,
     _history_filter: Subscription,
     _review_document: Subscription,
+    _review_excerpt: Subscription,
 }
 
 impl ReviewPreview {
@@ -188,6 +300,23 @@ impl ReviewPreview {
                 }
             });
         let status = snapshot.and_then(|snapshot| snapshot.git_status.clone());
+        let excerpt_subscription = cx.subscribe_in(
+            &review_document,
+            window,
+            |host, _, request: &kit::ReviewExcerptRequest, window, cx| {
+                if host.excerpt_target().as_ref().ok() == Some(request.target())
+                    && &host.review_document == request.document()
+                    && host
+                        .review_document
+                        .read(cx)
+                        .excerpt_request_is_current(request, cx)
+                {
+                    cx.emit(request.clone());
+                } else {
+                    window.push_notification(kit::STALE_REVIEW_EXCERPT, cx);
+                }
+            },
+        );
         let selected = status
             .as_ref()
             .map(|status| status.files.iter().map(|file| file.path.clone()).collect())
@@ -270,6 +399,7 @@ impl ReviewPreview {
             _commit: commit_subscription,
             _history_filter: history_subscription,
             _review_document: review_document_subscription,
+            _review_excerpt: excerpt_subscription,
         }
     }
 
@@ -516,7 +646,9 @@ impl ReviewPreview {
     }
 
     fn update_diff(&mut self, cx: &mut Context<Self>) {
+        let target = self.excerpt_target();
         self.review_document.update(cx, |document, cx| {
+            document.set_excerpt_target(target, cx);
             document.loading(self.ignore_whitespace, cx);
             if let Some(text) = self.captured_diff() {
                 document.set_patch(text, cx);
@@ -525,6 +657,22 @@ impl ReviewPreview {
             }
         });
         cx.notify();
+    }
+
+    fn excerpt_target(&self) -> Result<kit::ReviewExcerptTarget, String> {
+        let path = self
+            .document
+            .as_ref()
+            .filter(|path| !path.is_empty())
+            .ok_or("Open a single file instead of All changes")?;
+        let session = self.session.as_ref().ok_or("No chat draft is available")?;
+        Ok(kit::ReviewExcerptTarget::new(
+            session.runtime_work_dir.clone(),
+            path.clone(),
+            (Some(session.work_dir.clone()), Some(session.id.clone())),
+            self.document_revision,
+            self.ignore_whitespace,
+        ))
     }
 
     fn file_row(&self, file: &GitFile, tree: bool, cx: &mut Context<Self>) -> AnyElement {
