@@ -3338,14 +3338,17 @@ fn base64_data_url(bytes: &[u8]) -> String {
     )
 }
 
-fn convert_node_to_tree_item(node: FileNode, expanded_paths: &HashSet<String>) -> TreeItem {
+pub(crate) fn convert_node_to_tree_item(node: FileNode, expanded_paths: &HashSet<String>) -> TreeItem {
     let is_expanded = expanded_paths.contains(&node.relative_path);
     if node.is_dir {
-        let children = node
+        let mut children = node
             .children
             .into_iter()
             .map(|child| convert_node_to_tree_item(child, expanded_paths))
             .collect::<Vec<_>>();
+        if node.truncated {
+            children.push(threadlane_ui_kit::project_files_unlisted_item(&node.relative_path));
+        }
         TreeItem::new(node.relative_path, node.name)
             .expanded(is_expanded)
             .children(children)

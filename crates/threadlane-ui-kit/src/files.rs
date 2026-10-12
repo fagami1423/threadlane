@@ -3,7 +3,7 @@ use gpui::{prelude::*, *};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::list::ListItem;
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
-use gpui_component::tree::{Tree, TreeState};
+use gpui_component::tree::{Tree, TreeItem, TreeState};
 use gpui_component::{ActiveTheme, Icon, IconName, Sizable};
 
 pub fn project_files_surface() -> Div {
@@ -81,6 +81,30 @@ pub fn project_file_row(
         )
 }
 
+/// Disabled child for a folder whose contents the scan did not list. GPUI Kit treats a
+/// childless item as a file, so without it such folders showed a file icon and could not
+/// be expanded. The NUL in its id cannot occur in a real path.
+pub fn project_files_unlisted_item(folder: &str) -> TreeItem {
+    TreeItem::new(format!("{folder}/\0unlisted"), "Not listed · use Find in files").disabled(true)
+}
+
+fn project_files_unlisted_row(depth: usize, cx: &App) -> ListItem {
+    ListItem::new("project-files-unlisted")
+        .debug_selector(|| "project-files-unlisted".into())
+        .mx_1()
+        .px_1p5()
+        .py_1()
+        .pl(rems(0.375 + depth as f32 * 0.75 + 0.875 + 0.375))
+        .child(
+            div()
+                .text_xs()
+                .italic()
+                .truncate()
+                .text_color(cx.theme().muted_foreground)
+                .child("Not listed · use Find in files"),
+        )
+}
+
 /// Uses GPUI Kit's tree for keyboard navigation, expansion and scrolling on both platforms.
 pub fn project_file_tree(
     state: &Entity<TreeState>,
@@ -89,6 +113,9 @@ pub fn project_file_tree(
 ) -> impl IntoElement {
     let on_open = std::rc::Rc::new(on_open);
     Tree::new(state, move |_, entry, selected, _, cx| {
+        if entry.is_disabled() {
+            return project_files_unlisted_row(entry.depth(), cx);
+        }
         let path = entry.item().id.to_string();
         let folder = entry.is_folder();
         let on_open = on_open.clone();
@@ -106,6 +133,9 @@ pub fn project_file_tree(
         })
     })
     .context_menu(move |_, entry, menu, window, cx| {
+        if entry.is_disabled() {
+            return menu;
+        }
         on_menu(&entry.item().id, entry.is_folder(), menu, window, cx)
     })
 }

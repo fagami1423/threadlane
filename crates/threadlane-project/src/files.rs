@@ -273,18 +273,27 @@ pub fn project_file_exists(root: &Path, relative: &str) -> Result<bool, String> 
 /// Skips `.git`, `target`, and `.threadlane`, stops at `limit` entries and
 /// `TREE_MAX_DEPTH` deep; directories sort before files, then by name.
 pub fn scan_project_tree(root: &Path, limit: usize) -> Vec<ProjectFileNode> {
-    fn visit(
-        root: &Path,
-        relative: &Path,
-        depth: usize,
-        limit: usize,
-        count: &mut usize,
-    ) -> Vec<ProjectFileNode> {
-        if *count >= limit || depth > TREE_MAX_DEPTH {
-            return Vec::new();
+    // Breadth-first: every level is listed before anything deeper, so one large early
+    // directory cannot spend the whole budget and leave later folders unlisted.
+    struct Slot {
+        node: ProjectFileNode,
+        parent: Option<usize>,
+    }
+    let mut slots: Vec<Slot> = Vec::new();
+    let mut queue: std::collections::VecDeque<(Option<usize>, PathBuf, usize)> =
+        std::collections::VecDeque::from([(None, PathBuf::new(), 0)]);
+    while let Some((parent, relative, depth)) = queue.pop_front() {
+        let mark_truncated = |slots: &mut Vec<Slot>| {
+            if let Some(parent) = parent {
+                slots[parent].node.truncated = true;
+            }
+        };
+        if slots.len() >= limit || depth > TREE_MAX_DEPTH {
+            mark_truncated(&mut slots);
+            continue;
         }
-        let Ok(read_dir) = std::fs::read_dir(root.join(relative)) else {
-            return Vec::new();
+        let Ok(read_dir) = std::fs::read_dir(root.join(&relative)) else {
+            continue;
         };
         let mut children = read_dir
             .filter_map(Result::ok)
@@ -297,38 +306,41 @@ pub fn scan_project_tree(root: &Path, limit: usize) -> Vec<ProjectFileNode> {
             })
             .collect::<Vec<_>>();
         children.sort_by_key(|(name, is_dir)| (!*is_dir, name.to_ascii_lowercase()));
-
-        let mut nodes = Vec::new();
         for (name, is_dir) in children {
-            if *count >= limit {
+            if slots.len() >= limit {
+                mark_truncated(&mut slots);
                 break;
             }
-            *count += 1;
             let path = relative.join(&name);
-            let rel_str = path.to_string_lossy().into_owned();
-            nodes.push(ProjectFileNode {
-                relative_path: rel_str,
-                name,
-                is_dir,
-                children: Vec::new(),
+            let index = slots.len();
+            slots.push(Slot {
+                node: ProjectFileNode {
+                    relative_path: path.to_string_lossy().into_owned(),
+                    name,
+                    is_dir,
+                    children: Vec::new(),
+                    truncated: false,
+                },
+                parent,
             });
-        }
-        for node in &mut nodes {
-            if node.is_dir {
-                node.children = visit(
-                    root,
-                    Path::new(&node.relative_path),
-                    depth + 1,
-                    limit,
-                    count,
-                );
+            if is_dir {
+                queue.push_back((Some(index), path, depth + 1));
             }
         }
-        nodes
     }
 
-    let mut count = 0;
-    visit(root, Path::new(""), 0, limit, &mut count)
+    // Children always follow their parent, so folding from the back completes each
+    // node's children before the node itself moves into its parent.
+    let mut roots = Vec::new();
+    while let Some(Slot { mut node, parent }) = slots.pop() {
+        node.children.reverse();
+        match parent {
+            Some(parent) => slots[parent].node.children.push(node),
+            None => roots.push(node),
+        }
+    }
+    roots.reverse();
+    roots
 }
 
 #[cfg(test)]
@@ -602,5 +614,34 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert!(!contains(&rel, &tree));
+    }
+
+    #[test]
+    fn scan_is_breadth_first_and_marks_unlisted_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("a/deep")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        for index in 0..10 {
+            std::fs::write(root.join(format!("a/deep/{index}")), "x").unwrap();
+        }
+        std::fs::write(root.join("b/kept.txt"), "x").unwrap();
+
+        // Root (a, b), then depth 1 (a/deep, b/kept.txt): the large `a/deep` cannot
+        // starve `b`, and is marked as unlisted rather than looking empty.
+        let tree = scan_project_tree(root, 4);
+        let names = |nodes: &[super::ProjectFileNode]| {
+            nodes.iter().map(|n| n.name.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(names(&tree), ["a", "b"]);
+        assert_eq!(names(&tree[0].children), ["deep"]);
+        assert_eq!(names(&tree[1].children), ["kept.txt"]);
+        assert!(tree[0].children[0].truncated && tree[0].children[0].children.is_empty());
+        assert!(!tree[0].truncated && !tree[1].truncated);
+
+        // A folder cut off partway keeps what was listed and is marked.
+        let tree = scan_project_tree(root, 7);
+        assert_eq!(tree[0].children[0].children.len(), 3);
+        assert!(tree[0].children[0].truncated);
     }
 }
