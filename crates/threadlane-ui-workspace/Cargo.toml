@@ -28,5 +28,6 @@ threadlane-updater.workspace = true
 tokio = { workspace = true, features = ["full"] }
 
 [dev-dependencies]
+tempfile.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 threadlane-ui-state = { workspace = true, features = ["test-support"] }

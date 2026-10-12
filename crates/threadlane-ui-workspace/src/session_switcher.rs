@@ -63,7 +63,7 @@ fn inventory(state: &AppState) -> Vec<VisitKey> {
         })
         .collect()
 }
-fn resolve<'a>(state: &'a AppState, key: &VisitKey) -> Option<(&'a str, &'a SessionInfo)> {
+pub(super) fn resolve<'a>(state: &'a AppState, key: &VisitKey) -> Option<(&'a str, &'a SessionInfo)> {
     if !state.session_inventory_available(&key.work_dir) {
         return None;
     }
@@ -347,7 +347,7 @@ impl WorkspaceView {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{VisitKey, Visits};
     fn key(id: &str) -> VisitKey {
         VisitKey {
@@ -374,7 +374,7 @@ mod tests {
         visits.record(None);
         assert_eq!(visits.recent[0], key("f"));
     }
-    pub(super) fn state() -> threadlane_ui_state::AppState {
+    pub(crate) fn state() -> threadlane_ui_state::AppState {
         use threadlane_protocol::daemon::{
             ProjectInfo, SessionCompletionSummary, SessionHealth, SessionInfo,
         };
@@ -492,4 +492,4 @@ mod tests {
 
 #[cfg(test)]
 #[path = "session_switcher_tests.rs"]
-mod interaction_tests;
+pub(crate) mod interaction_tests;

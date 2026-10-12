@@ -111,6 +111,9 @@ pub enum SettingsAction {
     Theme(&'static str),
     Update,
     AutoAddressReviews(bool),
+    CompletionAlerts(bool),
+    TestCompletionAlert,
+    RetryCompletionAlerts,
 }
 type SettingsCallback = Rc<dyn Fn(SettingsAction, &mut Window, &mut App)>;
 
@@ -121,6 +124,16 @@ pub struct SettingsGeneral {
     pub project_count: usize,
     pub auto_address_reviews: bool,
     pub update: Option<SettingsUpdate>,
+    pub completion_alerts: SettingsCompletionAlerts,
+}
+#[derive(Clone, Debug, Default)]
+pub struct SettingsCompletionAlerts {
+    pub enabled: bool,
+    pub busy: bool,
+    pub loading: bool,
+    pub supported: bool,
+    pub error: Option<String>,
+    pub status: Option<String>,
 }
 pub struct SettingsUpdate {
     pub status: String,
@@ -509,12 +522,51 @@ pub fn settings_general(
                             } else {
                                 "Enable automatic PR review addressing"
                             })
-                            .on_click(move |checked, _window, cx| {
+                            .on_click({ let on_action = on_action.clone(); move |checked, _window, cx| {
                                 on_action(SettingsAction::AutoAddressReviews(*checked), _window, cx);
+                            }
                             })),
                     ),
             )
+            .child(settings_completion_alerts(&general.completion_alerts, on_action, cx))
             .into_any_element()
+}
+
+fn settings_completion_alerts(
+    alerts: &SettingsCompletionAlerts,
+    on_action: SettingsCallback,
+    cx: &App,
+) -> Div {
+    let colors = cx.theme().colors;
+    settings_group(cx)
+        .flex_col()
+        .items_stretch()
+        .gap_2()
+        .child(div().flex().items_center().gap_3()
+            .child(div().flex_1().min_w_0()
+                .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Background completion alerts"))
+                .child(div().mt_1().text_xs().text_color(colors.muted_foreground).child("Notify when an interactive session finishes while Threadlane is in the background. Threadlane must remain open. System settings may block alerts.")))
+            .child(div().debug_selector(|| "general-completion-alerts-switch".into()).flex_none().child(Switch::new("general-completion-alerts-switch")
+                .accessibility_label("Background completion alerts")
+                .checked(alerts.enabled)
+                .disabled(alerts.busy || !alerts.supported)
+                .on_click({ let callback = on_action.clone(); move |checked, window, cx| callback(SettingsAction::CompletionAlerts(*checked), window, cx) }))))
+        .when(alerts.busy, |el| el.child(div().text_xs().text_color(colors.muted_foreground).child(if alerts.loading { "Loading background completion alerts…" } else { "Saving background completion alerts…" })))
+        .when(!alerts.supported, |el| el.child(div().text_xs().text_color(colors.muted_foreground).child("System alerts are unavailable in this preview.")))
+        .when_some(alerts.error.clone(), |el, error| el.child(div().text_sm().text_color(colors.danger).child(error)))
+        .when_some(alerts.status.clone(), |el, status| el.child(div().text_xs().text_color(colors.muted_foreground).child(status)))
+        .when(alerts.error.is_some(), |div| div.child(Button::new("general-retry-completion-alerts")
+            .debug_selector(|| "general-retry-completion-alerts".into())
+            .label("Retry").accessibility_label("Retry background completion alerts")
+            .outline().small().disabled(alerts.busy || !alerts.supported)
+            .on_click({ let callback = on_action.clone(); move |_, window, cx| callback(SettingsAction::RetryCompletionAlerts, window, cx) })))
+        .when(alerts.enabled, |div| div.child(Button::new("general-test-completion-alert")
+            .debug_selector(|| "general-test-completion-alert".into())
+            .label("Send test alert")
+            .accessibility_label("Send test alert")
+            .outline().small()
+            .disabled(alerts.busy || !alerts.supported)
+            .on_click(move |_, window, cx| on_action(SettingsAction::TestCompletionAlert, window, cx))))
 }
 
 /// The two bundled theme choices; swatches depict their own theme, not the active one.

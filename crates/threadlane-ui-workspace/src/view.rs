@@ -63,6 +63,8 @@ mod conversation_search;
 use conversation_search::*;
 #[path = "session_switcher.rs"]
 mod session_switcher;
+#[path = "completion_alerts.rs"]
+mod completion_alerts;
 use session_switcher::{SessionNavigation, SessionPicker};
 
 fn close_command_palette(open: &mut bool, previous_focus: &mut Option<FocusHandle>, window: &mut Window, cx: &mut App) {
@@ -393,6 +395,8 @@ fn session_pr_refresh_delay(succeeded: bool, active: bool, open: bool) -> std::t
 }
 
 pub struct WorkspaceView {
+    pending_completion_activation: Option<completion_alerts::Activation>,
+    completion_activation_task: Option<Task<()>>,
     window_handle: AnyWindowHandle,
     last_link_terminal: Option<Entity<TerminalView>>,
     focus_handle: FocusHandle,
@@ -643,7 +647,8 @@ impl WorkspaceView {
             }
             let focus_handle = cx.focus_handle();
             focus_handle.focus(window, cx);
-            let sub = cx.observe(&model_clone, move |this: &mut Self, model, cx| {
+            let sub = cx.observe_in(&model_clone, window, move |this: &mut Self, model, window, cx| {
+                cx.defer_in(window, |this, window, cx| this.dispatch_completion_alerts(window, cx));
                 this.session_navigation.observe(model.read(cx));
                 this.sync_git_status_with_active_project(cx);
                 if let Some(cmd) =
@@ -776,6 +781,8 @@ impl WorkspaceView {
                 });
 
             Self {
+                pending_completion_activation: None,
+                completion_activation_task: None,
                 window_handle: window.window_handle(),
                 last_link_terminal: None,
                 focus_handle,
@@ -815,6 +822,7 @@ impl WorkspaceView {
             }
         });
         view.update(cx, |view, cx| {
+            view.initialize_completion_alerts(window, cx);
             let weak_view = cx.weak_entity();
             let request_close = move |window: &mut Window, cx: &mut App| {
                 if cx.windows().len() != 1 {

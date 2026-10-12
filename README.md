@@ -150,6 +150,36 @@ retain their narrower scope. Custom system prompts remain authoritative; schedul
 tasks using the default native coding-agent prompt inherit the same policy when
 their requested work involves publishing a PR.
 
+## Background completion alerts
+
+Settings → General → **Background completion alerts** is a device-local, opt-in
+preference (Off by default). Enabling requests a clearly labeled test alert;
+**Send test alert** requests another. These requests cannot confirm permission
+or delivery: system notification settings, Focus/Do Not Disturb, or the desktop
+notification service may block them.
+
+While Threadlane remains open, newly completed successful interactive runs on
+the local daemon can alert when all Threadlane workspace windows are inactive.
+Startup/imported history, reconnect baselines, foreground results, automation
+runs, remote sessions, failures/cancellations, approval/question prompts,
+subagent-only completions, and terminal exits do not alert. Re-enabling does not
+replay old results. Alerts do not replace the persistent **New result** marker.
+
+Alerts say only **Session completed** / **Open Threadlane to review the result**.
+No project/session names, prompts, paths, code, or response text are sent to the
+OS; opaque in-memory tags resolve the exact project, session ID, and session
+file. Clicking an alert selects that session through normal hydration and opens
+Chat, without acknowledging its result before presentation. Open dialogs/sheets
+are respected. Missing, ambiguous, or stale targets report **This session is no
+longer available** instead of selecting a different session. Tags are not
+restored after quitting; Threadlane must remain running.
+
+For macOS notification validation, use `./scripts/run-gpui-macos.sh` (a packaged
+`.app`, not bare `cargo run`). Check allow/deny permission, an inactive-window
+completion and click-through, Focus mode, and permission revocation in System
+Settings. Delivery is best effort on Windows/Linux too; those platform-specific
+behaviors require separate packaged-app verification.
+
 ## Quick Start
 
 ### Prerequisites

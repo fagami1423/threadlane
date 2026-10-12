@@ -46,7 +46,22 @@ pub fn close_work_needs_refresh(current: &[String], disclosed: &[String]) -> boo
     current.iter().any(|identity| !disclosed.contains(identity))
 }
 
+struct CompletionAlertContext {
+    client: Arc<dyn threadlane_client::DaemonClient>,
+    connection_epoch: u64,
+    inventory_generation: u64,
+    remote: bool,
+    connected: bool,
+}
+
 pub struct AppState {
+    pub completion_alerts: crate::completion_alerts::CompletionAlerts,
+    pub completion_alerts_loaded: bool,
+    pub completion_alerts_saving: bool,
+    pub completion_alerts_error: Option<String>,
+    pub completion_alerts_retry: Option<bool>,
+    pub completion_alert_test_requested: bool,
+    completion_alert_context: Option<CompletionAlertContext>,
     pub client: threadlane_client::ClientState,
     pub automation_service: Option<Arc<crate::automation::AutomationService>>,
     pub automations: crate::automation::Projection,
@@ -384,6 +399,63 @@ impl AppState {
     pub fn register_session_seen(&mut self, work_dir: &Path, session_id: &str) {
         self.session_seen_store_for(work_dir).register(session_id);
         self.flush_session_seen(work_dir);
+    }
+
+    pub fn sync_completion_alert_context(&mut self) {
+        let epoch = self.daemon_client.file_search_connection_epoch();
+        let connected = self.daemon_client.is_connected();
+        let connection_changed = self.completion_alert_context.as_ref().is_some_and(|previous| {
+            !Arc::ptr_eq(&previous.client, &self.daemon_client)
+                || previous.connection_epoch != epoch
+                || previous.remote != self.daemon_remote
+                || previous.connected != connected
+        });
+        if connection_changed {
+            self.session_refresh_generation = self.session_refresh_generation.wrapping_add(1);
+        }
+        let changed = self.completion_alert_context.as_ref().is_none_or(|previous| {
+            !Arc::ptr_eq(&previous.client, &self.daemon_client)
+                || previous.connection_epoch != epoch
+                || previous.inventory_generation != self.session_refresh_generation
+                || previous.remote != self.daemon_remote
+                || previous.connected != connected
+        });
+        if changed {
+            self.completion_alerts.reset();
+            self.completion_alert_context = Some(CompletionAlertContext {
+                client: self.daemon_client.clone(),
+                connection_epoch: epoch,
+                inventory_generation: self.session_refresh_generation,
+                remote: self.daemon_remote,
+                connected,
+            });
+            if connection_changed && connected && !self.daemon_remote && self.completion_alerts.is_enabled() {
+                for project in &self.client.projects { self.request_session_refresh(&project.work_dir); }
+            }
+        }
+        self.completion_alerts.retain_projects(&self.client.projects.iter().map(|project| project.work_dir.clone()).collect());
+    }
+
+    pub fn set_completion_alerts_enabled(&mut self, enabled: bool) {
+        let changed = self.completion_alerts.is_enabled() != enabled;
+        if changed && enabled {
+            self.session_refresh_generation = self.session_refresh_generation.wrapping_add(1);
+        }
+        self.sync_completion_alert_context();
+        self.completion_alerts.set_enabled(enabled);
+        self.completion_alert_test_requested = false;
+        if enabled && changed && !self.daemon_remote {
+            for project in &self.client.projects { self.request_session_refresh(&project.work_dir); }
+        }
+    }
+
+    fn register_interactive_completion_alert(&mut self, project: &Path, id: &str) {
+        self.sync_completion_alert_context();
+        if !self.daemon_remote {
+            self.completion_alerts.register(crate::completion_alerts::CompletionAlertIdentity {
+                project: project.into(), session_id: id.into(), session_file: canonical_session_file(project, id),
+            });
+        }
     }
 
     /// First-confirmed-discovery baseline: sessions the store has no record
@@ -1026,6 +1098,13 @@ impl AppState {
             .unwrap_or_default();
 
         let mut state = Self {
+            completion_alerts: Default::default(),
+            completion_alerts_loaded: !load_host_state,
+            completion_alerts_saving: false,
+            completion_alerts_error: None,
+            completion_alerts_retry: None,
+            completion_alert_test_requested: false,
+            completion_alert_context: None,
             client: threadlane_client::ClientState {
                 projects: project_infos,
                 active_work_dir,
@@ -1814,9 +1893,15 @@ impl AppState {
         sessions: Vec<SessionInfo>,
         generation: u64,
     ) -> bool {
+        self.sync_completion_alert_context();
         if self.daemon_remote || generation != self.session_refresh_generation {
             return false;
         }
+        if !self.client.projects.iter().any(|project| project.work_dir == work_dir) {
+            return false;
+        }
+        let automation_files = self.automations.snapshot.runs.iter().filter_map(|run| run.session_file.clone()).collect();
+        self.completion_alerts.observe(&work_dir, &sessions, &automation_files);
         // Sessions first confirmed by this discovery pass inherit their
         // current completion as seen — history predating the marker is never
         // reported as a new result.
@@ -2374,6 +2459,20 @@ impl AppState {
             project.sessions.insert(0, session);
         }
         self.session_refresh_generation = self.session_refresh_generation.wrapping_add(1);
+        self.sync_completion_alert_context();
+        if let Some(session) = self.client.projects.iter()
+            .find(|project| project.work_dir == work_dir)
+            .and_then(|project| project.sessions.iter().find(|session| session.id == id))
+            .cloned()
+        {
+            self.baseline_session_seen(std::slice::from_ref(&session));
+            if !self.daemon_remote {
+                self.completion_alerts.baseline_interactive(
+                    crate::completion_alerts::CompletionAlertIdentity::new(&work_dir, &session),
+                    &session.completion_summary,
+                );
+            }
+        }
         self.select_session(work_dir.clone(), id);
         self.request_session_refresh(&work_dir);
     }
@@ -3526,6 +3625,7 @@ impl AppState {
             );
         }
         self.register_session_seen(&project, &id);
+        self.register_interactive_completion_alert(&project, &id);
         self.worktree_setups.insert(id.clone(), setup);
         self.select_session(project, id);
         self.composer_text.clear();
@@ -3706,6 +3806,7 @@ impl AppState {
         let session_file = sessions_dir.join(format!("{session_id}.jsonl"));
 
         self.register_session_seen(&work_dir, &session_id);
+        self.register_interactive_completion_alert(&work_dir, &session_id);
 
         threadlane_coding_agent::harness::CodingSessionHarness::append_fact_to_path(
             &session_file,
@@ -3835,6 +3936,7 @@ impl AppState {
             return Err("Generated issue session path already exists".into());
         }
         self.register_session_seen(&work_dir, &session_id);
+        self.register_interactive_completion_alert(&work_dir, &session_id);
 
         let cleanup = |work_dir: &Path, worktree_dir: &Path, session_file: &Path| {
             // Best-effort rollback of exactly what this setup created

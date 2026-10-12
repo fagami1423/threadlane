@@ -79,6 +79,7 @@ pub struct SettingsView {
     acp_rows: Vec<AcpAgentRecord>,
     acp_probe: threadlane_ui_state::settings::AcpProbeState,
     capability_status: Option<String>,
+    completion_alert_status: Option<String>,
     auth_tx: tokio::sync::mpsc::UnboundedSender<ProviderAuthEvent>,
     settings_tx: tokio::sync::mpsc::UnboundedSender<SettingsEvent>,
     auth_message: Option<AuthStatusMessage>,
@@ -297,6 +298,7 @@ impl SettingsView {
             acp_rows: Vec::new(),
             acp_probe: Default::default(),
             capability_status: None,
+            completion_alert_status: None,
             auth_tx,
             settings_tx,
             auth_message: None,
@@ -321,6 +323,86 @@ impl SettingsView {
 
     fn active_project(&self, cx: &App) -> Option<std::path::PathBuf> {
         self.model.read(cx).active_work_dir.clone()
+    }
+
+    fn request_completion_test(&mut self, cx: &mut Context<Self>) {
+        let state = self.model.read(cx);
+        if !state.completion_alerts.is_enabled() || state.completion_alerts_saving { return; }
+        self.model.update(cx, |state, cx| {
+            state.completion_alert_test_requested = true;
+            cx.notify();
+        });
+        self.completion_alert_status = Some("Test alert requested. If it did not appear, check system notification settings.".into());
+        cx.notify();
+    }
+
+    fn retry_completion_alerts(&mut self, cx: &mut Context<Self>) {
+        let state = self.model.read(cx);
+        if state.completion_alerts_saving || !state.completion_alerts_loaded { return; }
+        if let Some(enabled) = state.completion_alerts_retry {
+            self.save_completion_alerts(enabled, cx);
+            return;
+        }
+        self.model.update(cx, |state, cx| {
+            state.completion_alerts_loaded = false;
+            state.completion_alerts_error = None;
+            cx.notify();
+        });
+        let model = self.model.downgrade();
+        let load = cx.background_spawn(async {
+            threadlane_ui_state::completion_alert_preferences::load(&threadlane_ui_state::completion_alert_preferences::path())
+        });
+        cx.spawn(async move |_, cx| {
+            let result = load.await;
+            let _ = model.update(cx, |state, cx| {
+                state.completion_alerts_loaded = true;
+                match result {
+                    Ok(enabled) => state.set_completion_alerts_enabled(enabled),
+                    Err(error) => state.completion_alerts_error = Some(error),
+                }
+                cx.notify();
+            });
+        }).detach();
+    }
+
+    fn save_completion_alerts(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let state = self.model.read(cx);
+        if !state.completion_alerts_loaded || state.completion_alerts_saving { return; }
+        self.model.update(cx, |state, cx| {
+            state.completion_alerts_saving = true;
+            state.completion_alerts_error = None;
+            state.completion_alerts_retry = Some(enabled);
+            cx.notify();
+        });
+        self.completion_alert_status = None;
+        let model = self.model.downgrade();
+        let save = cx.background_spawn(async move {
+            let path = threadlane_ui_state::completion_alert_preferences::path();
+            threadlane_ui_state::completion_alert_preferences::save(&path, enabled)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = save.await;
+            let saved = result.is_ok();
+            let _ = model.update(cx, |state, cx| {
+                state.completion_alerts_saving = false;
+                match result {
+                    Ok(()) => {
+                        state.completion_alerts_retry = None;
+                        state.set_completion_alerts_enabled(enabled);
+                        state.completion_alert_test_requested = enabled;
+                    }
+                    Err(error) => state.completion_alerts_error = Some(error),
+                }
+                cx.notify();
+            });
+            let _ = this.update(cx, |this, cx| {
+                if saved && enabled {
+                    this.completion_alert_status = Some("Test alert requested. If it did not appear, check system notification settings.".into());
+                }
+                cx.notify();
+            });
+        }).detach();
+        cx.notify();
     }
 
     fn refresh_extensions(&mut self, cx: &mut Context<Self>) {
@@ -479,6 +561,14 @@ impl SettingsView {
         let state = self.model.read(cx);
         let (status, action, busy) = update_controls(&state.update_status);
         let general = SettingsGeneral {
+            completion_alerts: kit_settings::SettingsCompletionAlerts {
+                enabled: state.completion_alerts.is_enabled(),
+                busy: !state.completion_alerts_loaded || state.completion_alerts_saving,
+                loading: !state.completion_alerts_loaded,
+                supported: true,
+                error: state.completion_alerts_error.clone(),
+                status: self.completion_alert_status.clone(),
+            },
             version: current_version().to_string(),
             active_project: state.active_work_dir.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "No active project".into()),
             project_count: state.projects.len(),
@@ -503,6 +593,15 @@ impl SettingsView {
         let general = kit_settings::settings_general(
             &general,
             move |action, window, cx| match action {
+                SettingsAction::RetryCompletionAlerts => {
+                    let _ = owner.update(cx, |this, cx| this.retry_completion_alerts(cx));
+                }
+                SettingsAction::CompletionAlerts(enabled) => {
+                    let _ = owner.update(cx, |this, cx| this.save_completion_alerts(enabled, cx));
+                }
+                SettingsAction::TestCompletionAlert => {
+                    let _ = owner.update(cx, |this, cx| this.request_completion_test(cx));
+                }
                 SettingsAction::Update => {
                     window.dispatch_action(Box::new(crate::ActivateUpdate), cx)
                 }

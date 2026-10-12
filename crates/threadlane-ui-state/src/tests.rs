@@ -5758,6 +5758,106 @@ fn run_completion(seq: u64) -> RunCompletionToken {
 }
 
 #[test]
+fn completion_alerts_accept_current_inventory_only_and_preserve_result_marker() {
+    let (_root, project, mut session) = settled_project_session("alerts");
+    session.completion_summary = SessionCompletionSummary::None;
+    let mut state = state_with_session(&session);
+    state.register_session_seen(&project, &session.id);
+    state.set_completion_alerts_enabled(true);
+    let generation = state.session_refresh_generation;
+    let mut completed = session.clone();
+    completed.completion_summary = SessionCompletionSummary::Latest(run_completion(9));
+    assert!(!state.apply_session_refresh(project.clone(), vec![completed.clone()], generation.wrapping_sub(1)));
+    assert!(state.completion_alerts.drain().is_empty());
+    assert!(state.apply_session_refresh(project.clone(), vec![session.clone()], generation));
+    assert!(state.apply_session_refresh(project.clone(), vec![completed.clone()], generation));
+    assert_eq!(state.completion_alerts.drain().len(), 1);
+    assert!(state.session_has_unseen_result(&completed));
+    // Reconnect/client replacement rejects outstanding local inventory before baselining.
+    state.daemon_client = threadlane_client::LocalDaemon::new(state.daemon_core.clone());
+    assert!(!state.apply_session_refresh(project.clone(), vec![completed.clone()], generation));
+    let generation = state.session_refresh_generation;
+    assert!(state.apply_session_refresh(project.clone(), vec![completed.clone()], generation));
+    assert!(state.completion_alerts.drain().is_empty());
+    state.set_completion_alerts_enabled(false);
+    state.set_completion_alerts_enabled(true);
+    let generation = state.session_refresh_generation;
+    completed.completion_summary = SessionCompletionSummary::Latest(run_completion(10));
+    assert!(state.apply_session_refresh(project.clone(), vec![completed.clone()], generation));
+    assert!(state.completion_alerts.drain().is_empty());
+    state.projects.clear();
+    assert!(!state.apply_session_refresh(project, vec![completed], generation));
+}
+
+#[test]
+fn completion_alerts_automation_remote_and_noncompletion_events_never_emit() {
+    let (_root, project, mut session) = settled_project_session("alerts");
+    session.completion_summary = SessionCompletionSummary::None;
+    let mut state = state_with_session(&session);
+    state.set_completion_alerts_enabled(true);
+    let generation = state.session_refresh_generation;
+    assert!(state.apply_session_refresh(project.clone(), vec![session.clone()], generation));
+    let mut run = projected_automation_run(&project, "done", false);
+    run.session_file = Some(session.session_file.clone());
+    state.automations.snapshot.runs.push(run);
+    session.completion_summary = SessionCompletionSummary::Latest(run_completion(1));
+    assert!(state.apply_session_refresh(project.clone(), vec![session.clone()], generation));
+    assert!(state.completion_alerts.drain().is_empty());
+    state.automations.snapshot.runs.clear();
+    state.daemon_remote = true;
+    let project_info = ProjectInfo { name: "remote".into(), work_dir: project.clone(), sessions: vec![session.clone()], is_expanded: true };
+    state.drain_chat_stream(vec![SessionEvent::ProjectChanged { project: project_info }]);
+    assert!(!state.apply_session_refresh(project.clone(), vec![session.clone()], generation));
+    assert!(state.completion_alerts.drain().is_empty());
+    // Health/status alone (including failures/cancellation/waiting) is not a completion token.
+    state.daemon_remote = false;
+    state.sync_completion_alert_context();
+    let generation = state.session_refresh_generation;
+    session.completion_summary = SessionCompletionSummary::None;
+    for health in [SessionHealth::Working, SessionHealth::Healthy, SessionHealth::Warning] {
+        session.health = health;
+        assert!(state.apply_session_refresh(project.clone(), vec![session.clone()], generation));
+        assert!(state.completion_alerts.drain().is_empty());
+    }
+}
+
+#[test]
+fn completion_alerts_disabling_preserves_inflight_inventory_and_result_marker() {
+    let (_root, project, mut session) = settled_project_session("alerts");
+    session.completion_summary = SessionCompletionSummary::None;
+    let mut state = state_with_session(&session);
+    state.register_session_seen(&project, &session.id);
+    state.set_completion_alerts_enabled(true);
+    let generation = state.session_refresh_generation;
+    state.set_completion_alerts_enabled(false);
+    assert_eq!(state.session_refresh_generation, generation);
+    session.completion_summary = SessionCompletionSummary::Latest(run_completion(1));
+    assert!(state.apply_session_refresh(project, vec![session.clone()], generation));
+    assert!(state.completion_alerts.drain().is_empty());
+    assert!(state.session_has_unseen_result(&session));
+}
+
+#[test]
+fn completion_alerts_fork_baselines_inherited_history_before_first_new_run() {
+    for inherited in [SessionCompletionSummary::None, SessionCompletionSummary::Latest(run_completion(5))] {
+        let (_root, project, source) = settled_project_session("source");
+        let mut state = state_with_session(&source);
+        state.set_completion_alerts_enabled(true);
+        let mut fork = source.clone();
+        fork.id = "fork".into();
+        fork.session_file = canonical_session_file(&project, "fork");
+        fork.completion_summary = inherited;
+        state.finish_session_fork(project.clone(), fork.id.clone(), vec![fork.clone()]);
+        assert!(state.completion_alerts.drain().is_empty());
+        assert!(!state.session_has_unseen_result(&fork));
+        fork.completion_summary = SessionCompletionSummary::Latest(run_completion(6));
+        assert!(state.apply_session_refresh(project, vec![fork.clone(), source], state.session_refresh_generation));
+        assert_eq!(state.completion_alerts.drain().len(), 1);
+        assert!(state.session_has_unseen_result(&fork));
+    }
+}
+
+#[test]
 fn session_seen_baseline_hides_existing_history_and_tracks_new_completions() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().to_path_buf();
@@ -6370,6 +6470,7 @@ fn snooze_confirm_writes(state: &mut AppState, work_dir: &Path, session_id: &str
 fn settled_project_session(name: &str) -> (tempfile::TempDir, PathBuf, SessionInfo) {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
     let session_file = project.join(".threadlane/sessions/session.jsonl");
     let mut session = test_session("session", &session_file);
     session.title = name.into();
