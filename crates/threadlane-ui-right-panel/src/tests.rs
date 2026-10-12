@@ -16,7 +16,7 @@ use super::types::{
     DiscardOption, GitAction, ReviewDiffRequest, ReviewDiffTarget, can_publish_branch,
     discard_git_action, message_generated_matches_active_project,
 };
-use super::view::{RightPanelView, retain_review_selection};
+use super::view::{RightPanelView, convert_node_to_tree_item, retain_review_selection};
 use threadlane_project::files::scan_project_tree;
 
 fn paths(values: &[&str]) -> HashSet<String> {
@@ -443,6 +443,28 @@ fn project_scan_keeps_root_siblings_when_early_directory_is_large() {
         vec![".agents", "crates", "docs"]
     );
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unlisted_folders_stay_expandable_with_a_disabled_placeholder() {
+    let node = |path: &str, is_dir: bool, truncated: bool| threadlane_protocol::repo::ProjectFileNode {
+        relative_path: path.into(),
+        name: path.rsplit('/').next().unwrap().into(),
+        is_dir,
+        truncated,
+        ..Default::default()
+    };
+    let expanded = HashSet::new();
+
+    // Contents skipped by the scan budget: still a folder, holding one disabled note.
+    let unlisted = convert_node_to_tree_item(node("crates/deep", true, true), &expanded);
+    assert!(unlisted.is_folder());
+    assert_eq!(unlisted.children.len(), 1);
+    assert!(unlisted.children[0].is_disabled());
+
+    // A fully listed empty folder and a file get no placeholder.
+    assert!(convert_node_to_tree_item(node("empty", true, false), &expanded).children.is_empty());
+    assert!(!convert_node_to_tree_item(node("a.rs", false, false), &expanded).is_folder());
 }
 
 #[test]

@@ -46,6 +46,10 @@ pub struct ProjectFileNode {
     pub is_dir: bool,
     #[serde(default)]
     pub children: Vec<ProjectFileNode>,
+    /// A directory whose contents were not (fully) listed because the scan hit its
+    /// entry limit or depth cap, so an empty `children` does not mean an empty folder.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 /// Options that alter how a diff is produced.

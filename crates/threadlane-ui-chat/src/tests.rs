@@ -4652,13 +4652,44 @@ fn conversation_find_large_history_profile() {
 }
 
 #[gpui::test]
+fn conversation_find_is_unavailable_on_a_new_task(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    cx.update(gpui_component::init);
+    cx.update(super::init);
+    let model = cx.new(|_| threadlane_ui_state::AppState::for_tests());
+    let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let capture = holder.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let chat = cx.new(|cx| super::ChatListView::new(model, window, cx));
+        capture.replace(Some(chat.clone()));
+        gpui_component::Root::new(chat, window, cx)
+    });
+    let chat = holder.borrow().as_ref().unwrap().clone();
+    cx.run_until_parked();
+    cx.update(|window, cx| chat.update(cx, |chat, cx| chat.focus_composer(window, cx)));
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") { "cmd-f" } else { "ctrl-f" });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    });
+    assert!(!chat.read_with(cx, |chat, _| chat.find_open));
+    assert!(cx.debug_bounds("conversation-find-open").is_none());
+    assert!(cx.debug_bounds("conversation-find-strip").is_none());
+}
+
+#[gpui::test]
 fn conversation_find_controls_fit_themes_narrow_panes_and_large_text(
     cx: &mut gpui::TestAppContext,
 ) {
     use gpui::AppContext as _;
     cx.update(gpui_component::init);
     cx.update(super::init);
-    let model = cx.new(|_| threadlane_ui_state::AppState::for_tests());
+    let model = cx.new(|_| {
+        let mut state = threadlane_ui_state::AppState::for_tests();
+        state.is_new_task = false;
+        state
+    });
     let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
     let capture = holder.clone();
     let (_, cx) = cx.add_window_view(move |window, cx| {

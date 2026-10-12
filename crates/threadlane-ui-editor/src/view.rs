@@ -1556,7 +1556,9 @@ impl EditorView {
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
         threadlane_ui_kit::editor_empty_state(
-            self.reopen_button(cx),
+            self.reopen_control(cx)
+                .is_available()
+                .then(|| self.reopen_button(cx)),
             cx,
         )
     }

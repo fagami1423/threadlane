@@ -200,7 +200,8 @@ impl ConversationFindStrip {
                     .id("conversation-find-status")
                     .role(Role::Status)
                     .aria_label(self.status.clone())
-                    .text_sm()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
                     .child(self.status),
             )
             .children(self.excerpt.map(|excerpt| {

@@ -306,7 +306,10 @@ impl Render for EditorPreview {
             } else if let Some(diff) = self.selected.as_ref().and_then(|id| self.diffs.get(id)) {
                 kit::editor_diff(diff, cx).into_any_element()
             } else {
-                kit::editor_empty_state(self.reopen_button(), cx).into_any_element()
+                kit::editor_empty_state(
+                    self.reopen_control().is_available().then(|| self.reopen_button()),
+                    cx,
+                ).into_any_element()
             })
             .when(!self.draft.is_empty(), |el| {
                 el.child(
