@@ -188,6 +188,11 @@ impl ReopenClosedFileControl {
         self
     }
 
+    /// Whether a closed file can be (or is being) reopened.
+    pub fn is_available(&self) -> bool {
+        self.loading || self.target.is_some()
+    }
+
     pub fn description(&self) -> String {
         match (&self.target, self.loading) {
             (Some(target), loading) => format!(
@@ -808,14 +813,20 @@ pub fn editor_diff(text: &Entity<TextViewState>, cx: &App) -> Scrollable<Div> {
         .child(crate::diff_text_view(text, cx))
 }
 
-pub fn editor_empty_state(reopen: Button, cx: &App) -> Div {
-    div().flex_1().min_h_0().flex().flex_col().items_center().justify_center().gap_3().p_6()
-        .child(div().size_12().rounded_full().bg(cx.theme().muted.opacity(0.5))
+/// `reopen` is `None` when there is nothing to reopen, so the empty state never shows a dead control.
+pub fn editor_empty_state(reopen: Option<Button>, cx: &App) -> Div {
+    // Single-line, width-independent text (no wrap, no ellipsis): with the terminal split open,
+    // GPUI paints the measurement from a near-zero-width layout probe into the full-width box,
+    // so wrapping text came out one letter per line and truncated text as a bare "…".
+    div().flex_1().min_h_0().overflow_hidden().flex().flex_col().items_center().justify_center().gap_3().p_6()
+        .child(div().flex_none().size_12().rounded_full().bg(cx.theme().muted.opacity(0.5))
             .flex().items_center().justify_center().text_2xl().text_color(cx.theme().muted_foreground)
             .child(Icon::new(IconName::File)))
-        .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(cx.theme().foreground)
-            .child("No files open in Editor"))
-        .child(div().max_w(rems(23.75)).text_center().text_xs().text_color(cx.theme().muted_foreground)
-            .child("Click a file in the Files panel or a changed file in Review to open and view here."))
-        .child(reopen)
+        .child(div().flex_none().w_full().text_center().whitespace_nowrap().overflow_hidden()
+            .text_sm().font_weight(FontWeight::MEDIUM).text_color(cx.theme().foreground)
+            .child("No files open"))
+        .child(div().flex_none().w_full().text_center().whitespace_nowrap().overflow_hidden()
+            .text_xs().text_color(cx.theme().muted_foreground)
+            .child("Open a file from the Files panel or Review."))
+        .children(reopen.map(|reopen| div().flex_none().child(reopen)))
 }
