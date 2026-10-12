@@ -1463,7 +1463,7 @@ impl ChatListView {
                     display_title, active_title, status_badge.map(IntoElement::into_any_element), cx,
                 ),
             )
-            .when(self.current_tab == CentralTab::Chat, |el| {
+            .when(self.can_find_in_conversation(cx), |el| {
                 el.child(
                     threadlane_ui_kit::conversation_find_button()
                         .on_click(cx.listener(|this, _, window, cx| {

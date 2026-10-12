@@ -19,13 +19,18 @@ pub struct ConversationFindHandoff {
 
 
 impl ChatListView {
+    /// Find needs a conversation: a new task has nothing to search yet.
+    pub(super) fn can_find_in_conversation(&self, cx: &App) -> bool {
+        self.current_tab == CentralTab::Chat && !self.model.read(cx).is_new_task
+    }
+
     pub(super) fn open_conversation_find(
         &mut self,
         _: &FindInConversation,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.current_tab != CentralTab::Chat || window.has_active_dialog(cx) {
+        if !self.can_find_in_conversation(cx) || window.has_active_dialog(cx) {
             cx.propagate();
             return;
         }
