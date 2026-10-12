@@ -19,7 +19,7 @@ impl Render for PickerHost {
     }
 }
 
-fn workspace(
+pub(crate) fn workspace(
     state: threadlane_ui_state::AppState,
     window: &mut Window,
     cx: &mut App,
@@ -42,6 +42,8 @@ fn workspace(
         });
         let command_state_subscription = cx.observe(&command_state, |_, _, cx| cx.notify());
         WorkspaceView {
+            pending_completion_activation: None,
+            completion_activation_task: None,
             window_handle: window.window_handle(),
             last_link_terminal: None,
             focus_handle: cx.focus_handle(),

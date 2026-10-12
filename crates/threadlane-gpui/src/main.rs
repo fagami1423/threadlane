@@ -82,6 +82,7 @@ fn main() {
 
     let shutdown_log = diagnostics.clone();
     app.run(move |cx| {
+        cx.set_app_identity("dev.threadlane.app", "Threadlane");
         if let Some(log) = shutdown_log {
             cx.on_app_quit(move |_| {
                 if let Err(error) = log.shutdown_requested() {

@@ -15,6 +15,10 @@ pub const SETTINGS_SEARCH_ITEMS: &[SettingsSearchItem] = &[
         page: "General",
         keywords: &[
             "application",
+            "alert",
+            "notification",
+            "background",
+            "completion",
             "updates",
             "upgrade",
             "auto review",

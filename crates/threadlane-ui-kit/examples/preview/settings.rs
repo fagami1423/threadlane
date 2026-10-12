@@ -1,5 +1,7 @@
 //! Local host for shared settings. No preference writes, updates, or authentication.
-use gpui::{AppContext, Context, EventEmitter, IntoElement, Render, Window};
+use gpui::{prelude::*, AppContext, Context, EventEmitter, IntoElement, Render, Window};
+use gpui_component::button::Button;
+use gpui_component::{ActiveTheme, Sizable};
 use gpui_component::input::InputState;
 use threadlane_protocol::{OrchestratorMode, ReasoningEffort};
 use threadlane_ui_kit::settings::{
@@ -27,6 +29,16 @@ pub struct SettingsPreview {
     opencode_key: gpui::Entity<InputState>,
 }
 impl EventEmitter<SettingsPreviewEvent> for SettingsPreview {}
+fn completion_alert_sample(sample: usize) -> kit::SettingsCompletionAlerts {
+    kit::SettingsCompletionAlerts {
+        supported: sample != 4,
+        enabled: sample == 2,
+        busy: sample == 1,
+        loading: false,
+        error: (sample == 3).then(|| "Sample save error. Try again.".into()),
+        status: (sample == 2).then(|| "Preview test alert requested. No system alert was sent.".into()),
+    }
+}
 impl SettingsPreview {
     pub(super) fn open_search_destination(&mut self, id: &str, cx: &mut Context<Self>) {
         if let Some(page) = threadlane_ui_kit::settings_search_page(id) { self.page = page; cx.notify(); }
@@ -147,6 +159,7 @@ impl SettingsPreview {
                 error: None,
             }),
             general: SettingsGeneral {
+                completion_alerts: completion_alert_sample(if cfg!(target_family = "wasm") { 4 } else { 0 }),
                 version: env!("CARGO_PKG_VERSION").into(),
                 active_project: project,
                 project_count: 1,
@@ -390,6 +403,16 @@ impl SettingsPreview {
                     update.status = "Up to date".into();
                 }
             }
+            SettingsAction::CompletionAlerts(enabled) => {
+                self.general.completion_alerts.enabled = enabled;
+                self.general.completion_alerts.status = enabled.then(|| "Preview test alert requested. No system alert was sent.".into());
+            }
+            SettingsAction::TestCompletionAlert => {
+                self.general.completion_alerts.status = Some("Preview test alert requested. No system alert was sent.".into());
+            }
+            SettingsAction::RetryCompletionAlerts => {
+                self.general.completion_alerts.error = None;
+            }
         }
         cx.notify();
     }
@@ -401,7 +424,16 @@ impl Render for SettingsPreview {
             let _ = owner.update(cx, |this, cx| this.apply(action, window, cx));
         };
         let content = match self.page {
-            SettingsPage::General => kit::settings_general(&self.general, callback.clone(), cx),
+            SettingsPage::General => gpui::div().flex().flex_col().gap_3()
+                .child(gpui::div().text_xs().text_color(cx.theme().muted_foreground).child("Completion alerts · local preview only"))
+                .child(gpui::div().flex().flex_wrap().gap_2().children(["Off", "Saving", "Enabled", "Error", "Unsupported"].into_iter().enumerate().map(|(sample, label)| {
+                    Button::new(("completion-alert-sample", sample)).label(label).outline().small()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.general.completion_alerts = completion_alert_sample(sample);
+                            cx.notify();
+                        }))
+                })))
+                .child(kit::settings_general(&self.general, callback.clone(), cx)).into_any_element(),
             SettingsPage::Appearance => kit::settings_appearance(
                 &threadlane_ui_theme::active_theme_name(cx),
                 callback.clone(),
@@ -502,6 +534,49 @@ mod tests {
         cx.simulate_event(KeyUpEvent { keystroke });
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    #[gpui::test]
+    fn completion_alert_preview_is_controlled_and_exposes_off_saving_enabled_error_unsupported(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(threadlane_ui_theme::init_bundled);
+        let captured = Rc::new(std::cell::RefCell::new(None));
+        let capture = captured.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let preview = cx.new(|cx| super::SettingsPreview::new("Sample workspace".into(), window, cx));
+            *capture.borrow_mut() = Some(preview.clone());
+            gpui_component::Root::new(preview, window, cx)
+        });
+        let preview = captured.borrow_mut().take().unwrap();
+        cx.simulate_resize(gpui::size(gpui::px(960.0), gpui::px(1200.0)));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(!preview.read_with(cx, |view, _| view.general.completion_alerts.enabled));
+        let switch = cx.debug_bounds("general-completion-alerts-switch").unwrap();
+        cx.simulate_click(switch.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(preview.read_with(cx, |view, _| view.general.completion_alerts.enabled));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let test = cx.debug_bounds("general-test-completion-alert").unwrap();
+        cx.simulate_click(test.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(preview.read_with(cx, |view, _| view.general.completion_alerts.status.as_deref().unwrap().contains("No system alert was sent")));
+        for sample in [1, 4] {
+            preview.update(cx, |view, cx| { view.general.completion_alerts = super::completion_alert_sample(sample); cx.notify(); });
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let switch = cx.debug_bounds("general-completion-alerts-switch").unwrap();
+            cx.simulate_click(switch.center(), Modifiers::default());
+            cx.run_until_parked();
+            assert!(!preview.read_with(cx, |view, _| view.general.completion_alerts.enabled));
+        }
+        preview.update(cx, |view, cx| { view.general.completion_alerts = super::completion_alert_sample(3); cx.notify(); });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let retry = cx.debug_bounds("general-retry-completion-alerts").unwrap();
+        cx.simulate_click(retry.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(preview.read_with(cx, |view, _| view.general.completion_alerts.error.is_none()));
     }
 
     #[gpui::test]

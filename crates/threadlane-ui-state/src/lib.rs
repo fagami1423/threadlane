@@ -9,6 +9,8 @@
 //! should import `threadlane_daemon` directly.
 
 pub mod actions;
+pub mod completion_alerts;
+pub mod completion_alert_preferences;
 pub mod automation_io;
 pub mod controller;
 mod app_state;
