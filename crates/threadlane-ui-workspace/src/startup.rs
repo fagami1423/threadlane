@@ -2,7 +2,7 @@ use gpui::{
     div, AnyElement, App, AppContext, Context, Entity, FontWeight, InteractiveElement,
     IntoElement, ParentElement, Render, Role, StatefulInteractiveElement, Styled, Window,
 };
-use gpui_component::{button::Button, ActiveTheme, Icon, Sizable, TitleBar};
+use gpui_component::{button::{Button, ButtonVariants}, ActiveTheme, Icon, Sizable, TitleBar};
 use threadlane_ui_state::AppState;
 
 use crate::WorkspaceView;
@@ -125,11 +125,15 @@ impl StartupView {
                         .id("startup-error")
                         .role(Role::Alert)
                         .aria_label("Could not load your workspace.")
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
                         .child("Could not load your workspace."),
                 )
                 .child(
                     Button::new("retry-workspace-startup")
                         .label("Try again")
+                        .primary()
+                        .small()
                         .on_click(cx.listener(|this, _, window, cx| this.load(window, cx))),
                 )
                 .into_any_element()
@@ -140,6 +144,12 @@ impl StartupView {
                         .id("startup-status")
                         .role(Role::Status)
                         .aria_label("Loading projects…")
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(gpui_component::spinner::Spinner::new().small())
                         .child("Loading projects…"),
                 )
                 .into_any_element()
