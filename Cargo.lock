@@ -8490,7 +8490,7 @@ dependencies = [
 
 [[package]]
 name = "threadlane-gpui"
-version = "0.1.49"
+version = "0.1.50"
 dependencies = [
  "futures",
  "gpui-component",
@@ -9004,7 +9004,7 @@ dependencies = [
 
 [[package]]
 name = "threadlane-updater"
-version = "0.1.49"
+version = "0.1.50"
 dependencies = [
  "cargo-packager-updater",
 ]
