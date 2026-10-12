@@ -438,7 +438,7 @@ impl AppState {
 
     pub fn set_completion_alerts_enabled(&mut self, enabled: bool) {
         let changed = self.completion_alerts.is_enabled() != enabled;
-        if changed {
+        if changed && enabled {
             self.session_refresh_generation = self.session_refresh_generation.wrapping_add(1);
         }
         self.sync_completion_alert_context();
@@ -2459,6 +2459,20 @@ impl AppState {
             project.sessions.insert(0, session);
         }
         self.session_refresh_generation = self.session_refresh_generation.wrapping_add(1);
+        self.sync_completion_alert_context();
+        if let Some(session) = self.client.projects.iter()
+            .find(|project| project.work_dir == work_dir)
+            .and_then(|project| project.sessions.iter().find(|session| session.id == id))
+            .cloned()
+        {
+            self.baseline_session_seen(std::slice::from_ref(&session));
+            if !self.daemon_remote {
+                self.completion_alerts.baseline_interactive(
+                    crate::completion_alerts::CompletionAlertIdentity::new(&work_dir, &session),
+                    &session.completion_summary,
+                );
+            }
+        }
         self.select_session(work_dir.clone(), id);
         self.request_session_refresh(&work_dir);
     }

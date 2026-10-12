@@ -68,11 +68,23 @@ impl CompletionAlerts {
 
     /// Only newly created interactive files are registered with an empty baseline.
     pub fn register(&mut self, identity: CompletionAlertIdentity) {
+        self.baseline_interactive(identity, &SessionCompletionSummary::None);
+    }
+
+    /// A fork's inherited completion is history, not a newly finished run.
+    pub fn baseline_interactive(
+        &mut self,
+        identity: CompletionAlertIdentity,
+        summary: &SessionCompletionSummary,
+    ) {
         if self.enabled && self.tracked.len() < MAX_TRACKED {
             self.tracked.entry(identity).or_insert(Baseline {
                 registered: true,
-                confirmed: true,
-                token: None,
+                confirmed: *summary != SessionCompletionSummary::Unknown,
+                token: match summary {
+                    SessionCompletionSummary::Latest(token) => Some(token.clone()),
+                    _ => None,
+                },
             });
         }
     }
