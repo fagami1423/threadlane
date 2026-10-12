@@ -23,16 +23,13 @@
 * **ui:** editor empty state, Find gating, review branch chip, and Files tree folders ([0462be8](https://github.com/wheregmis/threadlane/commit/0462be8f3c556d8180db2ab1c62afbae416ac5d2))
 * **ui:** keep sidebar empty-state copy on one line ([38c1b6f](https://github.com/wheregmis/threadlane/commit/38c1b6f7bf233c335ba172f79fb652fcfb5ee810))
 * **ui:** remove redundant badges, distinguish icons, and promote primary actions ([f334575](https://github.com/wheregmis/threadlane/commit/f334575b670feb684c19b49a3b696c31e32623b0))
-* **ui:** share one header row and status bar across workspace pages ([0f23c9f](https://github.com/wheregmis/threadlane/commit/0f23c9f327c09bf1fd99d9cb5ad89210e3694832))
 * **ui:** share one header row and status bar across workspace pages ([81f33db](https://github.com/wheregmis/threadlane/commit/81f33dbc6ff2f292ce91e45cc4329a0ee6ee7d26))
-* **ui:** stop wrapped text overlapping in sidebar and settings ([a86ebfb](https://github.com/wheregmis/threadlane/commit/a86ebfbf3d43e0a211738571a579ad332b8b80a0))
 * **ui:** stop wrapped text overlapping in sidebar and settings ([3af1bd6](https://github.com/wheregmis/threadlane/commit/3af1bd6157dbdf3398c14af7fdfde351595ede5a))
 * **workspace:** only move focus into Settings on keyboard entry ([ea423e3](https://github.com/wheregmis/threadlane/commit/ea423e3ed3c32f163077e0a5124f6e32e4b74843))
 
 
 ### Maintenance
 
-* **deps:** Configure hotpath Cloud ([c18cff3](https://github.com/wheregmis/threadlane/commit/c18cff38c124b4753db9173c0323a83dc14d1321))
 * **deps:** Configure hotpath Cloud ([8821162](https://github.com/wheregmis/threadlane/commit/8821162eba63844a8345b9aa23be214e21d10980))
 
 ## [0.1.49](https://github.com/wheregmis/threadlane/compare/v0.1.48...v0.1.49) (2026-10-09)
