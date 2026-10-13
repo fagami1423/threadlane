@@ -29,7 +29,7 @@ pub(crate) fn workspace(
     let chat_list = cx.new(|cx| threadlane_ui_chat::ChatListView::new(model.clone(), window, cx));
     let github = cx.new(|cx| threadlane_ui_github::GitHubView::new(model.clone(), window, cx));
     let automations =
-        cx.new(|cx| threadlane_ui_automation::AutomationsView::new(model.clone(), cx));
+        cx.new(|cx| threadlane_ui_automation::AutomationsView::new(model.clone(), window, cx));
     let settings =
         cx.new(|cx| threadlane_ui_settings::SettingsView::new(model.clone(), window, cx));
     let right_panel =

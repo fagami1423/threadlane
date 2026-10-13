@@ -1,14 +1,14 @@
 use gpui::*;
-use gpui_component::input::{InputEvent, InputState, TextareaState};
 use gpui_component::WindowExt;
-use threadlane_automation::{new_id, now, Definition, Schedule};
+use gpui_component::input::{InputEvent, InputState, TextareaState};
+use threadlane_automation::{Definition, Schedule, new_id, now};
 use threadlane_protocol::ReasoningEffort;
-use threadlane_ui_kit::automation_form::{
-    automation_editor_sheet, automation_form, automation_schedule_fields,
-    automation_schedule_preview, schedule_from_fields, AutomationForm, AutomationFormAction,
-};
 use threadlane_protocol::automation::AutomationCommand as Command;
-use threadlane_ui_state::{automation_io, AppState};
+use threadlane_ui_kit::automation_form::{
+    AutomationForm, AutomationFormAction, automation_editor_sheet, automation_form,
+    automation_schedule_fields, automation_schedule_preview, schedule_from_fields,
+};
+use threadlane_ui_state::{AppState, automation_io};
 
 fn default_project(state: &AppState) -> Option<&std::path::PathBuf> {
     state
@@ -35,7 +35,7 @@ mod tests {
     use threadlane_automation::Schedule;
     use threadlane_daemon::catalog::{ModelOption, ModelProvider};
     use threadlane_ui_kit::automation_form::{calendar_cadence, calendar_days};
-    use threadlane_ui_state::{activate_test_session, AppState};
+    use threadlane_ui_state::{AppState, activate_test_session};
 
     #[test]
     fn unrelated_edits_preserve_every_calendar_day_set_and_order() {
@@ -168,10 +168,11 @@ pub(super) fn open(
         let interval = cx.new(|cx| InputState::new(window, cx).default_value(interval));
         let time = cx.new(|cx| InputState::new(window, cx).default_value(time));
         let timezone = cx.new(|cx| InputState::new(window, cx).default_value(timezone));
-        let mut subscriptions: Vec<_> = [&interval, &time, &timezone]
+        let mut subscriptions: Vec<_> = [&name, &interval, &time, &timezone]
             .iter()
             .map(|input| cx.observe(*input, |_: &mut Editor, _, cx| cx.notify()))
             .collect();
+        subscriptions.push(cx.observe(&prompt, |_: &mut Editor, _, cx| cx.notify()));
         subscriptions.push(cx.subscribe_in(
             &name,
             window,
@@ -344,6 +345,22 @@ impl Render for Editor {
             move |action, window, cx| {
                 let _ = owner.update(cx, |this, cx| {
                     match action {
+                        AutomationFormAction::Starter(starter) => {
+                            if !this.busy
+                                && threadlane_ui_kit::automation_form::can_apply_starter(
+                                    this.definition.revision,
+                                    &this.name.read(cx).value(),
+                                    &this.prompt.read(cx).value(),
+                                )
+                            {
+                                this.name.update(cx, |input, cx| {
+                                    input.set_value(starter.title(), window, cx)
+                                });
+                                this.prompt.update(cx, |input, cx| {
+                                    input.set_value(starter.prompt(), window, cx)
+                                });
+                            }
+                        }
                         AutomationFormAction::Project(id) => {
                             this.definition.project = id.into();
                             this.is_git = true;

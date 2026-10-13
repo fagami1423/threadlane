@@ -603,7 +603,7 @@ impl WorkspaceView {
         let sidebar = cx.new(|cx| SidebarView::new(model.clone(), window, cx));
         let chat_list = cx.new(|cx| ChatListView::new(model.clone(), window, cx));
         let github = cx.new(|cx| GitHubView::new(model.clone(), window, cx));
-        let automations = cx.new(|cx| AutomationsView::new(model.clone(), cx));
+        let automations = cx.new(|cx| AutomationsView::new(model.clone(), window, cx));
         let automation_updates = model.update(cx, |state, _| state.start_automations());
         let settings = cx.new(|cx| SettingsView::new(model.clone(), window, cx));
         let right_panel = cx.new(|cx| RightPanelView::new(model.clone(), window, cx));

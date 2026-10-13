@@ -55,7 +55,7 @@ private and do not expose the sharing port publicly.
 ## Layout
 
 - `rust/` — `threadlane-mobile` crate: `staticlib` + `rlib`, its own
-  Cargo workspace using the same GPUI 0.3.7 API as desktop. `client.rs`
+  Cargo workspace using the same GPUI 0.3.8 API as desktop. `client.rs`
   adapts the shared `threadlane-client` transport to the iOS executor;
   `app.rs` owns pairing and mobile navigation. Shared state, session cards,
   transcripts, and composer surfaces live in the client and UI leaf crates.

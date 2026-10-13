@@ -453,8 +453,17 @@ impl SessionPreview {
                 cx.notify();
             }
         });
-        let automations = cx.new(|_| crate::automation::AutomationPreview::new(
-            snapshot.session.as_ref().map(|s| s.work_dir.clone()).unwrap_or_else(|| "/sample-project".into())));
+        let automations = cx.new(|cx| {
+            crate::automation::AutomationPreview::new(
+                snapshot
+                    .session
+                    .as_ref()
+                    .map(|s| s.work_dir.clone())
+                    .unwrap_or_else(|| "/sample-project".into()),
+                window,
+                cx,
+            )
+        });
         let automation_subscription = cx.observe(&automations, |_, _, cx| cx.notify());
         let settings = cx.new(|cx| crate::settings::SettingsPreview::new(
             snapshot.session.as_ref().and_then(|session| session.work_dir.file_name()).map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Sample project".into()), window, cx));
