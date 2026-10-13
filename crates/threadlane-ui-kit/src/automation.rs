@@ -659,6 +659,9 @@ pub fn automation_detail(
                     .tooltip(
                         "Start a fresh chat with the saved settings; leave the schedule unchanged",
                     )
+                    .accessibility_label(
+                        "Run now: start a fresh chat with the saved settings; leave the schedule unchanged",
+                    )
                     .disabled(busy || active)
                     .on_click(request(&on_action, AutomationAction::RunNow(run_id))),
             )
@@ -683,6 +686,9 @@ pub fn automation_detail(
                     .disabled(busy)
                     .debug_selector(|| "automation-duplicate".into())
                     .tooltip("Create a paused copy to edit before scheduling")
+                    .accessibility_label(
+                        "Duplicate: create a paused copy to edit before scheduling",
+                    )
                     .on_click(request(
                         &on_action,
                         AutomationAction::Duplicate(d.id.clone()),
