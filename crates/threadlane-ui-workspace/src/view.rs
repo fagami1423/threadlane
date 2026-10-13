@@ -2331,6 +2331,10 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.bottom_panel_visible && self.terminal_maximized {
+            self.terminal_maximized = false;
+            self.right_panel_visible = false;
+        }
         self.right_panel_visible = !self.right_panel_visible;
         self.right_panel.update(cx, |panel, cx| {
             panel.set_visible(self.right_panel_visible, cx);
@@ -2766,6 +2770,7 @@ impl Render for WorkspaceView {
                     let owner = cx.entity().clone();
                     let toolbar = threadlane_ui_kit::TerminalToolbar::new(shell_cwd_label(&shell_cwd))
                         .maximized(self.terminal_maximized)
+                        .window_controls_inset((self.terminal_maximized && !show_sidebar).then_some(header_inset))
                         .path_hint(shell_cwd.display().to_string())
                         .worktree(worktree_shell)
                         .tabs(tab_buttons)

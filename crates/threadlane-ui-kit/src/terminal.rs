@@ -228,6 +228,7 @@ pub struct TerminalToolbar {
     find_hint: SharedString,
     hide_hint: SharedString,
     maximized: Option<bool>,
+    window_controls_inset: Option<Pixels>,
 }
 
 impl TerminalToolbar {
@@ -243,6 +244,7 @@ impl TerminalToolbar {
             find_hint: "Find in terminal output".into(),
             hide_hint: "Hide terminal".into(),
             maximized: None,
+            window_controls_inset: None,
         }
     }
     /// Full shell working directory for the project chip's tooltip and
@@ -267,6 +269,11 @@ impl TerminalToolbar {
     /// Hosts opt in when the terminal can fill the workspace without ending its shell.
     pub fn maximized(mut self, maximized: bool) -> Self {
         self.maximized = Some(maximized);
+        self
+    }
+    /// Reserve native window chrome when this toolbar occupies the title row.
+    pub fn window_controls_inset(mut self, inset: Option<Pixels>) -> Self {
+        self.window_controls_inset = inset;
         self
     }
     pub fn selection(mut self, enabled: bool, hint: impl Into<SharedString>) -> Self {
@@ -298,6 +305,10 @@ impl TerminalToolbar {
             .clone()
             .unwrap_or_else(|| self.project.clone());
         let header = terminal_bar(cx)
+            .when_some(self.window_controls_inset, |bar, inset| {
+                bar.pl(inset)
+                    .min_h(threadlane_ui_theme::WINDOW_CONTROLS_CLEARANCE)
+            })
             .child(
                 div()
                     .id("terminal-project")
