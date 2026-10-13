@@ -49,7 +49,7 @@ pub(crate) fn encode_key(
     let lower = key.to_ascii_lowercase();
     if modifiers.control {
         if let Some(control) = control_character(&lower, key_char) {
-            return Some(vec![control]);
+            return Some(alt_prefix(&[control], modifiers.alt));
         }
         if matches!(lower.as_str(), "up" | "down" | "left" | "right") {
             return Some(encode_cursor(
@@ -66,16 +66,16 @@ pub(crate) fn encode_key(
     }
 
     let bytes = match lower.as_str() {
-        "enter" => b"\r".to_vec(),
-        "backspace" => vec![0x7f],
-        "tab" if modifiers.shift && !modifiers.alt => b"\x1b[Z".to_vec(),
-        "tab" if !modifiers.alt => b"\t".to_vec(),
+        "enter" => alt_prefix(b"\r", modifiers.alt),
+        "backspace" => alt_prefix(&[0x7f], modifiers.alt),
+        "tab" if modifiers.shift => alt_prefix(b"\x1b[Z", modifiers.alt),
+        "tab" => alt_prefix(b"\t", modifiers.alt),
         "up" => encode_cursor(b'A', modifiers, application_cursor),
         "down" => encode_cursor(b'B', modifiers, application_cursor),
         "right" => encode_cursor(b'C', modifiers, application_cursor),
         "left" => encode_cursor(b'D', modifiers, application_cursor),
-        "home" => encode_cursor_position(b'H', modifiers),
-        "end" => encode_cursor_position(b'F', modifiers),
+        "home" => encode_cursor_position(b'H', modifiers, application_cursor),
+        "end" => encode_cursor_position(b'F', modifiers, application_cursor),
         "insert" => encode_tilde_key(b'~', 2, modifiers),
         "delete" => encode_tilde_key(b'~', 3, modifiers),
         "pageup" => encode_tilde_key(b'~', 5, modifiers),
@@ -116,7 +116,22 @@ fn control_character(key: &str, key_char: Option<&str>) -> Option<u8> {
             return Some(byte - b'A' + 1);
         }
     }
-    match key_char.and_then(|text| text.as_bytes().first().copied()) {
+    match key {
+        "space" | "@" | "2" => Some(0),
+        "[" => Some(0x1b),
+        "\\" => Some(0x1c),
+        "]" => Some(0x1d),
+        "^" => Some(0x1e),
+        "_" => Some(0x1f),
+        "?" => Some(0x7f),
+        _ => {
+            control_character_from_byte(key_char.and_then(|text| text.as_bytes().first().copied()))
+        }
+    }
+}
+
+fn control_character_from_byte(byte: Option<u8>) -> Option<u8> {
+    match byte {
         Some(b' ') | Some(b'@') | Some(b'2') => Some(0),
         Some(b'[') => Some(0x1b),
         Some(b'\\') => Some(0x1c),
@@ -125,6 +140,14 @@ fn control_character(key: &str, key_char: Option<&str>) -> Option<u8> {
         Some(b'_') => Some(0x1f),
         Some(b'?') => Some(0x7f),
         _ => None,
+    }
+}
+
+fn alt_prefix(bytes: &[u8], alt: bool) -> Vec<u8> {
+    if alt {
+        [vec![0x1b], bytes.to_vec()].concat()
+    } else {
+        bytes.to_vec()
     }
 }
 
@@ -153,9 +176,15 @@ fn encode_function_key(final_byte: u8, number: u8, modifiers: Modifiers) -> Vec<
     }
 }
 
-fn encode_cursor_position(final_byte: u8, modifiers: Modifiers) -> Vec<u8> {
+fn encode_cursor_position(
+    final_byte: u8,
+    modifiers: Modifiers,
+    application_cursor: bool,
+) -> Vec<u8> {
     let modifier = key_modifier_code(modifiers);
-    if modifier == 1 {
+    if modifier == 1 && application_cursor {
+        vec![0x1b, b'O', final_byte]
+    } else if modifier == 1 {
         vec![0x1b, b'[', final_byte]
     } else {
         format!("\x1b[1;{modifier}{}", final_byte as char).into_bytes()
@@ -228,7 +257,9 @@ pub(crate) fn encode_mouse(
         pressed_button.unwrap_or(3) | 32
     } else {
         button.code()
-            | if matches!(kind, MouseEventKind::Release) {
+            | if matches!(kind, MouseEventKind::Release)
+                && !matches!(encoding, vt100::MouseProtocolEncoding::Sgr)
+            {
                 3
             } else {
                 0
@@ -248,7 +279,11 @@ pub(crate) fn encode_mouse(
         return None;
     }
 
-    let code = button_code.saturating_add(modifier_code(modifiers));
+    let code = if mode == vt100::MouseProtocolMode::Press {
+        button_code
+    } else {
+        button_code.saturating_add(modifier_code(modifiers))
+    };
     let x = cell.1.checked_add(1)?;
     let y = cell.0.checked_add(1)?;
     match encoding {
@@ -323,8 +358,32 @@ mod tests {
             Some(vec![0])
         );
         assert_eq!(
+            encode_key("space", None, modifiers(true, false, false), false),
+            Some(vec![0])
+        );
+        assert_eq!(
+            encode_key("[", None, modifiers(true, false, false), false),
+            Some(vec![0x1b])
+        );
+        assert_eq!(
             encode_key("?", Some("?"), modifiers(true, false, false), false),
             Some(vec![0x7f])
+        );
+        assert_eq!(
+            encode_key("a", None, modifiers(true, false, true), false),
+            Some(vec![0x1b, 1])
+        );
+        assert_eq!(
+            encode_key("enter", None, modifiers(false, false, true), false),
+            Some(b"\x1b\r".to_vec())
+        );
+        assert_eq!(
+            encode_key("backspace", None, modifiers(false, false, true), false),
+            Some(vec![0x1b, 0x7f])
+        );
+        assert_eq!(
+            encode_key("tab", None, modifiers(false, false, true), false),
+            Some(b"\x1b\t".to_vec())
         );
         assert_eq!(
             encode_key("up", None, modifiers(true, true, false), false),
@@ -333,6 +392,18 @@ mod tests {
         assert_eq!(
             encode_key("up", None, modifiers(false, false, false), true),
             Some(b"\x1bOA".to_vec())
+        );
+        assert_eq!(
+            encode_key("home", None, modifiers(false, false, false), true),
+            Some(b"\x1bOH".to_vec())
+        );
+        assert_eq!(
+            encode_key("end", None, modifiers(false, false, false), true),
+            Some(b"\x1bOF".to_vec())
+        );
+        assert_eq!(
+            encode_key("home", None, modifiers(false, false, true), true),
+            Some(b"\x1b[1;3H".to_vec())
         );
         assert_eq!(
             encode_key("tab", None, modifiers(false, true, false), false),
@@ -425,7 +496,18 @@ mod tests {
                 (2, 3),
                 plain
             ),
-            Some(b"\x1b[<3;4;3m".to_vec())
+            Some(b"\x1b[<2;4;3m".to_vec())
+        );
+        assert_eq!(
+            encode_mouse(
+                vt100::MouseProtocolMode::PressRelease,
+                vt100::MouseProtocolEncoding::Sgr,
+                MouseEventKind::Release,
+                TerminalMouseButton::Left,
+                (2, 3),
+                plain
+            ),
+            Some(b"\x1b[<0;4;3m".to_vec())
         );
         assert_eq!(
             encode_mouse(
@@ -483,6 +565,17 @@ mod tests {
                 plain
             ),
             Some(b"\x1b[M \xc4\x80!".to_vec())
+        );
+        assert_eq!(
+            encode_mouse(
+                vt100::MouseProtocolMode::Press,
+                vt100::MouseProtocolEncoding::Default,
+                MouseEventKind::Press,
+                TerminalMouseButton::Left,
+                (0, 0),
+                modifiers(true, true, true)
+            ),
+            Some(b"\x1b[M !!".to_vec())
         );
         assert_eq!(
             encode_mouse(

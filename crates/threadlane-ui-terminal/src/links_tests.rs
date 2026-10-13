@@ -3,8 +3,18 @@ use gpui::{
     point, px, AppContext, Entity, Focusable, Modifiers, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, TestAppContext,
 };
-use std::{cell::RefCell, path::PathBuf, rc::Rc};
 use std::sync::{Arc, Mutex};
+use std::{cell::RefCell, path::PathBuf, rc::Rc};
+
+struct RecordingIo(Arc<Mutex<Vec<u8>>>);
+
+impl super::TerminalIo for RecordingIo {
+    fn write(&self, bytes: &[u8]) {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+    }
+
+    fn resize(&self, _: u16, _: u16) {}
+}
 
 fn output(terminal: &mut TerminalView, text: &str) {
     let mut parser = vt100::Parser::new(terminal.rows, terminal.cols, 20);
@@ -201,15 +211,6 @@ fn terminal_dispatches_modified_keys_to_the_io_and_keeps_shift_navigation_local(
 ) {
     use gpui::Focusable as _;
 
-    struct RecordingIo(Arc<Mutex<Vec<u8>>>);
-    impl super::TerminalIo for RecordingIo {
-        fn write(&self, bytes: &[u8]) {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-        }
-
-        fn resize(&self, _: u16, _: u16) {}
-    }
-
     let (terminal, cx) = terminal(cx);
     let written = Arc::new(Mutex::new(Vec::new()));
     let sink = written.clone();
@@ -224,6 +225,120 @@ fn terminal_dispatches_modified_keys_to_the_io_and_keeps_shift_navigation_local(
     assert_eq!(&*written.lock().unwrap(), b"\x1b[1;6A");
     cx.simulate_keystrokes("shift-up");
     assert_eq!(&*written.lock().unwrap(), b"\x1b[1;6A");
+}
+
+#[gpui::test]
+fn terminal_dispatches_mouse_reports_and_keeps_local_interactions(cx: &mut TestAppContext) {
+    let (terminal, cx) = terminal(cx);
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let sink = written.clone();
+    terminal.update(cx, |terminal, _| {
+        terminal.session = Some(Box::new(RecordingIo(sink)));
+        output(terminal, "\x1b[?1000h\x1b[?1006hword other");
+    });
+    cx.run_until_parked();
+    let position = terminal.read_with(cx, |terminal, _| {
+        terminal.screen_bounds.unwrap().origin + gpui::point(gpui::px(16.), gpui::px(16.))
+    });
+    let cell = terminal.read_with(cx, |terminal, _| terminal.report_cell_at(position).unwrap());
+    cx.update(|window, app| window.draw(app).clear(app));
+
+    cx.simulate_event(MouseDownEvent {
+        position,
+        button: MouseButton::Left,
+        ..Default::default()
+    });
+    cx.update(|window, app| {
+        assert!(
+            terminal.read(app).focus_handle(app).is_focused(window),
+            "reported mouse input must focus the terminal"
+        );
+    });
+    cx.simulate_event(MouseUpEvent {
+        position,
+        button: MouseButton::Left,
+        ..Default::default()
+    });
+    let expected = format!(
+        "\x1b[<0;{};{}M\x1b[<0;{};{}m",
+        cell.1 + 1,
+        cell.0 + 1,
+        cell.1 + 1,
+        cell.0 + 1
+    );
+    assert_eq!(
+        &*written.lock().unwrap(),
+        expected.as_bytes(),
+        "mouse down/up must use SGR press and release reports"
+    );
+
+    written.lock().unwrap().clear();
+    cx.update(|window, app| window.draw(app).clear(app));
+    let other = terminal.read_with(cx, |terminal, _| {
+        terminal.screen_bounds.unwrap().origin
+            + gpui::point(
+                gpui::px(terminal.content_inset + terminal.cell_width * 10.0 + 0.1),
+                gpui::px(16.),
+            )
+    });
+    let shift = Modifiers {
+        shift: true,
+        ..Default::default()
+    };
+    cx.simulate_event(MouseDownEvent {
+        position,
+        button: MouseButton::Left,
+        modifiers: shift,
+        ..Default::default()
+    });
+    cx.simulate_event(MouseMoveEvent {
+        position: other,
+        pressed_button: Some(MouseButton::Left),
+        modifiers: shift,
+    });
+    cx.simulate_event(MouseUpEvent {
+        position: other,
+        button: MouseButton::Left,
+        modifiers: shift,
+        ..Default::default()
+    });
+    assert!(
+        written.lock().unwrap().is_empty(),
+        "Shift selection must bypass mouse reporting"
+    );
+    assert_eq!(
+        terminal.read_with(cx, |terminal, _| terminal.selected_text()),
+        Some("word other".to_string())
+    );
+
+    terminal.update(cx, |terminal, _| {
+        let mut parser = vt100::Parser::new(terminal.rows, terminal.cols, 20);
+        parser.process(b"\x1b[?1000h\x1b[?1006h");
+        for index in 0..=terminal.rows {
+            parser.process(format!("line{index}\r\n").as_bytes());
+        }
+        parser.screen_mut().set_scrollback(1);
+        let frame = visible_terminal_frame(&mut parser, terminal.rows, terminal.cols)
+            .with_link_epoch(terminal.frame_epoch);
+        terminal.apply_event(PtyEvent::Frame(frame));
+    });
+    cx.run_until_parked();
+    written.lock().unwrap().clear();
+    cx.update(|window, app| window.draw(app).clear(app));
+    let before_offset = terminal.read_with(cx, |terminal, _| terminal.scrollback_offset);
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position,
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(40.))),
+        ..Default::default()
+    });
+    assert!(
+        written.lock().unwrap().is_empty(),
+        "scrollback wheel input must not report to the TUI"
+    );
+    assert!(
+        terminal.read_with(cx, |terminal, _| terminal.scrollback_offset) > before_offset,
+        "scrollback wheel input must remain local"
+    );
 }
 
 #[gpui::test]

@@ -970,6 +970,7 @@ impl TerminalView {
         }
         self.invalidate_links();
         self.last_mouse_cell = None;
+        self.mouse_wheel_accumulator = 0.0;
         self.rows = rows;
         self.cols = cols;
         self.clear_selection();
@@ -1039,6 +1040,7 @@ impl TerminalView {
                         != frame.screen.mouse_protocol_encoding()
                 {
                     self.last_mouse_cell = None;
+                    self.mouse_wheel_accumulator = 0.0;
                 }
                 self.links = frame.links;
                 self.screen = frame.screen;
@@ -1063,6 +1065,10 @@ impl TerminalView {
                 {
                     self.invalidate_links();
                     self.sync_link_frame();
+                }
+                if self.alt_screen != alt_screen {
+                    self.last_mouse_cell = None;
+                    self.mouse_wheel_accumulator = 0.0;
                 }
                 // Replies for an older query generation never land; the
                 // generation moves on every query edit and on close.
@@ -1433,6 +1439,11 @@ impl TerminalView {
         self.grid_geometry()?.link_cell_at(position)
     }
 
+    fn mouse_reporting_active(&self) -> bool {
+        self.scrollback_offset == 0
+            && self.screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None
+    }
+
     fn report_mouse(
         &mut self,
         position: Point<Pixels>,
@@ -1441,7 +1452,7 @@ impl TerminalView {
         modifiers: Modifiers,
     ) {
         let mode = self.screen.mouse_protocol_mode();
-        if mode == vt100::MouseProtocolMode::None || self.scrollback_offset != 0 {
+        if !self.mouse_reporting_active() {
             return;
         }
         let Some(cell) = self.report_cell_at(position) else {
@@ -1470,9 +1481,8 @@ impl TerminalView {
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.last_mouse_cell = None;
-        if !event.modifiers.shift
-            && self.screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None
-        {
+        if !event.modifiers.shift && self.mouse_reporting_active() {
+            self.focus_handle.focus(window, cx);
             if let Some(button) = terminal_mouse_button(event.button) {
                 self.report_mouse(
                     event.position,
@@ -1495,9 +1505,7 @@ impl TerminalView {
 
     fn mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.last_mouse_cell = None;
-        if !event.modifiers.shift
-            && self.screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None
-        {
+        if !event.modifiers.shift && self.mouse_reporting_active() {
             if let Some(button) = terminal_mouse_button(event.button) {
                 self.report_mouse(
                     event.position,
@@ -1518,9 +1526,7 @@ impl TerminalView {
         if event.modifiers.shift {
             self.last_mouse_cell = None;
         }
-        if !event.modifiers.shift
-            && self.screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None
-        {
+        if !event.modifiers.shift && self.mouse_reporting_active() {
             self.report_mouse(
                 event.position,
                 input::MouseEventKind::Motion {
@@ -1548,8 +1554,7 @@ impl TerminalView {
             ScrollDelta::Lines(lines) => lines.y * 2.0,
             ScrollDelta::Pixels(pixels) => pixels.y.as_f32() / row_height,
         };
-        let mode = self.screen.mouse_protocol_mode();
-        if mode != vt100::MouseProtocolMode::None {
+        if self.mouse_reporting_active() {
             self.mouse_wheel_accumulator += delta;
             let steps = self.mouse_wheel_accumulator.trunc() as isize;
             self.mouse_wheel_accumulator -= steps as f32;
@@ -2149,7 +2154,7 @@ impl Render for TerminalView {
                     .on_mouse_up(MouseButton::Middle, cx.listener(Self::mouse_up))
                     .on_mouse_up(MouseButton::Right, cx.listener(Self::mouse_up))
                     .children(autoscroll_pill);
-                if self.screen.mouse_protocol_mode() == vt100::MouseProtocolMode::None {
+                if !self.mouse_reporting_active() {
                     grid.context_menu(Self::output_context_menu(terminal_actions.clone()))
                         .into_any_element()
                 } else {
