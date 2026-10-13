@@ -1998,6 +1998,7 @@ impl MobileApp {
                 streaming: false,
                 reasoning_content: None,
                 reasoning_expanded: false,
+                retry_prompt: None,
             });
             active.transcript.sync(
                 self.client.messages.clone(),
@@ -2070,6 +2071,7 @@ impl MobileApp {
                 streaming: false,
                 reasoning_content: None,
                 reasoning_expanded: false,
+                retry_prompt: None,
             });
             active.transcript.sync(
                 self.client.messages.clone(),

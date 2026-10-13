@@ -417,8 +417,7 @@ pub fn automation_screen(
                     .min_h_0().overflow_y_scrollbar().child(list)))
                 .when(!view.compact || !show_list, |body| body.child(div().id("automation-detail-scroll")
                     .debug_selector(|| "automation-content".into()).flex_1().min_w_0().min_h_0().overflow_y_scrollbar()
-                    // Rebuild retained text measurements after filtering; preserve the scroll owner.
-                    .child(content.id(SharedString::from(format!("automation-detail-content-{}", view.query)))))))
+                    .child(content))))
 }
 
 /// An automation identity, schedule, and last outcome. Selection stays in the host.
