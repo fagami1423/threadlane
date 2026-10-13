@@ -369,28 +369,29 @@ impl TerminalToolbar {
             (
                 "terminal-clear-btn",
                 "Clear terminal",
-                IconName::Undo2,
+                // Not undo/redo arrows: these actions erase output and restart the shell.
+                Icon::default().path("icons/eraser.svg"),
                 None,
                 TerminalAction::Clear,
             ),
             (
                 "terminal-restart-btn",
                 "Restart shell",
-                IconName::Redo,
+                Icon::default().path("icons/rotate-cw.svg"),
                 None,
                 TerminalAction::Restart,
             ),
             (
                 "terminal-find-btn",
                 self.find_hint.as_ref(),
-                IconName::Search,
+                Icon::new(IconName::Search),
                 Some("Find"),
                 TerminalAction::Find,
             ),
             (
                 "terminal-open-link",
                 "Open link… — Links in visible output",
-                IconName::ExternalLink,
+                Icon::new(IconName::ExternalLink),
                 Some("Open link…"),
                 TerminalAction::OpenLinks,
             ),
