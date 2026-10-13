@@ -50,7 +50,7 @@ impl<S: TrajectorySource> TrajectoryView<S> {
     pub fn new(source: S, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let trajectory_list_state = ListState::new(0, ListAlignment::Top, window.rem_size() * 25.0);
         let trajectory_search_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Search trajectory…"));
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search…"));
         let sub = cx.observe(&trajectory_search_input, |this, input, cx| {
             this.trajectory_search = input.read(cx).value().to_lowercase();
             cx.notify();
@@ -840,6 +840,9 @@ impl<S: TrajectorySource> TrajectoryView<S> {
                     ),
             );
         let stats_bar = crate::trajectory_stats(&cache.summary, cx);
+        // With no events in this mode, the blank meter and all-zero stats say nothing. The
+        // toolbar stays: another mode or a filter reset may be the way back to events.
+        let has_events = !cache.all_entries.is_empty();
 
         let layout_view = cx.entity().downgrade();
         div()
@@ -851,9 +854,13 @@ impl<S: TrajectorySource> TrajectoryView<S> {
             .min_h_0()
             .flex()
             .flex_col()
-            .child(overview)
+            .when(has_events, |panel| {
+                panel.child(overview.debug_selector(|| "trajectory-overview".into()))
+            })
             .child(toolbar)
-            .child(stats_bar)
+            .when(has_events, |panel| {
+                panel.child(stats_bar.debug_selector(|| "trajectory-stats".into()))
+            })
             .child(
                 div()
                     .flex_1()

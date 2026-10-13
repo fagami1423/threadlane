@@ -6635,6 +6635,9 @@ fn trajectory_empty_stream_keeps_recovery_controls_reachable(cx: &mut gpui::Test
     for selector in ["trajectory-empty-state", "trajectory-mode-filter", "trajectory-category-filter"] {
         assert!(cx.debug_bounds(selector).is_some(), "{selector} remains visible without events");
     }
+    for selector in ["trajectory-overview", "trajectory-stats"] {
+        assert!(cx.debug_bounds(selector).is_none(), "{selector} is hidden without events");
+    }
 }
 
 #[gpui::test]
