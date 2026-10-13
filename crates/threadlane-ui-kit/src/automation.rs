@@ -507,6 +507,13 @@ pub fn automation_run_row(
         run.definition.name,
         display_time(run.created_at, run.definition.schedule.timezone())
     );
+    let open_label = match run.status {
+        RunStatus::WaitingPermission => "Review request",
+        RunStatus::WaitingAnswer => "Answer question",
+        RunStatus::Failed | RunStatus::Interrupted => "Inspect run",
+        RunStatus::Succeeded if !run.reviewed => "Review result",
+        _ => "Open chat",
+    };
     let mut row = div()
                     .id(SharedString::from(format!("automation-run-{id}")))
                     .debug_selector({ let id = id.clone(); move || format!("automation-run-{id}") })
@@ -532,17 +539,11 @@ pub fn automation_run_row(
                             .child(
                                 Button::new(SharedString::from(format!("open-{id}")))
                                     .small()
-                                    .label(match run.status {
-                                        RunStatus::WaitingPermission => "Review request",
-                                        RunStatus::WaitingAnswer => "Answer question",
-                                        RunStatus::Failed | RunStatus::Interrupted => "Inspect run",
-                                        RunStatus::Succeeded if !run.reviewed => "Review result",
-                                        _ => "Open chat",
-                                    })
+                                    .label(open_label)
                                     .accessibility_label(if run.session_file.is_some() {
-                                        format!("Open chat for {run_label}")
+                                        format!("{open_label} for {run_label}")
                                     } else {
-                                        format!("Open chat for {run_label}, unavailable because this run has no chat yet")
+                                        format!("{open_label} for {run_label}, unavailable because this run has no chat yet")
                                     })
                                     .disabled(run.session_file.is_none())
                                     .on_click(request(&on_action, AutomationAction::OpenChat(id))),
