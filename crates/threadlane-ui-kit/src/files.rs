@@ -10,12 +10,17 @@ pub fn project_files_surface() -> Div {
     div().flex_1().min_w_0().min_h_0().flex().flex_col().py_2()
 }
 
+/// Reads as the tree's search field: an outlined row with a search icon.
+/// A ghost button stretched by the column centered its label and looked like stray text.
 pub fn project_files_find_button() -> Button {
     Button::new("find-in-files")
         .debug_selector(|| "find-in-files".into())
+        .icon(IconName::Search)
         .label("Find in files…")
-        .ghost()
+        .outline()
         .small()
+        .mx_2()
+        .mb_1()
 }
 
 pub fn project_file_row(
