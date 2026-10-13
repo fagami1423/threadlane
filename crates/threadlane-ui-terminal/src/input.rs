@@ -122,7 +122,7 @@ fn control_character(key: &str, key_char: Option<&str>) -> Option<u8> {
         "\\" => Some(0x1c),
         "]" => Some(0x1d),
         "^" => Some(0x1e),
-        "_" => Some(0x1f),
+        "_" | "/" | "-" => Some(0x1f),
         "?" => Some(0x7f),
         _ => {
             control_character_from_byte(key_char.and_then(|text| text.as_bytes().first().copied()))
@@ -137,7 +137,7 @@ fn control_character_from_byte(byte: Option<u8>) -> Option<u8> {
         Some(b'\\') => Some(0x1c),
         Some(b']') => Some(0x1d),
         Some(b'^') => Some(0x1e),
-        Some(b'_') => Some(0x1f),
+        Some(b'_') | Some(b'/') | Some(b'-') => Some(0x1f),
         Some(b'?') => Some(0x7f),
         _ => None,
     }
@@ -364,6 +364,22 @@ mod tests {
         assert_eq!(
             encode_key("[", None, modifiers(true, false, false), false),
             Some(vec![0x1b])
+        );
+        assert_eq!(
+            encode_key("/", None, modifiers(true, false, false), false),
+            Some(vec![0x1f])
+        );
+        assert_eq!(
+            encode_key("-", None, modifiers(true, false, false), false),
+            Some(vec![0x1f])
+        );
+        assert_eq!(
+            encode_key("slash", Some("/"), modifiers(true, false, false), false),
+            Some(vec![0x1f])
+        );
+        assert_eq!(
+            encode_key("minus", Some("-"), modifiers(true, false, false), false),
+            Some(vec![0x1f])
         );
         assert_eq!(
             encode_key("?", Some("?"), modifiers(true, false, false), false),

@@ -728,6 +728,7 @@ pub struct TerminalView {
     frame_epoch: u64,
     dismissed_link_focus: Option<FocusHandle>,
     context_link: Option<(String, u64)>,
+    context_menu_suppressed: bool,
     project: PathBuf,
     focus_handle: FocusHandle,
     screen: vt100::Screen,
@@ -832,6 +833,7 @@ impl TerminalView {
             frame_epoch: 0,
             dismissed_link_focus: None,
             context_link: None,
+            context_menu_suppressed: false,
             project,
             focus_handle: cx.focus_handle(),
             screen: vt100::Parser::new(DEFAULT_ROWS, DEFAULT_COLS, 0)
@@ -1317,6 +1319,9 @@ impl TerminalView {
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         move |menu, window, cx| {
             let view = terminal.read(cx);
+            if view.context_menu_suppressed {
+                return menu;
+            }
             let output = view.screen_text();
             let selection = view.selected_text();
             let presentation = kit::TerminalOutputMenu::new(view.font_size)
@@ -1455,7 +1460,16 @@ impl TerminalView {
         if !self.mouse_reporting_active() {
             return;
         }
-        let Some(cell) = self.report_cell_at(position) else {
+        let cell = match kind {
+            input::MouseEventKind::Release
+            | input::MouseEventKind::Motion {
+                button: Some(_), ..
+            } => self.cell_at(position),
+            input::MouseEventKind::Press | input::MouseEventKind::Motion { button: None } => {
+                self.report_cell_at(position)
+            }
+        };
+        let Some(cell) = cell else {
             return;
         };
         if matches!(kind, input::MouseEventKind::Motion { .. })
@@ -1481,6 +1495,9 @@ impl TerminalView {
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.last_mouse_cell = None;
+        self.context_menu_suppressed = event.button == MouseButton::Right
+            && !event.modifiers.shift
+            && self.mouse_reporting_active();
         if !event.modifiers.shift && self.mouse_reporting_active() {
             self.focus_handle.focus(window, cx);
             if let Some(button) = terminal_mouse_button(event.button) {
@@ -2154,12 +2171,8 @@ impl Render for TerminalView {
                     .on_mouse_up(MouseButton::Middle, cx.listener(Self::mouse_up))
                     .on_mouse_up(MouseButton::Right, cx.listener(Self::mouse_up))
                     .children(autoscroll_pill);
-                if !self.mouse_reporting_active() {
-                    grid.context_menu(Self::output_context_menu(terminal_actions.clone()))
-                        .into_any_element()
-                } else {
-                    grid.into_any_element()
-                }
+                grid.context_menu(Self::output_context_menu(terminal_actions.clone()))
+                    .into_any_element()
             })
             .children(status_banner)
     }

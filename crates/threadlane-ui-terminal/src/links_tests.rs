@@ -234,13 +234,19 @@ fn terminal_dispatches_mouse_reports_and_keeps_local_interactions(cx: &mut TestA
     let sink = written.clone();
     terminal.update(cx, |terminal, _| {
         terminal.session = Some(Box::new(RecordingIo(sink)));
-        output(terminal, "\x1b[?1000h\x1b[?1006hword other");
+        output(terminal, "\x1b[?1002h\x1b[?1006hword other");
     });
     cx.run_until_parked();
     let position = terminal.read_with(cx, |terminal, _| {
         terminal.screen_bounds.unwrap().origin + gpui::point(gpui::px(16.), gpui::px(16.))
     });
     let cell = terminal.read_with(cx, |terminal, _| terminal.report_cell_at(position).unwrap());
+    cx.update(|window, app| window.draw(app).clear(app));
+    cx.simulate_event(MouseMoveEvent {
+        position,
+        ..Default::default()
+    });
+    cx.run_until_parked();
     cx.update(|window, app| window.draw(app).clear(app));
 
     cx.simulate_event(MouseDownEvent {
@@ -270,6 +276,47 @@ fn terminal_dispatches_mouse_reports_and_keeps_local_interactions(cx: &mut TestA
         &*written.lock().unwrap(),
         expected.as_bytes(),
         "mouse down/up must use SGR press and release reports"
+    );
+
+    written.lock().unwrap().clear();
+    let (padding, padding_cell) = terminal.read_with(cx, |terminal, _| {
+        let bounds = terminal.screen_bounds.unwrap();
+        let padding = bounds.origin + gpui::point(bounds.size.width - gpui::px(1.), gpui::px(16.));
+        assert!(
+            terminal.report_cell_at(padding).is_none(),
+            "drag endpoint should be in inset padding"
+        );
+        (padding, terminal.cell_at(padding).unwrap())
+    });
+    cx.update(|window, app| window.draw(app).clear(app));
+    cx.simulate_event(MouseDownEvent {
+        position,
+        button: MouseButton::Left,
+        ..Default::default()
+    });
+    cx.simulate_event(MouseMoveEvent {
+        position: padding,
+        pressed_button: Some(MouseButton::Left),
+        modifiers: Default::default(),
+    });
+    cx.simulate_event(MouseUpEvent {
+        position: padding,
+        button: MouseButton::Left,
+        ..Default::default()
+    });
+    let drag_expected = format!(
+        "\x1b[<0;{};{}M\x1b[<32;{};{}M\x1b[<0;{};{}m",
+        cell.1 + 1,
+        cell.0 + 1,
+        padding_cell.1 + 1,
+        padding_cell.0 + 1,
+        padding_cell.1 + 1,
+        padding_cell.0 + 1,
+    );
+    assert_eq!(
+        &*written.lock().unwrap(),
+        drag_expected.as_bytes(),
+        "drag and release in grid padding must report bounded SGR cells"
     );
 
     written.lock().unwrap().clear();
@@ -313,7 +360,7 @@ fn terminal_dispatches_mouse_reports_and_keeps_local_interactions(cx: &mut TestA
 
     terminal.update(cx, |terminal, _| {
         let mut parser = vt100::Parser::new(terminal.rows, terminal.cols, 20);
-        parser.process(b"\x1b[?1000h\x1b[?1006h");
+        parser.process(b"\x1b[?1002h\x1b[?1006h");
         for index in 0..=terminal.rows {
             parser.process(format!("line{index}\r\n").as_bytes());
         }
@@ -339,6 +386,108 @@ fn terminal_dispatches_mouse_reports_and_keeps_local_interactions(cx: &mut TestA
         terminal.read_with(cx, |terminal, _| terminal.scrollback_offset) > before_offset,
         "scrollback wheel input must remain local"
     );
+}
+
+#[gpui::test]
+fn terminal_context_menu_respects_shift_while_mouse_reporting(cx: &mut TestAppContext) {
+    let (terminal, cx) = terminal(cx);
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let sink = written.clone();
+    terminal.update(cx, |terminal, _| {
+        terminal.session = Some(Box::new(RecordingIo(sink)));
+        output(terminal, "\x1b[?1000h\x1b[?1006hmenu output");
+    });
+    cx.run_until_parked();
+    let position = terminal.read_with(cx, |terminal, _| {
+        terminal.screen_bounds.unwrap().origin + gpui::point(gpui::px(16.), gpui::px(16.))
+    });
+    let cell = terminal.read_with(cx, |terminal, _| terminal.report_cell_at(position).unwrap());
+    let terminal_focus = terminal.read_with(cx, |terminal, cx| terminal.focus_handle(cx));
+    cx.update(|window, app| window.draw(app).clear(app));
+
+    cx.simulate_event(MouseDownEvent {
+        position,
+        button: MouseButton::Right,
+        ..Default::default()
+    });
+    cx.run_until_parked();
+    cx.update(|window, app| {
+        window.draw(app).clear(app);
+        assert!(
+            terminal_focus.is_focused(window),
+            "unmodified right-click must keep focus in the terminal"
+        );
+    });
+    cx.simulate_event(MouseUpEvent {
+        position,
+        button: MouseButton::Right,
+        ..Default::default()
+    });
+    cx.run_until_parked();
+    cx.update(|window, app| window.draw(app).clear(app));
+    let expected = format!(
+        "\x1b[<2;{};{}M\x1b[<2;{};{}m",
+        cell.1 + 1,
+        cell.0 + 1,
+        cell.1 + 1,
+        cell.0 + 1
+    );
+    assert_eq!(&*written.lock().unwrap(), expected.as_bytes());
+
+    written.lock().unwrap().clear();
+    let shift = Modifiers {
+        shift: true,
+        ..Default::default()
+    };
+    cx.simulate_mouse_move(position, None, shift);
+    cx.simulate_event(MouseDownEvent {
+        position,
+        button: MouseButton::Right,
+        modifiers: shift,
+        ..Default::default()
+    });
+    cx.run_until_parked();
+    cx.update(|window, app| {
+        window.draw(app).clear(app);
+        assert!(
+            !terminal_focus.is_focused(window),
+            "Shift-right-click must transfer focus to the local menu"
+        );
+    });
+    cx.simulate_event(MouseUpEvent {
+        position,
+        button: MouseButton::Right,
+        modifiers: shift,
+        ..Default::default()
+    });
+    cx.run_until_parked();
+    cx.update(|window, app| window.draw(app).clear(app));
+    assert!(
+        written.lock().unwrap().is_empty(),
+        "Shift-right-click must not report mouse input to the TUI"
+    );
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|window, _| {
+        assert!(
+            terminal_focus.is_focused(window),
+            "Escape must restore focus from the local menu to the terminal"
+        );
+    });
+
+    cx.simulate_event(MouseDownEvent {
+        position,
+        button: MouseButton::Right,
+        ..Default::default()
+    });
+    cx.simulate_event(MouseUpEvent {
+        position,
+        button: MouseButton::Right,
+        ..Default::default()
+    });
+    cx.run_until_parked();
+    assert_eq!(&*written.lock().unwrap(), expected.as_bytes());
 }
 
 #[gpui::test]

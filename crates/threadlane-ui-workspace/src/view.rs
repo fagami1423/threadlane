@@ -950,12 +950,17 @@ impl WorkspaceView {
         view
     }
 
+    fn reveal_right_panel(&mut self) {
+        self.terminal_maximized = false;
+        self.right_panel_visible = true;
+    }
+
     fn open_git_review(&mut self, cx: &mut Context<Self>) {
         self.model.update(cx, |state, cx| {
             state.workspace_page = WorkspacePage::Chat;
             cx.notify();
         });
-        self.right_panel_visible = true;
+        self.reveal_right_panel();
         self.right_panel.update(cx, |panel, cx| {
             panel.open_review(cx);
         });
@@ -968,7 +973,7 @@ impl WorkspaceView {
             state.workspace_page = WorkspacePage::Chat;
             cx.notify();
         });
-        self.right_panel_visible = true;
+        self.reveal_right_panel();
         self.right_panel.update(cx, |panel, cx| {
             panel.open_surface(threadlane_ui_right_panel::Surface::Agents, cx);
         });
@@ -980,7 +985,7 @@ impl WorkspaceView {
             state.workspace_page = WorkspacePage::Chat;
             cx.notify();
         });
-        self.right_panel_visible = true;
+        self.reveal_right_panel();
         self.right_panel.update(cx, |panel, cx| {
             panel.open_surface(threadlane_ui_right_panel::Surface::Trajectory, cx);
         });
@@ -992,7 +997,7 @@ impl WorkspaceView {
             state.workspace_page = WorkspacePage::Chat;
             cx.notify();
         });
-        self.right_panel_visible = true;
+        self.reveal_right_panel();
         self.right_panel.update(cx, |panel, cx| {
             panel.open_branch_popover(cx);
         });
@@ -1005,7 +1010,7 @@ impl WorkspaceView {
             state.workspace_page = WorkspacePage::Chat;
             cx.notify();
         });
-        self.right_panel_visible = true;
+        self.reveal_right_panel();
         self.right_panel.update(cx, |panel, cx| {
             panel.open_new_branch_dialog(window, cx);
         });
@@ -1018,7 +1023,7 @@ impl WorkspaceView {
             state.workspace_page = WorkspacePage::Chat;
             cx.notify();
         });
-        self.right_panel_visible = true;
+        self.reveal_right_panel();
         self.right_panel.update(cx, |panel, cx| {
             panel.open_merge_dialog(window, cx);
         });
@@ -1120,8 +1125,7 @@ impl WorkspaceView {
                 });
                 match result {
                     Ok(()) => {
-                        self.right_panel_visible = true;
-                        self.terminal_maximized = false;
+                        self.reveal_right_panel();
                         cx.notify();
                     }
                     Err(error) => {
@@ -1689,7 +1693,7 @@ impl WorkspaceView {
                 return; // keep palette open in the new mode
             }
             "open_file" => {
-                self.right_panel_visible = true;
+                self.reveal_right_panel();
                 self.right_panel.update(cx, |panel, cx| {
                     panel.open_surface(threadlane_ui_right_panel::Surface::Files, cx);
                 });
@@ -2936,7 +2940,7 @@ impl Render for WorkspaceView {
             ))
             .on_action(
                 cx.listener(|this, _: &threadlane_ui_chat::OpenWorkspaceFiles, _, cx| {
-                    this.right_panel_visible = true;
+                    this.reveal_right_panel();
                     this.right_panel.update(cx, |panel, cx| {
                         panel.open_surface(threadlane_ui_right_panel::Surface::Files, cx);
                     });
@@ -3034,6 +3038,50 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use threadlane_git::GitStatus;
+
+    #[gpui::test]
+    fn destination_panel_opens_restore_terminal_from_maximized_state(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{AppContext as _, Context, IntoElement, Render, Window};
+        use gpui_component::Root;
+
+        struct EmptyHost;
+        impl Render for EmptyHost {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                gpui::div()
+            }
+        }
+
+        cx.update(gpui_component::init);
+        let (_, cx) =
+            cx.add_window_view(|window, cx| Root::new(cx.new(|_| EmptyHost), window, cx));
+        let workspace = cx.update(|window, cx| {
+            super::session_switcher::interaction_tests::workspace(AppState::for_tests(), window, cx)
+        });
+
+        cx.update(|_, cx| {
+            workspace.update(cx, |view, cx| {
+                view.terminal_maximized = true;
+                view.right_panel_visible = false;
+                view.open_git_review(cx);
+                assert!(!view.terminal_maximized);
+                assert!(view.right_panel_visible);
+
+                view.terminal_maximized = true;
+                view.right_panel_visible = false;
+                view.open_agents_panel(cx);
+                assert!(!view.terminal_maximized);
+                assert!(view.right_panel_visible);
+
+                view.terminal_maximized = true;
+                view.right_panel_visible = false;
+                view.open_trajectory_panel(cx);
+                assert!(!view.terminal_maximized);
+                assert!(view.right_panel_visible);
+            });
+        });
+    }
 
     #[gpui::test]
     fn quit_uses_close_guard_with_and_without_a_focused_window(cx: &mut gpui::TestAppContext) {
