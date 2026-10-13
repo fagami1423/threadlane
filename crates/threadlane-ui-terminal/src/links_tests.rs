@@ -4,6 +4,7 @@ use gpui::{
     MouseMoveEvent, MouseUpEvent, TestAppContext,
 };
 use std::{cell::RefCell, path::PathBuf, rc::Rc};
+use std::sync::{Arc, Mutex};
 
 fn output(terminal: &mut TerminalView, text: &str) {
     let mut parser = vt100::Parser::new(terminal.rows, terminal.cols, 20);
@@ -192,6 +193,91 @@ fn links_clear_and_resize_reject_queued_frames_and_old_menu_actions(cx: &mut Tes
     });
     cx.run_until_parked();
     assert!(opened.borrow().is_empty());
+}
+
+#[gpui::test]
+fn terminal_dispatches_modified_keys_to_the_io_and_keeps_shift_navigation_local(
+    cx: &mut TestAppContext,
+) {
+    use gpui::Focusable as _;
+
+    struct RecordingIo(Arc<Mutex<Vec<u8>>>);
+    impl super::TerminalIo for RecordingIo {
+        fn write(&self, bytes: &[u8]) {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+        }
+
+        fn resize(&self, _: u16, _: u16) {}
+    }
+
+    let (terminal, cx) = terminal(cx);
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let sink = written.clone();
+    terminal.update(cx, |terminal, _| {
+        terminal.session = Some(Box::new(RecordingIo(sink)));
+    });
+    cx.update(|window, app| {
+        terminal.read(app).focus_handle(app).focus(window, app);
+        window.draw(app).clear(app);
+    });
+    cx.simulate_keystrokes("ctrl-shift-up");
+    assert_eq!(&*written.lock().unwrap(), b"\x1b[1;6A");
+    cx.simulate_keystrokes("shift-up");
+    assert_eq!(&*written.lock().unwrap(), b"\x1b[1;6A");
+}
+
+#[gpui::test]
+fn terminal_multiclick_dispatch_selects_words_and_visible_lines(cx: &mut TestAppContext) {
+    let (terminal, cx) = terminal(cx);
+    terminal.update(cx, |terminal, _cx| output(terminal, "word other"));
+    cx.run_until_parked();
+    let position = terminal.read_with(cx, |terminal, _| {
+        terminal.screen_bounds.unwrap().origin + gpui::point(gpui::px(30.), gpui::px(16.))
+    });
+    cx.update(|window, app| window.draw(app).clear(app));
+    cx.simulate_event(MouseDownEvent {
+        position,
+        button: MouseButton::Left,
+        click_count: 2,
+        first_mouse: false,
+        ..Default::default()
+    });
+    assert_eq!(
+        terminal.read_with(cx, |terminal, _| terminal.selected_text()),
+        Some("word".to_string())
+    );
+
+    cx.update(|window, app| window.draw(app).clear(app));
+    let other_word = position + gpui::point(gpui::px(40.), gpui::px(0.));
+    cx.simulate_event(MouseMoveEvent {
+        position: other_word,
+        pressed_button: Some(MouseButton::Left),
+        modifiers: Default::default(),
+    });
+    assert_eq!(
+        terminal.read_with(cx, |terminal, _| terminal.selected_text()),
+        Some("word other".to_string())
+    );
+    cx.update(|window, app| window.draw(app).clear(app));
+    cx.simulate_event(MouseUpEvent {
+        position: other_word,
+        button: MouseButton::Left,
+        click_count: 2,
+        ..Default::default()
+    });
+
+    cx.update(|window, app| window.draw(app).clear(app));
+    cx.simulate_event(MouseDownEvent {
+        position,
+        button: MouseButton::Left,
+        click_count: 3,
+        first_mouse: false,
+        ..Default::default()
+    });
+    assert_eq!(
+        terminal.read_with(cx, |terminal, _| terminal.selected_text()),
+        Some("word other".to_string())
+    );
 }
 
 #[test]

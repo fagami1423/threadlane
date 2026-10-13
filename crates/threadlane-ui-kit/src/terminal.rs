@@ -175,6 +175,7 @@ pub enum TerminalAction {
     OpenLinks,
     AddSelectionToChat,
     Hide,
+    ToggleMaximize,
     RecreateWorktree,
     UseProjectFolder,
 }
@@ -226,6 +227,7 @@ pub struct TerminalToolbar {
     selection_hint: SharedString,
     find_hint: SharedString,
     hide_hint: SharedString,
+    maximized: Option<bool>,
 }
 
 impl TerminalToolbar {
@@ -240,6 +242,7 @@ impl TerminalToolbar {
             selection_hint: "Select terminal output first".into(),
             find_hint: "Find in terminal output".into(),
             hide_hint: "Hide terminal".into(),
+            maximized: None,
         }
     }
     /// Full shell working directory for the project chip's tooltip and
@@ -259,6 +262,11 @@ impl TerminalToolbar {
     }
     pub fn new_tab(mut self, enabled: bool) -> Self {
         self.new_tab = enabled;
+        self
+    }
+    /// Hosts opt in when the terminal can fill the workspace without ending its shell.
+    pub fn maximized(mut self, maximized: bool) -> Self {
+        self.maximized = Some(maximized);
         self
     }
     pub fn selection(mut self, enabled: bool, hint: impl Into<SharedString>) -> Self {
@@ -283,6 +291,7 @@ impl TerminalToolbar {
         let callback = Rc::new(on_request);
         let new_tab = callback.clone();
         let hide = callback.clone();
+        let maximize = callback.clone();
         let theme = cx.theme().colors;
         let project_hint = self
             .project_hint
@@ -310,7 +319,7 @@ impl TerminalToolbar {
                     .child(
                         Icon::new(IconName::SquareTerminal)
                             .xsmall()
-                            .text_color(theme.primary),
+                            .text_color(theme.muted_foreground),
                     )
                     .child(
                         div()
@@ -360,6 +369,23 @@ impl TerminalToolbar {
                     .icon(IconName::Plus)
                     .on_click(move |_, window, cx| new_tab(TerminalAction::NewTab, window, cx))
             }))
+            .children(self.maximized.map(|maximized| {
+                action_button(
+                    "terminal-maximize-btn",
+                    if maximized {
+                        "Restore terminal size"
+                    } else {
+                        "Maximize terminal"
+                    },
+                )
+                .icon(if maximized {
+                    IconName::Minimize
+                } else {
+                    IconName::Maximize
+                })
+                .selected(maximized)
+                .on_click(move |_, window, cx| maximize(TerminalAction::ToggleMaximize, window, cx))
+            }))
             .child(
                 action_button("terminal-close-panel-btn", self.hide_hint)
                     .icon(IconName::Close)
@@ -392,7 +418,7 @@ impl TerminalToolbar {
                 "terminal-open-link",
                 "Open link… — Links in visible output",
                 Icon::new(IconName::ExternalLink),
-                Some("Open link…"),
+                Some("Links…"),
                 TerminalAction::OpenLinks,
             ),
         ]
@@ -422,7 +448,7 @@ impl TerminalToolbar {
                     .child(
                         action_button("terminal-add-selection-to-chat", selection_hint)
                             .icon(Icon::default().path("icons/square-pen.svg"))
-                            .label("Add selection to chat")
+                            .label("Add to chat")
                             .disabled(!self.selection_enabled)
                             .on_click(move |_, window, cx| {
                                 if self.selection_enabled {

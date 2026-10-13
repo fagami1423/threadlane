@@ -17,6 +17,7 @@ actions!(
         SwitchSession,
         ToggleRightPanel,
         ToggleTerminal,
+        ToggleTerminalMaximize,
         OpenSettings,
         CancelActiveGeneration,
         SelectChatTab,
@@ -165,6 +166,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-r", ToggleRightPanel, None),
         KeyBinding::new("cmd-j", ToggleTerminal, None),
         KeyBinding::new("ctrl-j", ToggleTerminal, None),
+        KeyBinding::new("cmd-shift-j", ToggleTerminalMaximize, None),
+        KeyBinding::new("ctrl-shift-j", ToggleTerminalMaximize, None),
         KeyBinding::new("cmd-n", BeginNewTask, None),
         KeyBinding::new("ctrl-n", BeginNewTask, None),
         KeyBinding::new("cmd-1", SelectChatTab, None),
@@ -413,6 +416,7 @@ pub struct WorkspaceView {
     sidebar_collapsed: bool,
     right_panel_visible: bool,
     bottom_panel_visible: bool,
+    terminal_maximized: bool,
     command_palette_open: bool,
     command_palette_previous_focus: Option<FocusHandle>,
     command_state: Entity<CommandState>,
@@ -808,6 +812,7 @@ impl WorkspaceView {
                 sidebar_collapsed: false,
                 right_panel_visible: false,
                 bottom_panel_visible: false,
+                terminal_maximized: false,
                 command_palette_open: false,
                 command_palette_previous_focus: None,
                 command_state,
@@ -1116,6 +1121,7 @@ impl WorkspaceView {
                 match result {
                     Ok(()) => {
                         self.right_panel_visible = true;
+                        self.terminal_maximized = false;
                         cx.notify();
                     }
                     Err(error) => {
@@ -1471,6 +1477,9 @@ impl WorkspaceView {
             return;
         }
         match action {
+            TerminalAction::ToggleMaximize => {
+                self.toggle_terminal_maximize_action(&ToggleTerminalMaximize, window, cx);
+            }
             TerminalAction::NewTab => {
                 if let Some(project) = project {
                     self.add_terminal_tab(project.clone(), cwd.unwrap_or(project), window, cx);
@@ -1485,6 +1494,7 @@ impl WorkspaceView {
                 terminal.update(cx, |terminal, cx| terminal.open_links(window, cx))
             }
             TerminalAction::AddSelectionToChat => {
+                self.terminal_maximized = false;
                 self.add_terminal_selection_to_chat(terminal, project, window, cx)
             }
             _ => {}
@@ -2356,6 +2366,29 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn toggle_terminal_maximize_action(
+        &mut self,
+        _: &ToggleTerminalMaximize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.model.read(cx).workspace_page != WorkspacePage::Chat
+            || self.model.read(cx).active_worktree_unavailable()
+        {
+            return;
+        }
+        if !self.bottom_panel_visible {
+            self.toggle_terminal_action(&ToggleTerminal, window, cx);
+            self.terminal_maximized = true;
+        } else {
+            self.terminal_maximized = !self.terminal_maximized;
+        }
+        if let Some((_, terminal)) = self.displayed_terminal(cx) {
+            terminal.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
     fn begin_new_task_action(
         &mut self,
         _: &BeginNewTask,
@@ -2539,8 +2572,10 @@ impl Render for WorkspaceView {
         let review_focus = layout.right_panel_focus;
         let visible_panels = [
             workspace_page != WorkspacePage::Settings && show_sidebar,
-            workspace_page == WorkspacePage::Chat && self.right_panel_visible && !review_focus,
-            workspace_page == WorkspacePage::Chat && self.bottom_panel_visible,
+            workspace_page == WorkspacePage::Chat && self.right_panel_visible && !review_focus
+                && !(self.bottom_panel_visible && self.terminal_maximized),
+            workspace_page == WorkspacePage::Chat && self.bottom_panel_visible
+                && (!self.terminal_maximized || terminal_unavailable),
         ];
         let panel_layout = (viewport, rem, visible_panels);
         if self.panel_layout != Some(panel_layout) {
@@ -2603,7 +2638,7 @@ impl Render for WorkspaceView {
 
         let chat_page_content = {
         self.right_panel.update(cx, |panel, cx| {
-            panel.set_visible(self.right_panel_visible, cx);
+            panel.set_visible(self.right_panel_visible && !(self.bottom_panel_visible && self.terminal_maximized), cx);
         });
             let upper_content = if review_focus {
                 threadlane_ui_kit::workspace_right_panel_focus(
@@ -2730,6 +2765,7 @@ impl Render for WorkspaceView {
                     let terminal = active_terminal.clone();
                     let owner = cx.entity().clone();
                     let toolbar = threadlane_ui_kit::TerminalToolbar::new(shell_cwd_label(&shell_cwd))
+                        .maximized(self.terminal_maximized)
                         .path_hint(shell_cwd.display().to_string())
                         .worktree(worktree_shell)
                         .tabs(tab_buttons)
@@ -2766,6 +2802,9 @@ impl Render for WorkspaceView {
                         .child(toolbar)
                         .child(div().flex_1().min_h_0().child(active_terminal));
 
+                    if self.terminal_maximized {
+                        terminal_panel.into_any_element()
+                    } else {
                     threadlane_ui_kit::workspace_terminal_split(
                         &self.bottom_panel_resizable_state,
                         upper_content,
@@ -2781,6 +2820,7 @@ impl Render for WorkspaceView {
                         }),
                     )
                     .into_any_element()
+                    }
                 }
             } else {
                 upper_content
@@ -2905,6 +2945,7 @@ impl Render for WorkspaceView {
             )
             .on_action(cx.listener(Self::switch_session_action))
             .on_action(cx.listener(Self::toggle_terminal_action))
+            .on_action(cx.listener(Self::toggle_terminal_maximize_action))
             .on_action(cx.listener(Self::begin_new_task_action))
             .on_action(cx.listener(Self::open_settings_action))
             .on_action(cx.listener(Self::activate_update))

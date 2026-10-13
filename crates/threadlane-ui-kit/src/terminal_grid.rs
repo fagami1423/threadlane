@@ -155,6 +155,127 @@ pub fn terminal_selected_excerpt(
     Some(screen.contents_between(start.0, start.1, end.0, end.1))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalSelectionGranularity {
+    Word,
+    Line,
+}
+
+/// Returns the range for a word or line drag while preserving the direction
+/// of the drag in the existing anchor/head selection representation.
+pub fn terminal_granular_selection(
+    screen: &vt100::Screen,
+    origin: (u16, u16),
+    head: (u16, u16),
+    cols: u16,
+    granularity: TerminalSelectionGranularity,
+) -> Option<((u16, u16), (u16, u16))> {
+    let origin_range = match granularity {
+        TerminalSelectionGranularity::Word => terminal_word_bounds(screen, origin, cols)?,
+        TerminalSelectionGranularity::Line => terminal_line_bounds(origin, head, cols),
+    };
+    let head_range = match granularity {
+        TerminalSelectionGranularity::Word => terminal_word_bounds(screen, head, cols)?,
+        TerminalSelectionGranularity::Line => terminal_line_bounds(origin, head, cols),
+    };
+    let origin_ix = usize::from(origin.0) * usize::from(cols) + usize::from(origin.1);
+    let head_ix = usize::from(head.0) * usize::from(cols) + usize::from(head.1);
+    let (start, end, reversed) = if head_ix >= origin_ix {
+        (origin_range.0, head_range.1, false)
+    } else {
+        (head_range.0, origin_range.1, true)
+    };
+    if start == end {
+        return None;
+    }
+    if reversed {
+        let anchor = (end.0, end.1.saturating_sub(1));
+        Some((anchor, start))
+    } else {
+        Some((start, end))
+    }
+}
+
+pub fn terminal_word_bounds(
+    screen: &vt100::Screen,
+    (row, col): (u16, u16),
+    cols: u16,
+) -> Option<((u16, u16), (u16, u16))> {
+    if row >= screen.size().0 || col >= cols {
+        return None;
+    }
+    let col = if screen
+        .cell(row, col)
+        .is_some_and(vt100::Cell::is_wide_continuation)
+    {
+        col.saturating_sub(1)
+    } else {
+        col
+    };
+    let class = terminal_word_class(screen.cell(row, col).map(vt100::Cell::contents));
+    let mut start = col;
+    while start > 0 && terminal_word_class_at(screen, row, start - 1) == class {
+        if screen
+            .cell(row, start - 1)
+            .is_some_and(vt100::Cell::is_wide_continuation)
+        {
+            start = start.saturating_sub(2);
+        } else {
+            start -= 1;
+        }
+    }
+    let mut end = col.saturating_add(1);
+    if screen.cell(row, col).is_some_and(vt100::Cell::is_wide) {
+        end = end.saturating_add(1);
+    }
+    while end < cols && terminal_word_class_at(screen, row, end) == class {
+        end += if screen.cell(row, end).is_some_and(vt100::Cell::is_wide) {
+            2
+        } else {
+            1
+        };
+    }
+    Some(((row, start), (row, end.min(cols))))
+}
+
+fn terminal_word_class_at(screen: &vt100::Screen, row: u16, col: u16) -> TerminalWordClass {
+    let cell = screen.cell(row, col);
+    let contents = if cell.is_some_and(vt100::Cell::is_wide_continuation) && col > 0 {
+        screen.cell(row, col - 1).map(vt100::Cell::contents)
+    } else {
+        cell.map(vt100::Cell::contents)
+    };
+    terminal_word_class(contents)
+}
+
+pub fn terminal_line_bounds(
+    origin: (u16, u16),
+    head: (u16, u16),
+    cols: u16,
+) -> ((u16, u16), (u16, u16)) {
+    let start = origin.0.min(head.0);
+    let end = origin.0.max(head.0);
+    ((start, 0), (end, cols))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalWordClass {
+    Whitespace,
+    Word,
+    Punctuation,
+}
+
+fn terminal_word_class(contents: Option<&str>) -> TerminalWordClass {
+    let character = contents.and_then(|text| text.chars().next()).unwrap_or(' ');
+    if character.is_whitespace() {
+        TerminalWordClass::Whitespace
+    } else if character.is_alphanumeric() || character == '_' {
+        TerminalWordClass::Word
+    } else {
+        TerminalWordClass::Punctuation
+    }
+}
+
 type GridLayoutCallback = Box<dyn FnOnce(Bounds<Pixels>, &mut Window, &mut App)>;
 
 /// A controlled viewport over a host-supplied parsed terminal frame.
@@ -496,5 +617,56 @@ mod tests {
     fn xterm_color_cube_uses_standard_channel_levels() {
         assert_eq!(ansi_index_to_hsla(17, false), rgb_to_hsla(0, 0, 95));
         assert_eq!(ansi_index_to_hsla(67, false), rgb_to_hsla(95, 135, 175));
+    }
+
+    #[test]
+    fn granular_selection_expands_words_lines_and_reverse_drags() {
+        let mut parser = vt100::Parser::new(3, 12, 0);
+        parser.process(b"foo.bar baz\nsecond row");
+        let screen = parser.screen();
+        assert_eq!(
+            super::terminal_word_bounds(screen, (0, 1), 12),
+            Some(((0, 0), (0, 3)))
+        );
+        assert_eq!(
+            super::terminal_word_bounds(screen, (0, 3), 12),
+            Some(((0, 3), (0, 4)))
+        );
+        let mut wide_parser = vt100::Parser::new(1, 8, 0);
+        wide_parser.process("界foo".as_bytes());
+        assert_eq!(
+            super::terminal_word_bounds(wide_parser.screen(), (0, 1), 8),
+            Some(((0, 0), (0, 5)))
+        );
+        assert_eq!(
+            super::terminal_granular_selection(
+                screen,
+                (0, 1),
+                (0, 5),
+                12,
+                super::TerminalSelectionGranularity::Word,
+            ),
+            Some(((0, 0), (0, 7)))
+        );
+        assert_eq!(
+            super::terminal_granular_selection(
+                screen,
+                (0, 5),
+                (0, 1),
+                12,
+                super::TerminalSelectionGranularity::Word,
+            ),
+            Some(((0, 6), (0, 0)))
+        );
+        assert_eq!(
+            super::terminal_granular_selection(
+                screen,
+                (0, 1),
+                (1, 2),
+                12,
+                super::TerminalSelectionGranularity::Line,
+            ),
+            Some(((0, 0), (1, 12)))
+        );
     }
 }
