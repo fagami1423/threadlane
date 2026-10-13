@@ -5,6 +5,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod search;
+mod input;
 mod links;
 #[cfg(test)]
 mod links_tests;
@@ -17,7 +18,7 @@ use gpui_component::menu::{ContextMenuExt, PopupMenu};
 use links::{visible_links, TerminalLink};
 pub use links::is_web_url;
 use gpui_component::WindowExt;
-use threadlane_ui_kit::{self as kit, TerminalFindAction, TerminalFindStatus};
+use threadlane_ui_kit::{self as kit, TerminalFindAction, TerminalFindStatus, TerminalSelectionGranularity};
 pub use threadlane_ui_kit::{CloseTerminalFind, FindInTerminalOutput, NextTerminalMatch, PreviousTerminalMatch, TerminalLinkDestination as LinkDestination};
 
 use search::{
@@ -59,6 +60,15 @@ fn terminal_frame_policy(saturated: bool) -> (Duration, usize) {
 
 fn terminal_parse_budget_exhausted(parsed_bytes: usize, parse_budget: usize) -> bool {
     parsed_bytes >= parse_budget
+}
+
+fn terminal_mouse_button(button: MouseButton) -> Option<input::TerminalMouseButton> {
+    match button {
+        MouseButton::Left => Some(input::TerminalMouseButton::Left),
+        MouseButton::Middle => Some(input::TerminalMouseButton::Middle),
+        MouseButton::Right => Some(input::TerminalMouseButton::Right),
+        MouseButton::Navigate(_) => None,
+    }
 }
 
 struct PtySession {
@@ -718,6 +728,7 @@ pub struct TerminalView {
     frame_epoch: u64,
     dismissed_link_focus: Option<FocusHandle>,
     context_link: Option<(String, u64)>,
+    context_menu_suppressed: bool,
     project: PathBuf,
     focus_handle: FocusHandle,
     screen: vt100::Screen,
@@ -731,6 +742,7 @@ pub struct TerminalView {
     screen_bounds: Option<Bounds<Pixels>>,
     selection_anchor: Option<(u16, u16)>,
     selection_head: Option<(u16, u16)>,
+    selection_granularity: Option<(TerminalSelectionGranularity, (u16, u16))>,
     cell_width: f32,
     content_inset: f32,
     font_size: f32,
@@ -739,8 +751,10 @@ pub struct TerminalView {
     cursor_visible: bool,
     scrollback_offset: usize,
     scroll_accumulator: f32,
+    mouse_wheel_accumulator: f32,
     scrollback_len: usize,
     alt_screen: bool,
+    last_mouse_cell: Option<(u16, u16)>,
     find: Option<TerminalFind>,
     /// Monotonic seed for find generations so a generation is never reused
     /// across find instances or shell restarts in this view: a delayed reply
@@ -819,6 +833,7 @@ impl TerminalView {
             frame_epoch: 0,
             dismissed_link_focus: None,
             context_link: None,
+            context_menu_suppressed: false,
             project,
             focus_handle: cx.focus_handle(),
             screen: vt100::Parser::new(DEFAULT_ROWS, DEFAULT_COLS, 0)
@@ -834,6 +849,7 @@ impl TerminalView {
             screen_bounds: None,
             selection_anchor: None,
             selection_head: None,
+            selection_granularity: None,
             cell_width: TERMINAL_CELL_WIDTH_FALLBACK,
             content_inset: 12.0, // Default p_3 until the first resolved window frame.
             font_size: TERMINAL_FONT_SIZE,
@@ -842,8 +858,10 @@ impl TerminalView {
             cursor_visible: true,
             scrollback_offset: 0,
             scroll_accumulator: 0.0,
+            mouse_wheel_accumulator: 0.0,
             scrollback_len: 0,
             alt_screen: false,
+            last_mouse_cell: None,
             find: None,
             find_generation_seed: 0,
         };
@@ -876,8 +894,10 @@ impl TerminalView {
         self.screen = vt100::Parser::new(self.rows, self.cols, 0).screen().clone();
         self.scrollback_offset = 0;
         self.scroll_accumulator = 0.0;
+        self.mouse_wheel_accumulator = 0.0;
         self.scrollback_len = 0;
         self.alt_screen = false;
+        self.last_mouse_cell = None;
         self.find = None;
         self.status = None;
         self.clear_selection();
@@ -895,6 +915,8 @@ impl TerminalView {
         }
         self.scrollback_offset = 0;
         self.scroll_accumulator = 0.0;
+        self.mouse_wheel_accumulator = 0.0;
+        self.last_mouse_cell = None;
         self.status = None;
         self.clear_selection();
         cx.notify();
@@ -949,6 +971,8 @@ impl TerminalView {
             return;
         }
         self.invalidate_links();
+        self.last_mouse_cell = None;
+        self.mouse_wheel_accumulator = 0.0;
         self.rows = rows;
         self.cols = cols;
         self.clear_selection();
@@ -1012,6 +1036,14 @@ impl TerminalView {
                     self.invalidate_links();
                     self.sync_link_frame();
                 }
+                if self.alt_screen != frame.alt_screen
+                    || self.screen.mouse_protocol_mode() != frame.screen.mouse_protocol_mode()
+                    || self.screen.mouse_protocol_encoding()
+                        != frame.screen.mouse_protocol_encoding()
+                {
+                    self.last_mouse_cell = None;
+                    self.mouse_wheel_accumulator = 0.0;
+                }
                 self.links = frame.links;
                 self.screen = frame.screen;
                 self.scrollback_offset = frame.scrollback;
@@ -1035,6 +1067,10 @@ impl TerminalView {
                 {
                     self.invalidate_links();
                     self.sync_link_frame();
+                }
+                if self.alt_screen != alt_screen {
+                    self.last_mouse_cell = None;
+                    self.mouse_wheel_accumulator = 0.0;
                 }
                 // Replies for an older query generation never land; the
                 // generation moves on every query edit and on close.
@@ -1099,13 +1135,12 @@ impl TerminalView {
         }
     }
 
-    fn paste(&self, text: String) {
-        if self.screen.bracketed_paste() {
-            self.send(b"\x1b[200~");
-            self.send(text.as_bytes());
-            self.send(b"\x1b[201~");
-        } else {
-            self.send(text.as_bytes());
+    fn paste(&mut self, text: String, cx: &mut Context<Self>) {
+        if let Some(bytes) = input::encode_paste(&text, self.screen.bracketed_paste()) {
+            self.clear_selection();
+            self.scroll_to_bottom(cx);
+            self.cursor_visible = true;
+            self.send(&bytes);
         }
     }
 
@@ -1123,7 +1158,7 @@ impl TerminalView {
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
 
-        if modifiers.shift {
+        if modifiers.shift && !modifiers.control && !modifiers.alt && !modifiers.platform {
             match key {
                 "pageup" => {
                     self.scroll_by((self.rows / 2).max(1) as f32, cx);
@@ -1159,9 +1194,9 @@ impl TerminalView {
             }
         }
 
-        if modifiers.platform && key.eq_ignore_ascii_case("v") {
+        if cfg!(target_os = "macos") && modifiers.platform && key.eq_ignore_ascii_case("v") {
             if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                self.paste(text);
+                self.paste(text, cx);
             }
             cx.stop_propagation();
             return;
@@ -1169,7 +1204,7 @@ impl TerminalView {
 
         // Platform copy shortcut: copy the selection when one exists, otherwise
         // fall through so the keystroke still sends ^C to the shell.
-        if modifiers.platform && key.eq_ignore_ascii_case("c") {
+        if cfg!(target_os = "macos") && modifiers.platform && key.eq_ignore_ascii_case("c") {
             if let Some(text) = self.selected_text() {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 cx.stop_propagation();
@@ -1179,88 +1214,38 @@ impl TerminalView {
             cx.stop_propagation();
             return;
         }
-
-        let bytes: Option<Vec<u8>> = if modifiers.control {
-            match key.to_ascii_lowercase().as_str() {
-                "v" if !modifiers.platform => cx
-                    .read_from_clipboard()
-                    .and_then(|item| item.text())
-                    .map(|text| {
-                        if self.screen.bracketed_paste() {
-                            [
-                                b"\x1b[200~".as_slice(),
-                                text.as_bytes(),
-                                b"\x1b[201~".as_slice(),
-                            ]
-                            .concat()
-                        } else {
-                            text.into_bytes()
-                        }
-                    }),
-                letter if letter.len() == 1 && letter.as_bytes()[0].is_ascii_lowercase() => {
-                    // Convert Ctrl+<letter> to the standard terminal control character.
-                    Some(vec![letter.as_bytes()[0] - b'a' + 1])
+        if !cfg!(target_os = "macos") && modifiers.control && modifiers.shift {
+            if key.eq_ignore_ascii_case("c") {
+                if let Some(text) = self.selected_text() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
-                _ => None,
+                cx.stop_propagation();
+                return;
             }
-        } else {
-            match key {
-                "enter" => Some(b"\r".to_vec()),
-                "backspace" => Some(vec![0x7f]),
-                "tab" => Some(b"\t".to_vec()),
-                "up" => Some(self.cursor_key(b'A', modifiers)),
-                "down" => Some(self.cursor_key(b'B', modifiers)),
-                "right" => Some(self.cursor_key(b'C', modifiers)),
-                "left" => Some(self.cursor_key(b'D', modifiers)),
-                "home" => Some(b"\x1b[H".to_vec()),
-                "end" => Some(b"\x1b[F".to_vec()),
-                "delete" => Some(b"\x1b[3~".to_vec()),
-                "pageup" => Some(b"\x1b[5~".to_vec()),
-                "pagedown" => Some(b"\x1b[6~".to_vec()),
-                "f1" => Some(b"\x1bOP".to_vec()),
-                "f2" => Some(b"\x1bOQ".to_vec()),
-                "f3" => Some(b"\x1bOR".to_vec()),
-                "f4" => Some(b"\x1bOS".to_vec()),
-                "f5" => Some(b"\x1b[15~".to_vec()),
-                "f6" => Some(b"\x1b[17~".to_vec()),
-                "f7" => Some(b"\x1b[18~".to_vec()),
-                "f8" => Some(b"\x1b[19~".to_vec()),
-                "f9" => Some(b"\x1b[20~".to_vec()),
-                "f10" => Some(b"\x1b[21~".to_vec()),
-                "f11" => Some(b"\x1b[23~".to_vec()),
-                "f12" => Some(b"\x1b[24~".to_vec()),
-                "escape" => Some(vec![0x1b]),
-                _ if !modifiers.platform => event.keystroke.key_char.as_ref().map(|text| {
-                    let mut bytes = Vec::with_capacity(text.len() + usize::from(modifiers.alt));
-                    if modifiers.alt {
-                        bytes.push(0x1b);
-                    }
-                    bytes.extend_from_slice(text.as_bytes());
-                    bytes
-                }),
-                _ => None,
+            if key.eq_ignore_ascii_case("v") {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    self.paste(text, cx);
+                }
+                cx.stop_propagation();
+                return;
             }
-        };
+        }
+
+        let bytes = input::encode_key(
+            key,
+            event.keystroke.key_char.as_deref(),
+            modifiers,
+            self.screen.application_cursor(),
+        );
 
         if let Some(bytes) = bytes {
+            if !modifiers.control && !modifiers.alt && !modifiers.platform {
+                self.clear_selection();
+                self.scroll_to_bottom(cx);
+                self.cursor_visible = true;
+            }
             self.send(&bytes);
             cx.stop_propagation();
-        }
-    }
-
-    fn cursor_key(&self, key: u8, modifiers: Modifiers) -> Vec<u8> {
-        let modifier = 1
-            + u8::from(modifiers.shift)
-            + 2 * u8::from(modifiers.alt)
-            + 4 * u8::from(modifiers.control);
-        if modifier == 1 {
-            if self.screen.application_cursor() {
-                vec![0x1b, b'O', key]
-            } else {
-                vec![0x1b, b'[', key]
-            }
-        } else {
-            format!("\x1b[1;{modifier}{}", key as char).into_bytes()
         }
     }
 
@@ -1328,6 +1313,73 @@ impl TerminalView {
             },
         )
     }
+
+    fn output_context_menu(
+        terminal: Entity<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        move |menu, window, cx| {
+            let view = terminal.read(cx);
+            if view.context_menu_suppressed {
+                return menu;
+            }
+            let output = view.screen_text();
+            let selection = view.selected_text();
+            let presentation = kit::TerminalOutputMenu::new(view.font_size)
+                .compact(view.compact)
+                .blend(view.translucent_background)
+                .selection(selection.is_some());
+            let menu = if let Some((url, epoch)) = view.context_link.clone() {
+                Self::link_commands(menu, url, terminal.downgrade(), epoch).separator()
+            } else {
+                menu
+            };
+            let terminal = terminal.clone();
+            presentation.render(
+                menu,
+                move |action, window, cx| {
+                    terminal.update(cx, |view, cx| {
+                        use kit::TerminalOutputAction as Action;
+                        match action {
+                            Action::CopySelection => {
+                                if let Some(text) = &selection {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                                }
+                            }
+                            Action::CopyOutput => {
+                                cx.write_to_clipboard(ClipboardItem::new_string(output.clone()));
+                            }
+                            Action::FontSize(size) => {
+                                view.invalidate_links();
+                                view.font_size = size;
+                                view.sync_link_frame();
+                                cx.notify();
+                            }
+                            Action::ToggleCompact => {
+                                view.invalidate_links();
+                                view.compact = !view.compact;
+                                view.sync_link_frame();
+                                cx.notify();
+                            }
+                            Action::ToggleBackground => {
+                                view.translucent_background = !view.translucent_background;
+                                cx.notify();
+                            }
+                            Action::Find => {
+                                view.open_find(&FindInTerminalOutput, window, cx);
+                            }
+                            Action::Paste => view.paste_from_clipboard(cx),
+                            Action::SelectAll => view.select_all(cx),
+                            Action::Clear => view.clear(cx),
+                            Action::Restart => view.restart(cx),
+                        }
+                    });
+                },
+                window,
+                cx,
+            )
+        }
+    }
+
     pub fn retry_link(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
         self.retry_url = Some(url);
         self.open_links(window, cx);
@@ -1386,6 +1438,182 @@ impl TerminalView {
 
     fn cell_at(&self, position: Point<Pixels>) -> Option<(u16, u16)> {
         self.grid_geometry()?.cell_at(position)
+    }
+
+    fn report_cell_at(&self, position: Point<Pixels>) -> Option<(u16, u16)> {
+        self.grid_geometry()?.link_cell_at(position)
+    }
+
+    fn mouse_reporting_active(&self) -> bool {
+        self.scrollback_offset == 0
+            && self.screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None
+    }
+
+    fn report_mouse(
+        &mut self,
+        position: Point<Pixels>,
+        kind: input::MouseEventKind,
+        button: input::TerminalMouseButton,
+        modifiers: Modifiers,
+    ) {
+        let mode = self.screen.mouse_protocol_mode();
+        if !self.mouse_reporting_active() {
+            return;
+        }
+        let cell = match kind {
+            input::MouseEventKind::Release
+            | input::MouseEventKind::Motion {
+                button: Some(_), ..
+            } => self.cell_at(position),
+            input::MouseEventKind::Press | input::MouseEventKind::Motion { button: None } => {
+                self.report_cell_at(position)
+            }
+        };
+        let Some(cell) = cell else {
+            return;
+        };
+        if matches!(kind, input::MouseEventKind::Motion { .. })
+            && self.last_mouse_cell == Some(cell)
+        {
+            return;
+        }
+        let Some(bytes) = input::encode_mouse(
+            mode,
+            self.screen.mouse_protocol_encoding(),
+            kind,
+            button,
+            cell,
+            modifiers,
+        ) else {
+            return;
+        };
+        self.send(&bytes);
+        if matches!(kind, input::MouseEventKind::Motion { .. }) {
+            self.last_mouse_cell = Some(cell);
+        }
+    }
+
+    fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.last_mouse_cell = None;
+        self.context_menu_suppressed = event.button == MouseButton::Right
+            && !event.modifiers.shift
+            && self.mouse_reporting_active();
+        if !event.modifiers.shift && self.mouse_reporting_active() {
+            self.focus_handle.focus(window, cx);
+            if let Some(button) = terminal_mouse_button(event.button) {
+                self.report_mouse(
+                    event.position,
+                    input::MouseEventKind::Press,
+                    button,
+                    event.modifiers,
+                );
+                cx.stop_propagation();
+            }
+            return;
+        }
+        if event.button == MouseButton::Right {
+            self.context_link = self
+                .link_at(event.position)
+                .map(|link| (link.url.clone(), self.link_epoch));
+        } else if event.button == MouseButton::Left {
+            self.begin_selection(event, window, cx);
+        }
+    }
+
+    fn mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.last_mouse_cell = None;
+        if !event.modifiers.shift && self.mouse_reporting_active() {
+            if let Some(button) = terminal_mouse_button(event.button) {
+                self.report_mouse(
+                    event.position,
+                    input::MouseEventKind::Release,
+                    button,
+                    event.modifiers,
+                );
+                cx.stop_propagation();
+            }
+            return;
+        }
+        if event.button == MouseButton::Left {
+            self.end_selection(event, window, cx);
+        }
+    }
+
+    fn mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.modifiers.shift {
+            self.last_mouse_cell = None;
+        }
+        if !event.modifiers.shift && self.mouse_reporting_active() {
+            self.report_mouse(
+                event.position,
+                input::MouseEventKind::Motion {
+                    button: event.pressed_button,
+                },
+                input::TerminalMouseButton::Left,
+                event.modifiers,
+            );
+            cx.stop_propagation();
+        } else {
+            self.extend_selection(event, window, cx);
+        }
+    }
+
+    fn scroll_wheel(&mut self, event: &ScrollWheelEvent, row_height: f32, cx: &mut Context<Self>) {
+        if event.modifiers.shift {
+            let delta = match event.delta {
+                ScrollDelta::Lines(lines) => lines.y * 2.0,
+                ScrollDelta::Pixels(pixels) => pixels.y.as_f32() / row_height,
+            };
+            self.scroll_by(delta, cx);
+            return;
+        }
+        let delta = match event.delta {
+            ScrollDelta::Lines(lines) => lines.y * 2.0,
+            ScrollDelta::Pixels(pixels) => pixels.y.as_f32() / row_height,
+        };
+        if self.mouse_reporting_active() {
+            self.mouse_wheel_accumulator += delta;
+            let steps = self.mouse_wheel_accumulator.trunc() as isize;
+            self.mouse_wheel_accumulator -= steps as f32;
+            let count = steps.unsigned_abs().min(32);
+            if count > 0 {
+                let button = if steps > 0 {
+                    input::TerminalMouseButton::WheelUp
+                } else {
+                    input::TerminalMouseButton::WheelDown
+                };
+                for _ in 0..count {
+                    self.report_mouse(
+                        event.position,
+                        input::MouseEventKind::Press,
+                        button,
+                        event.modifiers,
+                    );
+                }
+            }
+            cx.stop_propagation();
+        } else if self.alt_screen {
+            self.scroll_accumulator += delta;
+            let steps = self.scroll_accumulator.trunc() as isize;
+            self.scroll_accumulator -= steps as f32;
+            let count = steps.unsigned_abs().min(32);
+            if count > 0 {
+                let key = if steps > 0 { "up" } else { "down" };
+                if let Some(bytes) = input::encode_key(
+                    key,
+                    None,
+                    Modifiers::default(),
+                    self.screen.application_cursor(),
+                ) {
+                    for _ in 0..count {
+                        self.send(&bytes);
+                    }
+                }
+            }
+            cx.stop_propagation();
+        } else if delta.abs() > 0.01 {
+            self.scroll_by(delta, cx);
+        }
     }
 
     fn selected_text(&self) -> Option<String> {
@@ -1452,6 +1680,7 @@ impl TerminalView {
         self.link_press = None;
         self.selection_anchor = None;
         self.selection_head = None;
+        self.selection_granularity = None;
     }
 
     fn begin_selection(
@@ -1472,8 +1701,27 @@ impl TerminalView {
                 .cloned()
                 .map(|link| (link, event.position));
         }
-        self.selection_anchor = self.cell_at(event.position);
-        self.selection_head = self.selection_anchor;
+        let Some(cell) = self.cell_at(event.position) else {
+            return;
+        };
+        let granularity = match event.click_count {
+            2 => Some(TerminalSelectionGranularity::Word),
+            count if count >= 3 => Some(TerminalSelectionGranularity::Line),
+            _ => None,
+        };
+        if let Some(granularity) = granularity {
+            if let Some((anchor, head)) =
+                kit::terminal_granular_selection(&self.screen, cell, cell, self.cols, granularity)
+            {
+                self.selection_anchor = Some(anchor);
+                self.selection_head = Some(head);
+                self.selection_granularity = Some((granularity, cell));
+            }
+        } else {
+            self.selection_anchor = Some(cell);
+            self.selection_head = Some(cell);
+            self.selection_granularity = None;
+        }
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
@@ -1491,7 +1739,22 @@ impl TerminalView {
             self.link_press = None;
         }
         if event.dragging() && self.selection_anchor.is_some() {
-            self.selection_head = self.cell_at(event.position);
+            if let (Some((granularity, origin)), Some(cell)) =
+                (self.selection_granularity, self.cell_at(event.position))
+            {
+                if let Some((anchor, head)) = kit::terminal_granular_selection(
+                    &self.screen,
+                    origin,
+                    cell,
+                    self.cols,
+                    granularity,
+                ) {
+                    self.selection_anchor = Some(anchor);
+                    self.selection_head = Some(head);
+                }
+            } else {
+                self.selection_head = self.cell_at(event.position);
+            }
             cx.notify();
         }
     }
@@ -1523,7 +1786,18 @@ impl TerminalView {
                 return;
             }
         }
-        self.selection_head = self.cell_at(event.position).or(self.selection_head);
+        if let (Some((granularity, origin)), Some(cell)) =
+            (self.selection_granularity, self.cell_at(event.position))
+        {
+            if let Some((anchor, head)) =
+                kit::terminal_granular_selection(&self.screen, origin, cell, self.cols, granularity)
+            {
+                self.selection_anchor = Some(anchor);
+                self.selection_head = Some(head);
+            }
+        } else {
+            self.selection_head = self.cell_at(event.position).or(self.selection_head);
+        }
         cx.notify();
     }
     fn select_all(&mut self, cx: &mut Context<Self>) {
@@ -1534,7 +1808,7 @@ impl TerminalView {
 
     fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.paste(text);
+            self.paste(text, cx);
         }
     }
 
@@ -1786,7 +2060,6 @@ impl TerminalView {
             )
             .into_any_element()
     }
-
 }
 
 impl Focusable for TerminalView {
@@ -1885,96 +2158,22 @@ impl Render for TerminalView {
             .on_key_down(cx.listener(Self::key_down))
             .children(find_strip)
             .children(self.link_menu.as_ref().map(kit::terminal_link_overlay))
-            .child(
-                screen_grid
-                    .on_scroll_wheel(cx.listener(
-                        move |this, event: &ScrollWheelEvent, _window, cx| {
-                            let delta = match event.delta {
-                                ScrollDelta::Lines(lines) => lines.y * 2.0,
-                                ScrollDelta::Pixels(pixels) => pixels.y.as_f32() / row_height,
-                            };
-                            if delta.abs() > 0.01 {
-                                this.scroll_by(delta, cx);
-                            }
-                        },
-                    ))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, event: &MouseDownEvent, _, _| {
-                            this.context_link = this
-                                .link_at(event.position)
-                                .map(|link| (link.url.clone(), this.link_epoch));
-                        }),
-                    )
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_selection))
-                    .on_mouse_move(cx.listener(Self::extend_selection))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::end_selection))
-                    .children(autoscroll_pill)
-                    .context_menu({
-                        let terminal = terminal_actions.clone();
-                        move |menu, window, cx| {
-                            let view = terminal.read(cx);
-                            let output = view.screen_text();
-                            let selection = view.selected_text();
-                            let presentation = kit::TerminalOutputMenu::new(view.font_size)
-                                .compact(view.compact)
-                                .blend(view.translucent_background)
-                                .selection(selection.is_some());
-                            let mut menu = menu;
-                            if let Some((url, epoch)) = view.context_link.clone() {
-                                menu = Self::link_commands(menu, url, terminal.downgrade(), epoch)
-                                    .separator();
-                            }
-                            let terminal = terminal.clone();
-                            presentation.render(
-                                menu,
-                                move |action, window, cx| {
-                                    terminal.update(cx, |view, cx| {
-                                        use kit::TerminalOutputAction as Action;
-                                        match action {
-                                            Action::CopySelection => {
-                                                if let Some(text) = &selection {
-                                                    cx.write_to_clipboard(
-                                                        ClipboardItem::new_string(text.clone()),
-                                                    );
-                                                }
-                                            }
-                                            Action::CopyOutput => cx.write_to_clipboard(
-                                                ClipboardItem::new_string(output.clone()),
-                                            ),
-                                            Action::FontSize(size) => {
-                                                view.invalidate_links();
-                                                view.font_size = size;
-                                                view.sync_link_frame();
-                                                cx.notify();
-                                            }
-                                            Action::ToggleCompact => {
-                                                view.invalidate_links();
-                                                view.compact = !view.compact;
-                                                view.sync_link_frame();
-                                                cx.notify();
-                                            }
-                                            Action::ToggleBackground => {
-                                                view.translucent_background =
-                                                    !view.translucent_background;
-                                                cx.notify();
-                                            }
-                                            Action::Find => {
-                                                view.open_find(&FindInTerminalOutput, window, cx)
-                                            }
-                                            Action::Paste => view.paste_from_clipboard(cx),
-                                            Action::SelectAll => view.select_all(cx),
-                                            Action::Clear => view.clear(cx),
-                                            Action::Restart => view.restart(cx),
-                                        }
-                                    });
-                                },
-                                window,
-                                cx,
-                            )
-                        }
-                    }),
-            )
+            .child({
+                let grid = screen_grid
+                    .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
+                        this.scroll_wheel(event, row_height, cx);
+                    }))
+                    .on_mouse_down(MouseButton::Right, cx.listener(Self::mouse_down))
+                    .on_mouse_down(MouseButton::Middle, cx.listener(Self::mouse_down))
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
+                    .on_mouse_move(cx.listener(Self::mouse_move))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
+                    .on_mouse_up(MouseButton::Middle, cx.listener(Self::mouse_up))
+                    .on_mouse_up(MouseButton::Right, cx.listener(Self::mouse_up))
+                    .children(autoscroll_pill);
+                grid.context_menu(Self::output_context_menu(terminal_actions.clone()))
+                    .into_any_element()
+            })
             .children(status_banner)
     }
 }
@@ -2344,9 +2543,8 @@ mod tests {
         command_tx
             .send(ParserCommand::Find { generation: 7, query: Some("needle".to_string()) })
             .unwrap();
-        let PtyEvent::SearchResults {
-            generation, hits, total, scrollback_len, alt_screen, revealed, ..
-        } = next_search_results(&mut event_rx).await
+        let PtyEvent::SearchResults { generation, hits, total, scrollback_len, alt_screen, revealed, .. } =
+            next_search_results(&mut event_rx).await
         else {
             panic!("expected search results");
         };
@@ -2674,7 +2872,6 @@ mod tests {
         .await;
         assert!(!produced_results);
     }
-
 
     #[test]
     fn backward_selection_includes_its_anchor_cell() {

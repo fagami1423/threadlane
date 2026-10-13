@@ -61,6 +61,7 @@ pub(crate) fn workspace(
             sidebar_collapsed: false,
             right_panel_visible: false,
             bottom_panel_visible: false,
+            terminal_maximized: false,
             command_palette_open: false,
             command_palette_previous_focus: None,
             command_state,
