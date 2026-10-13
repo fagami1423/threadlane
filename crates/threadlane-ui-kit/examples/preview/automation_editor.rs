@@ -1,12 +1,12 @@
 //! Local host for the production automation form; saves only to the sample snapshot.
 use gpui::*;
-use gpui_component::input::{InputEvent, InputState, TextareaState};
 use gpui_component::WindowExt;
+use gpui_component::input::{InputEvent, InputState, TextareaState};
 use std::rc::Rc;
 use threadlane_automation::{Definition, Schedule};
 use threadlane_ui_kit::automation_form::{
-    automation_form, automation_schedule_fields, automation_schedule_preview, schedule_from_fields,
-    AutomationForm, AutomationFormAction,
+    AutomationForm, AutomationFormAction, automation_form, automation_schedule_fields,
+    automation_schedule_preview, schedule_from_fields,
 };
 
 pub struct AutomationSampleEditor {
@@ -44,10 +44,11 @@ impl AutomationSampleEditor {
         let interval = cx.new(|cx| InputState::new(window, cx).default_value(interval));
         let time = cx.new(|cx| InputState::new(window, cx).default_value(time));
         let timezone = cx.new(|cx| InputState::new(window, cx).default_value(timezone));
-        let mut subscriptions = [&interval, &time, &timezone]
+        let mut subscriptions = [&name, &interval, &time, &timezone]
             .iter()
             .map(|input| cx.observe(*input, |_: &mut Self, _, cx| cx.notify()))
             .collect::<Vec<_>>();
+        subscriptions.push(cx.observe(&prompt, |_: &mut Self, _, cx| cx.notify()));
         subscriptions.push(cx.subscribe_in(
             &name,
             window,
@@ -103,6 +104,19 @@ impl AutomationSampleEditor {
 
     fn apply(&mut self, action: AutomationFormAction, window: &mut Window, cx: &mut Context<Self>) {
         match action {
+            AutomationFormAction::Starter(starter) => {
+                if threadlane_ui_kit::automation_form::can_apply_starter(
+                    self.definition.revision,
+                    &self.name.read(cx).value(),
+                    &self.prompt.read(cx).value(),
+                ) {
+                    self.name
+                        .update(cx, |input, cx| input.set_value(starter.title(), window, cx));
+                    self.prompt.update(cx, |input, cx| {
+                        input.set_value(starter.prompt(), window, cx)
+                    });
+                }
+            }
             AutomationFormAction::Project(id) => self.definition.project = id.into(),
             AutomationFormAction::Model(id) => self.definition.model = id,
             AutomationFormAction::Effort(id) => self.definition.effort = id,
@@ -201,8 +215,9 @@ mod tests {
                 )
             });
             *capture.borrow_mut() = Some(editor);
-            let host =
-                cx.new(|_| crate::automation::AutomationPreview::new("/sample-project".into()));
+            let host = cx.new(|cx| {
+                crate::automation::AutomationPreview::new("/sample-project".into(), window, cx)
+            });
             gpui_component::Root::new(host, window, cx)
         });
         let editor = captured.borrow_mut().take().unwrap();

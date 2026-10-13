@@ -1,18 +1,26 @@
 //! Local automation samples. No scheduler, stores, sessions, or provider calls.
-use gpui::{App, AppContext, Context, IntoElement, Render, Window};
+use gpui::{App, AppContext, Context, IntoElement, Render, Subscription, Window};
 use gpui_component::WindowExt;
+use gpui_component::input::{InputEvent, InputState};
 use threadlane_automation::{Definition, Run, RunStatus, Schedule, Snapshot};
-use threadlane_ui_kit::automation::{automation_screen, AutomationAction, AutomationScreen};
+use threadlane_ui_kit::automation::{AutomationAction, AutomationScreen, automation_screen};
 use threadlane_ui_kit::automation_form::automation_editor_sheet;
 
 pub struct AutomationPreview {
     snapshot: Snapshot,
     screen: AutomationScreen,
     next_run: usize,
+    _search_subscription: Subscription,
 }
 
 impl AutomationPreview {
-    pub fn new(project: std::path::PathBuf) -> Self {
+    pub fn new(project: std::path::PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search automations…"));
+        let search_subscription = cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
         let mut definition = Definition {
             id: "sample-research".into(), revision: 1,
             name: "Sample · Review project activity".into(),
@@ -59,6 +67,7 @@ impl AutomationPreview {
                 ..Default::default()
             },
             screen: AutomationScreen {
+                search: Some(search),
                 projects: vec![(
                     project.to_string_lossy().into_owned(),
                     project
@@ -70,6 +79,7 @@ impl AutomationPreview {
                 ..Default::default()
             },
             next_run: 31,
+            _search_subscription: search_subscription,
         }
     }
 
@@ -107,6 +117,22 @@ impl AutomationPreview {
             }
             AutomationAction::ExpandPrompt(id) => self.screen.expanded_prompt = id,
             AutomationAction::Page(page) => self.screen.page = page,
+            AutomationAction::ClearSearch => {
+                if let Some(search) = &self.screen.search {
+                    search.update(cx, |search, cx| search.set_value("", window, cx));
+                }
+            }
+            AutomationAction::Duplicate(id) => {
+                if let Some(source) = self.snapshot.definitions.iter().find(|d| d.id == id) {
+                    let draft = threadlane_ui_kit::automation::duplicate_automation(
+                        source,
+                        format!("sample-automation-{}", self.next_run),
+                        1_791_120_000,
+                    );
+                    self.next_run += 1;
+                    self.edit_definition(draft, window, cx);
+                }
+            }
             AutomationAction::SetEnabled(id, enabled) => {
                 if let Some(d) = self.snapshot.definitions.iter_mut().find(|d| d.id == id) {
                     d.enabled = enabled;
@@ -167,7 +193,6 @@ impl AutomationPreview {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Entity<crate::automation_editor::AutomationSampleEditor>> {
-        let editing = id.is_some();
         let definition = if let Some(id) = id {
             self.snapshot
                 .definitions
@@ -196,6 +221,16 @@ impl AutomationPreview {
                 paused_reason: None,
             }
         };
+        Some(self.edit_definition(definition, window, cx))
+    }
+
+    fn edit_definition(
+        &mut self,
+        definition: Definition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Entity<crate::automation_editor::AutomationSampleEditor> {
+        let editing = definition.revision != 0;
         let owner = cx.entity().downgrade();
         let projects = self.screen.projects.clone();
         let editor = cx.new(|cx| {
@@ -206,9 +241,14 @@ impl AutomationPreview {
                     let _ = owner.update(cx, |this, cx| {
                         definition.revision += 1;
                         definition.next_at = definition
-                            .schedule
-                            .next(definition.anchor, definition.anchor)
-                            .ok()
+                            .enabled
+                            .then(|| {
+                                definition
+                                    .schedule
+                                    .next(definition.anchor, definition.anchor)
+                                    .ok()
+                                    .flatten()
+                            })
                             .flatten();
                         if let Some(existing) = this
                             .snapshot
@@ -231,7 +271,7 @@ impl AutomationPreview {
         window.open_sheet(cx, move |sheet, _, _| {
             automation_editor_sheet(sheet, editing, sheet_editor.clone())
         });
-        Some(editor)
+        editor
     }
 
     fn notice(window: &mut Window, cx: &mut App) {
@@ -241,11 +281,18 @@ impl AutomationPreview {
 }
 
 impl Render for AutomationPreview {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut screen = self.screen.clone();
+        screen.query = screen
+            .search
+            .as_ref()
+            .map(|search| search.read(cx).value().to_string())
+            .unwrap_or_default();
+        screen.compact = window.viewport_size().width < window.rem_size() * 70.0;
         let owner = cx.entity().downgrade();
         automation_screen(
             &self.snapshot,
-            &self.screen,
+            &screen,
             move |action, window, cx| {
                 let _ = owner.update(cx, |this, cx| this.apply(action, window, cx));
             },
@@ -256,8 +303,79 @@ impl Render for AutomationPreview {
 
 #[cfg(test)]
 mod tests {
-    use gpui::{AppContext, Modifiers, TestAppContext};
+    use gpui::{AppContext, Focusable, Modifiers, TestAppContext};
+    use gpui_component::WindowExt;
     use threadlane_automation::RunStatus;
+
+    #[gpui::test]
+    fn automation_search_retains_selection_and_duplicate_stays_unsaved(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(threadlane_ui_kit::automation_form::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let capture = captured.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let preview =
+                cx.new(|cx| super::AutomationPreview::new("/sample-project".into(), window, cx));
+            *capture.borrow_mut() = Some(preview.clone());
+            gpui_component::Root::new(preview, window, cx)
+        });
+        let preview = captured.borrow_mut().take().unwrap();
+        cx.simulate_resize(gpui::size(gpui::px(1440.0), gpui::px(900.0)));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let row = cx.debug_bounds("automation-row-sample-research").unwrap();
+        cx.simulate_click(row.center(), Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let search = preview.read(cx).screen.search.as_ref().unwrap();
+            window.focus(&search.read(cx).focus_handle(cx), cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_input("no such automation");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("automation-row-sample-research").is_none());
+        assert!(cx.debug_bounds("automation-empty").is_some());
+        assert!(
+            cx.debug_bounds("automation-duplicate").is_some(),
+            "search preserves the selected detail"
+        );
+        preview.read_with(cx, |state, _| {
+            assert_eq!(state.screen.selected.as_deref(), Some("sample-research"))
+        });
+        let clear = cx.debug_bounds("automation-clear-search").unwrap();
+        cx.simulate_click(clear.center(), Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("automation-row-sample-research").is_some());
+        let count = preview.read_with(cx, |state, _| state.snapshot.definitions.len());
+        let duplicate = cx.debug_bounds("automation-duplicate").unwrap();
+        cx.simulate_click(duplicate.center(), Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| assert!(window.has_active_sheet(cx)));
+        preview.read_with(cx, |state, _| {
+            assert_eq!(state.snapshot.definitions.len(), count)
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, cx| assert!(!window.has_active_sheet(cx)));
+        preview.read_with(cx, |state, _| {
+            assert_eq!(state.snapshot.definitions.len(), count)
+        });
+        cx.simulate_resize(gpui::size(gpui::px(480.0), gpui::px(900.0)));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("automation-list").is_none());
+        assert!(cx.debug_bounds("automation-duplicate").is_some());
+    }
 
     #[gpui::test]
     fn shared_history_review_remove_and_cancel_update_local_attention(cx: &mut TestAppContext) {
@@ -265,8 +383,9 @@ mod tests {
         let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
         let capture = captured.clone();
         let (_, cx) = cx.add_window_view(move |window, cx| {
-            let preview = cx.new(|_| {
-                let mut preview = super::AutomationPreview::new("/sample-project".into());
+            let preview = cx.new(|cx| {
+                let mut preview =
+                    super::AutomationPreview::new("/sample-project".into(), window, cx);
                 preview.screen.history = true;
                 preview.screen.attention_only = true;
                 preview
@@ -296,11 +415,13 @@ mod tests {
             );
         }
         preview.read_with(cx, |state, _| {
-            assert!(state
-                .snapshot
-                .runs
-                .iter()
-                .all(|run| run.session_file.is_none()));
+            assert!(
+                state
+                    .snapshot
+                    .runs
+                    .iter()
+                    .all(|run| run.session_file.is_none())
+            );
             assert!(!state.snapshot.runs.iter().any(|run| run.id == "sample-29"));
             assert_eq!(
                 state

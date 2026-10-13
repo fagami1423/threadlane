@@ -34,41 +34,44 @@ actions!(
 );
 // `BeginNewTask` and `ToggleSidebar` are shared with the sidebar, so the
 // action types live in `threadlane-ui-sidebar`.
-use threadlane_ui_sidebar::{BeginNewTask, ToggleSidebar};
 use threadlane_git::GitStatus;
+use threadlane_ui_sidebar::{BeginNewTask, ToggleSidebar};
 
-use threadlane_ui_state::{actions::AppAction, controller};
+use gpui_component::WindowExt;
+use threadlane_coding_agent::controller::runtime_status_text;
+use threadlane_ui_automation::AutomationsView;
 use threadlane_ui_chat::{ChatListView, ConversationFindHandoff, TrajectoryView};
 use threadlane_ui_github::GitHubView;
-use threadlane_ui_automation::AutomationsView;
-use gpui_component::WindowExt;
 use threadlane_ui_right_panel::RightPanelView;
 use threadlane_ui_settings::SettingsView;
 use threadlane_ui_sidebar::SidebarView;
-use threadlane_ui_terminal::{
-    FindInTerminalOutput, LinkDestination, OpenTerminalLink, SelectionStatus, TerminalView,
-};
-use threadlane_ui_state::updater::{self, UpdaterEvent};
-use threadlane_coding_agent::controller::runtime_status_text;
-use threadlane_ui_state::{
-    AppState, SessionHydrationRequest, SessionInfo, WorkspacePage,
-};
 use threadlane_ui_state::projection::{
     coding_agent_options, compute_full_session_projection, compute_latest_run_completion,
     compute_session_messages,
+};
+use threadlane_ui_state::updater::{self, UpdaterEvent};
+use threadlane_ui_state::{AppState, SessionHydrationRequest, SessionInfo, WorkspacePage};
+use threadlane_ui_state::{actions::AppAction, controller};
+use threadlane_ui_terminal::{
+    FindInTerminalOutput, LinkDestination, OpenTerminalLink, SelectionStatus, TerminalView,
 };
 use threadlane_updater::UpdateStatus;
 
 #[path = "conversation_search.rs"]
 mod conversation_search;
 use conversation_search::*;
-#[path = "session_switcher.rs"]
-mod session_switcher;
 #[path = "completion_alerts.rs"]
 mod completion_alerts;
+#[path = "session_switcher.rs"]
+mod session_switcher;
 use session_switcher::{SessionNavigation, SessionPicker};
 
-fn close_command_palette(open: &mut bool, previous_focus: &mut Option<FocusHandle>, window: &mut Window, cx: &mut App) {
+fn close_command_palette(
+    open: &mut bool,
+    previous_focus: &mut Option<FocusHandle>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     *open = false;
     if let Some(focus) = previous_focus.take() {
         focus.focus(window, cx);
@@ -81,8 +84,14 @@ fn open_active_close_confirmation(
     model: Entity<AppState>,
     work: Vec<threadlane_ui_state::ActiveCloseWork>,
 ) {
-    let mut list = work.iter().take(8).map(|item| format!("{} — {} · {}", item.title, item.project, item.status)).collect::<Vec<_>>();
-    if work.len() > list.len() { list.push(format!("…and {} more", work.len() - list.len())); }
+    let mut list = work
+        .iter()
+        .take(8)
+        .map(|item| format!("{} — {} · {}", item.title, item.project, item.status))
+        .collect::<Vec<_>>();
+    if work.len() > list.len() {
+        list.push(format!("…and {} more", work.len() - list.len()));
+    }
     let description = format!(
         "Closing this window quits Threadlane and interrupts its active work. External commands may not stop immediately.\n\n{}",
         list.join("\n")
@@ -90,7 +99,8 @@ fn open_active_close_confirmation(
     window.open_alert_dialog(cx, move |dialog, _, _| {
         let expected: Vec<_> = work.iter().map(|item| item.identity.clone()).collect();
         let current_model = model.clone();
-        dialog.title("Close Threadlane while work is active?")
+        dialog
+            .title("Close Threadlane while work is active?")
             .description(description.clone())
             .confirm()
             .show_cancel(true)
@@ -98,7 +108,10 @@ fn open_active_close_confirmation(
             .ok_variant(gpui_component::button::ButtonVariant::Danger)
             .on_ok(move |_, window, cx| {
                 let current_work = current_model.read(cx).active_close_work();
-                let current: Vec<_> = current_work.iter().map(|item| item.identity.clone()).collect();
+                let current: Vec<_> = current_work
+                    .iter()
+                    .map(|item| item.identity.clone())
+                    .collect();
                 if threadlane_ui_state::close_work_needs_refresh(&current, &expected) {
                     window.close_dialog(cx);
                     let model = current_model.clone();
@@ -180,7 +193,11 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-l", FocusComposer, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("ctrl-,", OpenSettings, None),
-        KeyBinding::new("escape", CancelActiveGeneration, Some("ThreadlaneWorkspace")),
+        KeyBinding::new(
+            "escape",
+            CancelActiveGeneration,
+            Some("ThreadlaneWorkspace"),
+        ),
         KeyBinding::new("cmd-s", threadlane_ui_editor::SaveFile, None),
         KeyBinding::new("ctrl-s", threadlane_ui_editor::SaveFile, None),
     ]);
@@ -293,7 +310,9 @@ fn terminal_link_is_current(
     page: WorkspacePage,
     url: &str,
 ) -> bool {
-    visible && page == WorkspacePage::Chat && displayed == Some(source)
+    visible
+        && page == WorkspacePage::Chat
+        && displayed == Some(source)
         && threadlane_ui_terminal::is_web_url(url)
 }
 
@@ -357,10 +376,14 @@ fn path_is_threadlane_worktree(cwd: &Path) -> bool {
 /// id — while every other directory shows its last component.
 fn shell_cwd_label(cwd: &Path) -> String {
     let components: Vec<_> = cwd.components().collect();
-    if let Some(index) = components.windows(2).position(|pair| {
-        pair[0].as_os_str() == ".threadlane" && pair[1].as_os_str() == "worktrees"
-    }) {
-        let tail: PathBuf = components[index + 1..].iter().map(|c| c.as_os_str()).collect();
+    if let Some(index) = components
+        .windows(2)
+        .position(|pair| pair[0].as_os_str() == ".threadlane" && pair[1].as_os_str() == "worktrees")
+    {
+        let tail: PathBuf = components[index + 1..]
+            .iter()
+            .map(|c| c.as_os_str())
+            .collect();
         return format!(".threadlane/{}", tail.display());
     }
     cwd.file_name()
@@ -501,9 +524,9 @@ impl WorkspaceView {
                 let capture_file = request.session_file.clone();
                 let presented_completion = cx
                     .background_executor()
-                    .spawn(async move {
-                        compute_latest_run_completion(&capture_file).ok().flatten()
-                    })
+                    .spawn(
+                        async move { compute_latest_run_completion(&capture_file).ok().flatten() },
+                    )
                     .await;
                 let history_file = request.session_file.clone();
                 let history = cx
@@ -603,7 +626,7 @@ impl WorkspaceView {
         let sidebar = cx.new(|cx| SidebarView::new(model.clone(), window, cx));
         let chat_list = cx.new(|cx| ChatListView::new(model.clone(), window, cx));
         let github = cx.new(|cx| GitHubView::new(model.clone(), window, cx));
-        let automations = cx.new(|cx| AutomationsView::new(model.clone(), cx));
+        let automations = cx.new(|cx| AutomationsView::new(model.clone(), window, cx));
         let automation_updates = model.update(cx, |state, _| state.start_automations());
         let settings = cx.new(|cx| SettingsView::new(model.clone(), window, cx));
         let right_panel = cx.new(|cx| RightPanelView::new(model.clone(), window, cx));
@@ -637,67 +660,83 @@ impl WorkspaceView {
                     let mut last_notification = None;
                     while automation_updates.changed().await.is_ok() {
                         let projection = automation_updates.borrow_and_update().clone();
-                        if this.update_in(cx, |this: &mut Self, window, cx| {
-                            if let Some((id, message)) = &projection.notification {
-                                if last_notification.as_ref() != Some(id) {
-                                    window.push_notification(message.clone(), cx);
-                                    last_notification = Some(id.clone());
+                        if this
+                            .update_in(cx, |this: &mut Self, window, cx| {
+                                if let Some((id, message)) = &projection.notification {
+                                    if last_notification.as_ref() != Some(id) {
+                                        window.push_notification(message.clone(), cx);
+                                        last_notification = Some(id.clone());
+                                    }
                                 }
-                            }
-                            this.model.update(cx, |state, cx| { state.apply_automation_projection(projection); cx.notify(); });
-                        }).is_err() { break; }
+                                this.model.update(cx, |state, cx| {
+                                    state.apply_automation_projection(projection);
+                                    cx.notify();
+                                });
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                }).detach();
+                })
+                .detach();
             }
             let focus_handle = cx.focus_handle();
             focus_handle.focus(window, cx);
-            let sub = cx.observe_in(&model_clone, window, move |this: &mut Self, model, window, cx| {
-                cx.defer_in(window, |this, window, cx| this.dispatch_completion_alerts(window, cx));
-                this.session_navigation.observe(model.read(cx));
-                this.sync_git_status_with_active_project(cx);
-                if let Some(cmd) =
-                    model.update(cx, |state, _cx| state.requested_terminal_command.take())
-                {
-                    this.bottom_panel_visible = true;
-                    let state = model.read(cx);
-                    let group_key = state.terminal_group_key();
-                    let work_dir = state.active_git_work_dir();
-                    let unavailable = state.active_worktree_unavailable();
-                    let term = match (group_key, work_dir) {
-                        (Some(group_key), Some(work_dir)) => Some(
-                            this.get_or_create_active_terminal(&group_key, &work_dir, cx),
-                        ),
-                        _ => (!unavailable).then(|| this.fallback_terminal(cx)),
-                    };
-                    if let Some(term) = term {
-                        term.update(cx, |term, _cx| {
-                            let trimmed = cmd.trim_end();
-                            term.send_input(&format!("{trimmed}\n"));
-                        });
-                    } else {
-                        model.update(cx, |state, _cx| {
-                            state.session_status = Some("The active worktree is unavailable".into());
-                        });
+            let sub = cx.observe_in(
+                &model_clone,
+                window,
+                move |this: &mut Self, model, window, cx| {
+                    cx.defer_in(window, |this, window, cx| {
+                        this.dispatch_completion_alerts(window, cx)
+                    });
+                    this.session_navigation.observe(model.read(cx));
+                    this.sync_git_status_with_active_project(cx);
+                    if let Some(cmd) =
+                        model.update(cx, |state, _cx| state.requested_terminal_command.take())
+                    {
+                        this.bottom_panel_visible = true;
+                        let state = model.read(cx);
+                        let group_key = state.terminal_group_key();
+                        let work_dir = state.active_git_work_dir();
+                        let unavailable = state.active_worktree_unavailable();
+                        let term = match (group_key, work_dir) {
+                            (Some(group_key), Some(work_dir)) => {
+                                Some(this.get_or_create_active_terminal(&group_key, &work_dir, cx))
+                            }
+                            _ => (!unavailable).then(|| this.fallback_terminal(cx)),
+                        };
+                        if let Some(term) = term {
+                            term.update(cx, |term, _cx| {
+                                let trimmed = cmd.trim_end();
+                                term.send_input(&format!("{trimmed}\n"));
+                            });
+                        } else {
+                            model.update(cx, |state, _cx| {
+                                state.session_status =
+                                    Some("The active worktree is unavailable".into());
+                            });
+                        }
                     }
-                }
-                if let Some(work_dir) =
-                    model.update(cx, |state, _cx| state.requested_terminal_work_dir.take())
-                {
-                    this.bottom_panel_visible = true;
-                    let state = model.read(cx);
-                    let group_key = state.terminal_group_key();
-                    let project = state.active_git_work_dir();
-                    let unavailable = state.active_worktree_unavailable();
-                    if let (Some(group_key), Some(_)) = (group_key, project) {
-                        this.add_terminal_tab_for_project(group_key, work_dir, cx);
-                    } else if !unavailable {
-                        this.get_or_create_active_terminal(&work_dir, &work_dir, cx);
+                    if let Some(work_dir) =
+                        model.update(cx, |state, _cx| state.requested_terminal_work_dir.take())
+                    {
+                        this.bottom_panel_visible = true;
+                        let state = model.read(cx);
+                        let group_key = state.terminal_group_key();
+                        let project = state.active_git_work_dir();
+                        let unavailable = state.active_worktree_unavailable();
+                        if let (Some(group_key), Some(_)) = (group_key, project) {
+                            this.add_terminal_tab_for_project(group_key, work_dir, cx);
+                        } else if !unavailable {
+                            this.get_or_create_active_terminal(&work_dir, &work_dir, cx);
+                        }
                     }
-                }
-                this.invalidate_conversation_search(cx);
-                let _ = model_wake_tx.send(());
-                cx.notify();
-            });
+                    this.invalidate_conversation_search(cx);
+                    let _ = model_wake_tx.send(());
+                    cx.notify();
+                },
+            );
 
             cx.spawn(async move |this, cx| {
                 while let Some(event) = next_workspace_event(
@@ -899,8 +938,11 @@ impl WorkspaceView {
             .detach();
             let antigravity_model = view.model.clone();
             cx.spawn(async move |_view, cx| {
-                threadlane_ui_settings::refresh_antigravity_models_and_update(antigravity_model, cx)
-                    .await;
+                threadlane_ui_settings::refresh_antigravity_models_and_update(
+                    antigravity_model,
+                    cx,
+                )
+                .await;
             })
             .detach();
             // Connect each external agent once in the background and cache
@@ -926,9 +968,13 @@ impl WorkspaceView {
                 keystroke.modifiers.platform || keystroke.modifiers.control
             };
             if keystroke.key.eq_ignore_ascii_case("k") && modifier && !keystroke.modifiers.alt {
-                if switch_session && event.context_stack.iter().any(|context| {
-                    context.contains("PopupMenu") || context.contains("Dialog") || context.contains("Sheet")
-                }) {
+                if switch_session
+                    && event.context_stack.iter().any(|context| {
+                        context.contains("PopupMenu")
+                            || context.contains("Dialog")
+                            || context.contains("Sheet")
+                    })
+                {
                     cx.stop_propagation();
                     return;
                 }
@@ -1064,18 +1110,21 @@ impl WorkspaceView {
                 cx.notify();
             }
         });
-        let links = cx.subscribe(&terminal, |this, terminal, request: &OpenTerminalLink, cx| {
-            let owner = cx.weak_entity();
-            let window = this.window_handle;
-            let request = request.clone();
-            cx.defer(move |cx| {
-                let _ = window.update(cx, |_, window, cx| {
-                    let _ = owner.update(cx, |this, cx| {
-                        this.open_terminal_link(terminal, request, window, cx)
+        let links = cx.subscribe(
+            &terminal,
+            |this, terminal, request: &OpenTerminalLink, cx| {
+                let owner = cx.weak_entity();
+                let window = this.window_handle;
+                let request = request.clone();
+                cx.defer(move |cx| {
+                    let _ = window.update(cx, |_, window, cx| {
+                        let _ = owner.update(cx, |this, cx| {
+                            this.open_terminal_link(terminal, request, window, cx)
+                        });
                     });
                 });
-            });
-        });
+            },
+        );
         (terminal, vec![subscription, links])
     }
 
@@ -1109,7 +1158,8 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         if !terminal_link_is_current(
-            self.displayed_terminal(cx).map(|(_, active)| active.entity_id()),
+            self.displayed_terminal(cx)
+                .map(|(_, active)| active.entity_id()),
             terminal.entity_id(),
             self.bottom_panel_visible,
             self.model.read(cx).workspace_page,
@@ -1177,15 +1227,10 @@ impl WorkspaceView {
             None => current_group.is_none() && is_fallback,
         };
         if !still_displayed {
-            window.push_notification(
-                "The terminal changed — the selection was not added",
-                cx,
-            );
+            window.push_notification("The terminal changed — the selection was not added", cx);
             return;
         }
-        if let Some(reason) =
-            terminal_excerpt_block_reason(terminal.read(cx).selection_status())
-        {
+        if let Some(reason) = terminal_excerpt_block_reason(terminal.read(cx).selection_status()) {
             window.push_notification(reason, cx);
             return;
         }
@@ -1209,10 +1254,7 @@ impl WorkspaceView {
             chat.append_draft_text_for(destination, &excerpt, window, cx)
         });
         if !added {
-            window.push_notification(
-                "The chat draft changed — the selection was not added",
-                cx,
-            );
+            window.push_notification("The chat draft changed — the selection was not added", cx);
         }
     }
 
@@ -1254,14 +1296,11 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let still_current = self
-            .right_panel
-            .update(cx, |panel, cx| panel.selection_request_is_current(&request, cx));
+        let still_current = self.right_panel.update(cx, |panel, cx| {
+            panel.selection_request_is_current(&request, cx)
+        });
         if !still_current {
-            window.push_notification(
-                "The editor selection changed — it was not added",
-                cx,
-            );
+            window.push_notification("The editor selection changed — it was not added", cx);
             return;
         }
         let excerpt = threadlane_ui_kit::format_editor_excerpt(
@@ -1273,10 +1312,7 @@ impl WorkspaceView {
             chat.append_draft_text_for(request.destination.clone(), &excerpt, window, cx)
         });
         if !added {
-            window.push_notification(
-                "The chat draft changed — the selection was not added",
-                cx,
-            );
+            window.push_notification("The chat draft changed — the selection was not added", cx);
         }
     }
 
@@ -1396,8 +1432,7 @@ impl WorkspaceView {
 
     fn fallback_terminal(&mut self, cx: &mut Context<Self>) -> Entity<TerminalView> {
         if self.fallback_terminal.is_none() {
-            let project =
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let (terminal, subscription) = self.new_terminal_with_tracking(project, cx);
             self.terminal_subscriptions.extend(subscription);
             self.fallback_terminal = Some(terminal);
@@ -1524,8 +1559,14 @@ impl WorkspaceView {
     fn close_terminal_tab(&mut self, project: &PathBuf, tab: usize, cx: &mut Context<Self>) {
         // Two-step confirm when the shell holds output: the first click arms,
         // the second destroys. A clean shell closes immediately.
-        let Some(terminal_id) = self.terminal_groups.get(project)
-            .and_then(|group| group.tabs.get(tab)).map(|terminal| terminal.entity_id()) else { return; };
+        let Some(terminal_id) = self
+            .terminal_groups
+            .get(project)
+            .and_then(|group| group.tabs.get(tab))
+            .map(|terminal| terminal.entity_id())
+        else {
+            return;
+        };
         let dirty = self
             .terminal_groups
             .get(project)
@@ -1543,9 +1584,7 @@ impl WorkspaceView {
             .model
             .read(cx)
             .active_git_work_dir()
-            .filter(|_| {
-                self.model.read(cx).terminal_group_key().as_ref() == Some(project)
-            })
+            .filter(|_| self.model.read(cx).terminal_group_key().as_ref() == Some(project))
             .unwrap_or_else(|| project.clone());
         let needs_replacement = match self.terminal_groups.get_mut(project) {
             Some(group) if tab < group.tabs.len() => {
@@ -1643,10 +1682,15 @@ impl WorkspaceView {
                 })
                 .detach();
             }
-            "find_files" => threadlane_ui_right_panel::file_search::open(self.model.clone(), window, cx),
+            "find_files" => {
+                threadlane_ui_right_panel::file_search::open(self.model.clone(), window, cx)
+            }
             "git" => self.open_git_review(cx),
             "automations" => {
-                self.model.update(cx, |state, cx| { controller::dispatch(state, AppAction::OpenAutomations); cx.notify(); });
+                self.model.update(cx, |state, cx| {
+                    controller::dispatch(state, AppAction::OpenAutomations);
+                    cx.notify();
+                });
             }
             "github" => {
                 model.update(cx, |state, cx| {
@@ -1711,21 +1755,21 @@ impl WorkspaceView {
                     window.push_notification("Open a terminal first", cx);
                 }
             }
-            "add_terminal_selection" => {
-                match self.displayed_terminal(cx) {
-                    Some((group_key, terminal)) => {
-                        self.add_terminal_selection_to_chat(terminal, group_key, window, cx)
-                    }
-                    None => window.push_notification("No terminal is visible", cx),
+            "add_terminal_selection" => match self.displayed_terminal(cx) {
+                Some((group_key, terminal)) => {
+                    self.add_terminal_selection_to_chat(terminal, group_key, window, cx)
                 }
-            }
+                None => window.push_notification("No terminal is visible", cx),
+            },
             "add_editor_selection" => match self.editor_selection_target(cx) {
                 Ok(EditorSelectionTarget::CentralEditor) => self
                     .chat_list
                     .update(cx, |chat, cx| chat.add_editor_selection_to_chat(window, cx)),
-                Ok(EditorSelectionTarget::FilesPanel) => self
-                    .right_panel
-                    .update(cx, |panel, cx| panel.request_add_selection_to_chat(window, cx)),
+                Ok(EditorSelectionTarget::FilesPanel) => {
+                    self.right_panel.update(cx, |panel, cx| {
+                        panel.request_add_selection_to_chat(window, cx)
+                    })
+                }
                 Err(reason) => window.push_notification(reason.to_string(), cx),
             },
             "open_issue" => {
@@ -1866,9 +1910,7 @@ impl WorkspaceView {
                 // wait, retry the inspect once before reporting.
                 for attempt in 0..2 {
                     for _ in 0..20 {
-                        if client.supports_project_io()
-                            || client.supports_command_requests()
-                        {
+                        if client.supports_project_io() || client.supports_command_requests() {
                             break;
                         }
                         executor.timer(std::time::Duration::from_millis(200)).await;
@@ -1877,12 +1919,8 @@ impl WorkspaceView {
                     // a failed fetch must not hide the local Git status
                     // (offline use is valid).
                     let result =
-                        threadlane_ui_state::project_io::inspect(&client, &work_dir, true)
-                            .await;
-                    if result.is_ok()
-                        || client.supports_command_requests()
-                        || attempt == 1
-                    {
+                        threadlane_ui_state::project_io::inspect(&client, &work_dir, true).await;
+                    if result.is_ok() || client.supports_command_requests() || attempt == 1 {
                         let _ = tx.send(GitEvent::Loaded { work_dir, result });
                         return;
                     }
@@ -1900,11 +1938,19 @@ impl WorkspaceView {
             } => {
                 let target = (work_dir.clone(), branch.clone());
                 let state = self.model.read(cx);
-                let active = state.projects.iter().flat_map(|project| &project.sessions)
-                    .any(|session| state.active_session_id.as_ref() == Some(&session.id)
-                        && session.work_dir == work_dir
-                        && session.git_branch.as_ref() == Some(&branch));
-                let open = result.as_ref().ok().and_then(|pr| pr.as_ref())
+                let active = state
+                    .projects
+                    .iter()
+                    .flat_map(|project| &project.sessions)
+                    .any(|session| {
+                        state.active_session_id.as_ref() == Some(&session.id)
+                            && session.work_dir == work_dir
+                            && session.git_branch.as_ref() == Some(&branch)
+                    });
+                let open = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|pr| pr.as_ref())
                     .is_some_and(|pr| pr.state.eq_ignore_ascii_case("open"));
                 let refresh_delay = session_pr_refresh_delay(result.is_ok(), active, open);
                 if let Ok(pr) = result {
@@ -2254,56 +2300,53 @@ impl WorkspaceView {
                             }))
                     }))
                     .children(pr_badge)
-                    .children(page_summary.map(|summary| {
-                        div().pl_2().text_xs().text_color(muted).child(summary)
-                    })),
+                    .children(
+                        page_summary
+                            .map(|summary| div().pl_2().text_xs().text_color(muted).child(summary)),
+                    ),
             )
             .right(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("status-terminal-toggle")
-                            .icon(if self.bottom_panel_visible {
-                                IconName::PanelBottomOpen
-                            } else {
-                                IconName::PanelBottom
-                            })
-                            .label("Terminal")
-                            .ghost()
-                            .selected(self.bottom_panel_visible)
-                            .xsmall()
-                            .accessibility_label(if self.bottom_panel_visible {
-                                "Hide terminal"
-                            } else {
-                                "Show terminal"
-                            })
-                            .tooltip(if self.bottom_panel_visible {
-                                "Hide terminal"
-                            } else {
-                                "Show terminal"
-                            })
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.bottom_panel_visible = !this.bottom_panel_visible;
-                                if this.bottom_panel_visible {
-                                    let state = this.model.read(cx);
-                                    let project = state.terminal_group_key();
-                                    let unavailable = state.active_worktree_unavailable();
-                                    if !unavailable {
-                                        let terminal = project
-                                            .as_ref()
-                                            .and_then(|project| this.terminal_groups.get(project))
-                                            .and_then(|group| group.tabs.get(group.active_tab))
-                                            .cloned()
-                                            .unwrap_or_else(|| this.fallback_terminal(cx));
-                                        let focus = terminal.read(cx).focus_handle(cx);
-                                        focus.focus(window, cx);
-                                    }
+                div().flex().items_center().gap_2().child(
+                    Button::new("status-terminal-toggle")
+                        .icon(if self.bottom_panel_visible {
+                            IconName::PanelBottomOpen
+                        } else {
+                            IconName::PanelBottom
+                        })
+                        .label("Terminal")
+                        .ghost()
+                        .selected(self.bottom_panel_visible)
+                        .xsmall()
+                        .accessibility_label(if self.bottom_panel_visible {
+                            "Hide terminal"
+                        } else {
+                            "Show terminal"
+                        })
+                        .tooltip(if self.bottom_panel_visible {
+                            "Hide terminal"
+                        } else {
+                            "Show terminal"
+                        })
+                        .on_click(cx.listener(|this, _event, window, cx| {
+                            this.bottom_panel_visible = !this.bottom_panel_visible;
+                            if this.bottom_panel_visible {
+                                let state = this.model.read(cx);
+                                let project = state.terminal_group_key();
+                                let unavailable = state.active_worktree_unavailable();
+                                if !unavailable {
+                                    let terminal = project
+                                        .as_ref()
+                                        .and_then(|project| this.terminal_groups.get(project))
+                                        .and_then(|group| group.tabs.get(group.active_tab))
+                                        .cloned()
+                                        .unwrap_or_else(|| this.fallback_terminal(cx));
+                                    let focus = terminal.read(cx).focus_handle(cx);
+                                    focus.focus(window, cx);
                                 }
-                                cx.notify();
-                            })),
-                    ),
+                            }
+                            cx.notify();
+                        })),
+                ),
             )
     }
 
@@ -2344,7 +2387,8 @@ impl WorkspaceView {
             panel.set_visible(self.right_panel_visible, cx);
         });
         if !self.right_panel_visible {
-            self.chat_list.update(cx, |chat, cx| chat.focus_composer(window, cx));
+            self.chat_list
+                .update(cx, |chat, cx| chat.focus_composer(window, cx));
         }
         cx.notify();
     }
@@ -2514,7 +2558,8 @@ impl Render for WorkspaceView {
                 self.focus_handle.focus(window, cx);
                 cx.on_next_frame(window, |this, window, cx| {
                     if this.model.read(cx).workspace_page == WorkspacePage::Chat {
-                        this.chat_list.update(cx, |chat, cx| chat.focus_composer(window, cx));
+                        this.chat_list
+                            .update(cx, |chat, cx| chat.focus_composer(window, cx));
                     } else if window.last_input_was_keyboard() {
                         // Keyboard entry (cmd-,) moves focus into the page. A click
                         // keeps it on the workspace (Tab still enters the page), so
@@ -2557,8 +2602,7 @@ impl Render for WorkspaceView {
                 }
             };
         let terminal_project = terminal_key;
-        let new_tab_cwd =
-            terminal_cwd.or_else(|| terminal_project.clone());
+        let new_tab_cwd = terminal_cwd.or_else(|| terminal_project.clone());
         let theme = cx.theme().colors;
         let rem = window.rem_size();
         let viewport = window.viewport_size();
@@ -2580,9 +2624,12 @@ impl Render for WorkspaceView {
         let review_focus = layout.right_panel_focus;
         let visible_panels = [
             workspace_page != WorkspacePage::Settings && show_sidebar,
-            workspace_page == WorkspacePage::Chat && self.right_panel_visible && !review_focus
+            workspace_page == WorkspacePage::Chat
+                && self.right_panel_visible
+                && !review_focus
                 && !(self.bottom_panel_visible && self.terminal_maximized),
-            workspace_page == WorkspacePage::Chat && self.bottom_panel_visible
+            workspace_page == WorkspacePage::Chat
+                && self.bottom_panel_visible
                 && (!self.terminal_maximized || terminal_unavailable),
         ];
         let panel_layout = (viewport, rem, visible_panels);
@@ -2645,9 +2692,13 @@ impl Render for WorkspaceView {
         });
 
         let chat_page_content = {
-        self.right_panel.update(cx, |panel, cx| {
-            panel.set_visible(self.right_panel_visible && !(self.bottom_panel_visible && self.terminal_maximized), cx);
-        });
+            self.right_panel.update(cx, |panel, cx| {
+                panel.set_visible(
+                    self.right_panel_visible
+                        && !(self.bottom_panel_visible && self.terminal_maximized),
+                    cx,
+                );
+            });
             let upper_content = if review_focus {
                 threadlane_ui_kit::workspace_right_panel_focus(
                     self.right_panel.clone(),
@@ -2655,17 +2706,24 @@ impl Render for WorkspaceView {
                         this.toggle_right_panel_action(&ToggleRightPanel, window, cx);
                     }),
                     cx,
-                ).into_any_element()
+                )
+                .into_any_element()
             } else if self.right_panel_visible {
                 threadlane_ui_kit::workspace_right_panel_split(
-                    &self.right_panel_resizable_state, self.chat_list.clone(), self.right_panel.clone(), rem, viewport.width,
+                    &self.right_panel_resizable_state,
+                    self.chat_list.clone(),
+                    self.right_panel.clone(),
+                    rem,
+                    viewport.width,
                 )
-                    .on_resize(cx.listener(|this, state: &Entity<ResizableState>, window, cx| {
+                .on_resize(
+                    cx.listener(|this, state: &Entity<ResizableState>, window, cx| {
                         if let Some(size) = state.read(cx).sizes().get(1) {
                             this.preferred_panel_sizes[1] = *size / window.rem_size();
                         }
-                    }))
-                    .into_any_element()
+                    }),
+                )
+                .into_any_element()
             } else {
                 self.chat_list.clone().into_any_element()
             };
@@ -2682,7 +2740,10 @@ impl Render for WorkspaceView {
                                     }
                                     threadlane_ui_kit::TerminalAction::RecreateWorktree => {
                                         this.model.update(cx, |state, cx| {
-                                            controller::dispatch(state, AppAction::RecreateActiveWorktree);
+                                            controller::dispatch(
+                                                state,
+                                                AppAction::RecreateActiveWorktree,
+                                            );
                                             cx.notify();
                                         });
                                     }
@@ -2734,7 +2795,8 @@ impl Render for WorkspaceView {
                                 terminal.read(cx).project().display()
                             );
                             let armed = project.as_ref().is_some_and(|project| {
-                                self.pending_terminal_close == Some((project.clone(), terminal.entity_id()))
+                                self.pending_terminal_close
+                                    == Some((project.clone(), terminal.entity_id()))
                             });
                             threadlane_ui_kit::TerminalTab::new(
                                 format!("terminal-{:?}", terminal.entity_id()),
@@ -2764,7 +2826,9 @@ impl Render for WorkspaceView {
                     let excerpt_block =
                         terminal_excerpt_block_reason(active_terminal.read(cx).selection_status());
                     let handoff_hint = excerpt_block.map(str::to_owned).unwrap_or_else(|| {
-                        format!("Add the selected terminal text to {composer_target} — nothing is sent")
+                        format!(
+                            "Add the selected terminal text to {composer_target} — nothing is sent"
+                        )
                     });
                     let shell_cwd = active_terminal.read(cx).project().clone();
                     let worktree_shell = path_is_threadlane_worktree(&shell_cwd);
@@ -2772,41 +2836,44 @@ impl Render for WorkspaceView {
                     let cwd = new_tab_cwd.clone();
                     let terminal = active_terminal.clone();
                     let owner = cx.entity().clone();
-                    let toolbar = threadlane_ui_kit::TerminalToolbar::new(shell_cwd_label(&shell_cwd))
-                        .maximized(self.terminal_maximized)
-                        .window_controls_inset((self.terminal_maximized && !show_sidebar).then_some(header_inset))
-                        .path_hint(shell_cwd.display().to_string())
-                        .worktree(worktree_shell)
-                        .tabs(tab_buttons)
-                        .new_tab(project.is_some())
-                        .selection(excerpt_block.is_none(), handoff_hint)
-                        .shortcuts(
-                            if cfg!(target_os = "macos") {
-                                "Find in terminal output (Cmd+F)"
-                            } else {
-                                "Find in terminal output (Ctrl+Shift+F)"
-                            },
-                            if cfg!(target_os = "macos") {
-                                "Hide terminal (Cmd+J)"
-                            } else {
-                                "Hide terminal (Ctrl+J)"
-                            },
-                        )
-                        .render(
-                            move |action, window, cx| {
-                                owner.update(cx, |this, cx| {
-                                    this.request_terminal_action(
-                                        action,
-                                        project.clone(),
-                                        cwd.clone(),
-                                        terminal.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                })
-                            },
-                            cx,
-                        );
+                    let toolbar =
+                        threadlane_ui_kit::TerminalToolbar::new(shell_cwd_label(&shell_cwd))
+                            .maximized(self.terminal_maximized)
+                            .window_controls_inset(
+                                (self.terminal_maximized && !show_sidebar).then_some(header_inset),
+                            )
+                            .path_hint(shell_cwd.display().to_string())
+                            .worktree(worktree_shell)
+                            .tabs(tab_buttons)
+                            .new_tab(project.is_some())
+                            .selection(excerpt_block.is_none(), handoff_hint)
+                            .shortcuts(
+                                if cfg!(target_os = "macos") {
+                                    "Find in terminal output (Cmd+F)"
+                                } else {
+                                    "Find in terminal output (Ctrl+Shift+F)"
+                                },
+                                if cfg!(target_os = "macos") {
+                                    "Hide terminal (Cmd+J)"
+                                } else {
+                                    "Hide terminal (Ctrl+J)"
+                                },
+                            )
+                            .render(
+                                move |action, window, cx| {
+                                    owner.update(cx, |this, cx| {
+                                        this.request_terminal_action(
+                                            action,
+                                            project.clone(),
+                                            cwd.clone(),
+                                            terminal.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                },
+                                cx,
+                            );
                     let terminal_panel = threadlane_ui_kit::terminal_surface(cx)
                         .child(toolbar)
                         .child(div().flex_1().min_h_0().child(active_terminal));
@@ -2814,21 +2881,21 @@ impl Render for WorkspaceView {
                     if self.terminal_maximized {
                         terminal_panel.into_any_element()
                     } else {
-                    threadlane_ui_kit::workspace_terminal_split(
-                        &self.bottom_panel_resizable_state,
-                        upper_content,
-                        terminal_panel,
-                        rem,
-                        viewport.height,
-                    )
-                    .on_resize(
-                        cx.listener(|this, state: &Entity<ResizableState>, window, cx| {
-                            if let Some(size) = state.read(cx).sizes().get(1) {
-                                this.preferred_panel_sizes[2] = *size / window.rem_size();
-                            }
-                        }),
-                    )
-                    .into_any_element()
+                        threadlane_ui_kit::workspace_terminal_split(
+                            &self.bottom_panel_resizable_state,
+                            upper_content,
+                            terminal_panel,
+                            rem,
+                            viewport.height,
+                        )
+                        .on_resize(cx.listener(
+                            |this, state: &Entity<ResizableState>, window, cx| {
+                                if let Some(size) = state.read(cx).sizes().get(1) {
+                                    this.preferred_panel_sizes[2] = *size / window.rem_size();
+                                }
+                            },
+                        ))
+                        .into_any_element()
                     }
                 }
             } else {
@@ -2846,14 +2913,19 @@ impl Render for WorkspaceView {
         };
         let page_content = if workspace_page != WorkspacePage::Settings && show_sidebar {
             threadlane_ui_kit::workspace_sidebar_split(
-                &self.sidebar_resizable_state, self.sidebar.clone(), central_content, rem,
+                &self.sidebar_resizable_state,
+                self.sidebar.clone(),
+                central_content,
+                rem,
             )
-                .on_resize(cx.listener(|this, state: &Entity<ResizableState>, window, cx| {
+            .on_resize(
+                cx.listener(|this, state: &Entity<ResizableState>, window, cx| {
                     if let Some(size) = state.read(cx).sizes().first() {
                         this.preferred_panel_sizes[0] = *size / window.rem_size();
                     }
-                }))
-                .into_any_element()
+                }),
+            )
+            .into_any_element()
         } else {
             central_content
         };
@@ -2958,9 +3030,11 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::begin_new_task_action))
             .on_action(cx.listener(Self::open_settings_action))
             .on_action(cx.listener(Self::activate_update))
-            .on_action(cx.listener(|this, _: &threadlane_ui_settings::ActivateUpdate, window, cx| {
-                this.activate_update(&threadlane_ui_sidebar::ActivateUpdate, window, cx);
-            }))
+            .on_action(cx.listener(
+                |this, _: &threadlane_ui_settings::ActivateUpdate, window, cx| {
+                    this.activate_update(&threadlane_ui_sidebar::ActivateUpdate, window, cx);
+                },
+            ))
             .on_action(cx.listener(Self::cancel_active_generation_action))
             .on_action(cx.listener(Self::select_chat_tab_action))
             .on_action(cx.listener(Self::select_trajectory_tab_action))
@@ -2985,11 +3059,11 @@ impl Render for WorkspaceView {
             }))
             .children((workspace_page == WorkspacePage::Chat).then(|| {
                 Button::new("right-panel-toggle")
-                        .accessibility_label(if self.right_panel_visible {
-                            "Hide right panel"
-                        } else {
-                            "Show right panel"
-                        })
+                    .accessibility_label(if self.right_panel_visible {
+                        "Hide right panel"
+                    } else {
+                        "Show right panel"
+                    })
                     .icon(IconName::PanelRight)
                     .tooltip(if self.right_panel_visible {
                         "Hide right panel"
@@ -3006,10 +3080,13 @@ impl Render for WorkspaceView {
                     }))
             }))
             .children((workspace_page != WorkspacePage::Settings).then(|| {
-                threadlane_ui_kit::workspace_sidebar_toggle(self.sidebar_collapsed, layout.sidebar_available)
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        this.toggle_sidebar_action(&ToggleSidebar, window, cx);
-                    }))
+                threadlane_ui_kit::workspace_sidebar_toggle(
+                    self.sidebar_collapsed,
+                    layout.sidebar_available,
+                )
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.toggle_sidebar_action(&ToggleSidebar, window, cx);
+                }))
             }))
             .children(self.command_palette_open.then(|| {
                 if self.session_picker.is_some() {
@@ -3026,18 +3103,18 @@ impl Render for WorkspaceView {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_project_git_status, format_terminal_excerpt, git_result_matches_active,
-        next_workspace_event, open_github_from_palette, path_is_threadlane_worktree,
-        session_pr_refresh_delay, session_pr_target_is_active, shell_cwd_label,
-        terminal_excerpt_block_reason, GitEvent, WorkspacePumpEvent, TERMINAL_EXCERPT_LIMIT,
+        GitEvent, TERMINAL_EXCERPT_LIMIT, WorkspacePumpEvent, active_project_git_status,
+        format_terminal_excerpt, git_result_matches_active, next_workspace_event,
+        open_github_from_palette, path_is_threadlane_worktree, session_pr_refresh_delay,
+        session_pr_target_is_active, shell_cwd_label, terminal_excerpt_block_reason,
     };
-    use threadlane_ui_terminal::SelectionStatus;
-    use threadlane_ui_state::updater::UpdaterEvent;
-    use threadlane_ui_state::{AppState, SessionInfo, WorkspacePage};
     use std::cell::Cell;
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use threadlane_git::GitStatus;
+    use threadlane_ui_state::updater::UpdaterEvent;
+    use threadlane_ui_state::{AppState, SessionInfo, WorkspacePage};
+    use threadlane_ui_terminal::SelectionStatus;
 
     #[gpui::test]
     fn destination_panel_opens_restore_terminal_from_maximized_state(
@@ -3054,8 +3131,7 @@ mod tests {
         }
 
         cx.update(gpui_component::init);
-        let (_, cx) =
-            cx.add_window_view(|window, cx| Root::new(cx.new(|_| EmptyHost), window, cx));
+        let (_, cx) = cx.add_window_view(|window, cx| Root::new(cx.new(|_| EmptyHost), window, cx));
         let workspace = cx.update(|window, cx| {
             super::session_switcher::interaction_tests::workspace(AppState::for_tests(), window, cx)
         });
@@ -3120,7 +3196,9 @@ mod tests {
                     return true;
                 }
                 if !window.has_active_dialog(cx) {
-                    window.open_alert_dialog(cx, |dialog, _, _| dialog.title("Active work").confirm());
+                    window.open_alert_dialog(cx, |dialog, _, _| {
+                        dialog.title("Active work").confirm()
+                    });
                 }
                 false
             });
@@ -3167,13 +3245,28 @@ mod tests {
         use gpui::{InteractiveElement as _, ParentElement as _, StatefulInteractiveElement as _};
         struct FocusHost(gpui::FocusHandle, gpui::FocusHandle);
         impl gpui::Render for FocusHost {
-            fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
                 gpui::div()
-                    .child(gpui::div().id("trigger").role(gpui::Role::Button).track_focus(&self.0))
-                    .child(gpui::div().id("palette").role(gpui::Role::Button).track_focus(&self.1))
+                    .child(
+                        gpui::div()
+                            .id("trigger")
+                            .role(gpui::Role::Button)
+                            .track_focus(&self.0),
+                    )
+                    .child(
+                        gpui::div()
+                            .id("palette")
+                            .role(gpui::Role::Button)
+                            .track_focus(&self.1),
+                    )
             }
         }
-        let (view, cx) = cx.add_window_view(|_, cx| FocusHost(cx.focus_handle(), cx.focus_handle()));
+        let (view, cx) =
+            cx.add_window_view(|_, cx| FocusHost(cx.focus_handle(), cx.focus_handle()));
         cx.run_until_parked();
         cx.update(|window, cx| {
             let trigger = view.read(cx).0.clone();
@@ -3186,7 +3279,10 @@ mod tests {
             assert!(trigger.is_focused(window));
             palette.focus(window, cx);
             super::close_command_palette(&mut open, &mut previous, window, cx);
-            assert!(palette.is_focused(window), "a repeated dismissal must not restore stale focus");
+            assert!(
+                palette.is_focused(window),
+                "a repeated dismissal must not restore stale focus"
+            );
         });
     }
 
@@ -3197,13 +3293,22 @@ mod tests {
         use std::rc::Rc;
         struct DialogHost(Rc<Cell<bool>>);
         impl gpui::Render for DialogHost {
-            fn render(&mut self, _window: &mut gpui::Window, _cx: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
                 let cancelled = self.0.clone();
-                gpui::div().size_full().key_context("ThreadlaneWorkspace")
+                gpui::div()
+                    .size_full()
+                    .key_context("ThreadlaneWorkspace")
                     .on_action(move |_: &super::CancelActiveGeneration, _, _| cancelled.set(true))
             }
         }
-        cx.update(|cx| { gpui_component::init(cx); super::init(cx); });
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            super::init(cx);
+        });
         let cancelled = Rc::new(Cell::new(false));
         let tracked = cancelled.clone();
         let (_, cx) = cx.add_window_view(move |window, cx| {
@@ -3215,43 +3320,71 @@ mod tests {
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         cx.update(|window, cx| assert!(!window.has_active_dialog(cx)));
-        assert!(!cancelled.get(), "dialog dismissal must not cancel the underlying turn");
+        assert!(
+            !cancelled.get(),
+            "dialog dismissal must not cancel the underlying turn"
+        );
     }
 
     #[gpui::test]
     fn escape_dismisses_menu_before_cancelling_generation(cx: &mut gpui::TestAppContext) {
-        use gpui::{Focusable as _, InteractiveElement as _, StatefulInteractiveElement as _, ParentElement as _, Styled as _};
+        use gpui::{
+            Focusable as _, InteractiveElement as _, ParentElement as _,
+            StatefulInteractiveElement as _, Styled as _,
+        };
         use gpui_component::menu::PopupMenu;
         use std::rc::Rc;
         struct MenuHost(gpui::Entity<PopupMenu>, Rc<Cell<bool>>, gpui::FocusHandle);
         impl gpui::Render for MenuHost {
-            fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
                 let stopped = self.1.clone();
-                gpui::div().id("menu-test-workspace").size_full().key_context("ThreadlaneWorkspace")
-                    .track_focus(&self.2).role(gpui::Role::Application)
+                gpui::div()
+                    .id("menu-test-workspace")
+                    .size_full()
+                    .key_context("ThreadlaneWorkspace")
+                    .track_focus(&self.2)
+                    .role(gpui::Role::Application)
                     .on_action(move |_: &super::CancelActiveGeneration, _, _| stopped.set(true))
                     .child(self.0.clone())
             }
         }
-        cx.update(|cx| { gpui_component::init(cx); super::init(cx); });
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            super::init(cx);
+        });
         let stopped = Rc::new(Cell::new(false));
         let tracked = stopped.clone();
         let (host, cx) = cx.add_window_view(move |window, cx| {
             let focus = cx.focus_handle();
-            let menu = PopupMenu::build(window, cx, |menu, _, _| menu.label("Test menu").action_context(focus.clone()));
+            let menu = PopupMenu::build(window, cx, |menu, _, _| {
+                menu.label("Test menu").action_context(focus.clone())
+            });
             menu.read(cx).focus_handle(cx).focus(window, cx);
             MenuHost(menu, tracked, focus)
         });
         let dismissed = Rc::new(Cell::new(false));
         let tracked = dismissed.clone();
-        let _subscription = cx.update(|_, cx| { let menu = host.read(cx).0.clone(); cx.subscribe(&menu, move |_, _: &gpui::DismissEvent, _| tracked.set(true)) });
+        let _subscription = cx.update(|_, cx| {
+            let menu = host.read(cx).0.clone();
+            cx.subscribe(&menu, move |_, _: &gpui::DismissEvent, _| tracked.set(true))
+        });
         cx.run_until_parked();
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         assert!(dismissed.get(), "Escape must dismiss the native menu");
-        assert!(!stopped.get(), "menu dismissal must not stop the underlying turn");
+        assert!(
+            !stopped.get(),
+            "menu dismissal must not stop the underlying turn"
+        );
         cx.simulate_keystrokes("escape");
-        assert!(stopped.get(), "Escape still stops a turn after focus returns to the workspace");
+        assert!(
+            stopped.get(),
+            "Escape still stops a turn after focus returns to the workspace"
+        );
     }
 
     #[gpui::test]
@@ -3260,16 +3393,46 @@ mod tests {
         use threadlane_ui_state::WorkspacePage;
         let first = cx.new(|_| 1u8);
         let second = cx.new(|_| 2u8);
-        let accepts = |displayed, visible, page, url| super::terminal_link_is_current(
-            displayed, first.entity_id(), visible, page, url,
-        );
-        assert!(accepts(Some(first.entity_id()), true, WorkspacePage::Chat, "http://0.0.0.0:3000/"));
-        assert!(!accepts(Some(second.entity_id()), true, WorkspacePage::Chat, "http://host/"));
+        let accepts = |displayed, visible, page, url| {
+            super::terminal_link_is_current(displayed, first.entity_id(), visible, page, url)
+        };
+        assert!(accepts(
+            Some(first.entity_id()),
+            true,
+            WorkspacePage::Chat,
+            "http://0.0.0.0:3000/"
+        ));
+        assert!(!accepts(
+            Some(second.entity_id()),
+            true,
+            WorkspacePage::Chat,
+            "http://host/"
+        ));
         assert!(!accepts(None, true, WorkspacePage::Chat, "http://host/"));
-        assert!(!accepts(Some(first.entity_id()), false, WorkspacePage::Chat, "http://host/"));
-        assert!(!accepts(Some(first.entity_id()), true, WorkspacePage::Settings, "http://host/"));
-        for url in ["file:///tmp/a", "localhost:3000", "http://user@host/", "https://host/\n"] {
-            assert!(!accepts(Some(first.entity_id()), true, WorkspacePage::Chat, url));
+        assert!(!accepts(
+            Some(first.entity_id()),
+            false,
+            WorkspacePage::Chat,
+            "http://host/"
+        ));
+        assert!(!accepts(
+            Some(first.entity_id()),
+            true,
+            WorkspacePage::Settings,
+            "http://host/"
+        ));
+        for url in [
+            "file:///tmp/a",
+            "localhost:3000",
+            "http://user@host/",
+            "https://host/\n",
+        ] {
+            assert!(!accepts(
+                Some(first.entity_id()),
+                true,
+                WorkspacePage::Chat,
+                url
+            ));
         }
     }
 
@@ -3350,10 +3513,7 @@ mod tests {
             terminal_excerpt_block_reason(Some(status(true, TERMINAL_EXCERPT_LIMIT + 1))),
             Some("Select less terminal output (maximum 32 KiB)")
         );
-        assert_eq!(
-            terminal_excerpt_block_reason(Some(status(true, 17))),
-            None
-        );
+        assert_eq!(terminal_excerpt_block_reason(Some(status(true, 17))), None);
     }
 
     #[test]
@@ -3365,7 +3525,10 @@ mod tests {
 
         // Ordinary text still gets the minimum three-backtick fence.
         let plain = format_terminal_excerpt(1, Path::new("/repo"), "line");
-        assert_eq!(plain, "Terminal · Shell 1 · launched in /repo\n```\nline\n```");
+        assert_eq!(
+            plain,
+            "Terminal · Shell 1 · launched in /repo\n```\nline\n```"
+        );
     }
 
     #[test]
@@ -3394,17 +3557,19 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel::<(u64, PathBuf, Vec<SessionInfo>)>();
         let (model_tx, mut model_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_millis(10),
-            next_workspace_event(
-                &mut git_rx,
-                &mut updater_rx,
-                &mut sessions_rx,
-                &mut model_rx,
-            ),
-        )
-        .await
-        .is_err());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                next_workspace_event(
+                    &mut git_rx,
+                    &mut updater_rx,
+                    &mut sessions_rx,
+                    &mut model_rx,
+                ),
+            )
+            .await
+            .is_err()
+        );
         model_tx.send(()).unwrap();
         assert!(matches!(
             next_workspace_event(

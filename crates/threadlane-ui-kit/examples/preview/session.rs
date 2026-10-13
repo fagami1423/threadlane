@@ -1,10 +1,10 @@
 //! Local preview host. Production components own appearance; this host owns fixture state.
 use gpui::{prelude::*, *};
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::command::CommandState;
 use gpui_component::combobox::{ComboboxEvent, ComboboxState};
-use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenu};
+use gpui_component::command::CommandState;
 use gpui_component::input::{InputEvent, InputState, TextareaState};
+use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenu};
 use gpui_component::resizable::ResizableState;
 use gpui_component::{ActiveTheme, Selectable, Sizable, WindowExt};
 use std::{
@@ -19,18 +19,18 @@ use threadlane_ui_kit::{
     transcript::{TranscriptRow, TranscriptState},
 };
 
-#[path = "palette.rs"]
-mod palette;
 #[path = "conversation_find.rs"]
 mod conversation_find;
-#[path = "prompt_navigation.rs"]
-mod prompt_navigation;
+#[path = "file_completion.rs"]
+mod file_completion;
 #[path = "message_actions.rs"]
 mod message_actions;
 #[path = "message_markdown.rs"]
 mod message_markdown;
-#[path = "file_completion.rs"]
-mod file_completion;
+#[path = "palette.rs"]
+mod palette;
+#[path = "prompt_navigation.rs"]
+mod prompt_navigation;
 pub(super) use palette::init as init_palette;
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -186,24 +186,39 @@ pub fn import_requested() -> bool {
             );
         }
         let projection = threadlane_daemon::projection::compute_full_session_projection(&source)?;
-        let (trajectory_model_context, trajectory_durable_events, trajectory_recovery) = projection.diagnostics.as_ref().map(|diagnostics| (
-            threadlane_daemon::projection::project_model_context_diagnostics(diagnostics),
-            threadlane_daemon::projection::project_durable_event_diagnostics(diagnostics),
-            threadlane_daemon::projection::project_recovery_diagnostics(&diagnostics.recovery),
-        )).unwrap_or_default();
+        let (trajectory_model_context, trajectory_durable_events, trajectory_recovery) = projection
+            .diagnostics
+            .as_ref()
+            .map(|diagnostics| {
+                (
+                    threadlane_daemon::projection::project_model_context_diagnostics(diagnostics),
+                    threadlane_daemon::projection::project_durable_event_diagnostics(diagnostics),
+                    threadlane_daemon::projection::project_recovery_diagnostics(
+                        &diagnostics.recovery,
+                    ),
+                )
+            })
+            .unwrap_or_default();
         // Snapshot the same checkout inspection as production; never run services in WASM.
         let git_status = session
             .worktree_available
             .then(|| threadlane_git::inspect(&session.runtime_work_dir).ok())
             .flatten();
-        let (review_diffs, review_combined_diff) = git_status.as_ref()
+        let (review_diffs, review_combined_diff) = git_status
+            .as_ref()
             .map(|status| crate::review::capture_diffs(&session.runtime_work_dir, &status.files))
             .unwrap_or_default();
-        let review_can_create_pr = threadlane_git::can_create_pull_request(session.worktree_available, git_status.as_ref());
-        let review_feedback_count = git_status.as_ref().and_then(|status| status.pr.as_ref())
+        let review_can_create_pr = threadlane_git::can_create_pull_request(
+            session.worktree_available,
+            git_status.as_ref(),
+        );
+        let review_feedback_count = git_status
+            .as_ref()
+            .and_then(|status| status.pr.as_ref())
             .map(|pr| threadlane_git::collect_actionable_pr_feedback(pr).len());
         let review_file_manager_label = Some(kit::review_file_manager_label().into());
-        let (review_commits, review_stashes) = git_status.as_ref()
+        let (review_commits, review_stashes) = git_status
+            .as_ref()
             .map(|status| crate::review::capture_records(&session.runtime_work_dir, status))
             .unwrap_or_default();
         use threadlane_runtime::harness::{JsonlStore, SessionStore};
@@ -236,7 +251,9 @@ pub fn import_requested() -> bool {
             .and_then(|value| threadlane_protocol::ReasoningEffort::from_label(value));
         let provider = model.as_ref().and_then(|model| {
             threadlane_daemon::catalog::available_models_for_project(Some(project))
-                .into_iter().find(|option| option.id == model.id).map(|option| option.provider)
+                .into_iter()
+                .find(|option| option.id == model.id)
+                .map(|option| option.provider)
         });
         let mode = threadlane_project::subagent_settings::load(project).orchestrator_mode;
         let active_skills_count = threadlane_skills::settings::discover_skills(Some(project))
@@ -246,29 +263,56 @@ pub fn import_requested() -> bool {
         let reports_usage = model
             .as_ref()
             .is_none_or(|model| !threadlane_acp_engine::is_acp_model(&model.id));
-        let captured_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-        let sidebar_snooze_choices = threadlane_ui_state::SNOOZE_OPTIONS.iter().map(|(label, secs)| (label.to_string(), *secs, threadlane_ui_state::snooze_return_label(captured_at + secs))).collect();
+        let captured_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let sidebar_snooze_choices = threadlane_ui_state::SNOOZE_OPTIONS
+            .iter()
+            .map(|(label, secs)| {
+                (
+                    label.to_string(),
+                    *secs,
+                    threadlane_ui_state::snooze_return_label(captured_at + secs),
+                )
+            })
+            .collect();
         // Match the existing review import budget; retain complete patches only.
         let mut agent_diff_remaining = 5 * 1024 * 1024;
-        let agent_worktrees = projection.subagents.iter().filter_map(|agent| {
-            let isolation = agent.isolation.as_ref()?;
-            let diff = threadlane_git::diff_branch(&session.runtime_work_dir, &isolation.branch)
-                .ok()
-                .filter(|diff| {
-                    if diff.len() > agent_diff_remaining { return false; }
-                    agent_diff_remaining -= diff.len();
-                    true
-                });
-            Some((format!("queued-{}-{}", agent.batch_run_id, agent.task_index), crate::agents::CapturedAgentWorktree {
-                available: isolation.workspace.is_dir(),
-                diff,
-            }))
-        }).collect();
-        let file_inventory = Some(threadlane_git::list_project_files(&session.runtime_work_dir)
-            .map_err(|error| match error {
-                threadlane_git::FileInventoryError::NotARepository => threadlane_protocol::repo::FILE_INVENTORY_NOT_A_REPOSITORY.to_owned(),
-                threadlane_git::FileInventoryError::Failed(error) => error.to_string(),
-            }));
+        let agent_worktrees = projection
+            .subagents
+            .iter()
+            .filter_map(|agent| {
+                let isolation = agent.isolation.as_ref()?;
+                let diff =
+                    threadlane_git::diff_branch(&session.runtime_work_dir, &isolation.branch)
+                        .ok()
+                        .filter(|diff| {
+                            if diff.len() > agent_diff_remaining {
+                                return false;
+                            }
+                            agent_diff_remaining -= diff.len();
+                            true
+                        });
+                Some((
+                    format!("queued-{}-{}", agent.batch_run_id, agent.task_index),
+                    crate::agents::CapturedAgentWorktree {
+                        available: isolation.workspace.is_dir(),
+                        diff,
+                    },
+                ))
+            })
+            .collect();
+        let file_inventory = Some(
+            threadlane_git::list_project_files(&session.runtime_work_dir).map_err(|error| {
+                match error {
+                    threadlane_git::FileInventoryError::NotARepository => {
+                        threadlane_protocol::repo::FILE_INVENTORY_NOT_A_REPOSITORY.to_owned()
+                    }
+                    threadlane_git::FileInventoryError::Failed(error) => error.to_string(),
+                }
+            }),
+        );
         let snapshot = Snapshot {
             file_inventory,
             agent_worktrees,
@@ -288,9 +332,20 @@ pub fn import_requested() -> bool {
             plan: projection.plan,
             metrics: projection.metrics,
             run_timing: projection.run_timing,
-            runnable_code_languages: ["bash", "sh", "zsh", "shell", "terminal", "console", "cmd", "powershell"].into_iter()
-                .filter(|language| kit::markdown::active_shell_supports_language(language))
-                .map(str::to_owned).collect(),
+            runnable_code_languages: [
+                "bash",
+                "sh",
+                "zsh",
+                "shell",
+                "terminal",
+                "console",
+                "cmd",
+                "powershell",
+            ]
+            .into_iter()
+            .filter(|language| kit::markdown::active_shell_supports_language(language))
+            .map(str::to_owned)
+            .collect(),
             context_window: projection.context_window,
             session: Some(session),
             git_status,
@@ -421,53 +476,114 @@ impl SessionPreview {
                 .auto_grow(1, 8)
                 .submit_on_enter(true)
         });
-        input.update(cx, |input,cx| input.focus(window,cx));
-        let subscription = cx.subscribe_in(&input, window, |host, input, event: &InputEvent, window, cx| {
-            match event {
-                InputEvent::Change => {
-                    host.dismiss_file_menu = false;
-                    host.selected_file_index = 0;
-                    if host.prompt_recall.as_ref().is_some_and(|(_, text)| input.read(cx).value().as_str() != text.as_str()) {
-                        host.prompt_recall = None;
+        input.update(cx, |input, cx| input.focus(window, cx));
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            |host, input, event: &InputEvent, window, cx| {
+                match event {
+                    InputEvent::Change => {
+                        host.dismiss_file_menu = false;
+                        host.selected_file_index = 0;
+                        if host.prompt_recall.as_ref().is_some_and(|(_, text)| {
+                            input.read(cx).value().as_str() != text.as_str()
+                        }) {
+                            host.prompt_recall = None;
+                        }
                     }
+                    InputEvent::PressEnter { .. } if host.file_menu_open(cx) => {
+                        host.insert_selected_file(window, cx)
+                    }
+                    _ => {}
                 }
-                InputEvent::PressEnter { .. } if host.file_menu_open(cx) => host.insert_selected_file(window, cx),
-                _ => {}
-            }
-            cx.notify();
-        });
+                cx.notify();
+            },
+        );
         let input_observer = cx.observe(&input, |_, _, cx| cx.notify());
-        let find_input = cx.new(|cx| InputState::new(window, cx).placeholder("Find in conversation"));
+        let find_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Find in conversation"));
         let find_subscription = cx.subscribe(&find_input, |host, input, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) && host.find_open {
                 host.find_query = input.read(cx).value().to_string();
                 host.refresh_conversation_find(cx);
             }
         });
-        let model_picker = cx.new(|cx| ComboboxState::new(
-            kit::PickerDelegate::new(snapshot.model_picker_sections()), Vec::new(), window, cx).searchable(true));
-        let model_subscription = cx.subscribe_in(&model_picker, window, |_, picker, event, window, cx| {
-            if matches!(event, ComboboxEvent::Change(_)) {
-                // This host never writes model preferences or dispatches a turn.
-                picker.update(cx, |picker, cx| picker.set_selected_indices(Vec::new(), window, cx));
-                cx.notify();
-            }
+        let model_picker = cx.new(|cx| {
+            ComboboxState::new(
+                kit::PickerDelegate::new(snapshot.model_picker_sections()),
+                Vec::new(),
+                window,
+                cx,
+            )
+            .searchable(true)
         });
-        let automations = cx.new(|_| crate::automation::AutomationPreview::new(
-            snapshot.session.as_ref().map(|s| s.work_dir.clone()).unwrap_or_else(|| "/sample-project".into())));
+        let model_subscription =
+            cx.subscribe_in(&model_picker, window, |_, picker, event, window, cx| {
+                if matches!(event, ComboboxEvent::Change(_)) {
+                    // This host never writes model preferences or dispatches a turn.
+                    picker.update(cx, |picker, cx| {
+                        picker.set_selected_indices(Vec::new(), window, cx)
+                    });
+                    cx.notify();
+                }
+            });
+        let automations = cx.new(|cx| {
+            crate::automation::AutomationPreview::new(
+                snapshot
+                    .session
+                    .as_ref()
+                    .map(|s| s.work_dir.clone())
+                    .unwrap_or_else(|| "/sample-project".into()),
+                window,
+                cx,
+            )
+        });
         let automation_subscription = cx.observe(&automations, |_, _, cx| cx.notify());
-        let settings = cx.new(|cx| crate::settings::SettingsPreview::new(
-            snapshot.session.as_ref().and_then(|session| session.work_dir.file_name()).map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Sample project".into()), window, cx));
-        let settings_subscription = cx.subscribe(&settings, |this, _, _: &crate::settings::SettingsPreviewEvent, cx| { this.settings_open = false; cx.notify(); });
-        let github = cx.new(|cx| crate::github::GitHubPreview::new(
-            snapshot.session.as_ref().and_then(|session| session.work_dir.file_name()).map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Sample project".into()), window, cx));
-        let github_subscription = cx.subscribe(&github, |this, _, event: &crate::github::GitHubPreviewEvent, cx| {
-            match event {
-                crate::github::GitHubPreviewEvent::Close => this.github_open = None,
-                crate::github::GitHubPreviewEvent::Settings => { this.settings_open = true; this.clear_conversation_find(); this.clear_prompt_navigation(); },
-            }
-            cx.notify();
+        let settings = cx.new(|cx| {
+            crate::settings::SettingsPreview::new(
+                snapshot
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.work_dir.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Sample project".into()),
+                window,
+                cx,
+            )
         });
+        let settings_subscription = cx.subscribe(
+            &settings,
+            |this, _, _: &crate::settings::SettingsPreviewEvent, cx| {
+                this.settings_open = false;
+                cx.notify();
+            },
+        );
+        let github = cx.new(|cx| {
+            crate::github::GitHubPreview::new(
+                snapshot
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.work_dir.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Sample project".into()),
+                window,
+                cx,
+            )
+        });
+        let github_subscription = cx.subscribe(
+            &github,
+            |this, _, event: &crate::github::GitHubPreviewEvent, cx| {
+                match event {
+                    crate::github::GitHubPreviewEvent::Close => this.github_open = None,
+                    crate::github::GitHubPreviewEvent::Settings => {
+                        this.settings_open = true;
+                        this.clear_conversation_find();
+                        this.clear_prompt_navigation();
+                    }
+                }
+                cx.notify();
+            },
+        );
         let terminal = cx.new(|cx| {
             crate::terminal::TerminalPreview::new(
                 snapshot
@@ -499,28 +615,43 @@ impl SessionPreview {
                 cx.notify();
             },
         );
-        let agents = cx.new(|cx| crate::agents::AgentsPreview::new(snapshot.messages.clone(), snapshot.subagents.clone(), Some(&snapshot), window, cx));
-        let agents_subscription = cx.subscribe_in(&agents, window, |host, _, event: &crate::agents::AgentsPreviewEvent, window, cx| {
-            match event {
-                crate::agents::AgentsPreviewEvent::Prompt(prompt) => {
-                    host.input.update(cx, |input, cx| input.set_value(prompt.clone(), window, cx));
-                }
-                crate::agents::AgentsPreviewEvent::OpenTerminal => host.terminal_open = true,
-                crate::agents::AgentsPreviewEvent::OpenSampleFile => {
-                    host.editor.update(cx, |editor, cx| editor.open_sample(cx));
-                    host.editor_open = true;
-                    host.clear_conversation_find();
-                    host.clear_prompt_navigation();
-                }
-                crate::agents::AgentsPreviewEvent::OpenDiff { title, content } => {
-                    host.editor.update(cx, |editor, cx| editor.open_diff(title.clone(), content.clone(), cx));
-                    host.editor_open = true;
-                    host.clear_conversation_find();
-                    host.clear_prompt_navigation();
-                }
-            }
-            cx.notify();
+        let agents = cx.new(|cx| {
+            crate::agents::AgentsPreview::new(
+                snapshot.messages.clone(),
+                snapshot.subagents.clone(),
+                Some(&snapshot),
+                window,
+                cx,
+            )
         });
+        let agents_subscription = cx.subscribe_in(
+            &agents,
+            window,
+            |host, _, event: &crate::agents::AgentsPreviewEvent, window, cx| {
+                match event {
+                    crate::agents::AgentsPreviewEvent::Prompt(prompt) => {
+                        host.input
+                            .update(cx, |input, cx| input.set_value(prompt.clone(), window, cx));
+                    }
+                    crate::agents::AgentsPreviewEvent::OpenTerminal => host.terminal_open = true,
+                    crate::agents::AgentsPreviewEvent::OpenSampleFile => {
+                        host.editor.update(cx, |editor, cx| editor.open_sample(cx));
+                        host.editor_open = true;
+                        host.clear_conversation_find();
+                        host.clear_prompt_navigation();
+                    }
+                    crate::agents::AgentsPreviewEvent::OpenDiff { title, content } => {
+                        host.editor.update(cx, |editor, cx| {
+                            editor.open_diff(title.clone(), content.clone(), cx)
+                        });
+                        host.editor_open = true;
+                        host.clear_conversation_find();
+                        host.clear_prompt_navigation();
+                    }
+                }
+                cx.notify();
+            },
+        );
         let command_state = cx.new(|cx| CommandState::new(window, cx));
         let review_excerpt_subscription = cx.subscribe_in(
             &agents,
@@ -584,10 +715,23 @@ impl SessionPreview {
             prompt_rail: ListState::new(0, ListAlignment::Top, window.rem_size()),
             prompt_rail_active_id: None,
             outline_list: ListState::new(0, ListAlignment::Top, window.rem_size() * 20.0),
-            outline_open: false, outline_focus: cx.focus_handle(), outline_focus_id: None, outline_selected_id: None,
-            prompt_recall: None, segment_cache: HashMap::new(), code_wrap_blocks: HashMap::new(), copied_message: None, copy_feedback_task: None, armed_quotes: std::cell::RefCell::new(HashMap::new()),
-            find_input, find_open: false, find_query: String::new(), find_results: Vec::new(),
-            find_selected: None, find_previous_focus: None, _find_subscription: find_subscription,
+            outline_open: false,
+            outline_focus: cx.focus_handle(),
+            outline_focus_id: None,
+            outline_selected_id: None,
+            prompt_recall: None,
+            segment_cache: HashMap::new(),
+            code_wrap_blocks: HashMap::new(),
+            copied_message: None,
+            copy_feedback_task: None,
+            armed_quotes: std::cell::RefCell::new(HashMap::new()),
+            find_input,
+            find_open: false,
+            find_query: String::new(),
+            find_results: Vec::new(),
+            find_selected: None,
+            find_previous_focus: None,
+            _find_subscription: find_subscription,
             split: cx.new(|_| ResizableState::default()),
             sidebar_collapsed: false,
             preferred_panel_sizes: [16.5, 22.0, 14.0],
@@ -595,8 +739,10 @@ impl SessionPreview {
             gallery: cx.new(|cx| crate::gallery::Gallery::new(snapshot.clone(), window, cx)),
             editor: cx.new(|cx| crate::editor::EditorPreview::new(window, cx)),
             editor_open: false,
-            terminal, terminal_open: false,
-            agents, agents_open: false,
+            terminal,
+            terminal_open: false,
+            agents,
+            agents_open: false,
             right_split: cx.new(|_| ResizableState::default()),
             _agents_subscription: agents_subscription,
             _review_excerpt_subscription: review_excerpt_subscription,
@@ -612,8 +758,14 @@ impl SessionPreview {
             _settings_subscription: settings_subscription,
             gallery_open: false,
             context_meter_open: false,
-            palette_open: false, palette_search: false, palette_sessions: false, palette_previous_focus: None,
-            palette_matches: Vec::new(), palette_recent: Vec::new(), command_state, _command_subscription: command_subscription,
+            palette_open: false,
+            palette_search: false,
+            palette_sessions: false,
+            palette_previous_focus: None,
+            palette_matches: Vec::new(),
+            palette_recent: Vec::new(),
+            command_state,
+            _command_subscription: command_subscription,
             project_filtered: false,
             sidebar_pinned: false,
             sidebar_snooze: None,
@@ -639,8 +791,13 @@ impl SessionPreview {
                 None,
                 cx,
             ))
-            .when(!self.editor_open, |el| el.child(kit::conversation_find_button().on_click(
-                cx.listener(|host, _, window, cx| host.open_conversation_find(&kit::FindInConversation, window, cx)))))
+            .when(!self.editor_open, |el| {
+                el.child(kit::conversation_find_button().on_click(cx.listener(
+                    |host, _, window, cx| {
+                        host.open_conversation_find(&kit::FindInConversation, window, cx)
+                    },
+                )))
+            })
             .child(
                 kit::chat_tab_button("central-tab-chat", "Chat", !self.editor_open, cx)
                     .tooltip("Chat (⌘1)")
@@ -716,11 +873,14 @@ impl SessionPreview {
                         )
                         .child(
                             kit::result_viewport(format!("preview-output-{}", tool.id)).child(
-                                kit::result_scroll_body(format!("preview-output-scroll-{}", tool.id), div()
-                                    .p_3()
-                                    .text_xs()
-                                    .font_family(cx.theme().mono_font_family.clone())
-                                    .child(tool.detail.clone())),
+                                kit::result_scroll_body(
+                                    format!("preview-output-scroll-{}", tool.id),
+                                    div()
+                                        .p_3()
+                                        .text_xs()
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .child(tool.detail.clone()),
+                                ),
                             ),
                         )
                         .into_any_element()
@@ -764,7 +924,8 @@ impl SessionPreview {
             return Empty.into_any_element();
         };
         let selected_prompt = matches!(&row, TranscriptRow::Message(index) if self.outline_selected_id.as_ref() == Some(&self.messages[*index].id));
-        let selected_match = self.find_open && matches!(&row,
+        let selected_match = self.find_open
+            && matches!(&row,
             TranscriptRow::Message(index) if self.find_selected.as_ref() == Some(&self.messages[*index].id));
         let content = match row {
             TranscriptRow::Message(index) => {
@@ -772,13 +933,29 @@ impl SessionPreview {
                 let (body, content_states) = if message.role == MessageRole::Assistant {
                     self.render_message_markdown(&message, cx)
                 } else {
-                    let markdown = kit::markdown::markdown_state(&mut self.markdown, "saved-session-preview".into(), message.id.clone(), &message.content, cx);
-                    (kit::markdown::markdown_view(&markdown, |_, _| {}).into_any_element(), Vec::new())
+                    let markdown = kit::markdown::markdown_state(
+                        &mut self.markdown,
+                        "saved-session-preview".into(),
+                        message.id.clone(),
+                        &message.content,
+                        cx,
+                    );
+                    (
+                        kit::markdown::markdown_view(&markdown, |_, _| {}).into_any_element(),
+                        Vec::new(),
+                    )
                 };
                 match message.role {
                     MessageRole::User => kit::message_row(MessageRole::User)
-                        .child(kit::user_message_bubble(cx).child(body).context_menu(self.message_context_menu(&message, None, cx)))
-                        .children((!message.content.is_empty()).then(|| self.render_message_actions(&message, true, None, cx)))
+                        .child(
+                            kit::user_message_bubble(cx)
+                                .child(body)
+                                .context_menu(self.message_context_menu(&message, None, cx)),
+                        )
+                        .children(
+                            (!message.content.is_empty())
+                                .then(|| self.render_message_actions(&message, true, None, cx)),
+                        )
                         .into_any_element(),
                     MessageRole::Assistant => {
                         let reasoning = message.reasoning_content.as_ref().map(|text| {
@@ -824,19 +1001,36 @@ impl SessionPreview {
                             .filter(|tool| tool.title != "update_plan")
                             .map(|tool| self.render_tool(tool, window, cx))
                             .collect::<Vec<_>>();
-                        let quote = (!message.streaming && !message.content.is_empty())
-                            .then(|| Self::quote_control(&self.armed_quotes, &message.id, &content_states, message.streaming, window, cx));
+                        let quote =
+                            (!message.streaming && !message.content.is_empty()).then(|| {
+                                Self::quote_control(
+                                    &self.armed_quotes,
+                                    &message.id,
+                                    &content_states,
+                                    message.streaming,
+                                    window,
+                                    cx,
+                                )
+                            });
                         kit::message_row(MessageRole::Assistant)
                             .child(
                                 kit::assistant_message_content()
                                     .children(reasoning)
-                                    .children(
-                                        (!message.content.is_empty())
-                                            .then(|| body),
-                                    )
+                                    .children((!message.content.is_empty()).then(|| body))
                                     .children(tools)
-                                    .children(quote.clone().map(|quote| self.render_message_actions(&message, false, Some(quote), cx)))
-                                    .context_menu(self.message_context_menu(&message, Some(content_states), cx)),
+                                    .children(quote.clone().map(|quote| {
+                                        self.render_message_actions(
+                                            &message,
+                                            false,
+                                            Some(quote),
+                                            cx,
+                                        )
+                                    }))
+                                    .context_menu(self.message_context_menu(
+                                        &message,
+                                        Some(content_states),
+                                        cx,
+                                    )),
                             )
                             .into_any_element()
                     }
@@ -895,12 +1089,23 @@ impl SessionPreview {
             }
             TranscriptRow::Working => Empty.into_any_element(),
         };
-        kit::conversation_transcript_row(if selected_prompt { Some("Selected prompt") } else { selected_match.then_some("Selected matching message") }, cx)
-            .child(content)
-            .into_any_element()
+        kit::conversation_transcript_row(
+            if selected_prompt {
+                Some("Selected prompt")
+            } else {
+                selected_match.then_some("Selected matching message")
+            },
+            cx,
+        )
+        .child(content)
+        .into_any_element()
     }
 
-    pub(super) fn environment_action(action: kit::EnvironmentAction, window: &mut Window, cx: &mut App) {
+    pub(super) fn environment_action(
+        action: kit::EnvironmentAction,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         Self::preview_notice(
             match action {
                 kit::EnvironmentAction::Branches => "Branches",
@@ -1095,7 +1300,8 @@ impl SessionPreview {
             move |destination, _, cx| {
                 let _ = owner.update(cx, |this, cx| {
                     this.gallery_open = false;
-                    this.clear_conversation_find(); this.clear_prompt_navigation();
+                    this.clear_conversation_find();
+                    this.clear_prompt_navigation();
                     this.automations_open = destination == kit::SidebarDestination::Automations;
                     this.github_open = match destination {
                         kit::SidebarDestination::Automations => None,
@@ -1280,7 +1486,8 @@ impl SessionPreview {
                         kit::sidebar_settings_button(self.settings_open, cx).on_click(cx.listener(
                             |this, _, _, cx| {
                                 this.settings_open = true;
-                                this.clear_conversation_find(); this.clear_prompt_navigation();
+                                this.clear_conversation_find();
+                                this.clear_prompt_navigation();
                                 cx.notify();
                             },
                         )),
@@ -1290,14 +1497,16 @@ impl SessionPreview {
                     })),
             )
     }
-
-
 }
 
 impl Render for SessionPreview {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.transcript
-            .sync(self.messages.clone(), false, false, self.find_open || self.outline_selected_id.is_some());
+        self.transcript.sync(
+            self.messages.clone(),
+            false,
+            false,
+            self.find_open || self.outline_selected_id.is_some(),
+        );
         let rem = window.rem_size();
         let viewport = window.viewport_size();
         let chat_page = !self.gallery_open
@@ -1369,7 +1578,8 @@ impl Render for SessionPreview {
             self.automations.clone().into_any_element()
         } else if self.editor_open {
             kit::conversation_surface(cx)
-                .role(Role::Group).track_focus(&self.chat_focus)
+                .role(Role::Group)
+                .track_focus(&self.chat_focus)
                 .child(self.render_header(layout.header_inset, cx))
                 .child(self.editor.clone())
                 .into_any_element()
@@ -1424,13 +1634,18 @@ impl Render for SessionPreview {
                         project_name.clone(),
                         self.session.work_dir.display().to_string(),
                     )
-                    .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
-                        kit::project_picker_menu(menu,
-                            [kit::project_picker_item(project_name.clone(), true)],
-                            kit::new_project_picker_item().on_click(|_, window, cx| {
-                                Self::preview_notice("New project", window, cx)
-                            }))
-                    }),
+                    .dropdown_menu_with_anchor(
+                        Anchor::BottomLeft,
+                        move |menu, _, _| {
+                            kit::project_picker_menu(
+                                menu,
+                                [kit::project_picker_item(project_name.clone(), true)],
+                                kit::new_project_picker_item().on_click(|_, window, cx| {
+                                    Self::preview_notice("New project", window, cx)
+                                }),
+                            )
+                        },
+                    ),
                 )
                 .child(
                     kit::composer_work_mode_button(work_mode, self.session.is_worktree)
@@ -1455,19 +1670,26 @@ impl Render for SessionPreview {
                         self.input.read(cx).focus_handle(cx).is_focused(window),
                         cx,
                     )
-                    .when(self.prompt_recall.is_some() || self.input.read(cx).value().is_empty(), |el| el.key_context(kit::PROMPT_RECALL_KEY_CONTEXT)
-                        .on_action(cx.listener(Self::recall_older_prompt_action))
-                        .on_action(cx.listener(Self::recall_newer_prompt_action)))
-                    .when(file_menu_open, |el| el.key_context(kit::file_completion::FILE_COMPLETION_KEY_CONTEXT)
-                        .on_action(cx.listener(Self::complete_file_action))
-                        .on_action(cx.listener(Self::previous_file_action))
-                        .on_action(cx.listener(Self::next_file_action))
-                        .on_action(cx.listener(Self::dismiss_file_action))
-                        .on_key_down(cx.listener(|host, event: &KeyDownEvent, _, cx| {
-                            if event.keystroke.key == "enter" && host.file_menu_open(cx) {
-                                cx.stop_propagation();
-                            }
-                        })))
+                    .when(
+                        self.prompt_recall.is_some() || self.input.read(cx).value().is_empty(),
+                        |el| {
+                            el.key_context(kit::PROMPT_RECALL_KEY_CONTEXT)
+                                .on_action(cx.listener(Self::recall_older_prompt_action))
+                                .on_action(cx.listener(Self::recall_newer_prompt_action))
+                        },
+                    )
+                    .when(file_menu_open, |el| {
+                        el.key_context(kit::file_completion::FILE_COMPLETION_KEY_CONTEXT)
+                            .on_action(cx.listener(Self::complete_file_action))
+                            .on_action(cx.listener(Self::previous_file_action))
+                            .on_action(cx.listener(Self::next_file_action))
+                            .on_action(cx.listener(Self::dismiss_file_action))
+                            .on_key_down(cx.listener(|host, event: &KeyDownEvent, _, cx| {
+                                if event.keystroke.key == "enter" && host.file_menu_open(cx) {
+                                    cx.stop_propagation();
+                                }
+                            }))
+                    })
                     .children(file_menu)
                     .children(self.render_prompt_recall_strip(cx))
                     .child(
@@ -1482,15 +1704,30 @@ impl Render for SessionPreview {
                             .child(
                                 kit::composer_picker_group()
                                     .child({
-                                        if !self.model_picker_open.get() && !self.model_picker.read(cx).query(cx).is_empty() {
-                                            self.model_picker.update(cx, |picker, cx| picker.set_query("", window, cx));
+                                        if !self.model_picker_open.get()
+                                            && !self.model_picker.read(cx).query(cx).is_empty()
+                                        {
+                                            self.model_picker.update(cx, |picker, cx| {
+                                                picker.set_query("", window, cx)
+                                            });
                                         }
                                         let open = self.model_picker_open.clone();
-                                        kit::composer_model_picker(&self.model_picker,
-                                            self.fixture.model.as_ref().map_or("Model unavailable", |model| model.label.as_str()),
+                                        kit::composer_model_picker(
+                                            &self.model_picker,
+                                            self.fixture
+                                                .model
+                                                .as_ref()
+                                                .map_or("Model unavailable", |model| {
+                                                    model.label.as_str()
+                                                }),
                                             self.fixture.model.is_some(),
-                                            self.fixture.model_provider_icon.clone().map(Into::into),
-                                            move |is_open| open.set(is_open), cx)
+                                            self.fixture
+                                                .model_provider_icon
+                                                .clone()
+                                                .map(Into::into),
+                                            move |is_open| open.set(is_open),
+                                            cx,
+                                        )
                                     })
                                     .children(self.fixture.mode.map(|mode| {
                                         kit::composer_mode_button(mode.label(), true).on_click(
@@ -1521,14 +1758,26 @@ impl Render for SessionPreview {
                                     ),
                             )
                             .child(div().flex_1().min_w_2())
-                            .child(kit::composer_actions_group().child(
-                                kit::recall_prompt_button(self.recall_unavailable_reason(cx))
-                                    .on_click(cx.listener(|host, _, window, cx| {
-                                        if host.recall_unavailable_reason(cx).is_none() { host.step_prompt_recall(true, window, cx); }
-                                    }))
-                            ).child(context_meter).child(
-                                kit::composer_send_button(false, "Saved session preview"),
-                            )),
+                            .child(
+                                kit::composer_actions_group()
+                                    .child(
+                                        kit::recall_prompt_button(
+                                            self.recall_unavailable_reason(cx),
+                                        )
+                                        .on_click(
+                                            cx.listener(|host, _, window, cx| {
+                                                if host.recall_unavailable_reason(cx).is_none() {
+                                                    host.step_prompt_recall(true, window, cx);
+                                                }
+                                            }),
+                                        ),
+                                    )
+                                    .child(context_meter)
+                                    .child(kit::composer_send_button(
+                                        false,
+                                        "Saved session preview",
+                                    )),
+                            ),
                     ),
                 )
                 .child(kit::composer_shortcuts(
@@ -1537,17 +1786,34 @@ impl Render for SessionPreview {
                 ));
             let rail = self.render_prompt_rail(cx);
             let list = kit::transcript_list(&self.transcript, cx.processor(Self::render_row));
-            let viewport = kit::conversation_transcript_viewport(rail, list, &self.transcript.list, show_environment,
-                cx.listener(|host, _, _, cx| { host.outline_selected_id = None; host.transcript.list.scroll_to_end(); cx.notify(); }));
+            let viewport = kit::conversation_transcript_viewport(
+                rail,
+                list,
+                &self.transcript.list,
+                show_environment,
+                cx.listener(|host, _, _, cx| {
+                    host.outline_selected_id = None;
+                    host.transcript.list.scroll_to_end();
+                    cx.notify();
+                }),
+            );
             kit::conversation_surface(cx)
-                .role(Role::Group).track_focus(&self.chat_focus)
-                .key_context(if self.find_open { "Conversation ConversationFindActive" } else { "Conversation" })
+                .role(Role::Group)
+                .track_focus(&self.chat_focus)
+                .key_context(if self.find_open {
+                    "Conversation ConversationFindActive"
+                } else {
+                    "Conversation"
+                })
                 .on_action(cx.listener(Self::open_conversation_find))
                 .on_action(cx.listener(Self::close_conversation_find))
                 .on_action(cx.listener(Self::next_conversation_match))
                 .on_action(cx.listener(Self::previous_conversation_match))
                 .child(header)
-                .children(self.find_open.then(|| self.render_conversation_find(layout.header_inset, cx)))
+                .children(
+                    self.find_open
+                        .then(|| self.render_conversation_find(layout.header_inset, cx)),
+                )
                 .child(
                     div()
                         .flex()
@@ -1557,7 +1823,18 @@ impl Render for SessionPreview {
                         .justify_center()
                         .child(
                             kit::conversation_column(show_environment)
-                                .children(self.fixture.run_timing.as_ref().and_then(|timing| timing.elapsed_seconds(self.captured_at.saturating_mul(1000), false)).map(|seconds| kit::last_run_duration(seconds, cx)))
+                                .children(
+                                    self.fixture
+                                        .run_timing
+                                        .as_ref()
+                                        .and_then(|timing| {
+                                            timing.elapsed_seconds(
+                                                self.captured_at.saturating_mul(1000),
+                                                false,
+                                            )
+                                        })
+                                        .map(|seconds| kit::last_run_duration(seconds, cx)),
+                                )
                                 .child(viewport)
                                 .children(kit::plan_tracker(
                                     &self.session.id,
@@ -1569,11 +1846,20 @@ impl Render for SessionPreview {
                         )
                         .children(show_environment.then(|| {
                             let owner = cx.entity().downgrade();
-                            saved_environment(&self.fixture, move |action, window, cx| {
-                                if action == kit::EnvironmentAction::Terminal {
-                                    let _ = owner.update(cx, |host, cx| { host.terminal_open = !host.terminal_open; cx.notify(); });
-                                } else { Self::environment_action(action, window, cx); }
-                            }, cx)
+                            saved_environment(
+                                &self.fixture,
+                                move |action, window, cx| {
+                                    if action == kit::EnvironmentAction::Terminal {
+                                        let _ = owner.update(cx, |host, cx| {
+                                            host.terminal_open = !host.terminal_open;
+                                            cx.notify();
+                                        });
+                                    } else {
+                                        Self::environment_action(action, window, cx);
+                                    }
+                                },
+                                cx,
+                            )
                         })),
                 )
                 .into_any_element()
@@ -1652,53 +1938,148 @@ impl Render for SessionPreview {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(if compact_status { "Local preview" } else if self.settings_open && !self.gallery_open { "Sample settings · Local preview · Preferences are not saved" } else if self.github_open.is_some() && !self.gallery_open { "Sample GitHub collection · Local preview · No GitHub requests" } else if self.automations_open && !self.gallery_open { "Sample automations · Local preview · No prompts run" } else if self.editor_open && !self.gallery_open { "Sample editor · Local preview" } else { "Saved session · Local preview" }),
+                    .child(if compact_status {
+                        "Local preview"
+                    } else if self.settings_open && !self.gallery_open {
+                        "Sample settings · Local preview · Preferences are not saved"
+                    } else if self.github_open.is_some() && !self.gallery_open {
+                        "Sample GitHub collection · Local preview · No GitHub requests"
+                    } else if self.automations_open && !self.gallery_open {
+                        "Sample automations · Local preview · No prompts run"
+                    } else if self.editor_open && !self.gallery_open {
+                        "Sample editor · Local preview"
+                    } else {
+                        "Saved session · Local preview"
+                    }),
             )
             .right(
-                div().flex().items_center().gap_2()
-                    .children(self.sidebar_removed.then(|| Button::new("preview-restore-session").label("Restore preview session").small().ghost().on_click(cx.listener(|host, _, _, cx| { host.sidebar_removed = false; cx.notify(); }))))
-                    .children((self.editor_open && self.github_open.is_none() && !self.automations_open && !self.settings_open && !self.gallery_open).then(|| {
-                        Button::new("preview-editor-reset").label("Reset editor samples").small().ghost()
-                            .on_click(cx.listener(|host, _, window, cx| host.editor.update(cx, |editor, cx| editor.reset(window, cx))))
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .children(self.sidebar_removed.then(|| {
+                        Button::new("preview-restore-session")
+                            .label("Restore preview session")
+                            .small()
+                            .ghost()
+                            .on_click(cx.listener(|host, _, _, cx| {
+                                host.sidebar_removed = false;
+                                cx.notify();
+                            }))
                     }))
-                    .children((!self.gallery_open && !self.settings_open && self.github_open.is_none() && !self.automations_open).then(|| {
-                        Button::new("preview-agents-toggle").debug_selector(|| "preview-agents-toggle".into())
-                            .label("Agents").small().ghost().selected(self.agents_open)
-                            .on_click(cx.listener(|host, _, _, cx| { host.agents_open = !host.agents_open; cx.notify(); }))
-                    }))
-                    .children((!self.gallery_open && !self.settings_open && self.github_open.is_none() && !self.automations_open).then(|| {
-                        Button::new("preview-terminal-toggle").debug_selector(|| "preview-terminal-toggle".into())
-                            .label(if compact_status { "Terminal" } else { "Terminal sample" }).tooltip("Toggle local terminal sample").accessibility_label("Toggle local terminal sample").small().ghost()
-                            .on_click(cx.listener(|host, _, _, cx| { host.terminal_open = !host.terminal_open; cx.notify(); }))
-                    }))
-                    .child(Button::new("preview-command-palette").debug_selector(|| "preview-command-palette".into()).icon(gpui_component::IconName::Search)
-                        .small().ghost().selected(self.palette_open).tooltip("Command palette (Cmd+K)")
-                        .accessibility_label("Command palette (Cmd+K)")
-                        .on_click(cx.listener(|host,_,window,cx| host.toggle_palette(window,cx))))
-                    .child(Button::new("preview-component-mode").debug_selector(|| "preview-component-mode".into())
-                    .label(if self.gallery_open {
-                        "Workspace"
-                    } else {
-                        "Components"
-                    })
-                    .small()
-                    .ghost()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.gallery_open = !this.gallery_open;
-                        this.clear_conversation_find(); this.clear_prompt_navigation();
-                        cx.notify();
-                    }))),
+                    .children(
+                        (self.editor_open
+                            && self.github_open.is_none()
+                            && !self.automations_open
+                            && !self.settings_open
+                            && !self.gallery_open)
+                            .then(|| {
+                                Button::new("preview-editor-reset")
+                                    .label("Reset editor samples")
+                                    .small()
+                                    .ghost()
+                                    .on_click(cx.listener(|host, _, window, cx| {
+                                        host.editor
+                                            .update(cx, |editor, cx| editor.reset(window, cx))
+                                    }))
+                            }),
+                    )
+                    .children(
+                        (!self.gallery_open
+                            && !self.settings_open
+                            && self.github_open.is_none()
+                            && !self.automations_open)
+                            .then(|| {
+                                Button::new("preview-agents-toggle")
+                                    .debug_selector(|| "preview-agents-toggle".into())
+                                    .label("Agents")
+                                    .small()
+                                    .ghost()
+                                    .selected(self.agents_open)
+                                    .on_click(cx.listener(|host, _, _, cx| {
+                                        host.agents_open = !host.agents_open;
+                                        cx.notify();
+                                    }))
+                            }),
+                    )
+                    .children(
+                        (!self.gallery_open
+                            && !self.settings_open
+                            && self.github_open.is_none()
+                            && !self.automations_open)
+                            .then(|| {
+                                Button::new("preview-terminal-toggle")
+                                    .debug_selector(|| "preview-terminal-toggle".into())
+                                    .label(if compact_status {
+                                        "Terminal"
+                                    } else {
+                                        "Terminal sample"
+                                    })
+                                    .tooltip("Toggle local terminal sample")
+                                    .accessibility_label("Toggle local terminal sample")
+                                    .small()
+                                    .ghost()
+                                    .on_click(cx.listener(|host, _, _, cx| {
+                                        host.terminal_open = !host.terminal_open;
+                                        cx.notify();
+                                    }))
+                            }),
+                    )
+                    .child(
+                        Button::new("preview-command-palette")
+                            .debug_selector(|| "preview-command-palette".into())
+                            .icon(gpui_component::IconName::Search)
+                            .small()
+                            .ghost()
+                            .selected(self.palette_open)
+                            .tooltip("Command palette (Cmd+K)")
+                            .accessibility_label("Command palette (Cmd+K)")
+                            .on_click(
+                                cx.listener(|host, _, window, cx| host.toggle_palette(window, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("preview-component-mode")
+                            .debug_selector(|| "preview-component-mode".into())
+                            .label(if self.gallery_open {
+                                "Workspace"
+                            } else {
+                                "Components"
+                            })
+                            .small()
+                            .ghost()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.gallery_open = !this.gallery_open;
+                                this.clear_conversation_find();
+                                this.clear_prompt_navigation();
+                                cx.notify();
+                            })),
+                    ),
             );
-        kit::workspace_with_status(split, status).relative()
-            .children((!self.settings_open && !self.gallery_open).then(|| kit::workspace_sidebar_toggle(self.sidebar_collapsed, layout.sidebar_available)
-                .on_click(cx.listener(|host, _, _, cx| { host.sidebar_collapsed = !host.sidebar_collapsed; cx.notify(); }))))
-            .on_action(cx.listener(|host, _: &palette::TogglePreviewPalette, window,cx| host.toggle_palette(window,cx)))
+        kit::workspace_with_status(split, status)
+            .relative()
+            .children((!self.settings_open && !self.gallery_open).then(|| {
+                kit::workspace_sidebar_toggle(self.sidebar_collapsed, layout.sidebar_available)
+                    .on_click(cx.listener(|host, _, _, cx| {
+                        host.sidebar_collapsed = !host.sidebar_collapsed;
+                        cx.notify();
+                    }))
+            }))
+            .on_action(
+                cx.listener(|host, _: &palette::TogglePreviewPalette, window, cx| {
+                    host.toggle_palette(window, cx)
+                }),
+            )
             .children(self.palette_open.then(|| self.render_palette(cx)))
     }
 }
 
 /// Both preview modes consume one immutable, imported fixture.
-pub(super) fn saved_environment(fixture: &Arc<Snapshot>, on_action: impl Fn(kit::EnvironmentAction, &mut Window, &mut App) + 'static, cx: &App) -> AnyElement {
+pub(super) fn saved_environment(
+    fixture: &Arc<Snapshot>,
+    on_action: impl Fn(kit::EnvironmentAction, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
     let fallback = SessionInfo::default();
     let session = fixture.session.as_ref().unwrap_or(&fallback);
     let project = session
@@ -1731,9 +2112,8 @@ pub(super) fn saved_environment(fixture: &Arc<Snapshot>, on_action: impl Fn(kit:
                 false,
                 |label, action| {
                     let on_action = menu_action.clone();
-                    gpui_component::menu::PopupMenuItem::new(label).on_click(
-                        move |_, window, cx| on_action(action, window, cx),
-                    )
+                    gpui_component::menu::PopupMenuItem::new(label)
+                        .on_click(move |_, window, cx| on_action(action, window, cx))
                 },
             )
         },

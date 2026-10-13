@@ -5,9 +5,9 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_component::sheet::Sheet;
-use gpui_component::{ActiveTheme, Disableable};
+use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt};
 use std::rc::Rc;
-use threadlane_automation::{display_time, Definition, Schedule};
+use threadlane_automation::{Definition, Schedule, display_time};
 
 actions!(threadlane_automation_ui, [SaveAutomation]);
 
@@ -17,14 +17,23 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-enter", SaveAutomation, Some("AutomationEditor")),
         KeyBinding::new("ctrl-enter", SaveAutomation, Some("AutomationEditor")),
         // Match at the focused input so its secondary Enter cannot insert a newline.
-        KeyBinding::new("cmd-enter", SaveAutomation, Some("AutomationEditor > Input")),
-        KeyBinding::new("ctrl-enter", SaveAutomation, Some("AutomationEditor > Input")),
+        KeyBinding::new(
+            "cmd-enter",
+            SaveAutomation,
+            Some("AutomationEditor > Input"),
+        ),
+        KeyBinding::new(
+            "ctrl-enter",
+            SaveAutomation,
+            Some("AutomationEditor > Input"),
+        ),
     ]);
 }
 
 /// Requested form changes. Inputs and persistence belong to the host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AutomationFormAction {
+    Starter(AutomationStarter),
     Project(String),
     Model(String),
     Effort(String),
@@ -34,6 +43,69 @@ pub enum AutomationFormAction {
     NotifyAll(bool),
     Save,
     Cancel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutomationStarter {
+    ProjectReview,
+    TestGaps,
+    DependencyReview,
+}
+
+impl AutomationStarter {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::ProjectReview => "Review recent changes",
+            Self::TestGaps => "Find test gaps",
+            Self::DependencyReview => "Review dependencies",
+        }
+    }
+
+    pub fn prompt(self) -> &'static str {
+        match self {
+            Self::ProjectReview => {
+                "Review the last 24 hours of commits in this project. Summarize the changes, identify potential regressions with file references, and suggest follow-up checks. If there are no recent commits, say so. Do not modify files, create issues, or publish anything."
+            }
+            Self::TestGaps => {
+                "Inspect recent changes and their tests in this project. Identify important behaviors that lack coverage, prioritizing concrete regressions and edge cases. Report file references and suggested tests. Do not modify files, create issues, or publish anything."
+            }
+            Self::DependencyReview => {
+                "Review this project's dependency manifests and lockfiles. Highlight maintenance risks and updates worth investigating, distinguishing verified findings from recommendations. Do not claim vulnerabilities without evidence. Do not modify files, create issues, or publish anything."
+            }
+        }
+    }
+}
+
+pub fn can_apply_starter(revision: u64, name: &str, prompt: &str) -> bool {
+    revision == 0 && name.trim().is_empty() && prompt.trim().is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::can_apply_starter;
+
+    #[test]
+    fn automation_starters_never_replace_existing_or_typed_tasks() {
+        assert!(can_apply_starter(0, "", "  "));
+        assert!(!can_apply_starter(1, "", ""));
+        assert!(!can_apply_starter(0, "My task", ""));
+        assert!(!can_apply_starter(0, "", "My prompt"));
+    }
+}
+
+fn section(title: &'static str, description: &'static str, cx: &App) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .pt_2()
+        .child(div().font_semibold().child(title))
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(description),
+        )
 }
 
 /// Controlled form values. Hosts retain input entities and supply their catalog.
@@ -157,6 +229,19 @@ pub fn automation_form(
         .flex()
         .flex_col()
         .gap_4()
+        .child(section("1. Define the task", "Give each run a clear goal and a useful result to report.", cx))
+        .when(form.definition.revision == 0, |body| {
+            let available = can_apply_starter(form.definition.revision, &form.name.read(cx).value(), &form.prompt.read(cx).value());
+            body.child(div().flex().flex_col().gap_2()
+                .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Start from a suggestion, or write your own. Suggestions only fill an empty task."))
+                .child(div().flex().flex_wrap().gap_2().children([
+                    AutomationStarter::ProjectReview, AutomationStarter::TestGaps, AutomationStarter::DependencyReview
+                ].into_iter().enumerate().map(|(i, starter)| {
+                    Button::new(("automation-starter", i)).small().label(starter.title())
+                        .disabled(form.busy || !available)
+                        .on_click(form_request(&on_action, AutomationFormAction::Starter(starter)))
+                }))))
+        })
         .child(crate::form_field(
             "Name",
             Input::new(form.name)
@@ -169,11 +254,7 @@ pub fn automation_form(
                 .aria_label("Automation prompt")
                 .disabled(form.busy),
         ))
-        .child(crate::form_field("Project", project))
-        .child(crate::form_field("Model", model))
-        .when(form.show_effort, |body| {
-            body.child(crate::form_field("Reasoning effort", effort))
-        })
+        .child(section("2. Choose when to run", "Saving never starts a run immediately. Use Run now when you are ready.", cx))
         .child(crate::form_field("Schedule", cadence));
     if form.cadence == "interval" {
         body = body.child(crate::form_field(
@@ -260,6 +341,12 @@ pub fn automation_form(
     body = body
             .child(div().text_sm().text_color(cx.theme().muted_foreground)
                 .child(form.schedule_preview.clone()))
+            .when(!form.definition.enabled, |body| body.child(div().text_sm().text_color(cx.theme().muted_foreground)
+                .child("This automation will stay paused after saving. Resume it from its details to enable scheduled runs.")))
+            .child(section("3. Configure execution", "Each run opens a fresh chat with these settings.", cx))
+            .child(crate::form_field("Project", project))
+            .child(crate::form_field("Model", model))
+            .when(form.show_effort, |body| body.child(crate::form_field("Reasoning effort", effort)))
             .child(crate::form_field("Run in", automation_picker(
                 "automation-environment",
                 if form.definition.worktree { "Worktree" } else { "Local" }.into(),

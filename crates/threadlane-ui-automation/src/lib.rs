@@ -1,16 +1,21 @@
 //! Automation navigation, editor, and paged run history. Execution stays in the owning daemon.
 mod editor;
 use gpui::*;
+use gpui_component::input::{InputEvent, InputState};
 use std::path::PathBuf;
 use threadlane_automation::Definition;
 use threadlane_protocol::automation::AutomationCommand as Command;
-use threadlane_ui_state::{automation_io, AppState};
+use threadlane_ui_state::{AppState, automation_io};
 
 pub use threadlane_ui_kit::automation_form::SaveAutomation;
-pub fn init(cx: &mut App) { threadlane_ui_kit::automation_form::init(cx); }
+pub fn init(cx: &mut App) {
+    threadlane_ui_kit::automation_form::init(cx);
+}
 
 pub struct AutomationsView {
     model: Entity<AppState>,
+    search: Entity<InputState>,
+    _search_subscription: Subscription,
     selected: Option<String>,
     expanded_prompt: Option<String>,
     scope: Option<PathBuf>,
@@ -29,10 +34,18 @@ fn deleted_selection_is_current(deleted_id: Option<&str>, selected: Option<&str>
 }
 
 impl AutomationsView {
-    pub fn new(model: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+    pub fn new(model: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let subscription = cx.observe(&model, |_, _, cx| cx.notify());
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search automations…"));
+        let search_subscription = cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
         Self {
             model,
+            search,
+            _search_subscription: search_subscription,
             selected: None,
             expanded_prompt: None,
             scope: None,
@@ -76,10 +89,7 @@ impl AutomationsView {
             let _ = this.update(cx, |this, cx| {
                 this.busy = false;
                 if result.is_ok()
-                    && deleted_selection_is_current(
-                        deleted_id.as_deref(),
-                        this.selected.as_deref(),
-                    )
+                    && deleted_selection_is_current(deleted_id.as_deref(), this.selected.as_deref())
                 {
                     this.selected = None;
                     this.history = true;
@@ -102,13 +112,16 @@ impl AutomationsView {
     }
 }
 impl Render for AutomationsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use threadlane_ui_kit::automation::{
-            automation_screen, AutomationAction, AutomationScreen,
+            AutomationAction, AutomationScreen, automation_screen,
         };
         let state = self.model.read(cx);
         let snapshot = state.automations.snapshot.clone();
         let screen = AutomationScreen {
+            search: Some(self.search.clone()),
+            query: self.search.read(cx).value().to_string(),
+            compact: window.viewport_size().width < window.rem_size() * 70.0,
             projects: state
                 .projects
                 .iter()
@@ -158,6 +171,29 @@ impl Render for AutomationsView {
                         }
                         AutomationAction::ExpandPrompt(id) => this.expanded_prompt = id,
                         AutomationAction::Page(page) => this.page = page,
+                        AutomationAction::ClearSearch => {
+                            this.search
+                                .update(cx, |search, cx| search.set_value("", window, cx));
+                        }
+                        AutomationAction::Duplicate(id) => {
+                            let source = this
+                                .model
+                                .read(cx)
+                                .automations
+                                .snapshot
+                                .definitions
+                                .iter()
+                                .find(|d| d.id == id)
+                                .cloned();
+                            if let Some(source) = source {
+                                let draft = threadlane_ui_kit::automation::duplicate_automation(
+                                    &source,
+                                    threadlane_automation::new_id(),
+                                    threadlane_automation::now(),
+                                );
+                                this.edit(Some(draft), window, cx);
+                            }
+                        }
                         AutomationAction::Edit(id) => {
                             let editing_existing = id.is_some();
                             let definition = id.and_then(|id| {
@@ -170,7 +206,9 @@ impl Render for AutomationsView {
                                     .find(|d| d.id == id)
                                     .cloned()
                             });
-                            if editing_existing && definition.is_none() { return; }
+                            if editing_existing && definition.is_none() {
+                                return;
+                            }
                             this.edit(definition, window, cx);
                         }
                         AutomationAction::RunNow(id) => this.command(Command::RunNow { id }, cx),
@@ -180,7 +218,9 @@ impl Render for AutomationsView {
                         AutomationAction::Delete(id) => this.command(Command::Delete { id }, cx),
                         AutomationAction::CancelRun(id) => this.command(Command::Cancel { id }, cx),
                         AutomationAction::ReviewRun(id) => this.command(Command::Review { id }, cx),
-                        AutomationAction::DeleteRun(id) => this.command(Command::DeleteRun { id }, cx),
+                        AutomationAction::DeleteRun(id) => {
+                            this.command(Command::DeleteRun { id }, cx)
+                        }
                         AutomationAction::OpenChat(id) => {
                             let result = this.model.update(cx, |state, cx| {
                                 let result = state.open_automation_run(&id);
@@ -205,7 +245,7 @@ impl Render for AutomationsView {
 mod tests {
     use gpui::{AppContext, Modifiers, TestAppContext};
     use gpui_component::WindowExt;
-    use threadlane_ui_state::{activate_test_session, AppState};
+    use threadlane_ui_state::{AppState, activate_test_session};
 
     /// Remote deletion must not undo a newer selection or a return to the list.
     #[test]
@@ -275,7 +315,7 @@ mod tests {
         let capture = captured.clone();
         let (_, cx) = cx.add_window_view(move |window, cx| {
             let view = cx.new(|cx| {
-                let mut view = super::AutomationsView::new(shared, cx);
+                let mut view = super::AutomationsView::new(shared, window, cx);
                 view.selected = Some("research".into());
                 view.page = 9; // A removed last page must fall back to existing rows.
                 view
@@ -438,8 +478,10 @@ mod tests {
             });
             let title = cx.debug_bounds("automation-run-title-30").unwrap();
             let context = cx.debug_bounds("automation-run-context-30").unwrap();
-            assert!(title.right() <= gpui::px(width) && context.top() >= title.bottom(),
-                "history must wrap long titles above their metadata at width {width}, rem {rem_size}");
+            assert!(
+                title.right() <= gpui::px(width) && context.top() >= title.bottom(),
+                "history must wrap long titles above their metadata at width {width}, rem {rem_size}"
+            );
             view.update(cx, |view, cx| {
                 view.history = false;
                 cx.notify();
@@ -471,7 +513,7 @@ mod tests {
         });
         let shared = model.clone();
         let (_, cx) = cx.add_window_view(move |window, cx| {
-            let view = cx.new(|cx| super::AutomationsView::new(shared, cx));
+            let view = cx.new(|cx| super::AutomationsView::new(shared, window, cx));
             gpui_component::Root::new(view, window, cx)
         });
         cx.run_until_parked();
@@ -491,12 +533,18 @@ mod tests {
                 ..Default::default()
             });
             cx.run_until_parked();
-            cx.update(|window, cx| { window.refresh(); window.draw(cx).clear(cx); });
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
         };
         scroll_form(cx);
         let save = cx.debug_bounds("automation-editor-save").unwrap();
         let viewport = cx.update(|window, _| window.viewport_size());
-        assert!(save.right() <= viewport.width && save.bottom() <= viewport.height, "Save must be visible before it is clicked");
+        assert!(
+            save.right() <= viewport.width && save.bottom() <= viewport.height,
+            "Save must be visible before it is clicked"
+        );
         cx.simulate_click(save.center(), Modifiers::default());
         cx.run_until_parked();
         cx.update(|window, cx| {
@@ -506,7 +554,10 @@ mod tests {
             )
         });
         scroll_form(cx);
-        assert!(cx.debug_bounds("automation-editor-error").is_some(), "invalid fields must show validation feedback");
+        assert!(
+            cx.debug_bounds("automation-editor-error").is_some(),
+            "invalid fields must show validation feedback"
+        );
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         cx.update(|window, cx| assert!(!window.has_active_sheet(cx)));
