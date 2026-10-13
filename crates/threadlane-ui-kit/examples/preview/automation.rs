@@ -16,16 +16,11 @@ pub struct AutomationPreview {
 impl AutomationPreview {
     pub fn new(project: std::path::PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search automations…"));
-        let search_subscription = cx.subscribe_in(
-            &search,
-            window,
-            |_, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::Change) {
-                    window.refresh();
-                    cx.notify();
-                }
-            },
-        );
+        let search_subscription = cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
         let mut definition = Definition {
             id: "sample-research".into(), revision: 1,
             name: "Sample · Review project activity".into(),
@@ -126,7 +121,6 @@ impl AutomationPreview {
                 if let Some(search) = &self.screen.search {
                     search.update(cx, |search, cx| search.set_value("", window, cx));
                 }
-                window.refresh();
             }
             AutomationAction::Duplicate(id) => {
                 if let Some(source) = self.snapshot.definitions.iter().find(|d| d.id == id) {
@@ -342,6 +336,7 @@ mod tests {
         cx.simulate_input("no such automation");
         cx.run_until_parked();
         cx.update(|window, cx| {
+            window.refresh();
             window.draw(cx).clear(cx);
         });
         assert!(cx.debug_bounds("automation-row-sample-research").is_none());

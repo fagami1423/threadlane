@@ -37,16 +37,11 @@ impl AutomationsView {
     pub fn new(model: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let subscription = cx.observe(&model, |_, _, cx| cx.notify());
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search automations…"));
-        let search_subscription = cx.subscribe_in(
-            &search,
-            window,
-            |_, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::Change) {
-                    window.refresh();
-                    cx.notify();
-                }
-            },
-        );
+        let search_subscription = cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
         Self {
             model,
             search,
@@ -179,7 +174,6 @@ impl Render for AutomationsView {
                         AutomationAction::ClearSearch => {
                             this.search
                                 .update(cx, |search, cx| search.set_value("", window, cx));
-                            window.refresh();
                         }
                         AutomationAction::Duplicate(id) => {
                             let source = this
