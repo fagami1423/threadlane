@@ -345,6 +345,12 @@ mod tests {
             cx.debug_bounds("automation-duplicate").is_some(),
             "search preserves the selected detail"
         );
+        let detail = cx.debug_bounds("automation-detail-heading").unwrap();
+        let pane = cx.debug_bounds("automation-content").unwrap();
+        assert!(
+            detail.size.width > pane.size.width / 2.0,
+            "the retained detail must not collapse when its list row is filtered out"
+        );
         preview.read_with(cx, |state, _| {
             assert_eq!(state.screen.selected.as_deref(), Some("sample-research"))
         });

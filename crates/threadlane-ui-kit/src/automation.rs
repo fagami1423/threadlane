@@ -246,7 +246,7 @@ pub fn automation_screen(
             .selected(selected.as_ref() == Some(&d.id)),
         );
     }
-    let mut content = div().flex().flex_col().gap_4().p_4();
+    let mut content = div().flex().flex_col().w_full().min_w_0().gap_4().p_4();
     if let Some(d) = definition {
         let active = snapshot
             .runs
@@ -630,7 +630,7 @@ pub fn automation_detail(
 ) -> Div {
     let on_action: Callback = Rc::new(on_action);
     let muted = cx.theme().muted_foreground;
-    let content = div().flex().flex_col().gap_4();
+    let content = div().flex().flex_col().w_full().min_w_0().gap_4();
     let run_id = d.id.clone();
     let pause_id = d.id.clone();
     let delete_id = d.id.clone();
@@ -708,6 +708,9 @@ pub fn automation_detail(
         .child(
             div()
                 .id("automation-detail-heading")
+                .debug_selector(|| "automation-detail-heading".into())
+                .w_full()
+                .min_w_0()
                 .role(Role::Heading)
                 .aria_label(d.name.clone())
                 .text_xl()
