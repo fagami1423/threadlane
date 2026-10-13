@@ -431,18 +431,15 @@ pub fn agent_empty_state(main: bool, cx: &App) -> Div {
                 .text_sm()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(theme.muted_foreground)
-                .child(if main {
-                    "No main-agent activity yet"
-                } else {
-                    "No activity yet"
-                }),
+                // The selected agent's card above already names it.
+                .child("No activity yet"),
         )
         .child(
             div()
                 .text_xs()
                 .text_color(theme.muted_foreground.opacity(0.8))
                 .child(if main {
-                    "Select an agent above to inspect its work."
+                    "Tool calls and replies appear here once the agent runs."
                 } else {
                     "The prompt is shown above. New tool calls and replies will appear here."
                 }),
