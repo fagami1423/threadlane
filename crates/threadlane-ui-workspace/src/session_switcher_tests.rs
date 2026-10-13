@@ -1,7 +1,7 @@
 //! Mounted host tests omit service pumps: confirming only queues normal hydration.
 use super::{SessionNavigation, WorkspaceView};
-use gpui::{App, AppContext, Context, Entity, IntoElement, Render, TestAppContext, Window, div};
-use gpui_component::{Root, command::CommandState, resizable::ResizableState};
+use gpui::{div, App, AppContext, Context, Entity, IntoElement, Render, TestAppContext, Window};
+use gpui_component::{command::CommandState, resizable::ResizableState, Root};
 
 struct PickerHost(Option<Entity<WorkspaceView>>);
 impl Render for PickerHost {
@@ -92,23 +92,13 @@ fn switch_session_enter_cancel_and_stale_target_use_normal_selection(cx: &mut Te
     // Remote selection queues hydration without local filesystem/registry access.
     state.daemon_remote = true;
     state.active_session_id = Some("a".into());
-    state.pending_permissions.insert(
-        "d".into(),
-        threadlane_protocol::PermissionRequest {
-            id: "background-permission".into(),
-            capability: "network".into(),
-            title: "Allow network".into(),
-            detail: String::new(),
-            scopes: vec![],
-        },
-    );
-    state.pending_questions.insert(
-        "d".into(),
-        threadlane_protocol::QuestionRequest {
-            id: "background-question".into(),
-            questions: vec![],
-        },
-    );
+    state.pending_permissions.insert("d".into(), threadlane_protocol::PermissionRequest {
+        id: "background-permission".into(), capability: "network".into(),
+        title: "Allow network".into(), detail: String::new(), scopes: vec![],
+    });
+    state.pending_questions.insert("d".into(), threadlane_protocol::QuestionRequest {
+        id: "background-question".into(), questions: vec![],
+    });
     let project = state.projects[0].clone();
     state.drain_chat_stream(vec![
         threadlane_protocol::daemon::SessionEvent::ProjectChanged { project },
@@ -175,9 +165,7 @@ fn switch_session_enter_cancel_and_stale_target_use_normal_selection(cx: &mut Te
         .clone()),
         "c"
     );
-    let prior_focus = view.read_with(cx, |view, _| {
-        view.command_palette_previous_focus.clone().unwrap()
-    });
+    let prior_focus = view.read_with(cx, |view, _| view.command_palette_previous_focus.clone().unwrap());
     cx.simulate_input("a query");
     cx.run_until_parked();
     cx.simulate_keystrokes("escape");
