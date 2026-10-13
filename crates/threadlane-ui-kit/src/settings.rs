@@ -24,7 +24,7 @@ pub use external_agents::{settings_external_agent_row, settings_external_agents,
 #[path = "settings_providers.rs"]
 mod providers;
 pub use providers::{settings_provider_connection, settings_provider_account, settings_provider_key,
-    settings_providers, SettingsProvider, SettingsProviderAccount, SettingsProviderAction,
+    settings_providers, SettingsProvider, SettingsProviderAccount, SettingsProviderAction, SettingsProviderSection,
     SettingsProviders, SettingsProviderStatus, SettingsProviderStatusKind};
 
 /// Stable settings destinations. The host owns selection and page loading.

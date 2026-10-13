@@ -52,6 +52,7 @@ impl SettingsPreview {
                 ],
                 antigravity_connected: false, github_status: None,
                 gitlab_status: Some("Connected · preview sample".into()), status: None,
+                models_open: true, hosting_open: true,
             },
             github_key: cx.new(|cx| InputState::new(window, cx).placeholder("Sample GitHub token").masked(true)),
             openai_key: cx.new(|cx| InputState::new(window, cx).placeholder("Sample OpenAI key").default_value("sample-openai-key").masked(true)),
@@ -384,6 +385,16 @@ impl SettingsPreview {
                 } else { "Sample key test passed. No network request was sent." }
             }
             Action::RefreshModels => "Sample model refresh finished. No network request was sent.",
+            // Presentation only: leave the sample status untouched.
+            Action::ToggleSection(section) => {
+                let open = match section {
+                    kit::SettingsProviderSection::Models => &mut self.providers.models_open,
+                    kit::SettingsProviderSection::Hosting => &mut self.providers.hosting_open,
+                };
+                *open = !*open;
+                cx.notify();
+                return;
+            }
         };
         self.providers.status = Some(kit::SettingsProviderStatus { text: message.into(), kind });
         cx.notify();

@@ -73,6 +73,16 @@ pub struct SettingsProviders {
     pub github_status: Option<String>,
     pub gitlab_status: Option<String>,
     pub status: Option<SettingsProviderStatus>,
+    /// Expanded groups; the host retains them across renders.
+    pub models_open: bool,
+    pub hosting_open: bool,
+}
+
+/// A collapsible group on the providers page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsProviderSection {
+    Models,
+    Hosting,
 }
 /// The host reads its retained masked fields for SaveKey/TestKey intents.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,6 +96,8 @@ pub enum SettingsProviderAction {
     RemoveAccount(String),
     /// Clear the cached model lists and re-fetch every provider's inventory.
     RefreshModels,
+    /// Expand or collapse a group; presentation only.
+    ToggleSection(SettingsProviderSection),
 }
 type Callback = Rc<dyn Fn(SettingsProviderAction, &mut Window, &mut App)>;
 
@@ -607,13 +619,28 @@ pub fn settings_providers(
 
     // Model providers: sign-ins, API keys and the shared model catalog.
     let antigravity = providers.antigravity_connected;
-    let mut models = group_card(cx)
+    // Each API key sits beside the provider it belongs to.
+    let key_row = |provider, input: &Entity<InputState>| {
+        let callback = callback.clone();
+        separator(
+            settings_provider_key(
+                provider,
+                input,
+                move |action, window, cx| callback(action, window, cx),
+                window,
+                cx,
+            ),
+            cx,
+        )
+    };
+    let models = group_card(cx)
         .child(separator(
             div()
                 .child(chatgpt)
                 .when(connected, |row| row.child(accounts)),
             cx,
         ))
+        .child(key_row(SettingsProvider::OpenAI, openai))
         .child(separator(
             settings_provider_connection(
                 SettingsProvider::Antigravity,
@@ -626,22 +653,9 @@ pub fn settings_providers(
                 cx,
             ),
             cx,
-        ));
-    for (provider, input) in [
-        (SettingsProvider::OpenAI, openai),
-        (SettingsProvider::OpenCode, opencode),
-    ] {
-        let callback = callback.clone();
-        let row = settings_provider_key(
-            provider,
-            input,
-            move |action, window, cx| callback(action, window, cx),
-            window,
-            cx,
-        );
-        models = models.child(separator(row, cx));
-    }
-    models = models.child(model_catalog_row(callback.clone(), cx));
+        ))
+        .child(key_row(SettingsProvider::OpenCode, opencode))
+        .child(model_catalog_row(callback.clone(), cx));
 
     // Code hosts: repository access for issues, pull requests and reviews.
     let github_connected = providers.github_status.is_some();
@@ -681,7 +695,13 @@ pub fn settings_providers(
                 .gitlab_status
                 .clone()
                 .unwrap_or_else(|| "Not connected".into()),
-            "Connect GitLab to inspect merge requests and issues.",
+            // Detected from a saved token or the environment, never signed in
+            // here, so a disconnected row says how to connect instead.
+            if gitlab_connected {
+                "Connect GitLab to inspect merge requests and issues."
+            } else {
+                "Set GITLAB_TOKEN (or GL_TOKEN) to inspect merge requests and issues."
+            },
             connection_controls(SettingsProvider::GitLab, gitlab_connected, callback.clone())
                 .into_any_element(),
             window,
@@ -695,19 +715,92 @@ pub fn settings_providers(
         .flex_col()
         .gap_4()
         .children(status_banner)
-        .child(group_label("Model providers", cx))
-        .child(models)
-        .child(group_label("Code hosts", cx).mt_2())
-        .child(hosts)
+        .child(section_header(
+            SettingsProviderSection::Models,
+            "Model providers",
+            connected_summary(usize::from(connected) + usize::from(antigravity)),
+            providers.models_open,
+            callback.clone(),
+            cx,
+        ))
+        .when(providers.models_open, |page| page.child(models))
+        .child(section_header(
+            SettingsProviderSection::Hosting,
+            "Code hosts",
+            connected_summary(usize::from(github_connected) + usize::from(gitlab_connected)),
+            providers.hosting_open,
+            callback,
+            cx,
+        ))
+        .when(providers.hosting_open, |page| page.child(hosts))
         .into_any_element()
 }
 
-fn group_label(title: &'static str, cx: &App) -> Div {
-    div()
-        .text_xs()
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(cx.theme().muted_foreground)
-        .child(title)
+/// "N connected" for a collapsed group's header.
+fn connected_summary(count: usize) -> String {
+    if count == 0 {
+        "Not connected".into()
+    } else {
+        format!("{count} connected")
+    }
+}
+
+/// Disclosure header for one providers group: chevron, title, and a status
+/// summary so a collapsed group still says whether anything is connected.
+fn section_header(
+    section: SettingsProviderSection,
+    label: &'static str,
+    summary: String,
+    open: bool,
+    callback: Callback,
+    cx: &App,
+) -> impl IntoElement {
+    let id = match section {
+        SettingsProviderSection::Models => "provider-section-models",
+        SettingsProviderSection::Hosting => "provider-section-hosting",
+    };
+    let state = if open { "expanded" } else { "collapsed" };
+    Button::new(id)
+        .debug_selector(move || id.into())
+        .ghost()
+        .w_full()
+        .justify_start()
+        .accessibility_label(format!("{label}, {summary}, {state}"))
+        .tooltip(if open { "Collapse" } else { "Expand" })
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    Icon::new(if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .small()
+                    .text_color(cx.theme().muted_foreground),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(cx.theme().foreground)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(summary),
+                ),
+        )
+        .on_click(move |_, window, cx| {
+            callback(SettingsProviderAction::ToggleSection(section), window, cx)
+        })
 }
 
 fn group_card(cx: &App) -> Div {
