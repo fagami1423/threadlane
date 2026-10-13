@@ -131,18 +131,19 @@ fn validate_snapshot_identity(
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PrWorkflowAction {
     Status,
     Feedback,
+    Wait,
     Logs,
     Comment,
     Reply,
     Ready,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrWorkflowRequest {
     action: PrWorkflowAction,
@@ -151,9 +152,26 @@ pub struct PrWorkflowRequest {
     body: Option<String>,
     comment_id: Option<u64>,
     run_id: Option<u64>,
+    cursor: Option<String>,
+    timeout_seconds: Option<u64>,
+}
+
+pub struct PrWaitSettings {
+    pub cursor: Option<String>,
+    pub timeout_seconds: u64,
 }
 
 impl PrWorkflowRequest {
+    pub fn wait_settings(&self) -> Result<Option<PrWaitSettings>, String> {
+        self.validate()?;
+        Ok(
+            matches!(self.action, PrWorkflowAction::Wait).then(|| PrWaitSettings {
+                cursor: self.cursor.clone(),
+                timeout_seconds: self.timeout_seconds.unwrap_or(1800),
+            }),
+        )
+    }
+
     pub fn mutates(&self) -> bool {
         matches!(
             self.action,
@@ -164,6 +182,24 @@ impl PrWorkflowRequest {
     fn validate(&self) -> Result<GitHubRepository, String> {
         let repository = parse_pr_repository(&self.repository)?;
         validate_github_number(self.number, "pull request")?;
+        if let Some(cursor) = &self.cursor {
+            if cursor.len() != 64 || !cursor.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(
+                    "cursor must be the 64-character watch_cursor from feedback or wait".into(),
+                );
+            }
+        }
+        if self
+            .timeout_seconds
+            .is_some_and(|seconds| !(1..=1800).contains(&seconds))
+        {
+            return Err("timeout_seconds must be between 1 and 1800".into());
+        }
+        if !matches!(self.action, PrWorkflowAction::Wait)
+            && (self.cursor.is_some() || self.timeout_seconds.is_some())
+        {
+            return Err("cursor and timeout_seconds are only supported for wait".into());
+        }
         if matches!(
             self.action,
             PrWorkflowAction::Comment | PrWorkflowAction::Reply
@@ -317,7 +353,9 @@ pub fn execute_pr_workflow(
     let url = snapshot["url"].as_str().unwrap();
     match request.action {
         PrWorkflowAction::Status => Ok(snapshot.to_string()),
-        PrWorkflowAction::Feedback => {
+        // The session adapter owns the cancellable async wait; this function
+        // samples the same complete feedback for both actions.
+        PrWorkflowAction::Feedback | PrWorkflowAction::Wait => {
             let repo = format!("repos/{}/{}", repository.owner, repository.repo);
             let mut feedback = json!({"status": snapshot});
             for (key, endpoint) in [
@@ -451,6 +489,10 @@ mod tests {
             json!({"action":"reply", "repository":"owner/repo", "number":1, "body":"fix"}),
             json!({"action":"comment", "repository":"owner/repo", "number":1, "body":" "}),
             json!({"action":"logs", "repository":"owner/repo", "number":1, "run_id":0}),
+            json!({"action":"wait", "repository":"owner/repo", "number":1, "timeout_seconds":0}),
+            json!({"action":"wait", "repository":"owner/repo", "number":1, "timeout_seconds":1801}),
+            json!({"action":"wait", "repository":"owner/repo", "number":1, "cursor":"invalid"}),
+            json!({"action":"feedback", "repository":"owner/repo", "number":1, "timeout_seconds":60}),
         ] {
             assert!(
                 serde_json::from_value::<PrWorkflowRequest>(args)
@@ -472,6 +514,7 @@ mod tests {
         for (action, mutates) in [
             ("status", false),
             ("feedback", false),
+            ("wait", false),
             ("logs", false),
             ("comment", true),
             ("reply", true),

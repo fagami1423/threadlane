@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 mod cache;
 mod agent;
-pub use agent::{execute_pr_workflow, PrWorkflowRequest};
+pub use agent::{PrWaitSettings, PrWorkflowRequest, execute_pr_workflow};
 use cache::ResponseCache;
 
 use crate::error::GitError;

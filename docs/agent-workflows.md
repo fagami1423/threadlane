@@ -57,6 +57,32 @@ default workflow guidance does not override them. Fusion and native child-role
 contracts still apply where those modes already inject their own instructions.
 External ACP agents own their own prompt/workflow behavior.
 
+## Waiting for PR events without model polling
+
+Native Git sessions expose `github_pr` with a `wait` action. Read `feedback`
+first, handle existing findings, then pass its `watch_cursor` as `cursor` to
+`wait` (with the same explicit `repository` and PR `number`). The tool stays
+pending while host code checks the complete, paginated CI/review snapshot every
+60 seconds. Unchanged polls do not return to the model or append tool messages.
+Changes between the initial feedback read and registering the wait are detected
+by the cursor. Array ordering alone does not trigger a wake.
+
+The response has `wake_reason: changed` or `closed`, full feedback, and the next
+`watch_cursor`. A `timeout` response contains no cached readiness snapshot;
+fetch fresh feedback before claiming readiness. `timeout_seconds` defaults to
+1800 and accepts 1–1800 seconds; use the remaining no-progress budget rather
+than resetting it on each wait. Omitting the cursor baselines the current state.
+Errors (including rate limits or incomplete pagination) return to the agent
+instead of being mistaken for an unchanged or green PR. Existing credential
+handling and GitHub request throttling still apply. Waiting is read-only.
+
+This is local monitoring, not a hosted webhook endpoint: no public listener or
+GitHub App installation is required. Stop/cancellation drops the asynchronous
+wait and prevents further polls; an already-running GitHub read can finish.
+The session remains in a pending tool call, and quitting Threadlane interrupts
+it. It is not a durable subscription that wakes a stopped application. External
+ACP agents without this tool retain the bounded-polling fallback.
+
 Disabling a workflow skill removes its optional detailed guidance, not the native
 delegation contract. No new approval, publication, merge, or cleanup permission is
 granted by loading a skill. The upstream scripts, mandatory every-turn loading,
