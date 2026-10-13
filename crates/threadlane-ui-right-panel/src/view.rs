@@ -1972,7 +1972,12 @@ impl RightPanelView {
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let refresh = (!matches!(self.active_surface, Some(Surface::Agents | Surface::Trajectory))).then(|| {
+        // Live surfaces have nothing to refresh; Browser has its own reload in its toolbar.
+        let refresh = (!matches!(
+            self.active_surface,
+            Some(Surface::Agents | Surface::Trajectory | Surface::Browser)
+        ))
+        .then(|| {
             threadlane_ui_kit::right_panel_refresh_button()
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.refresh_active_surface(cx);
