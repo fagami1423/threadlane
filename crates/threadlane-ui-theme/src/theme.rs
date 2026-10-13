@@ -34,11 +34,13 @@ pub const WINDOW_CONTROLS_CONTENT_INSET: f32 = if APP_CAPTION_STRIP { 2.75 } els
 /// lights on macOS, at the content edge under a caption strip.
 pub const SIDEBAR_TOGGLE_LEFT: f32 = if APP_CAPTION_STRIP { 0.625 } else { 4.75 };
 
-/// True on desktop platforms whose frameless window has no native caption
-/// (Windows, Linux): the shell draws a caption strip with the window
-/// controls, drag area and sidebar toggle. macOS keeps its traffic lights in
-/// the transparent titlebar; the web preview has no window chrome.
-pub const APP_CAPTION_STRIP: bool = cfg!(any(target_os = "windows", target_os = "linux"));
+/// True where the frameless window has no native caption (Windows): the
+/// shell draws a caption strip with the window controls, drag area and
+/// sidebar toggle. macOS keeps its traffic lights in the transparent
+/// titlebar; the web preview has no window chrome. Linux is excluded: under
+/// server-side decorations (most X11, some Wayland compositors) the window
+/// manager already draws a title bar, and the strip would stack a second one.
+pub const APP_CAPTION_STRIP: bool = cfg!(target_os = "windows");
 
 /// Shared reading width for user messages, relative to the interface font size.
 pub const USER_BUBBLE_MAX_WIDTH: f32 = 40.0;

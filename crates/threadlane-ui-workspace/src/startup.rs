@@ -68,12 +68,13 @@ impl Render for StartupView {
         let body = self.render_body(window, cx);
         if !threadlane_ui_theme::APP_CAPTION_STRIP {
             // macOS draws traffic lights inside the transparent titlebar and
-            // every panel header already reserves room for them.
+            // every panel header already reserves room for them; on Linux the
+            // window manager's own title bar provides the controls.
             return body;
         }
-        // Elsewhere the frameless window has no native caption: this strip
-        // provides dragging, double-click maximize, and min/max/close (Windows
-        // routes them through native hit-testing, so snap layouts work).
+        // On Windows the frameless window has no native caption: this strip
+        // provides dragging, double-click maximize, and min/max/close, routed
+        // through native hit-testing so snap layouts work.
         let theme = cx.theme();
         div()
             .size_full()
