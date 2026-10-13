@@ -6,6 +6,8 @@ use gpui_component::resizable::{
 };
 use gpui_component::Icon;
 use gpui_component::{ActiveTheme, Disableable, Selectable, Sizable};
+use gpui_component::menu::PopupMenuItem;
+use threadlane_protocol::ReasoningEffort;
 use threadlane_ui_theme::CHAT_CONTENT_MAX_WIDTH;
 
 /// Shared responsive geometry. Hosts retain panel visibility and resize preferences.
@@ -392,18 +394,41 @@ pub fn composer_model_button(
         })
 }
 
-pub fn composer_effort_button(label: impl Into<SharedString>) -> Button {
-    let label = label.into();
+pub fn composer_effort_button(effort: ReasoningEffort) -> Button {
+    // A bare level ("Medium") does not say what it measures.
+    let text = effort_text(effort);
     Button::new("composer-reasoning-effort-picker")
         .debug_selector(|| "composer-reasoning-effort-picker".into())
         .small()
         .icon(Icon::default().path("icons/effort.svg"))
-        .label(label.clone())
-        .accessibility_label(format!("Reasoning effort: {label}"))
-        .tooltip(format!("Reasoning effort: {label}"))
+        .label(text.clone())
+        // The accessible name starts with the visible text (label in name).
+        .accessibility_label(format!("{text}, reasoning effort"))
+        .tooltip("Reasoning effort")
         .dropdown_caret(true)
         .ghost()
         .rounded_full()
+        .max_w(rems(12.5))
+}
+
+/// One row of the reasoning-effort menu, worded like the button.
+pub fn composer_effort_menu_item(effort: ReasoningEffort, selected: bool) -> PopupMenuItem {
+    PopupMenuItem::new(effort_text(effort)).checked(selected)
+}
+
+/// Visible text for a reasoning-effort level: "Medium effort", "Thinking off".
+/// Runtime levels (`Other`) are stored lowercase, so they are capitalized to
+/// sit beside the built-in ones.
+fn effort_text(effort: ReasoningEffort) -> String {
+    match effort {
+        ReasoningEffort::Off => "Thinking off".into(),
+        other => {
+            let label = other.label();
+            let mut chars = label.chars();
+            let first = chars.next().map(|c| c.to_uppercase().collect::<String>());
+            format!("{}{} effort", first.unwrap_or_default(), chars.as_str())
+        }
+    }
 }
 
 pub fn composer_mode_button(label: impl Into<SharedString>, enabled: bool) -> Button {
@@ -540,4 +565,18 @@ pub fn composer_branch_label(branch: impl Into<SharedString>, cx: &App) -> State
                 .text_color(cx.theme().muted_foreground),
         )
         .child(branch)
+}
+
+#[cfg(test)]
+mod effort_text_tests {
+    use super::effort_text;
+    use threadlane_protocol::ReasoningEffort;
+
+    #[test]
+    fn effort_text_names_the_setting() {
+        assert_eq!(effort_text(ReasoningEffort::Off), "Thinking off");
+        assert_eq!(effort_text(ReasoningEffort::Medium), "Medium effort");
+        assert_eq!(effort_text(ReasoningEffort::XHigh), "XHigh effort");
+        assert_eq!(effort_text(ReasoningEffort::Other("auto")), "Auto effort");
+    }
 }

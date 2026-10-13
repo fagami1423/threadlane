@@ -88,7 +88,7 @@ impl Render for RefinementPreview {
                 super::composer_toolbar(cx)
                     .child(super::composer_model_button("Balanced", true, false, false))
                     .child(super::composer_mode_button("Agent", true))
-                    .child(super::composer_effort_button("Medium")),
+                    .child(super::composer_effort_button(threadlane_protocol::ReasoningEffort::Medium)),
             )
     }
 }

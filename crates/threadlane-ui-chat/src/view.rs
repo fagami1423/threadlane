@@ -4332,7 +4332,7 @@ impl ChatListView {
         // offer no effort control instead of dead options.
         let show_effort_picker =
             threadlane_daemon::catalog::supports_reasoning(&selected_model, project_root.as_deref());
-        let effort_picker = threadlane_ui_kit::composer_effort_button(reasoning_effort.label())
+        let effort_picker = threadlane_ui_kit::composer_effort_button(reasoning_effort)
             .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, window, _cx| {
                 let menu = menu.check_side(gpui_component::Side::Right);
                 effort_options
@@ -4341,9 +4341,10 @@ impl ChatListView {
                     .fold(menu, |menu, effort| {
                         let model = effort_model.clone();
                         menu.item(
-                            PopupMenuItem::new(effort.label())
-                                .icon(Icon::default().path("icons/effort.svg"))
-                                .checked(effort == reasoning_effort)
+                            threadlane_ui_kit::composer_effort_menu_item(
+                                effort,
+                                effort == reasoning_effort,
+                            )
                                 .on_click(move |_event, _window, cx| {
                                     model.update(cx, |state, cx| {
                                         controller::dispatch(
