@@ -5,11 +5,9 @@
 
 ### Features
 
-* **agent:** wait for PR changes without model polling ([09cda3d](https://github.com/wheregmis/threadlane/commit/09cda3d9867dec946c48cbec2d7eecb2aa899a6d))
 * **agent:** wait for PR changes without model polling ([ee07c74](https://github.com/wheregmis/threadlane/commit/ee07c7468d356afc3f644cd267f32ee1ec989781))
 * **automation:** improve setup, navigation, and run review ([a79fa4f](https://github.com/wheregmis/threadlane/commit/a79fa4f09525545d76b1658c12a83fbb1e81dc4d))
 * notify on background interactive session completion ([44c5f65](https://github.com/wheregmis/threadlane/commit/44c5f6533ce51d526d671a103037732ebdda65f0))
-* **review:** add selected diff excerpts to chat drafts ([88698c2](https://github.com/wheregmis/threadlane/commit/88698c2c2a3412f159d406c83f44f6fd969e27cc))
 * **review:** add selected diff excerpts to chat drafts ([79c6278](https://github.com/wheregmis/threadlane/commit/79c627870779d06b1d8efc4ab8f0163faf0d8401))
 * **terminal:** improve keyboard, paste, mouse, and selection input ([bac9b60](https://github.com/wheregmis/threadlane/commit/bac9b607dfb01a2d11a31d47b7d67f487ebf5823))
 * **terminal:** improve terminal input, TUI mouse support, and workspace focus ([6c69f4c](https://github.com/wheregmis/threadlane/commit/6c69f4c8b963920e9c7778daa2864908d444d121))
