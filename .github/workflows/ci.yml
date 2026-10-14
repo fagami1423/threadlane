@@ -52,3 +52,5 @@ jobs:
       - name: Test ACP subprocess handling
         run: cargo nextest run -p threadlane-acp
       - run: cargo check -p threadlane-gpui
+      - name: Validate bundled model catalog
+        run: python3 resources/validate_models.py

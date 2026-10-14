@@ -3,6 +3,7 @@ pub mod antigravity;
 pub mod convert;
 pub mod credentials;
 pub mod exec;
+pub mod model_catalog;
 pub mod model_registry;
 pub mod openai;
 pub mod opencode;

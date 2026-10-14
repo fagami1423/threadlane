@@ -85,16 +85,9 @@ pub fn discovered_is_stale() -> bool {
 
 /// A model entry that can be supplied without a code change.
 ///
-/// Sources merge in increasing precedence:
-/// 1. [`builtin_models()`] compiled seeds,
-/// 2. `resources/models.json` if present (kept out of `target/`),
-/// 3. `$THREADLANE_MODELS_JSON` file or inline JSON,
-/// 4. `~/.threadlane/models.json`,
-/// 5. `<project>/.threadlane/models.json`,
-/// 6. live discovery ([`update_discovered_models`]): reasoning levels
-///    overlay known ids and unknown ids append; labels and context windows
-///    of curated seeds never change.
-/// Later sources override earlier ones by `id`.
+/// The bundled or newer cached catalog supplies curated metadata. Environment,
+/// global and project overrides take precedence, in that order. Discovery only
+/// appends unknown IDs and cannot overwrite curated capabilities.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
@@ -130,136 +123,16 @@ impl ModelInfo {
     }
 }
 
+#[cfg(test)]
 fn builtin_entry(id: &str, label: &str, provider: &str, context_window: usize) -> ModelInfo {
     ModelInfo {
-        id: id.to_string(),
-        label: label.to_string(),
-        provider: Some(provider.to_string()),
+        id: id.into(),
+        label: label.into(),
+        provider: Some(provider.into()),
         context_window: Some(context_window),
         supported_efforts: Vec::new(),
         default_effort: None,
     }
-}
-
-fn builtin_reasoning_entry(
-    id: &str,
-    label: &str,
-    provider: &str,
-    default_effort: &str,
-) -> ModelInfo {
-    ModelInfo {
-        id: id.to_string(),
-        label: label.to_string(),
-        provider: Some(provider.to_string()),
-        context_window: None,
-        supported_efforts: Vec::new(),
-        default_effort: Some(default_effort.to_string()),
-    }
-}
-
-/// Native Anthropic seeds (`anthropic/` prefix); ids and 1M windows per
-/// https://platform.claude.com/docs/en/about-claude/models/overview.
-pub const ANTHROPIC_BUILTIN_MODELS: &[(&str, &str, usize)] = &[
-    ("anthropic/claude-opus-5-5", "Claude Opus 5.5", 1_000_000),
-    (
-        "anthropic/claude-sonnet-5-5",
-        "Claude Sonnet 5.5",
-        1_000_000,
-    ),
-    ("anthropic/claude-haiku-5-5", "Claude Haiku 5.5", 1_000_000),
-    ("anthropic/claude-fable-5-1", "Claude Fable 5.1", 1_000_000),
-];
-
-/// Compiled fallback seeds. Prefer `resources/models.json` or user files for
-/// new models; this list only guarantees offline startup.
-pub(crate) fn builtin_models() -> Vec<ModelInfo> {
-    let mut models = Vec::new();
-    models.push(builtin_reasoning_entry(
-        "gpt-6-sol",
-        "GPT-6 Sol",
-        "openai",
-        "medium",
-    ));
-    models.push(builtin_reasoning_entry(
-        "gpt-6-luna",
-        "GPT-6 Luna",
-        "openai",
-        "high",
-    ));
-    for (id, label, context) in [
-        ("gpt-5.6-luna", "GPT-5.6 Luna", 1_000_000),
-        ("gpt-5.4", "GPT-5.4", 1_000_000),
-        ("gpt-5.4-mini", "GPT-5.4 Mini", 128_000),
-        ("gpt-5.5", "GPT-5.5", 1_000_000),
-        ("gpt-5.6-sol", "GPT-5.6 Sol", 1_000_000),
-        ("gpt-5.6-terra", "GPT-5.6 Terra", 1_000_000),
-        ("gpt-5.3-codex-spark", "GPT-5.3 Codex Spark", 128_000),
-        ("gpt-4o", "GPT-4o", 128_000),
-        ("gpt-4o-mini", "GPT-4o Mini", 128_000),
-    ] {
-        models.push(builtin_entry(id, label, "openai", context));
-    }
-    for (id, label, context) in [
-        (
-            "antigravity/gemini-3.7-flash",
-            "Gemini 3.7 Flash",
-            1_000_000,
-        ),
-        ("antigravity/gemini-3.1-pro", "Gemini 3.1 Pro", 2_000_000),
-        (
-            "antigravity/claude-sonnet-4-6",
-            "Claude Sonnet 4.6",
-            200_000,
-        ),
-        ("antigravity/claude-opus-4-6", "Claude Opus 4.6", 200_000),
-        ("antigravity/gpt-oss-120b", "GPT-OSS 120B", 128_000),
-    ] {
-        models.push(builtin_entry(id, label, "antigravity", context));
-    }
-    for (id, label, context) in ANTHROPIC_BUILTIN_MODELS {
-        models.push(builtin_entry(id, label, "anthropic", *context));
-    }
-    for (id, label) in [
-        ("opencode-go/grok-4.6", "Grok 4.6"),
-        ("opencode-go/glm-5.3-flash", "GLM-5.3-Flash"),
-        ("opencode-go/glm-5.3", "GLM-5.3"),
-        ("opencode-go/glm-5.2", "GLM-5.2"),
-        ("opencode-go/glm-5.1", "GLM-5.1"),
-        ("opencode-go/gpt-5.6-luna", "GPT 5.6 Luna"),
-        ("opencode-go/kimi-k3", "Kimi K3"),
-        ("opencode-go/kimi-k2.7-code", "Kimi K2.7 Code"),
-        ("opencode-go/kimi-k2.6", "Kimi K2.6"),
-        ("opencode-go/longcat-2.0", "LongCat-2.0"),
-        ("opencode-go/mimo-v2.5", "MiMo-V2.5"),
-        ("opencode-go/mimo-v2.5-pro", "MiMo-V2.5-Pro"),
-        ("opencode-go/minimax-m3", "MiniMax M3"),
-        ("opencode-go/minimax-m2.7", "MiniMax M2.7"),
-        (
-            "opencode-go/muse-spark-1.3-contributor",
-            "Muse Spark 1.3 Contributor (limited regions)",
-        ),
-        (
-            "opencode-go/muse-spark-1.2-contributor",
-            "Muse Spark 1.2 Contributor (limited regions)",
-        ),
-        ("opencode-go/qwen3.8-max", "Qwen3.8 Max"),
-        ("opencode-go/qwen3.8-flash", "Qwen3.8 Flash"),
-        ("opencode-go/qwen3.7-max", "Qwen3.7 Max"),
-        ("opencode-go/qwen3.7-plus", "Qwen3.7 Plus"),
-        ("opencode-go/qwen3.6-plus", "Qwen3.6 Plus"),
-        ("opencode-go/deepseek-v4.1-flash", "DeepSeek V4.1 Flash"),
-        ("opencode-go/deepseek-v4-pro", "DeepSeek V4 Pro"),
-        ("opencode-go/deepseek-v4-flash", "DeepSeek V4 Flash"),
-        (
-            "opencode-go/deepseek-v4-flash-vision-exp",
-            "DeepSeek V4 Flash Vision Exp",
-        ),
-        ("opencode-go/hy4-preview", "Hy4 preview"),
-        ("opencode-go/hy3", "Hy3"),
-    ] {
-        models.push(builtin_entry(id, label, "opencode", 128_000));
-    }
-    models
 }
 
 fn parse_models_value(value: serde_json::Value) -> Vec<ModelInfo> {
@@ -269,14 +142,12 @@ fn parse_models_value(value: serde_json::Value) -> Vec<ModelInfo> {
             .filter(|model| !model.id.trim().is_empty())
             .collect();
     }
-    if let Ok(wrapper) = serde_json::from_value::<HashMap<String, Vec<ModelInfo>>>(value) {
-        if let Some(models) = wrapper.get("models") {
-            return models
-                .iter()
-                .filter(|model| !model.id.trim().is_empty())
-                .cloned()
-                .collect();
-        }
+    if let Some(models) = value.get("models") {
+        return serde_json::from_value::<Vec<ModelInfo>>(models.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|model| !model.id.trim().is_empty())
+            .collect();
     }
     Vec::new()
 }
@@ -289,11 +160,17 @@ pub(crate) fn load_models_from_file(path: &Path) -> Vec<ModelInfo> {
         .unwrap_or_default()
 }
 
+fn bundled_catalog() -> crate::model_catalog::CatalogSnapshot {
+    crate::model_catalog::parse_catalog(include_bytes!("../../../resources/models.json"))
+        .expect("bundled model catalog must validate")
+}
+
 fn bundled_models() -> Vec<ModelInfo> {
-    const BUNDLED: &str = include_str!("../../../resources/models.json");
-    serde_json::from_str::<serde_json::Value>(BUNDLED)
-        .map(parse_models_value)
-        .unwrap_or_default()
+    let bundle = bundled_catalog();
+    crate::model_catalog::snapshot_path()
+        .map(|path| crate::model_catalog::best_snapshot(&bundle, Some(&path)))
+        .unwrap_or(bundle)
+        .models
 }
 
 fn env_models() -> Vec<ModelInfo> {
@@ -333,36 +210,41 @@ pub(crate) fn merge_models(lists: &[Vec<ModelInfo>]) -> Vec<ModelInfo> {
         .collect()
 }
 
-/// Full registry for a project: builtins, bundled JSON, env, global,
-/// project, plus live discovery merged additively.
+/// Full registry: bundled/cache catalog, environment, global, project overrides, and discovery.
 ///
-/// Live entries never relabel curated seeds (label/context stay) and never
-/// remove static entries: they overlay reasoning levels onto known ids and
-/// append unknown ids, so new models appear with neither a code change nor
-/// a `models.json` entry.
+/// Discovery appends unknown entries; curated metadata and local overrides win.
 pub fn registry_for_project(project_root: Option<&Path>) -> Vec<ModelInfo> {
     let project_models = project_root
         .map(|root| load_models_from_file(&root.join(".threadlane").join("models.json")))
         .unwrap_or_default();
     let mut registry = merge_models(&[
-        builtin_models(),
         bundled_models(),
         env_models(),
         global_models_file(),
         project_models,
     ]);
-    for live in discovered_snapshot() {
-        match registry.iter_mut().find(|model| model.id == live.id) {
-            Some(existing) => {
-                if !live.supported_efforts.is_empty() {
-                    existing.supported_efforts = live.supported_efforts.clone();
-                    existing.default_effort = live.default_effort.clone();
+    fill_discovered_capabilities(&mut registry, discovered_snapshot());
+    registry
+}
+
+fn fill_discovered_capabilities(registry: &mut Vec<ModelInfo>, discovered: Vec<ModelInfo>) {
+    for live in discovered {
+        if let Some(existing) = registry.iter_mut().find(|model| model.id == live.id) {
+            // Empty curated efforts mean unspecified, not an explicit capability claim.
+            if existing.supported_efforts.is_empty() && !live.supported_efforts.is_empty() {
+                existing.supported_efforts = live.supported_efforts;
+                if existing
+                    .default_effort
+                    .as_ref()
+                    .is_none_or(|default| !existing.supported_efforts.contains(default))
+                {
+                    existing.default_effort = live.default_effort;
                 }
             }
-            None => registry.push(live),
+        } else {
+            registry.push(live);
         }
     }
-    registry
 }
 
 /// Registry lookup by id across all file sources plus live discovery.
@@ -566,7 +448,7 @@ mod discovery_tests {
     }
 
     #[test]
-    fn discovered_levels_overlay_without_touching_curated_metadata() {
+    fn discovery_cannot_override_curated_efforts() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".threadlane")).unwrap();
         std::fs::write(
@@ -587,9 +469,21 @@ mod discovery_tests {
             .into_iter()
             .find(|model| model.id == "live-test/seeded")
             .expect("seeded model present");
-        // Levels come from live; label and context stay curated.
-        assert_eq!(merged.supported_efforts, vec!["low", "high"]);
+        // Explicit local metadata wins over live discovery.
+        assert_eq!(merged.supported_efforts, vec!["off"]);
         assert_eq!(merged.label, "Curated");
         assert_eq!(merged.context_window, Some(111));
+    }
+    #[test]
+    fn unspecified_efforts_use_discovery_without_relabeling() {
+        let mut curated = live("openai", "gpt-test", "Curated", &[]);
+        curated.default_effort = Some("max".into());
+        let mut discovered = live("openai", "gpt-test", "Live", &["low", "high"]);
+        discovered.default_effort = Some("low".into());
+        let mut registry = vec![curated];
+        fill_discovered_capabilities(&mut registry, vec![discovered]);
+        assert_eq!(registry[0].label, "Curated");
+        assert_eq!(registry[0].supported_efforts, ["low", "high"]);
+        assert_eq!(registry[0].default_effort.as_deref(), Some("low"));
     }
 }

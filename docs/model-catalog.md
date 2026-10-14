@@ -1,0 +1,13 @@
+# Model catalog maintenance
+
+`resources/models.json` is the complete offline curated catalog (schema 1). To publish metadata changes, edit this file, preserve model ordering where practical, increment its numeric `revision`, run `python3 resources/validate_models.py` and the provider/daemon catalog tests, then merge the change to `main`. The app checks the fixed GitHub raw-content URL over HTTPS and caches a validated snapshot separately from user model overrides at `~/.threadlane/cache/model-catalog.json`. HTTPS/GitHub delivery is trusted but not cryptographically signed. The catalog contains inert metadata only; runtime behavior, endpoints and provider support must already exist in the app.
+
+Curated unprefixed OpenAI models are offered when API-key routing is effective. With a ChatGPT/Codex login, the picker continues to rely on account-specific live discovery. Existing live API/Codex discovery is mixed and is not changed here; this catalog does not declare per-entry authentication capabilities. Adding models does not add adapter, context-window or reasoning support beyond existing backend capabilities. Do not infer new tool/vision flags or routing from metadata.
+
+## Refresh and precedence
+
+Startup loads the bundle or a validated, newer cached snapshot without waiting for the network. A background check uses a 24-hour successful-check TTL; failed checks are throttled for five minutes within the process. Settings' **Refresh models** bypasses this TTL. HTTP failures, invalid data and revision rollbacks leave the last good cache intact. A cache revision equal to the bundle must contain identical metadata. Publishing changed contents requires a revision bump.
+
+Curated metadata takes precedence over discovery. `THREADLANE_MODELS_JSON`, global `~/.threadlane/models.json`, and project `.threadlane/models.json` override it, in that order; those files are never overwritten by refreshes. Discovery can still append unknown models and determine account-specific availability. A catalog replacement removes old curated entries, but a provider may still advertise them live. Empty effort lists are unspecified and may be filled by live discovery (otherwise legacy adapter defaults apply); explicit effort lists constrain the picker and existing adapter lookups. This migration does not remove all provider-specific name heuristics.
+
+The updater sends no provider credentials, follows no redirects, limits downloads to 1 MiB and uses a 15-second timeout. The strict remote format rejects endpoint/header fields and unsupported providers. ACP agents remain locally configured. Updates refresh available options, not the saved selected model ID.
