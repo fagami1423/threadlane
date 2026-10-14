@@ -41,49 +41,16 @@ pub struct ModelOption {
     pub provider: ModelProvider,
 }
 
-const ANTIGRAVITY_MODELS: &[(&str, &str)] = &[
-    ("antigravity/gemini-3.7-flash", "Gemini 3.7 Flash"),
-    ("antigravity/gemini-3.1-pro", "Gemini 3.1 Pro"),
-    ("antigravity/claude-sonnet-4-6", "Claude Sonnet 4.6"),
-    ("antigravity/claude-opus-4-6", "Claude Opus 4.6"),
-    ("antigravity/gpt-oss-120b", "GPT-OSS 120B"),
-];
-
-const OPENCODE_MODELS: &[(&str, &str)] = &[
-    ("opencode-go/mimo-v2.5-pro", "MiMo V2.5 Pro"),
-    ("opencode-go/mimo-v2.5", "MiMo V2.5"),
-    ("opencode-go/qwen3.8-max", "Qwen 3.8 Max"),
-    ("opencode-go/minimax-m3", "MiniMax M3"),
-    ("opencode-go/minimax-m2.7", "MiniMax M2.7"),
-    ("opencode-go/deepseek-v4-pro", "DeepSeek V4 Pro"),
-    ("opencode-go/deepseek-v4-flash", "DeepSeek V4 Flash"),
-    ("opencode-go/hy3", "HY 3"),
-];
-
 /// Native Anthropic catalog, listed only when `ANTHROPIC_API_KEY` is set.
 /// Seeds come from the registry so ids/labels have one source of truth.
+#[cfg(test)]
 fn models_for_anthropic_key(has_key: bool) -> Vec<ModelOption> {
     if !has_key {
         return Vec::new();
     }
-    threadlane_provider::model_registry::ANTHROPIC_BUILTIN_MODELS
-        .iter()
-        .map(|(id, label, _)| ModelOption {
-            id: (*id).to_string(),
-            label: (*label).to_string(),
-            provider: ModelProvider::Anthropic,
-        })
-        .collect()
-}
-
-fn provider_models(models: &[(&str, &str)], provider: ModelProvider) -> Vec<ModelOption> {
-    models
-        .iter()
-        .map(|(id, label)| ModelOption {
-            id: (*id).to_string(),
-            label: (*label).to_string(),
-            provider,
-        })
+    registry_options(None)
+        .into_iter()
+        .filter(|m| m.provider == ModelProvider::Anthropic)
         .collect()
 }
 
@@ -91,16 +58,8 @@ pub fn available_models() -> Vec<ModelOption> {
     available_models_for_project(None)
 }
 
-pub fn available_models_for_project(
-    project_root: Option<&std::path::Path>,
-) -> Vec<ModelOption> {
-    let mut models = models_for_credentials(
-        threadlane_auth::antigravity_auth::load_antigravity_credentials().is_some(),
-        threadlane_coding_agent::credentials::opencode_api_key().is_some(),
-    );
-    models.extend(models_for_anthropic_key(credentials_allow(
-        ModelProvider::Anthropic,
-    )));
+pub fn available_models_for_project(project_root: Option<&std::path::Path>) -> Vec<ModelOption> {
+    let mut models = Vec::new();
     merge_discovered_opencode_models(&mut models);
     merge_discovered_openai_models(&mut models);
     merge_registry_models(&mut models, project_root);
@@ -113,7 +72,13 @@ pub fn available_models_for_project(
 /// Live Antigravity entries can be appended after other providers. Keep the
 /// provider contiguous so the picker renders one section heading.
 fn group_antigravity_models(models: &mut [ModelOption]) {
-    models.sort_by_key(|model| model.provider != ModelProvider::Antigravity);
+    models.sort_by_key(|model| match model.provider {
+        ModelProvider::Antigravity => 0,
+        ModelProvider::OpenAi => 1,
+        ModelProvider::OpenCode => 2,
+        ModelProvider::Anthropic => 3,
+        ModelProvider::Acp => 4,
+    });
 }
 
 /// Live-discovered Zen models, refreshed in the background by
@@ -211,7 +176,11 @@ pub async fn refresh_openai_models() {
     }
     let api_key = threadlane_auth::openai_auth::load_openai_api_key()
         .filter(|key| !key.trim().is_empty())
-        .or_else(|| std::env::var("OPENAI_API_KEY").ok().filter(|key| !key.trim().is_empty()));
+        .or_else(|| {
+            std::env::var("OPENAI_API_KEY")
+                .ok()
+                .filter(|key| !key.trim().is_empty())
+        });
     let login = threadlane_auth::openai_auth::get_active_codex_account()
         .filter(|account| threadlane_auth::openai_auth::is_own_source(&account.source));
     let cache_key = openai_catalog_key(api_key.as_deref(), login.as_ref().map(|a| a.id.as_str()));
@@ -231,13 +200,18 @@ pub async fn refresh_openai_models() {
     // Resolve the active login through the same refresh path as provider
     // requests; a stored access token may have expired since sign-in.
     let subscription = match login.as_ref() {
-        Some(account) => match threadlane_auth::openai_auth::get_valid_codex_account_token(&account.id).await {
-            Ok(token) => threadlane_provider::openai::try_fetch_subscription_models(
-                &token,
-                account.account_id.as_deref(),
-            ).await,
-            Err(_) => None,
-        },
+        Some(account) => {
+            match threadlane_auth::openai_auth::get_valid_codex_account_token(&account.id).await {
+                Ok(token) => {
+                    threadlane_provider::openai::try_fetch_subscription_models(
+                        &token,
+                        account.account_id.as_deref(),
+                    )
+                    .await
+                }
+                Err(_) => None,
+            }
+        }
         None => None,
     };
     let general = general.filter(|models| !models.is_empty());
@@ -245,8 +219,9 @@ pub async fn refresh_openai_models() {
     if general.is_none() && subscription.is_none() {
         return;
     }
-    let cache = DISCOVERED_OPENAI
-        .get_or_init(|| std::sync::Mutex::new((std::time::Instant::now(), Vec::new(), Vec::new(), cache_key)));
+    let cache = DISCOVERED_OPENAI.get_or_init(|| {
+        std::sync::Mutex::new((std::time::Instant::now(), Vec::new(), Vec::new(), cache_key))
+    });
     let Ok(mut guard) = cache.lock() else {
         return;
     };
@@ -281,7 +256,11 @@ fn merge_discovered_openai_models(models: &mut Vec<ModelOption>) {
     }
     let api_key = threadlane_auth::openai_auth::load_openai_api_key()
         .filter(|key| !key.trim().is_empty())
-        .or_else(|| std::env::var("OPENAI_API_KEY").ok().filter(|key| !key.trim().is_empty()));
+        .or_else(|| {
+            std::env::var("OPENAI_API_KEY")
+                .ok()
+                .filter(|key| !key.trim().is_empty())
+        });
     let login = threadlane_auth::openai_auth::get_active_codex_account()
         .filter(|account| threadlane_auth::openai_auth::is_own_source(&account.source));
     let cache_key = openai_catalog_key(api_key.as_deref(), login.as_ref().map(|a| a.id.as_str()));
@@ -340,7 +319,10 @@ pub async fn refresh_antigravity_models() {
         return;
     }
     let ids = live.iter().map(|model| model.id.clone()).collect();
-    let mut models = models_for_credentials(true, false);
+    let mut models = registry_options(None)
+        .into_iter()
+        .filter(|m| m.provider == ModelProvider::Antigravity)
+        .collect::<Vec<_>>();
     models.extend(
         threadlane_provider::model_registry::registry_for_project(None)
             .into_iter()
@@ -609,7 +591,11 @@ pub fn test_set_cached_acp_config_options(
         return;
     };
     guard.0 = std::time::Instant::now();
-    match guard.1.iter_mut().find(|cached| cached.agent_id == agent_id) {
+    match guard
+        .1
+        .iter_mut()
+        .find(|cached| cached.agent_id == agent_id)
+    {
         Some(cached) => {
             cached.options = options;
             cached.error = None;
@@ -650,10 +636,7 @@ pub fn invalidate_model_caches() {
     {
         guard.0 = expired;
     }
-    if let Some(mut guard) = DISCOVERED_OPENAI
-        .get()
-        .and_then(|cache| cache.lock().ok())
-    {
+    if let Some(mut guard) = DISCOVERED_OPENAI.get().and_then(|cache| cache.lock().ok()) {
         guard.0 = expired;
     }
     if let Some(mut guard) = DISCOVERED_ANTIGRAVITY
@@ -662,10 +645,7 @@ pub fn invalidate_model_caches() {
     {
         guard.0 = expired;
     }
-    if let Some(mut guard) = CACHED_ACP_MODELS
-        .get()
-        .and_then(|cache| cache.lock().ok())
-    {
+    if let Some(mut guard) = CACHED_ACP_MODELS.get().and_then(|cache| cache.lock().ok()) {
         guard.0 = expired;
     }
     // The provider clients keep their own TTL caches under the daemon's:
@@ -679,7 +659,16 @@ pub fn invalidate_model_caches() {
 /// inventory, so newly released models reach the picker without a restart.
 /// Providers without credentials skip their own fetch; failed fetches keep
 /// the last successful list.
+pub async fn refresh_curated_catalog() {
+    if let Err(error) = threadlane_provider::model_catalog::refresh_catalog(false).await {
+        tracing::warn!(%error, "Model catalog refresh failed; retaining last good snapshot");
+    }
+}
+
 pub async fn refresh_all_models(project_root: Option<std::path::PathBuf>) {
+    if let Err(error) = threadlane_provider::model_catalog::refresh_catalog(true).await {
+        tracing::warn!(%error, "Model catalog refresh failed; retaining last good snapshot");
+    }
     invalidate_model_caches();
     refresh_discovered_models().await;
     refresh_openai_models().await;
@@ -718,6 +707,35 @@ fn credentials_allow(provider: ModelProvider) -> bool {
     }
 }
 
+fn registry_options(project_root: Option<&std::path::Path>) -> Vec<ModelOption> {
+    threadlane_provider::model_registry::registry_for_project(project_root)
+        .into_iter()
+        .filter_map(|info| {
+            if info.id.starts_with("acp/") {
+                return None;
+            }
+            Some(ModelOption {
+                provider: provider_for_id(&info.id, info.provider.as_deref()),
+                id: info.id,
+                label: info.label,
+            })
+        })
+        .collect()
+}
+
+/// Mirrors provider_credentials precedence. An own-source login selects Codex even if account id is absent.
+fn api_key_route_is_effective_for(stored_key: bool, own_login: bool, env_key: bool) -> bool {
+    stored_key || (!own_login && env_key)
+}
+fn api_key_route_is_effective() -> bool {
+    let stored =
+        threadlane_auth::openai_auth::load_openai_api_key().is_some_and(|k| !k.trim().is_empty());
+    let own_login = threadlane_auth::openai_auth::load_credentials()
+        .is_some_and(|c| threadlane_auth::openai_auth::is_own_source(&c.source));
+    let env = std::env::var("OPENAI_API_KEY").is_ok_and(|k| !k.trim().is_empty());
+    api_key_route_is_effective_for(stored, own_login, env)
+}
+
 /// Merges `models.json` metadata over the discovered catalog.
 fn merge_registry_models(models: &mut Vec<ModelOption>, project_root: Option<&std::path::Path>) {
     for info in threadlane_provider::model_registry::registry_for_project(project_root) {
@@ -732,9 +750,9 @@ fn merge_registry_models(models: &mut Vec<ModelOption>, project_root: Option<&st
             continue;
         }
         let provider = provider_for_id(&info.id, info.provider.as_deref());
-        // OpenAI inventory is account-specific and comes only from its live
-        // model endpoints; registry data may annotate a discovered entry.
-        if provider == ModelProvider::OpenAi {
+        // Codex needs account-specific inventory; effective API-key routing
+        // can offer curated entries even when discovery is unavailable.
+        if provider == ModelProvider::OpenAi && !api_key_route_is_effective() {
             continue;
         }
         if provider != ModelProvider::Acp && !credentials_allow(provider) {
@@ -776,20 +794,6 @@ pub fn supports_reasoning(model_id: &str, project_root: Option<&std::path::Path>
         != vec![threadlane_protocol::ReasoningEffort::Off]
 }
 
-fn models_for_credentials(has_antigravity: bool, has_opencode: bool) -> Vec<ModelOption> {
-    let mut models = Vec::new();
-    if has_antigravity {
-        models.extend(provider_models(
-            ANTIGRAVITY_MODELS,
-            ModelProvider::Antigravity,
-        ));
-    }
-    if has_opencode {
-        models.extend(provider_models(OPENCODE_MODELS, ModelProvider::OpenCode));
-    }
-    models
-}
-
 fn append_acp_models(models: &mut Vec<ModelOption>, project_root: Option<&std::path::Path>) {
     let manager = threadlane_acp::AcpManager::new(
         threadlane_project::default_global_threadlane_dir(),
@@ -819,10 +823,8 @@ pub fn default_model_for_project(project_root: Option<&std::path::Path>) -> Opti
 }
 
 fn option_for(model_id: &str) -> Option<ModelOption> {
-    provider_models(ANTIGRAVITY_MODELS, ModelProvider::Antigravity)
+    registry_options(None)
         .into_iter()
-        .chain(provider_models(OPENCODE_MODELS, ModelProvider::OpenCode))
-        .chain(models_for_anthropic_key(true))
         .find(|model| model.id == model_id)
 }
 
@@ -898,12 +900,15 @@ mod tests {
         let first = openai_catalog_key(None, Some("account-a"));
         assert_eq!(first, openai_catalog_key(None, Some("account-a")));
         assert_ne!(first, openai_catalog_key(None, Some("account-b")));
-        assert_ne!(first, openai_catalog_key(Some("api-key"), Some("account-a")));
+        assert_ne!(
+            first,
+            openai_catalog_key(Some("api-key"), Some("account-a"))
+        );
     }
 
     #[test]
     fn no_credentials_produce_no_provider_models() {
-        assert!(models_for_credentials(false, false).is_empty());
+        assert!(!api_key_route_is_effective_for(false, false, false));
     }
 
     #[test]
@@ -1240,7 +1245,7 @@ mod tests {
             provider: ModelProvider::Acp,
         }];
         assert_eq!(selection_label("acp/claude", &models), "Claude Code");
-        assert_eq!(selection_label("gpt-5.5", &models), "Gpt 5.5");
+        assert_eq!(selection_label("gpt-5.5", &models), "GPT-5.5");
         assert_eq!(
             selection_label("acp/removed-agent", &models),
             "acp/removed-agent"
@@ -1249,12 +1254,12 @@ mod tests {
 
     #[test]
     fn providers_only_expose_their_own_models() {
-        assert!(models_for_credentials(true, false)
+        assert!(registry_options(None)
             .iter()
-            .all(|model| model.provider == ModelProvider::Antigravity));
-        assert!(models_for_credentials(false, true)
+            .any(|m| m.provider == ModelProvider::Antigravity));
+        assert!(registry_options(None)
             .iter()
-            .all(|model| model.provider == ModelProvider::OpenCode));
+            .any(|m| m.provider == ModelProvider::OpenCode));
     }
 
     #[test]
@@ -1285,8 +1290,12 @@ mod tests {
 
     #[test]
     fn catalog_matches_native_provider_inventory() {
-        assert_eq!(ANTIGRAVITY_MODELS.len(), 5);
-        assert_eq!(OPENCODE_MODELS.len(), 8);
+        assert!(registry_options(None)
+            .iter()
+            .any(|m| m.id == "antigravity/gemini-3.7-flash"));
+        assert!(registry_options(None)
+            .iter()
+            .any(|m| m.id == "opencode-go/minimax-m2.7"));
     }
 
     #[test]
@@ -1303,7 +1312,10 @@ mod tests {
             "Deepseek V4 Flash"
         );
         assert_eq!(threadlane_provider::pretty_model_label("hy3"), "Hy3");
-        let mut models = provider_models(OPENCODE_MODELS, ModelProvider::OpenCode);
+        let mut models = registry_options(None)
+            .into_iter()
+            .filter(|m| m.provider == ModelProvider::OpenCode)
+            .collect::<Vec<_>>();
         let before = models.len();
         // Seed entries already present must not be duplicated by discovery.
         // The pure core takes fixture data directly so the test needs no
@@ -1323,7 +1335,7 @@ mod tests {
                 },
             ],
         );
-        assert_eq!(models.len(), before + 1);
+        assert_eq!(models.len(), before);
         assert!(models
             .iter()
             .any(|model| model.id == "opencode-go/kimi-k2.6"));
@@ -1331,17 +1343,23 @@ mod tests {
 
     #[test]
     fn combined_catalog_preserves_provider_order() {
-        let models = models_for_credentials(true, true);
-        assert!(models[..ANTIGRAVITY_MODELS.len()]
-            .iter()
-            .all(|model| model.provider == ModelProvider::Antigravity));
-        assert!(models[ANTIGRAVITY_MODELS.len()..]
-            .iter()
-            .all(|model| model.provider == ModelProvider::OpenCode));
+        let mut models = registry_options(None);
+        group_antigravity_models(&mut models);
+        assert!(models
+            .first()
+            .is_some_and(|m| m.provider == ModelProvider::Antigravity));
     }
 
     #[test]
-    fn openai_models_are_only_live_discovered() {
-        assert!(models_for_credentials(false, false).is_empty());
+    fn credential_precedence_gates_curated_openai_models_to_api_route() {
+        assert!(api_key_route_is_effective_for(true, true, false));
+        assert!(!api_key_route_is_effective_for(false, true, true));
+        assert!(api_key_route_is_effective_for(false, false, true));
+        assert!(!api_key_route_is_effective_for(false, false, false));
+    }
+
+    #[test]
+    fn codex_only_credentials_still_require_live_inventory() {
+        assert!(!api_key_route_is_effective_for(false, true, false));
     }
 }

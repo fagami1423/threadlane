@@ -10,7 +10,7 @@ gpui::actions!(threadlane_settings, [ActivateUpdate]);
 
 mod search;
 mod view;
-pub use search::{SETTINGS_SEARCH_ITEMS, SettingsSearchItem};
+pub use search::{SettingsSearchItem, SETTINGS_SEARCH_ITEMS};
 
 pub use view::SettingsView;
 
@@ -59,10 +59,16 @@ pub async fn refresh_all_models_and_update(
     refresh_models(model, cx);
 }
 
-fn refresh_models(
+/// Background TTL-guarded refresh of the remote curated snapshot.
+pub async fn refresh_catalog_and_update(
     model: gpui::Entity<threadlane_ui_state::AppState>,
     cx: &mut gpui::AsyncApp,
 ) {
+    threadlane_daemon::catalog::refresh_curated_catalog().await;
+    refresh_models(model, cx);
+}
+
+fn refresh_models(model: gpui::Entity<threadlane_ui_state::AppState>, cx: &mut gpui::AsyncApp) {
     let _ = cx.update(|cx| {
         model.update(cx, |state, cx| {
             state.refresh_available_models();

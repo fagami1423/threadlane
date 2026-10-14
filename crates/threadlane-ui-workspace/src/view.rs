@@ -875,6 +875,11 @@ impl WorkspaceView {
             view.sync_git_status_with_active_project(cx);
             view.github
                 .update(cx, |github, cx| github.sync_active_project(cx));
+            let catalog_model = view.model.clone();
+            cx.spawn(async move |_view, cx| {
+                threadlane_ui_settings::refresh_catalog_and_update(catalog_model, cx).await;
+            })
+            .detach();
             // Pull the live Zen model list in the background so new
             // `opencode-go/*` models appear in the picker without a restart.
             let discovery_model = view.model.clone();
