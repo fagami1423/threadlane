@@ -120,12 +120,6 @@
       "default_effort": "medium"
     },
     {
-      "id": "gpt-5.3-codex-spark",
-      "label": "GPT-5.3 Codex Spark",
-      "provider": "openai",
-      "context_window": 128000
-    },
-    {
       "id": "gpt-4o",
       "label": "GPT-4o",
       "provider": "openai",

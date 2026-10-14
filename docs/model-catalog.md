@@ -14,7 +14,9 @@ The updater sends no provider credentials, follows no redirects, limits download
 
 ## Audit: October 14, 2026 (revision 2)
 
-Reviewed all 48 existing entries; retained their IDs and added 11 entries (59 total). Sources below establish public availability and metadata, not successful authenticated inference. No provider credentials were used. Pricing and output limits are outside schema 1.
+Reviewed all 48 existing entries; retained 47, removed retired Codex Spark, and added 11 entries (58 total). Sources below establish public availability and metadata, not successful authenticated inference. No provider credentials were used. Pricing and output limits are outside schema 1.
+
+Codex subscription discovery now requests compatibility version `0.159.2`, the [CLI release accompanying GPT-6.1 Sol's launch](https://learn.chatgpt.com/docs/changelog), instead of `0.157.0`. The endpoint filters inventory by client compatibility; catalog metadata alone cannot add a Codex picker option. This changes compiled discovery behavior, so it requires a rebuilt/updated app and a provider refresh. Account/workspace eligibility still comes from the live response, and the `CODEX_CLIENT_VERSION` override remains supported.
 
 ### OpenAI
 
@@ -33,7 +35,7 @@ Model IDs below are unprefixed. Context and effort corrections come from each li
 | [gpt-5.5](https://developers.openai.com/api/docs/models/gpt-5.5) | Correct context to 1,050,000; fill `none/low/medium/high/xhigh`, medium default. |
 | [gpt-4o](https://developers.openai.com/api/docs/models/gpt-4o) | Retain 128,000 context and off-only effort. Deprecated, still available. |
 | [gpt-4o-mini](https://developers.openai.com/api/docs/models/gpt-4o-mini) | Same retention. |
-| gpt-5.3-codex-spark | Retain existing 128,000 metadata; no current public API model page found, so API availability and this limit remain unverified. Subscription discovery determines account access. |
+| gpt-5.3-codex-spark | Remove: [retired from Codex on September 14, 2026](https://learn.chatgpt.com/docs/models). |
 | [chat-latest](https://developers.openai.com/api/docs/models/chat-latest) | Add Instant alias: 400,000 context, off-only effort; function calling supported. |
 
 [OpenAI's deprecation schedule](https://developers.openai.com/api/docs/deprecations) retires GPT-4o and GPT-4o Mini on January 14, 2027; retain them until then. Do not add the already-deprecated GPT-5.3-Codex or specialized audio/image/restricted research models to this coding catalog.
