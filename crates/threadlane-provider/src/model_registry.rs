@@ -223,12 +223,28 @@ pub fn registry_for_project(project_root: Option<&Path>) -> Vec<ModelInfo> {
         global_models_file(),
         project_models,
     ]);
-    for live in discovered_snapshot() {
-        if !registry.iter().any(|model| model.id == live.id) {
+    fill_discovered_capabilities(&mut registry, discovered_snapshot());
+    registry
+}
+
+fn fill_discovered_capabilities(registry: &mut Vec<ModelInfo>, discovered: Vec<ModelInfo>) {
+    for live in discovered {
+        if let Some(existing) = registry.iter_mut().find(|model| model.id == live.id) {
+            // Empty curated efforts mean unspecified, not an explicit capability claim.
+            if existing.supported_efforts.is_empty() && !live.supported_efforts.is_empty() {
+                existing.supported_efforts = live.supported_efforts;
+                if existing
+                    .default_effort
+                    .as_ref()
+                    .is_none_or(|default| !existing.supported_efforts.contains(default))
+                {
+                    existing.default_effort = live.default_effort;
+                }
+            }
+        } else {
             registry.push(live);
         }
     }
-    registry
 }
 
 /// Registry lookup by id across all file sources plus live discovery.
@@ -457,5 +473,17 @@ mod discovery_tests {
         assert_eq!(merged.supported_efforts, vec!["off"]);
         assert_eq!(merged.label, "Curated");
         assert_eq!(merged.context_window, Some(111));
+    }
+    #[test]
+    fn unspecified_efforts_use_discovery_without_relabeling() {
+        let mut curated = live("openai", "gpt-test", "Curated", &[]);
+        curated.default_effort = Some("max".into());
+        let mut discovered = live("openai", "gpt-test", "Live", &["low", "high"]);
+        discovered.default_effort = Some("low".into());
+        let mut registry = vec![curated];
+        fill_discovered_capabilities(&mut registry, vec![discovered]);
+        assert_eq!(registry[0].label, "Curated");
+        assert_eq!(registry[0].supported_efforts, ["low", "high"]);
+        assert_eq!(registry[0].default_effort.as_deref(), Some("low"));
     }
 }

@@ -57,10 +57,10 @@ pub fn parse_catalog(bytes: &[u8]) -> Result<CatalogSnapshot, String> {
 }
 
 fn effort_valid(s: &str) -> bool {
-    matches!(
-        s,
-        "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-    )
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
 pub fn validate_catalog(c: &CatalogSnapshot) -> Result<(), String> {
@@ -309,7 +309,7 @@ mod tests {
         }
         for (field, value) in [
             ("endpoint", serde_json::json!("https://evil.test")),
-            ("supported_efforts", serde_json::json!(["invented"])),
+            ("supported_efforts", serde_json::json!(["invalid effort"])),
             ("context_window", serde_json::json!(0)),
             ("id", serde_json::json!("anthropic/")),
         ] {
@@ -415,5 +415,17 @@ mod tests {
             .await
             .unwrap_err()
             .contains("1 MiB"));
+    }
+    #[test]
+    fn data_driven_efforts_and_repeated_atomic_replacement() {
+        assert!(effort_valid("ultra"));
+        assert!(effort_valid("none"));
+        assert!(!effort_valid(""));
+        assert!(!effort_valid(" high"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        atomic_write(&path, b"first").unwrap();
+        atomic_write(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"second");
     }
 }
