@@ -37,7 +37,8 @@ fn provider_controls_select_accounts_mask_keys_and_fit(cx: &mut TestAppContext) 
     cx.update(|window, cx| {
         window.blur(cx);
         // Back, all navigation destinations, Test, Add account, then Set active.
-        for _ in 0..SettingsPage::ALL.len() + 4 {
+        // (+1 for the "Model providers" section header before Test.)
+        for _ in 0..SettingsPage::ALL.len() + 5 {
             window.focus_next(cx);
         }
         window.draw(cx).clear(cx);

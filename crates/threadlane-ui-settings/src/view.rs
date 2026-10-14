@@ -84,6 +84,9 @@ pub struct SettingsView {
     settings_tx: tokio::sync::mpsc::UnboundedSender<SettingsEvent>,
     auth_message: Option<AuthStatusMessage>,
     providers_snapshot: Option<ProvidersStatusSnapshot>,
+    /// Expanded groups on the providers page (presentation only).
+    providers_models_open: bool,
+    providers_hosting_open: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -303,6 +306,8 @@ impl SettingsView {
             settings_tx,
             auth_message: None,
             providers_snapshot: None,
+            providers_models_open: true,
+            providers_hosting_open: false,
             _subscriptions: vec![observe_model, save_openai, save_opencode, save_github],
         }
     }
@@ -685,6 +690,16 @@ impl SettingsView {
         use kit_settings::{SettingsProvider as Provider, SettingsProviderAction as Action};
         let activating_account = matches!(&action, Action::SetActiveAccount(_));
         match action {
+            // Presentation only: no auth state or status message changes.
+            Action::ToggleSection(section) => {
+                let open = match section {
+                    kit_settings::SettingsProviderSection::Models => &mut self.providers_models_open,
+                    kit_settings::SettingsProviderSection::Hosting => &mut self.providers_hosting_open,
+                };
+                *open = !*open;
+                cx.notify();
+                return;
+            }
             Action::Connect(provider) => {
                 let result = match provider {
                     Provider::ChatGPT => provider_auth::start_chatgpt_login(self.auth_tx.clone()),
@@ -803,6 +818,8 @@ impl SettingsView {
             antigravity_connected: snapshot.is_some_and(|snapshot| snapshot.antigravity_connected),
             github_status: snapshot.and_then(|snapshot| snapshot.github_status.clone()),
             gitlab_status: snapshot.and_then(|snapshot| snapshot.gitlab_status.clone()),
+            models_open: self.providers_models_open,
+            hosting_open: self.providers_hosting_open,
         };
         let owner = cx.entity().downgrade();
         kit_settings::settings_providers(&providers, &self.github_input, &self.openai_input, &self.opencode_input,

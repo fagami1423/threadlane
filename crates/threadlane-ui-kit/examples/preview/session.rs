@@ -1518,7 +1518,7 @@ impl Render for SessionPreview {
                                                     .is_some_and(|model| !model.efforts.is_empty())
                                             })
                                             .map(|effort| {
-                                                kit::composer_effort_button(effort.label())
+                                                kit::composer_effort_button(effort)
                                                     .on_click(|_, window, cx| {
                                                         Self::preview_notice(
                                                             "Reasoning effort",
