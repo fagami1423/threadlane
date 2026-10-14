@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.1.51](https://github.com/wheregmis/threadlane/compare/v0.1.50...v0.1.51) (2026-10-14)
+
+
+### Features
+
+* **agent:** wait for PR changes without model polling ([09cda3d](https://github.com/wheregmis/threadlane/commit/09cda3d9867dec946c48cbec2d7eecb2aa899a6d))
+* **agent:** wait for PR changes without model polling ([ee07c74](https://github.com/wheregmis/threadlane/commit/ee07c7468d356afc3f644cd267f32ee1ec989781))
+* **automation:** improve setup, navigation, and run review ([a79fa4f](https://github.com/wheregmis/threadlane/commit/a79fa4f09525545d76b1658c12a83fbb1e81dc4d))
+* notify on background interactive session completion ([44c5f65](https://github.com/wheregmis/threadlane/commit/44c5f6533ce51d526d671a103037732ebdda65f0))
+* **review:** add selected diff excerpts to chat drafts ([88698c2](https://github.com/wheregmis/threadlane/commit/88698c2c2a3412f159d406c83f44f6fd969e27cc))
+* **review:** add selected diff excerpts to chat drafts ([79c6278](https://github.com/wheregmis/threadlane/commit/79c627870779d06b1d8efc4ab8f0163faf0d8401))
+* **terminal:** improve keyboard, paste, mouse, and selection input ([bac9b60](https://github.com/wheregmis/threadlane/commit/bac9b607dfb01a2d11a31d47b7d67f487ebf5823))
+* **terminal:** improve terminal input, TUI mouse support, and workspace focus ([6c69f4c](https://github.com/wheregmis/threadlane/commit/6c69f4c8b963920e9c7778daa2864908d444d121))
+* **ui:** improve automation workflow experience ([6f71d2f](https://github.com/wheregmis/threadlane/commit/6f71d2ffbc11fd36971507e7c82ded825c2baef8))
+
+
+### Bug Fixes
+
+* **agents:** point the main agent's empty state at what will appear ([2e58a91](https://github.com/wheregmis/threadlane/commit/2e58a9107aa34c25ca07ecc4a51137925617e927))
+* **files:** make Find in files read as the tree's search field ([0470ddb](https://github.com/wheregmis/threadlane/commit/0470ddba96f2808d1665197ae7ea6995d4d0365f))
+* preserve discovery on disable and baseline fork completions ([c5fd134](https://github.com/wheregmis/threadlane/commit/c5fd13440cc83b6b9f77bebc918fe9b002c691a1))
+* **review:** preserve excerpt button cancellation and reveal preview chat ([f54269d](https://github.com/wheregmis/threadlane/commit/f54269dff0c06e2e08d658fa5c0e7402992ba5c5))
+* **right-panel:** drop the no-op refresh button from Browser ([51c23a2](https://github.com/wheregmis/threadlane/commit/51c23a27180fc2042e06bfeece3130f3b9a702df))
+* **startup:** style the loading and failure screens like the rest of the app ([874fc55](https://github.com/wheregmis/threadlane/commit/874fc552019fedf99082dce9c67d03ca31f1b980))
+* **terminal:** correct input and mouse reporting ([2781ca7](https://github.com/wheregmis/threadlane/commit/2781ca755d43f3d7d735ff5b238350bfa891e3a5))
+* **terminal:** correct maximized workspace controls ([8191268](https://github.com/wheregmis/threadlane/commit/819126858ebbafefa1e32efd90a6b21ec4fe3faa))
+* **terminal:** preserve mouse and panel interactions ([f16a549](https://github.com/wheregmis/threadlane/commit/f16a549a054f8f494b666509cdeb9abd52d1bb10))
+* **terminal:** use clear and restart icons instead of undo/redo arrows ([4a5de8f](https://github.com/wheregmis/threadlane/commit/4a5de8f83b976ade88127e2419afd3bff8123e7c))
+* **trajectory:** hide the blank meter and zero stats until events exist ([37de4b5](https://github.com/wheregmis/threadlane/commit/37de4b596c0769505321fa847d3309247ee02b45))
+* **ui:** add accessibility labels to automation actions ([e75cba6](https://github.com/wheregmis/threadlane/commit/e75cba63befa5ac5cf8e962325b2641c90308aa1))
+* **ui:** align automation run accessibility labels ([e1e7128](https://github.com/wheregmis/threadlane/commit/e1e7128c94034353d11dfa77058154300fa96dfc))
+* **ui:** align GPUI snapshot pins ([d1941fe](https://github.com/wheregmis/threadlane/commit/d1941fe3ab924aa014ad56191123c9a0ebdb6943))
+* **ui:** invalidate retained automation detail on search ([56fb5a2](https://github.com/wheregmis/threadlane/commit/56fb5a229abd5dc7b554e8900624923e9299565d))
+* **ui:** polish startup, right-panel surfaces, and terminal toolbar ([ec3e053](https://github.com/wheregmis/threadlane/commit/ec3e053de349bd068cad26d8c8e7d3b0182142a9))
+* **ui:** refresh automation layout on search changes ([a61a20a](https://github.com/wheregmis/threadlane/commit/a61a20a522247f4a1e7910348f01fd09210a966f))
+* **ui:** retain automation detail width during search ([b62abb1](https://github.com/wheregmis/threadlane/commit/b62abb1784c6076b6acdd44d5cd9294e10f1ff83))
+
 ## [0.1.50](https://github.com/wheregmis/threadlane/compare/v0.1.49...v0.1.50) (2026-10-12)
 
 
