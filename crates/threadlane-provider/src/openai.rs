@@ -25,9 +25,9 @@ const CODEX_SSE_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const CODEX_WS_URL: &str = "wss://chatgpt.com/backend-api/codex/responses";
 const CODEX_WS_BETA: &str = "responses_websockets=2026-02-06";
 // The model endpoint filters inventory by Codex compatibility, independently of
-// Threadlane's version. GPT-6 Sol/Luna require at least 0.155.0; 0.157.0 is
-// verified against the live inventory. Keep CODEX_CLIENT_VERSION overridable.
-const CODEX_MODELS_CLIENT_VERSION: &str = "0.157.0";
+// Threadlane's version. Use the GPT-6.1 Sol launch's Codex release version;
+// keep CODEX_CLIENT_VERSION overridable for later compatibility changes.
+const CODEX_MODELS_CLIENT_VERSION: &str = "0.159.2";
 const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const WS_RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -1668,7 +1668,7 @@ mod tests {
             assert_eq!(request.headers()["originator"], "threadlane");
             assert_eq!(request.headers()["ChatGPT-Account-Id"], "test-account");
         }
-        assert_eq!(super::CODEX_MODELS_CLIENT_VERSION, "0.157.0");
+        assert_eq!(super::CODEX_MODELS_CLIENT_VERSION, "0.159.2");
     }
 
     #[test]

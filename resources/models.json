@@ -1,60 +1,123 @@
 {
   "schema_version": 1,
-  "revision": 1,
+  "revision": 2,
   "models": [
     {
       "id": "gpt-6-sol",
       "label": "GPT-6 Sol",
       "provider": "openai",
+      "context_window": 1050000,
+      "supported_efforts": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
       "default_effort": "medium"
     },
     {
       "id": "gpt-6-luna",
       "label": "GPT-6 Luna",
       "provider": "openai",
+      "context_window": 1050000,
+      "supported_efforts": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
       "default_effort": "high"
     },
     {
       "id": "gpt-5.6-luna",
       "label": "GPT-5.6 Luna",
       "provider": "openai",
-      "context_window": 1000000
+      "context_window": 1050000,
+      "supported_efforts": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "medium"
     },
     {
       "id": "gpt-5.4",
       "label": "GPT-5.4",
       "provider": "openai",
-      "context_window": 1000000
+      "context_window": 1050000,
+      "supported_efforts": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "default_effort": "none"
     },
     {
       "id": "gpt-5.4-mini",
       "label": "GPT-5.4 Mini",
       "provider": "openai",
-      "context_window": 128000
+      "context_window": 400000,
+      "supported_efforts": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "default_effort": "none"
     },
     {
       "id": "gpt-5.5",
       "label": "GPT-5.5",
       "provider": "openai",
-      "context_window": 1000000
+      "context_window": 1050000,
+      "supported_efforts": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "default_effort": "medium"
     },
     {
       "id": "gpt-5.6-sol",
       "label": "GPT-5.6 Sol",
       "provider": "openai",
-      "context_window": 1000000
+      "context_window": 1050000,
+      "supported_efforts": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "medium"
     },
     {
       "id": "gpt-5.6-terra",
       "label": "GPT-5.6 Terra",
       "provider": "openai",
-      "context_window": 1000000
-    },
-    {
-      "id": "gpt-5.3-codex-spark",
-      "label": "GPT-5.3 Codex Spark",
-      "provider": "openai",
-      "context_window": 128000
+      "context_window": 1050000,
+      "supported_efforts": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "medium"
     },
     {
       "id": "gpt-4o",
@@ -75,16 +138,38 @@
       ]
     },
     {
+      "id": "chat-latest",
+      "label": "Chat Latest",
+      "provider": "openai",
+      "context_window": 400000,
+      "supported_efforts": [
+        "off"
+      ]
+    },
+    {
       "id": "antigravity/gemini-3.1-pro",
       "label": "Gemini 3.1 Pro",
       "provider": "antigravity",
-      "context_window": 2000000
+      "context_window": 1048576
     },
     {
       "id": "antigravity/claude-opus-4-6",
       "label": "Claude Opus 4.6",
       "provider": "antigravity",
       "context_window": 200000
+    },
+    {
+      "id": "antigravity/claude-opus-5-5",
+      "label": "Claude Opus 5.5",
+      "provider": "antigravity",
+      "context_window": 1000000,
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high",
+        "max"
+      ],
+      "default_effort": "medium"
     },
     {
       "id": "antigravity/gpt-oss-120b",
@@ -153,6 +238,11 @@
       "context_window": 128000
     },
     {
+      "id": "opencode-go/longcat-2.5-preview-free",
+      "label": "LongCat 2.5 Preview Free (limited time)",
+      "provider": "opencode"
+    },
+    {
       "id": "opencode-go/mimo-v2.5",
       "label": "MiMo-V2.5",
       "provider": "opencode",
@@ -163,6 +253,16 @@
       "label": "MiMo-V2.5-Pro",
       "provider": "opencode",
       "context_window": 128000
+    },
+    {
+      "id": "opencode-go/mimo-v2.6-flash",
+      "label": "MiMo-V2.6-Flash",
+      "provider": "opencode"
+    },
+    {
+      "id": "opencode-go/mimo-v2.6-pro",
+      "label": "MiMo-V2.6-Pro",
+      "provider": "opencode"
     },
     {
       "id": "opencode-go/minimax-m3",
@@ -242,27 +342,69 @@
       "context_window": 128000
     },
     {
+      "id": "opencode-go/space-bunny",
+      "label": "Space Bunny",
+      "provider": "opencode"
+    },
+    {
+      "id": "opencode-go/step-5-preview-free",
+      "label": "Step 5 Preview Free (limited time)",
+      "provider": "opencode"
+    },
+    {
+      "id": "opencode-go/cat-jam-free",
+      "label": "Cat Jam Free (limited time)",
+      "provider": "opencode"
+    },
+    {
       "id": "anthropic/claude-opus-5-5",
       "label": "Claude Opus 5.5",
       "provider": "anthropic",
-      "context_window": 1000000
+      "context_window": 1000000,
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "medium"
     },
     {
       "id": "anthropic/claude-haiku-5-5",
       "label": "Claude Haiku 5.5",
       "provider": "anthropic",
-      "context_window": 1000000
+      "context_window": 1000000,
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "medium"
     },
     {
       "id": "anthropic/claude-fable-5-1",
       "label": "Claude Fable 5.1",
       "provider": "anthropic",
-      "context_window": 1000000
+      "context_window": 1000000,
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "high"
     },
     {
       "id": "gpt-6.1-sol",
       "label": "GPT-6.1 Sol",
-      "provider": "openai"
+      "provider": "openai",
+      "context_window": 1050000,
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "medium"
     },
     {
       "id": "antigravity/gemini-3.7-flash",
@@ -271,16 +413,47 @@
       "context_window": 1000000
     },
     {
+      "id": "antigravity/gemini-3.8-flash",
+      "label": "Gemini 3.8 Flash",
+      "provider": "antigravity",
+      "context_window": 1048576
+    },
+    {
+      "id": "antigravity/gemini-3.6-flash",
+      "label": "Gemini 3.6 Flash",
+      "provider": "antigravity",
+      "context_window": 1048576
+    },
+    {
       "id": "antigravity/claude-sonnet-4-6",
       "label": "Claude Sonnet 4.6",
       "provider": "antigravity",
       "context_window": 200000
     },
     {
+      "id": "antigravity/claude-sonnet-5-5",
+      "label": "Claude Sonnet 5.5",
+      "provider": "antigravity",
+      "context_window": 1000000,
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high",
+        "max"
+      ],
+      "default_effort": "medium"
+    },
+    {
       "id": "anthropic/claude-sonnet-5-5",
       "label": "Claude Sonnet 5.5",
       "provider": "anthropic",
-      "context_window": 1000000
+      "context_window": 1000000,
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "high"
     },
     {
       "id": "opencode-go/muse-spark-1.3-contributor",
