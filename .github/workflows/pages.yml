@@ -20,7 +20,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-06-18
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - name: Install the preview toolchain
         run: rustup toolchain install nightly-2026-06-18 --profile minimal --component rust-src --target wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
