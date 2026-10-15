@@ -98,6 +98,18 @@ fn shared_workspace_responsiveness_preserves_draft_and_agent_selection(cx: &mut 
         }
         let back = cx.debug_bounds("review-back-to-chat").unwrap();
         assert!(back.left() >= px(0.0) && back.right() <= rem * 30.0);
+        // Back shares the panel's title row (no second header band) and clears the
+        // window controls, since the panel spans the window in compact focus.
+        let title = cx.debug_bounds("right-panel-title").unwrap();
+        assert!(back.right() <= title.left(), "Back leads the panel title");
+        assert!(
+            back.top() < title.bottom() && title.top() < back.bottom(),
+            "Back and the title share one row"
+        );
+        assert!(
+            back.left() >= rem * threadlane_ui_theme::WINDOW_CONTROLS_CONTENT_INSET,
+            "Back clears the window controls"
+        );
         let collapsed = view.read_with(cx, |host, _| host.sidebar_collapsed);
         click(cx, "sidebar-collapse-toggle");
         assert_eq!(
