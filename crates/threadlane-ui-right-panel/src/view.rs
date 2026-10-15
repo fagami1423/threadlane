@@ -43,6 +43,8 @@ use super::types::{available_surfaces, ReviewDiffRequest, ReviewDiffState, Revie
 
 pub struct RightPanelView {
     pub(crate) model: Entity<AppState>,
+    /// Compact focus (the panel replaces the conversation): the header shows Back.
+    focus_back: bool,
     agents: Entity<AgentsPanel>,
     /// Live trajectory surface mounted from the workspace (owned by
     /// threadlane-ui-chat; injected type-erased to keep this crate chat-free).
@@ -380,6 +382,7 @@ impl RightPanelView {
             trajectory_view: None,
             active_surface: None,
             visible: false,
+            focus_back: false,
             project: None,
             worktree_unavailable: false,
             project_io_supported: false,
@@ -1753,6 +1756,14 @@ impl RightPanelView {
 
     /// Native browser views must be hidden explicitly when the panel leaves the layout.
     /// The workspace retains its panel-open preference on other pages.
+    /// The workspace marks compact focus; Back then emits [`threadlane_ui_kit::RightPanelBack`].
+    pub fn set_focus_back(&mut self, focus_back: bool, cx: &mut Context<Self>) {
+        if self.focus_back != focus_back {
+            self.focus_back = focus_back;
+            cx.notify();
+        }
+    }
+
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.visible = visible
             && self.model.read(cx).workspace_page == threadlane_ui_state::WorkspacePage::Chat;
@@ -1984,10 +1995,16 @@ impl RightPanelView {
                     cx.notify();
                 }))
         });
+        let back = self.focus_back.then(|| {
+            threadlane_ui_kit::right_panel_back_button().on_click(cx.listener(
+                |_, _, _, cx| cx.emit(threadlane_ui_kit::RightPanelBack),
+            ))
+        });
         threadlane_ui_kit::right_panel_header(
             self.active_surface,
             &available_surfaces(),
             refresh,
+            back,
             cx.listener(|this, surface: &Surface, _window, cx| this.open_surface(*surface, cx)),
             cx,
         )
@@ -3149,6 +3166,7 @@ impl RightPanelView {
 
 impl EventEmitter<threadlane_ui_kit::EditorSelectionRequest> for RightPanelView {}
 impl EventEmitter<threadlane_ui_kit::ReviewExcerptRequest> for RightPanelView {}
+impl EventEmitter<threadlane_ui_kit::RightPanelBack> for RightPanelView {}
 
 impl Render for RightPanelView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

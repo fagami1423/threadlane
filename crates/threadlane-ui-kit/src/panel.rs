@@ -45,13 +45,34 @@ impl RightPanelSurface {
     }
 }
 
+/// Emitted by a right-panel host when its Back button is pressed in compact focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RightPanelBack;
+
+/// Leading control of the panel title row in compact focus, where the panel replaces
+/// the conversation; the host emits [`RightPanelBack`] from its click.
+pub fn right_panel_back_button() -> Button {
+    Button::new("review-back-to-chat")
+        .debug_selector(|| "review-back-to-chat".into())
+        .icon(IconName::ChevronLeft)
+        .label("Back")
+        .accessibility_label("Back to conversation")
+        .tooltip("Back to conversation")
+        .ghost()
+        .small()
+}
+
+/// `back` is set only in compact focus, where the panel spans the window: the title row
+/// then also clears the window controls, replacing the separate Back band above it.
 pub fn right_panel_header(
     active: Option<RightPanelSurface>,
     surfaces: &[RightPanelSurface],
     refresh: Option<Button>,
+    back: Option<Button>,
     on_select: impl Fn(&RightPanelSurface, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> Div {
+    let inset_for_window_controls = back.is_some();
     let theme = cx.theme().colors;
     let selected = active.and_then(|active| surfaces.iter().position(|surface| *surface == active));
     let surfaces = surfaces.to_vec();
@@ -68,9 +89,14 @@ pub fn right_panel_header(
                 .flex_none()
                 .flex()
                 .items_center()
+                .gap_1()
                 .px_3()
+                .when(inset_for_window_controls, |row| {
+                    row.pl(rems(threadlane_ui_theme::WINDOW_CONTROLS_CONTENT_INSET))
+                })
                 // Workspace window controls occupy the trailing edge.
                 .pr_16()
+                .children(back)
                 .child(
                     div()
                         .id("right-panel-title")

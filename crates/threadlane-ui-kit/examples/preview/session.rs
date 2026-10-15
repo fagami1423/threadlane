@@ -515,6 +515,10 @@ impl SessionPreview {
                     host.input.update(cx, |input, cx| input.set_value(prompt.clone(), window, cx));
                 }
                 crate::agents::AgentsPreviewEvent::OpenTerminal => host.terminal_open = true,
+                crate::agents::AgentsPreviewEvent::Back => {
+                    host.agents_open = false;
+                    host.input.update(cx, |input, cx| input.focus(window, cx));
+                }
                 crate::agents::AgentsPreviewEvent::OpenSampleFile => {
                     host.editor.update(cx, |editor, cx| editor.open_sample(cx));
                     host.editor_open = true;
@@ -1329,6 +1333,8 @@ impl Render for SessionPreview {
             self.sidebar_collapsed,
             right_visible,
         );
+        let focus_back = right_visible && layout.right_panel_focus;
+        self.agents.update(cx, |agents, cx| agents.set_focus_back(focus_back, cx));
         let show_environment = kit::environment_fits(layout.environment_width, rem);
         let visible_panels = [
             !self.settings_open && layout.sidebar_visible,
@@ -1589,16 +1595,7 @@ impl Render for SessionPreview {
         };
         let content = if right_visible {
             if layout.right_panel_focus {
-                kit::workspace_right_panel_focus(
-                    self.agents.clone(),
-                    cx.listener(|host, _, window, cx| {
-                        host.agents_open = false;
-                        host.input.update(cx, |input, cx| input.focus(window, cx));
-                        cx.notify();
-                    }),
-                    cx,
-                )
-                .into_any_element()
+                kit::workspace_right_panel_focus(self.agents.clone()).into_any_element()
             } else {
                 kit::workspace_right_panel_split(
                     &self.right_split,

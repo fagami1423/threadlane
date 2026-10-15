@@ -102,34 +102,14 @@ fn sidebar_toggle_button(collapsed: bool, available: bool) -> Button {
 }
 
 /// Keep the selected inspector usable when chat and panel cannot fit side by side.
-pub fn workspace_right_panel_focus(
-    panel: impl IntoElement,
-    on_back: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    cx: &App,
-) -> Div {
+/// Compact focus: the right panel replaces the conversation. Its own header carries
+/// Back ([`crate::right_panel_back_button`]), so no second header band is stacked here.
+pub fn workspace_right_panel_focus(panel: impl IntoElement) -> Div {
     div()
         .debug_selector(|| "workspace-right-panel-focus".into())
         .flex()
         .flex_col()
         .size_full()
-        .child(
-            div()
-                .min_h(threadlane_ui_theme::WINDOW_CONTROLS_CLEARANCE)
-                .flex_none()
-                .flex()
-                .items_center()
-                .pl(rems(threadlane_ui_theme::WINDOW_CONTROLS_CONTENT_INSET))
-                .pr_16()
-                .bg(cx.theme().title_bar)
-                .child(
-                    Button::new("review-back-to-chat")
-                        .debug_selector(|| "review-back-to-chat".into())
-                        .label("Back to conversation")
-                        .ghost()
-                        .small()
-                        .on_click(on_back),
-                ),
-        )
         .child(div().flex_1().min_h_0().child(panel))
 }
 

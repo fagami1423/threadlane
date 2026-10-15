@@ -778,6 +778,13 @@ impl WorkspaceView {
                     this.insert_files_selection_to_chat(request.clone(), window, cx);
                 },
             );
+            let right_panel_back_sub = cx.subscribe_in(
+                &right_panel,
+                window,
+                |this, _, _: &threadlane_ui_kit::RightPanelBack, window, cx| {
+                    this.toggle_right_panel_action(&ToggleRightPanel, window, cx);
+                },
+            );
             let right_panel_review_excerpt_sub = cx.subscribe_in(
                 &right_panel,
                 window,
@@ -835,6 +842,7 @@ impl WorkspaceView {
                     right_panel_sub,
                     right_panel_selection_sub,
                     right_panel_review_excerpt_sub,
+                    right_panel_back_sub,
                 ],
             }
         });
@@ -2652,15 +2660,11 @@ impl Render for WorkspaceView {
         let chat_page_content = {
         self.right_panel.update(cx, |panel, cx| {
             panel.set_visible(self.right_panel_visible && !(self.bottom_panel_visible && self.terminal_maximized), cx);
+            panel.set_focus_back(review_focus, cx);
         });
             let upper_content = if review_focus {
-                threadlane_ui_kit::workspace_right_panel_focus(
-                    self.right_panel.clone(),
-                    cx.listener(|this, _, window, cx| {
-                        this.toggle_right_panel_action(&ToggleRightPanel, window, cx);
-                    }),
-                    cx,
-                ).into_any_element()
+                threadlane_ui_kit::workspace_right_panel_focus(self.right_panel.clone())
+                    .into_any_element()
             } else if self.right_panel_visible {
                 threadlane_ui_kit::workspace_right_panel_split(
                     &self.right_panel_resizable_state, self.chat_list.clone(), self.right_panel.clone(), rem, viewport.width,

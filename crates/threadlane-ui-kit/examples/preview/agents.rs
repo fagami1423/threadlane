@@ -14,6 +14,8 @@ pub enum AgentsPreviewEvent {
     OpenSampleFile,
     OpenTerminal,
     OpenDiff { title: String, content: String },
+    /// Back to the conversation from compact focus.
+    Back,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -32,6 +34,7 @@ pub struct AgentsPreview {
     worktrees: std::collections::HashMap<String, CapturedAgentWorktree>,
     parent: std::path::PathBuf,
     surface: kit::RightPanelSurface,
+    focus_back: bool,
     browser: Entity<crate::browser::BrowserPreview>,
     files: Entity<crate::files::FilesPreview>,
     review: Entity<crate::review::ReviewPreview>,
@@ -44,6 +47,14 @@ impl EventEmitter<AgentsPreviewEvent> for AgentsPreview {}
 impl EventEmitter<kit::ReviewExcerptRequest> for AgentsPreview {}
 
 impl AgentsPreview {
+    /// The host marks compact focus, where the panel header carries Back.
+    pub fn set_focus_back(&mut self, focus_back: bool, cx: &mut Context<Self>) {
+        if self.focus_back != focus_back {
+            self.focus_back = focus_back;
+            cx.notify();
+        }
+    }
+
     pub fn new(
         main: Vec<ChatMessageInfo>,
         agents: Vec<SubagentActivityInfo>,
@@ -99,6 +110,7 @@ impl AgentsPreview {
             expanded: HashSet::new(),
             sample,
             surface: kit::RightPanelSurface::Agents,
+            focus_back: false,
             browser: cx.new(|cx| crate::browser::BrowserPreview::new(window, cx)),
             files,
             review,
@@ -242,10 +254,15 @@ fn run_id(agent: &SubagentActivityInfo) -> String {
 
 impl Render for AgentsPreview {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let back = self.focus_back.then(|| {
+            kit::right_panel_back_button()
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(AgentsPreviewEvent::Back)))
+        });
         let header = kit::right_panel_header(
             Some(self.surface),
             &kit::RightPanelSurface::ALL,
             None,
+            back,
             cx.listener(|host, surface: &kit::RightPanelSurface, _, cx| {
                 if *surface != kit::RightPanelSurface::Review {
                     host.review.update(cx, |review, cx| review.leave_review(cx));
