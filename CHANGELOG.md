@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.1.52](https://github.com/wheregmis/threadlane/compare/v0.1.51...v0.1.52) (2026-10-15)
+
+
+### Features
+
+* ship independently updatable model catalog ([89a1fd0](https://github.com/wheregmis/threadlane/commit/89a1fd04145083ff17389fde8b0cc1b355de97bf))
+
+
+### Bug Fixes
+
+* **layout:** put Back in the right panel's header in narrow windows ([b6ed012](https://github.com/wheregmis/threadlane/commit/b6ed01225b5b3ca0baaee5b0c73b66ef2c60ebe2))
+* preserve discovered fallback efforts and extensible catalog modes ([71f9158](https://github.com/wheregmis/threadlane/commit/71f9158c4a6c05ac39f1993c6597eb56d25931f1))
+* refresh Codex compatibility for GPT-6.1 Sol discovery ([69f9a3f](https://github.com/wheregmis/threadlane/commit/69f9a3f469b539f270802b76c6bb3ec3aadeceba))
+* refresh model catalog and GPT-6.1 Sol discovery ([ed4f30b](https://github.com/wheregmis/threadlane/commit/ed4f30bf58c4e73c92dbe5033b7d1e1119a143d5))
+
+
+### Maintenance
+
+* audit and refresh the bundled model catalog ([5a33125](https://github.com/wheregmis/threadlane/commit/5a3312591e2c3443c8cc60dd269f7b6739106523))
+* **deps:** bump actions/checkout from 4.2.2 to 7.0.1 ([45d572e](https://github.com/wheregmis/threadlane/commit/45d572e2b906c8e44b108bfe87e56659461b18e3))
+* **deps:** bump actions/download-artifact from 8.0.1 to 8.0.2 ([245bee0](https://github.com/wheregmis/threadlane/commit/245bee0e2e7f755affb9004ba5482ae9a385810b))
+* **deps:** bump actions/github-script from 7.0.1 to 9.0.0 ([f2de536](https://github.com/wheregmis/threadlane/commit/f2de536c681b27516f57b38b05cd9aa74f4b9332))
+* **deps:** bump actions/upload-artifact from 7.0.1 to 7.0.2 ([fed85a0](https://github.com/wheregmis/threadlane/commit/fed85a04fbc9784ea27428829d2e17ee1ca692f4))
+* **deps:** bump hotpath from 0.28.5 to 0.28.6 ([cd6f632](https://github.com/wheregmis/threadlane/commit/cd6f63208edec4fe4c19101c463459d866400579))
+* **deps:** bump objc2 from 0.6.4 to 0.6.5 ([b84e3c4](https://github.com/wheregmis/threadlane/commit/b84e3c4e7fc38de7617d246983c0ae8922748ebf))
+* **deps:** bump pawurb/hotpath-rs/.github/workflows/hotpath-relay.yml ([43ca63c](https://github.com/wheregmis/threadlane/commit/43ca63ce8cfb8fe086530ec575a8200fb9a0ee14))
+* **deps:** bump pawurb/hotpath-rs/.github/workflows/hotpath-relay.yml from 0.28.5 to 0.28.6 ([2bf24b9](https://github.com/wheregmis/threadlane/commit/2bf24b9bb65dacb2544d77d394f5056e9a8ab4e2))
+* **deps:** bump serde_json from 1.0.151 to 1.0.154 ([fec811d](https://github.com/wheregmis/threadlane/commit/fec811d66b5afa22eeac0d86659aaa7fc26be326))
+
 ## [0.1.51](https://github.com/wheregmis/threadlane/compare/v0.1.50...v0.1.51) (2026-10-14)
 
 
