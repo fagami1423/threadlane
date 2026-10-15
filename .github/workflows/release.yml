@@ -85,7 +85,7 @@ jobs:
           THREADLANE_UPDATER_PUBLIC_KEY: ${{ vars.THREADLANE_UPDATER_PUBLIC_KEY }}
         run: ./scripts/bundle-gpui-linux.sh
 
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: linux-${{ matrix.arch }}
           path: target/release/Threadlane-*-linux-*.tar.gz
@@ -122,7 +122,7 @@ jobs:
         shell: pwsh
         run: ./scripts/bundle-gpui-windows.ps1
 
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: windows-x86_64
           path: target/release/Threadlane-*-windows-*.zip
@@ -179,7 +179,7 @@ jobs:
           tar -czf target/release/Threadlane.app.tar.gz -C target/release Threadlane.app
           cargo packager signer sign target/release/Threadlane.app.tar.gz
 
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: macos-aarch64
           path: |
