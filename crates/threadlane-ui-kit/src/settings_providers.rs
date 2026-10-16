@@ -495,7 +495,7 @@ fn model_catalog_row(callback: Callback, cx: &App) -> Div {
         .child(
             Button::new("provider-refresh-models")
                 .debug_selector(|| "provider-refresh-models".into())
-                .icon(IconName::Redo)
+                .icon(Icon::default().path("icons/refresh-cw.svg"))
                 .label("Refresh models")
                 .outline()
                 .accessibility_label(hint)
