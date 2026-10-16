@@ -300,7 +300,7 @@ pub fn settings_catalog(
                 "extension-refresh".into()
             }
         })
-        .icon(IconName::Redo)
+        .icon(Icon::default().path("icons/refresh-cw.svg"))
         .label("Refresh")
         .outline()
         .on_click(move |_, window, cx| refresh(SettingsCatalogAction::Refresh, window, cx)),

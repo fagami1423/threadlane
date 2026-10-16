@@ -247,7 +247,7 @@ pub fn settings_external_agents(
                 .child(
                     Button::new("acp-refresh")
                         .debug_selector(|| "acp-refresh".into())
-                        .icon(IconName::Redo)
+                        .icon(Icon::default().path("icons/refresh-cw.svg"))
                         .label("Refresh")
                         .outline()
                         .on_click(move |_, window, cx| {

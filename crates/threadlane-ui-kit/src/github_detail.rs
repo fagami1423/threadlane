@@ -1,6 +1,6 @@
 //! Shared GitHub detail presentation. Hosts retain requests, cached text and workflow state.
 use gpui::{prelude::*, *};
-use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants};
 use gpui_component::link::Link;
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::spinner::Spinner;
@@ -389,7 +389,15 @@ impl GitHubIssueActions {
 pub fn github_issue_actions(
     controls: GitHubIssueActions,
     on_action: impl Fn(GitHubDetailAction, &mut Window, &mut App) + 'static,
+    cx: &App,
 ) -> Div {
+    // Delete is permanent: danger text on the quiet ghost style, so it no longer reads
+    // like Close or Suggest labels yet stays lighter than the confirmation it opens.
+    let danger = cx.theme().danger;
+    let delete_style = ButtonCustomVariant::new(cx)
+        .foreground(danger)
+        .hover(danger.opacity(0.1))
+        .active(danger.opacity(0.16));
     let callback: DetailCallback = Rc::new(on_action);
     let start = callback.clone();
     let change = callback.clone();
@@ -465,7 +473,7 @@ pub fn github_issue_actions(
                         .label("Delete…")
                         .accessibility_label("Permanently delete this issue…")
                         .tooltip("Permanently delete this issue…")
-                        .ghost()
+                        .custom(delete_style)
                         .small()
                         .disabled(controls.pending)
                         .on_click(move |_, window, cx| {

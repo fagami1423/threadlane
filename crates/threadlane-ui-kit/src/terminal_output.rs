@@ -205,7 +205,7 @@ pub fn terminal_status(
             Button::new("terminal-restart-banner-btn")
                 .debug_selector(|| "terminal-restart-banner-btn".into())
                 .label("Restart shell")
-                .icon(IconName::Redo)
+                .icon(Icon::default().path("icons/rotate-cw.svg"))
                 .ghost()
                 .xsmall()
                 .on_click(move |_, window, cx| on_restart(window, cx)),
