@@ -1046,7 +1046,7 @@ impl GitHubPreview {
                     .pending(self.scenario == "issue-pending");
                 let actions = kit::github_issue_actions(controls, move |action, window, cx| {
                     let _ = owner.update(cx, |view, cx| view.request_detail(action, window, cx));
-                });
+                }, cx);
                 let summary = &detail.summary;
                 let header = kit::GitHubDetailHeader::new(
                     summary.title.clone(),

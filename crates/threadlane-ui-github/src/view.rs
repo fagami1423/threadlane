@@ -3099,7 +3099,7 @@ impl GitHubView {
                     let _ = owner.update(cx, |view, cx| view.delete_selected_issue(window, cx));
                 }
                 _ => {}
-            });
+            }, cx);
         let summary = &detail.summary;
         let header = kit_github::GitHubDetailHeader::new(
             title,
