@@ -37,7 +37,7 @@ use threadlane_runtime::harness::SessionStore;
 
 use crate::discovery::canonical_session_file;
 use crate::projection::{
-    compute_full_session_projection, compute_session_messages, coding_agent_options,
+    compute_full_session_projection, compute_session_messages_for_hydration, coding_agent_options,
 };
 
 /// How many recent events a reconnecting client can replay. Sized to a long
@@ -1600,7 +1600,8 @@ impl DaemonCore {
         // snapshot carries the fields a remote client can render.
         let projection = compute_full_session_projection(&identity.session_file)
             .map_err(|error| format!("could not project session {session_id}: {error}"))?;
-        let messages = compute_session_messages(&identity.session_file).unwrap_or_default();
+        let messages =
+            compute_session_messages_for_hydration(&identity.session_file).unwrap_or_default();
         Ok(SessionSnapshot {
             session,
             messages,

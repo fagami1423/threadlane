@@ -55,7 +55,7 @@ use threadlane_ui_state::{
 };
 use threadlane_ui_state::projection::{
     coding_agent_options, compute_full_session_projection, compute_latest_run_completion,
-    compute_session_messages,
+    compute_session_messages_for_hydration,
 };
 use threadlane_updater::UpdateStatus;
 
@@ -508,7 +508,7 @@ impl WorkspaceView {
                 let history_file = request.session_file.clone();
                 let history = cx
                     .background_executor()
-                    .spawn(async move { compute_session_messages(&history_file) })
+                    .spawn(async move { compute_session_messages_for_hydration(&history_file) })
                     .await;
                 let _ = model.update(cx, |state, cx| {
                     state.finish_session_hydration(&request.session_id, &request.session_file);

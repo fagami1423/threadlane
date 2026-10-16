@@ -167,7 +167,7 @@ pub fn load_session_messages(session_file: &Path) -> Vec<ChatMessageInfo> {
 }
 
 pub fn compute_session_messages(session_file: &Path) -> Result<Vec<ChatMessageInfo>, String> {
-    use threadlane_runtime::harness::{read_transcript_page, QueueKind, Reducer, TranscriptItem};
+    use threadlane_runtime::harness::{read_transcript_page, TranscriptItem};
 
     // The durable pager is the single transcript source, but exhaust it here:
     // GPUI state continues to expose complete chronological history.
@@ -225,6 +225,17 @@ pub fn compute_session_messages(session_file: &Path) -> Result<Vec<ChatMessageIn
         }
     }
     flush(&mut messages, &mut rows, segment_start);
+    Ok(rows)
+}
+
+/// Projects saved messages plus actionable pending inputs for a session hydration.
+/// History-only consumers must use `compute_session_messages` instead.
+pub fn compute_session_messages_for_hydration(
+    session_file: &Path,
+) -> Result<Vec<ChatMessageInfo>, String> {
+    use threadlane_runtime::harness::{QueueKind, Reducer};
+
+    let mut rows = compute_session_messages(session_file)?;
 
     // Queued inputs are durable work, not transcript entries until consumed.
     let store = JsonlStore::open_read_only(session_file).map_err(|error| error.to_string())?;
@@ -1646,7 +1657,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
 
         for _ in 0..2 {
-            let rows = super::compute_session_messages(&path).unwrap();
+            let rows = super::compute_session_messages_for_hydration(&path).unwrap();
             assert_eq!(rows.len(), 3);
             assert_eq!(rows[0].content, "original prompt");
             let queued: Vec<_> = rows

@@ -1,6 +1,7 @@
 use super::*;
 use crate::projection::{
     compute_full_session_projection, compute_latest_run_completion, compute_session_messages,
+    compute_session_messages_for_hydration,
 };
 use crate::test_support::{
     activate_test_session, generated_reported_session_path, reported_session_shape_state,
@@ -1156,7 +1157,7 @@ fn queued_messages_survive_session_switch_and_remain_editable() {
     assert_eq!(queued_ids.len(), 2);
     assert_ne!(queued_ids[0], queued_ids[1]);
     assert_eq!(
-        compute_session_messages(&session_file).unwrap().len(),
+        compute_session_messages_for_hydration(&session_file).unwrap().len(),
         2,
         "both inputs must be durable before switching"
     );
@@ -1166,7 +1167,7 @@ fn queued_messages_survive_session_switch_and_remain_editable() {
         state.apply_session_messages(
             "other-session",
             &other_file,
-            compute_session_messages(&other_file).unwrap(),
+            compute_session_messages_for_hydration(&other_file).unwrap(),
             None,
         );
         assert!(
@@ -1178,7 +1179,7 @@ fn queued_messages_survive_session_switch_and_remain_editable() {
         state.apply_session_messages(
             "queue-session",
             &session_file,
-            compute_session_messages(&session_file).unwrap(),
+            compute_session_messages_for_hydration(&session_file).unwrap(),
             None,
         );
         assert_eq!(
@@ -1201,7 +1202,7 @@ fn queued_messages_survive_session_switch_and_remain_editable() {
     state.apply_session_messages(
         "queue-session",
         &session_file,
-        compute_session_messages(&session_file).unwrap(),
+        compute_session_messages_for_hydration(&session_file).unwrap(),
         None,
     );
     assert_eq!(state.messages.len(), 1);
@@ -1212,7 +1213,7 @@ fn queued_messages_survive_session_switch_and_remain_editable() {
     state.apply_session_messages(
         "queue-session",
         &session_file,
-        compute_session_messages(&session_file).unwrap(),
+        compute_session_messages_for_hydration(&session_file).unwrap(),
         None,
     );
     assert!(
