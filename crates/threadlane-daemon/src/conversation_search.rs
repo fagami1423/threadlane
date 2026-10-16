@@ -238,6 +238,52 @@ mod tests {
     }
 
     #[test]
+    fn search_excludes_pending_queue_inputs() {
+        use threadlane_runtime::harness::{AgentHarness, JsonlStore, ProvisionedEntry, QueueKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        write_session(&path, vec![AgentMessage::user("saved history", Vec::new())]);
+        let mut harness = AgentHarness::new(JsonlStore::open(&path).unwrap());
+        for (id, queue) in [
+            ("follow-up", QueueKind::FollowUp),
+            ("next-run", QueueKind::NextRun),
+        ] {
+            harness
+                .enqueue_unbound(
+                    queue,
+                    ProvisionedEntry::new(
+                        id,
+                        None,
+                        AgentMessage::user("pending needle", Vec::new()),
+                    ),
+                )
+                .unwrap();
+            harness.drive_to_completion().unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        let report = search_conversations(
+            vec![target(dir.path(), "session", 1)],
+            "needle",
+            &cancelled(),
+            None,
+        );
+        assert_eq!(report.scanned, 1);
+        assert!(
+            report.matches.is_empty(),
+            "pending inputs are not saved conversation history"
+        );
+        let report = search_conversations(
+            vec![target(dir.path(), "session", 1)],
+            "saved history",
+            &cancelled(),
+            None,
+        );
+        assert_eq!(report.matches.len(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
     fn search_reports_one_row_per_matching_session_in_recency_order() {
         let dir = tempfile::tempdir().unwrap();
         write_session(
