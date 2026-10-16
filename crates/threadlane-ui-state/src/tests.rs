@@ -1115,6 +1115,114 @@ fn test_session(id: &str, session_file: &Path) -> SessionInfo {
 }
 
 #[test]
+fn queued_messages_survive_session_switch_and_remain_editable() {
+    let root = tempfile::tempdir().unwrap();
+    let work_dir = root.path().canonicalize().unwrap();
+    let sessions_dir = work_dir.join(".threadlane/sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    let session_file = sessions_dir.join("queue-session.jsonl");
+    let other_file = sessions_dir.join("other-session.jsonl");
+    let mut state = AppState::for_tests();
+    state.projects.push(ProjectInfo {
+        name: "project".into(),
+        work_dir: work_dir.clone(),
+        sessions: vec![
+            test_session("queue-session", &session_file),
+            test_session("other-session", &other_file),
+        ],
+        is_expanded: true,
+    });
+    state.select_session(work_dir.clone(), "queue-session".into());
+    let runtime = state.ensure_session_runtime(work_dir.clone(), session_file.clone());
+    runtime.begin_generation().unwrap();
+    // An active turn holds the agent while follow-ups wait in its durable queue.
+    let _running_turn = runtime.agent.try_lock().unwrap();
+    state.is_generating = true;
+    let images = vec![ImageAttachment {
+        display_name: "shot.png".into(),
+        data_url: "data:image/png;base64,AA==".into(),
+    }];
+    for _ in 0..2 {
+        state
+            .stage_busy_message("same follow-up".into(), images.clone())
+            .unwrap();
+        state.queue_pending_message().unwrap();
+    }
+    let queued_ids: Vec<_> = state
+        .messages
+        .iter()
+        .map(|message| message.id.clone())
+        .collect();
+    assert_eq!(queued_ids.len(), 2);
+    assert_ne!(queued_ids[0], queued_ids[1]);
+    assert_eq!(
+        compute_session_messages(&session_file).unwrap().len(),
+        2,
+        "both inputs must be durable before switching"
+    );
+
+    for _ in 0..2 {
+        state.select_session(work_dir.clone(), "other-session".into());
+        state.apply_session_messages(
+            "other-session",
+            &other_file,
+            compute_session_messages(&other_file).unwrap(),
+            None,
+        );
+        assert!(
+            state.messages.is_empty(),
+            "queues must not leak into another session"
+        );
+        state.select_session(work_dir.clone(), "queue-session".into());
+        assert!(state.is_generating);
+        state.apply_session_messages(
+            "queue-session",
+            &session_file,
+            compute_session_messages(&session_file).unwrap(),
+            None,
+        );
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .map(|message| message.id.clone())
+                .collect::<Vec<_>>(),
+            queued_ids,
+            "hydration must restore each queued occurrence with its actionable identity",
+        );
+    }
+
+    let prefix = "queued-user-queue-session-";
+    let (text, restored_images) = state
+        .edit_queued_message(queued_ids[0].strip_prefix(prefix).unwrap())
+        .unwrap();
+    assert_eq!(text, "same follow-up");
+    assert_eq!(restored_images, images);
+    state.apply_session_messages(
+        "queue-session",
+        &session_file,
+        compute_session_messages(&session_file).unwrap(),
+        None,
+    );
+    assert_eq!(state.messages.len(), 1);
+    assert_eq!(state.messages[0].id, queued_ids[1]);
+    state
+        .cancel_queued_message(queued_ids[1].strip_prefix(prefix).unwrap())
+        .unwrap();
+    state.apply_session_messages(
+        "queue-session",
+        &session_file,
+        compute_session_messages(&session_file).unwrap(),
+        None,
+    );
+    assert!(
+        state.messages.is_empty(),
+        "cancelled entries must not return on hydration"
+    );
+    state.scheduler_handles.remove(&session_file);
+}
+
+#[test]
 fn inactive_permission_is_visible_before_session_selection() {
     let mut state = AppState::load_from_registry(Vec::new());
     state.active_session_id = Some("foreground".into());

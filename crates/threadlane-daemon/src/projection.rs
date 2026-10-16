@@ -167,7 +167,7 @@ pub fn load_session_messages(session_file: &Path) -> Vec<ChatMessageInfo> {
 }
 
 pub fn compute_session_messages(session_file: &Path) -> Result<Vec<ChatMessageInfo>, String> {
-    use threadlane_runtime::harness::{read_transcript_page, TranscriptItem};
+    use threadlane_runtime::harness::{read_transcript_page, QueueKind, Reducer, TranscriptItem};
 
     // The durable pager is the single transcript source, but exhaust it here:
     // GPUI state continues to expose complete chronological history.
@@ -225,6 +225,23 @@ pub fn compute_session_messages(session_file: &Path) -> Result<Vec<ChatMessageIn
         }
     }
     flush(&mut messages, &mut rows, segment_start);
+
+    // Queued inputs are durable work, not transcript entries until consumed.
+    let store = JsonlStore::open_read_only(session_file).map_err(|error| error.to_string())?;
+    let state = Reducer::reduce(&store).map_err(|error| error.to_string())?;
+    if let Some(lane) = state.lane("main") {
+        for queued in &lane.queued {
+            if queued.run_id.is_some()
+                || !matches!(queued.queue, QueueKind::FollowUp | QueueKind::NextRun)
+            {
+                continue;
+            }
+            for mut row in project_agent_messages(vec![queued.target.message.clone()]) {
+                row.id = format!("queued-user-{}-{}", store.session_id(), queued.target.id);
+                rows.push(row);
+            }
+        }
+    }
     Ok(rows)
 }
 
@@ -1565,6 +1582,89 @@ mod tests {
             payload: serde_json::json!({"error":"failed", "retry_prompt":retry}),
         }]);
         assert_eq!(rows[0].retry_prompt.as_ref(), Some(&retry));
+    }
+
+    #[test]
+    fn pending_queue_projection_preserves_order_and_identity_without_writing() {
+        use threadlane_protocol::AgentMessage;
+        use threadlane_runtime::harness::{AgentHarness, ProvisionedEntry, QueueKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut harness = AgentHarness::new(JsonlStore::open(&path).unwrap());
+        harness
+            .accept_prompt("run", AgentMessage::user("original prompt", Vec::new()))
+            .unwrap();
+        harness.drive_to_completion().unwrap();
+        harness
+            .enqueue(
+                "run",
+                QueueKind::FollowUp,
+                ProvisionedEntry::new(
+                    "run-bound",
+                    None,
+                    AgentMessage::user("internal input", Vec::new()),
+                ),
+            )
+            .unwrap();
+        harness.drive_to_completion().unwrap();
+        for (id, queue) in [
+            ("cancelled", QueueKind::FollowUp),
+            ("consumed", QueueKind::NextRun),
+            ("follow-up", QueueKind::FollowUp),
+            ("next-run", QueueKind::NextRun),
+            ("steer", QueueKind::Steer),
+        ] {
+            harness
+                .enqueue_unbound(
+                    queue,
+                    ProvisionedEntry::new(
+                        id,
+                        None,
+                        AgentMessage::user("identical prompt", Vec::new()),
+                    ),
+                )
+                .unwrap();
+            harness.drive_to_completion().unwrap();
+        }
+        harness.cancel_unbound("cancelled").unwrap();
+        harness.drive_to_completion().unwrap();
+        harness.consume_unbound("consumed").unwrap();
+        harness.drive_to_completion().unwrap();
+        harness
+            .enqueue_unbound_on_lane(
+                "child",
+                QueueKind::FollowUp,
+                ProvisionedEntry::new(
+                    "child-input",
+                    None,
+                    AgentMessage::user("child input", Vec::new()),
+                ),
+            )
+            .unwrap();
+        harness.drive_to_completion().unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        for _ in 0..2 {
+            let rows = super::compute_session_messages(&path).unwrap();
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0].content, "original prompt");
+            let queued: Vec<_> = rows
+                .iter()
+                .filter(|row| row.id.starts_with("queued-user-"))
+                .collect();
+            assert_eq!(
+                queued.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+                [
+                    "queued-user-session-follow-up",
+                    "queued-user-session-next-run",
+                ]
+            );
+            assert!(queued.iter().all(|row| {
+                row.role == crate::types::MessageRole::User && row.content == "identical prompt"
+            }));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     fn started(id: &str, seq: u64, lane: &str, intent: OperationIntent) -> Record {
